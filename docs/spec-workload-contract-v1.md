@@ -1,10 +1,8 @@
 # Workload contract V1
 
-This document describes the implemented workload admission interfaces. Native
-qualification and release publication remain separate evidence requirements;
-the presence of these interfaces does not certify a host or grant a workload
-permission. Implementation references are linked below so schema and behavior
-changes can be reviewed together.
+This document describes the ordinary workload contract and local grant interfaces.
+Native observations and inventory are diagnostic facts. Permission comes from
+authenticated local admission and the active administrator-owned policy.
 
 ## Authority and supported profiles
 
@@ -69,7 +67,7 @@ After strict decoding, the resolver checks:
 2. The expected epoch equals the active epoch.
 3. The granted profile reference equals the requested ID and digest, and its
    catalogue entry is enabled.
-4. The profile matches the native backend and current qualification digest.
+4. The enabled local profile matches the actual native backend.
 5. The request ceiling fits the grant ceiling and contains the profile's
    complete authority.
 6. Every requirement is supported by that profile.
@@ -132,13 +130,13 @@ The following preimages establish the commitment dependency order:
 | --- | --- |
 | `memcordon-workload-contract-v1` | Plan digest; profile ID/digest; grant ID/revision/approved-plan digest; five ceiling tags; requirements sorted by ID; endpoints sorted by ID; epoch nonce/revision |
 | `profile-definition-v1` | Profile ID; five ceiling tags; baseline restriction tag; alternate-path knowledge tag |
-| `authorization-snapshot-v1` | Profiles sorted by ID; grants sorted by ID; active-attempt disposition |
+| `memcordon.local-policy/revision1` | Profiles sorted by ID; grants sorted by ID; active-attempt disposition |
 | `effective-workload-policy-v1` | Request digest; profile digest; registry digest; five effective ceiling tags |
-| `attempt-policy-binding-v1` | Request/plan/profile/grant/epoch binding; registry/qualification; provider generation/source/runtime digest; boot identity; effective digest; attempt ID/restart number; admission nonce; opaque caller/invocation reference |
+| `memcordon.local-attempt-binding/revision1` | Request/plan/profile/grant/epoch binding; registry; provider generation/source/runtime digest; boot identity; effective digest; attempt ID/restart number; admission nonce; opaque caller/invocation reference |
 | `attempt-policy-enforcement-v1` | Attempt-binding digest; restriction tag; six verified preauthorization facts |
 
-Registry profile entries encode ID/digest, enabled byte, and qualification
-digest. Grant entries encode ID/revision, profile ID/digest, ceiling, enabled
+Registry profile entries encode ID/digest and enabled byte.
+Grant entries encode ID/revision, profile ID/digest, ceiling, enabled
 byte, callers sorted by binary encoding, and plans sorted by digest. Caller
 tags are 1 for a big-endian Linux UID and 2 for a length-prefixed Windows SID.
 Disposition tags are 1 drain and 2 revoke. Epoch activation metadata is outside
@@ -187,7 +185,7 @@ even when revocation has already activated. A later drain activation cannot
 clear the revocation latch for an admission still live.
 
 [Discovery](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_discovery.rs) returns
-caller-filtered grants, support/availability, profile/catalog/qualification
+caller-filtered grants, support/availability, profile/catalog
 bindings, optional active epoch/registry identity, completeness, and a maximum
 TTL of 60 seconds. Its target-authorized field is fixed false. Discovery is
 advisory; a cached result or profile name cannot replace live admission. A
@@ -206,50 +204,31 @@ durability facts, bound to the exact attempt and baseline restriction.
 
 | Surface | Implemented revision |
 | --- | --- |
-| Execution / plan / doctor report | 10 / 9 / 6 |
+| Execution / plan / doctor report | memcordon.result / memcordon.plan / memcordon.capabilities revision 1 |
 | Workload contract and profile semantics | 1 |
 | Generic provider contract / Linux launch wire | 3 / 3 |
-| Windows public / private wire | 2 / 2 |
-| Policy-bearing Linux durable attempt / Windows durable attempt | 3 / 3 |
-| Runtime manifest | 2 |
-| Package and installed-provider inspection | 5 |
+| Windows public / private wire | 3 / 3 |
+| Policy-bearing Linux durable attempt / Windows durable attempt | Named operational journals, revision 1 |
+| Runtime manifest | memcordon.runtime-manifest revision 1 |
+| Package and installed-provider inspection | Named operational inspection, revision 1 |
+| Release configuration / release manifest | 5 / 5 |
 
 These are independent schema domains, not one interchangeable protocol
 number. Historical Linux records retain their older record conventions;
-decoding them does not manufacture strict V1 admission. Runtime manifests bind
-the platform protocol inventory, component provenance, profile catalogue, and
-qualification artifact references. Mixed or stale bindings cannot be promoted
-to a current qualified strict attempt.
+decoding them does not manufacture strict V1 admission. Numeric execution,
+plan, and doctor domains 10, 9, and 6 retain explicit historical readers;
+their old mandatory nested fields are never converted to operational admission.
+Runtime manifests bind platform protocols and actual component byte inventory.
+Saved observations cannot authorize a current attempt.
 
-## Qualification, certification, and release scope
+## Native execution and release scope
 
-[Runtime artifact references](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/runtime_manifest.rs)
-state both the qualified target and whether it qualifies the package target.
-The Linux profile artifact currently names `x86_64-unknown-linux-gnu`; attaching
-that artifact to another Linux package does not qualify that package target.
-Windows references distinguish x64 and ARM64 profile and causal-diagnostic
-qualification artifacts. Actual native qualification remains necessary for
-the corresponding installed component set and host observations.
-
-Ordinary backend certification remains independent of sealed workload
-admission. The [standard catalogue](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/tools/memcordon-ci/src/standard_contract.rs)
-requires 23 Linux x64 scenarios on `ubuntu-24.04` and 17 Windows x64 scenarios
-on `windows-2025`. The historical standard floor is preserved separately from
-the current catalogue, with the Linux guardian-observation regression appended.
-
-Standard certificate schema 3 binds the exact catalogue digest, standard
-boundary/backend, native target, source commit, runtime observations, ordered
-named passing tests, and zero skips. Hosted release certificates additionally
-bind repository, run, workflow reference/commit, source, and exact release job
-through [certification provenance](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/tools/memcordon-ci/src/certification_context.rs).
-A local observation cannot satisfy a hosted producer-origin check. Standard
-and sealed jobs, artifacts, and required release records remain distinct.
+Ordinary native suites run the actual platform scenario targets. Their selected
+results record exact source/backend association, ordered passing cases and real
+output bytes. No collector, saved report, or readiness observation grants local
+permission. The release DAG selects exact source/package bytes and executes
+matching native and installed consumers independently of runtime permission.
 Compilation caches cannot substitute for fresh native scenario execution.
-
-Release configuration uses schema 4, and the release manifest records the
-`standard-and-sealed-v1` certification contract. Its producer-origin checks
-bind the separate standard certificates to the releasing workflow run;
-valid sealed evidence cannot compensate for missing ordinary certification.
 
 Portable codec tests and seeded fuzz smoke substantiate data validation only.
 They do not establish OS enforcement, private TCP support, native revocation

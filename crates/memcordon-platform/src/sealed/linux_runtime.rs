@@ -1,6 +1,6 @@
 use memcordon_core::{
     PublicProviderBindingV1,
-    runtime_manifest::{RuntimeComponentRole, RuntimeManifestV2},
+    runtime_manifest::{RuntimeComponentRole, RuntimeManifest},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -33,16 +33,37 @@ fn protected(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
+fn protected_digest(mut file: File) -> Result<memcordon_core::DiagnosticSha256, String> {
+    let mut digest = Sha256::new();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&chunk[..count]);
+    }
+    Ok(memcordon_core::DiagnosticSha256::from_bytes(
+        digest.finalize().into(),
+    ))
+}
+
 pub fn verify(expected: &PublicProviderBindingV1) -> Result<(), String> {
+    if installed_binding()? != *expected {
+        return Err("authenticated provider runtime binding differs".into());
+    }
+    Ok(())
+}
+
+pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
     let file = protected(Path::new("/usr/libexec/memcordon-runtime-manifest.json"))?;
     let mut bytes = Vec::new();
     file.take(memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    let manifest = RuntimeManifestV2::parse(&bytes)?;
-    if manifest.public_binding(&bytes)? != *expected
-        || manifest.version != env!("CARGO_PKG_VERSION")
-    {
+    let manifest = RuntimeManifest::parse(&bytes)?;
+    let binding = manifest.public_binding(&bytes)?;
+    if manifest.version != env!("CARGO_PKG_VERSION") {
         return Err("authenticated provider runtime binding differs".into());
     }
     let target = match (std::env::consts::ARCH, cfg!(target_env = "musl")) {
@@ -52,14 +73,21 @@ pub fn verify(expected: &PublicProviderBindingV1) -> Result<(), String> {
         ("aarch64", true) => "aarch64-unknown-linux-musl",
         _ => return Err("unsupported provider runtime target".into()),
     };
+    let private_tcp = matches!(
+        &manifest.sealed,
+        memcordon_core::runtime_manifest::SealedRuntime::Included {
+            workload_contract_schema: 2,
+            ..
+        }
+    );
     if manifest
-        != RuntimeManifestV2::linux(
+        != RuntimeManifest::linux_selected(
             manifest.version.clone(),
             manifest.source_commit.clone(),
             target.into(),
             manifest.components.clone(),
-        )
-        || manifest.components.len() != 2
+            private_tcp,
+        )?
     {
         return Err("provider runtime support differs".into());
     }
@@ -82,23 +110,44 @@ pub fn verify(expected: &PublicProviderBindingV1) -> Result<(), String> {
     {
         return Err("provider runtime roles differ".into());
     }
-    let mut file = protected(Path::new("/usr/libexec/memcordon-sealed-agent"))?;
-    if file.metadata().map_err(|error| error.to_string())?.len() != agent.size {
-        return Err("installed provider size differs".into());
-    }
-    let mut digest = Sha256::new();
-    let mut chunk = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut chunk).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
+    for component in &manifest.components {
+        if !matches!(
+            component.role,
+            RuntimeComponentRole::PublicCli
+                | RuntimeComponentRole::SealedAgent
+                | RuntimeComponentRole::Arm32AbiHelper
+        ) {
+            return Err("installed GNU runtime component role differs".into());
         }
-        digest.update(&chunk[..count]);
+        let file = protected(&Path::new("/usr/libexec").join(&component.path))?;
+        let before = file.metadata().map_err(|error| error.to_string())?;
+        if before.len() != component.size || before.mode() & 0o7777 != component.mode {
+            return Err("installed runtime component size/mode differs".into());
+        }
+        let actual: String =
+            protected_digest(file.try_clone().map_err(|error| error.to_string())?)?.into();
+        let after = file.metadata().map_err(|error| error.to_string())?;
+        if actual != component.sha256
+            || (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) != (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            )
+        {
+            return Err("installed runtime component bytes changed or differ".into());
+        }
     }
-    let actual: String =
-        memcordon_core::DiagnosticSha256::from_bytes(digest.finalize().into()).into();
-    if actual != agent.sha256 {
-        return Err("installed provider hash differs".into());
-    }
-    Ok(())
+    Ok(binding)
 }

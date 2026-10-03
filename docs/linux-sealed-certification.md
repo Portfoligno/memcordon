@@ -1,15 +1,21 @@
-# Linux sealed certification
+# Linux sealed native tests
 
-Linux sealed support is a native release claim, not an inference from compilation or the standard cgroup backend. The blocking suite is:
+Linux native tests exercise cgroup containment, caller identity, credential
+transitions, cancellation and cleanup. Installed consumers use the selected native
+archive or packaged crates and exercise real provider installation, protected
+files and units, local grants, execution and package recovery. A native setup
+failure must remain a failure or an explicit unavailable host.
 
-The installed package contains a hardened public control service/socket and a separate root-only launcher service/socket. The control service retains `NoNewPrivileges=yes`, an explicit narrow capability bounding set, no ambient capabilities, and its filesystem sandbox. The launcher uses `NoNewPrivileges=no`, has no ambient capabilities, and omits `PrivateTmp`, `ProtectSystem`, `RestrictSUIDSGID`, and a guessed capability bounding set so that it can reproduce the authenticated caller's mount context, `NoNewPrivs`, and capability ceiling. Before authorization, the target has the caller's UID/GID/groups and bounding set but no provider effective, permitted, inheritable, or ambient capabilities.
+The installed privileged control and launcher services retain their operational
+authentication and isolation requirements. A saved self-test report is diagnostic
+output. Every launch performs its actual caller, file-identity and host-control
+checks; contract-bound launches also resolve the live local policy.
 
-```text
-cargo run --locked --package memcordon-ci -- suite backend-linux-sealed-v2
-```
+Useful scenarios cover credential transitions, caller restrictions, mount context,
+recursive-provider rejection, frontend/provider/launcher/guardian loss, descendants,
+and complete resource retirement. Test cleanup must remove only resources owned
+by that test and report any remaining process, cgroup, file, unit or account
+obligation honestly.
 
-The Rust CI driver builds the exact provider, installs the four ephemeral root-owned unit artifacts through the provider's private package interface, verifies their no-follow identities and exact bytes, and exercises upgrade/recovery. It obtains a complete qualification-schema-3 receipt, requires `doctor --require sealed`, and runs every scenario by exact name with one passing test and zero skips. The v2 inventory includes set-ID, `sudo -n -u`, file-capability, caller `NoNewPrivs`, reduced caller capability bounding set, caller mount-context, recursive-provider rejection, post-transition escape probes, front-end/provider/launcher/guardian loss, and terminal leak checks. Cleanup always invokes the private uninstall operation and proves that no test user, attempt process, record, cgroup, fixture, or unit remains.
-
-The suite accepts only `linux-pid-namespace-cgroup-v2`, provider contract/launch wire v3, qualification schema 3, terminal receipt v2, and report schemas 10/9/6. Every caller-envelope reproduction fact, transition-certification digest, post-transition membership fact, terminal emptiness fact, helper reap, and boundary retirement must be present. Linux x86-64 release certification requires usable set-ID, `sudo`, and file-capability scenarios; host unavailability is not a passing result there. A v1 provider, standard-boundary fallback, missing artifact, unrecognized schema, skipped scenario, or incomplete native receipt fails certification.
-
-The release artifact contains newline-terminated structured reports for package verification, qualification v3, set-ID, `sudo`, file capabilities, caller envelope, mount context, fault injection, and cleanup/leak proof. See [the Linux mechanism v2 specification](../spec/sealed-linux-v2.md) and [sealed provider operation](sealed-provider.md).
+See [the Linux mechanism specification](../spec/sealed-linux-v2.md) and
+[sealed provider operation](sealed-provider.md) for the retained runtime boundaries.

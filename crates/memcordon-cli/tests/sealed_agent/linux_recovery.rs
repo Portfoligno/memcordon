@@ -19,7 +19,7 @@ fn root_entries(path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn empty_recovery_inventory_allows_qualification_to_continue() {
+fn empty_recovery_inventory_allows_readiness_probe_to_continue() {
     assert!(crate::linux::qualification::require_unambiguous_recovery(&[]).is_ok());
 }
 
@@ -27,7 +27,7 @@ fn empty_recovery_inventory_allows_qualification_to_continue() {
 fn ambiguous_recovery_inventory_is_reported_with_bounded_examples() {
     let ambiguous = (0_u8..18).map(identity).collect::<Vec<_>>();
     let error = crate::linux::qualification::require_unambiguous_recovery(&ambiguous)
-        .expect_err("ambiguous recovery must block qualification");
+        .expect_err("ambiguous recovery must block readiness probing");
 
     assert!(error.starts_with("MCSEALED-PROVIDER-UNAVAILABLE:"));
     assert!(error.contains("recovery-ambiguous-count=18"));
@@ -76,11 +76,11 @@ fn sealed_recovery_blocks_capability_while_live_state_is_ambiguous() {
     std::fs::create_dir(&path).unwrap();
     let state_before = root_entries(Path::new(STATE_ROOT));
     let cgroups_before = root_entries(Path::new(CGROUP_ROOT));
-    let error = crate::linux::qualification::qualify_after_package_verification_for_test()
+    let error = crate::linux::qualification::observe_after_package_verification_for_test()
         .expect_err("ambiguous state must suppress sealed capability");
     assert!(
         error.starts_with("MCSEALED-PROVIDER-UNAVAILABLE:"),
-        "unexpected qualification error: {error}"
+        "unexpected readiness error: {error}"
     );
     assert!(
         error.contains(&identity),
@@ -88,6 +88,9 @@ fn sealed_recovery_blocks_capability_while_live_state_is_ambiguous() {
     );
     assert_eq!(root_entries(Path::new(STATE_ROOT)), state_before);
     assert_eq!(root_entries(Path::new(CGROUP_ROOT)), cgroups_before);
-    assert!(path.exists(), "qualification removed unauthenticated state");
+    assert!(
+        path.exists(),
+        "readiness probe removed unauthenticated state"
+    );
     std::fs::remove_dir(path).unwrap();
 }

@@ -10,6 +10,20 @@ pub enum FuzzShard {
 
 /// Cargo's explicit bin inventory is the single source of fuzz coverage.
 pub fn targets(manifest: &str, shard: Option<FuzzShard>) -> Result<Vec<String>> {
+    let shard = shard.map(|shard| {
+        crate::target_shard::ShardSpec::new(
+            usize::from(shard == FuzzShard::Second),
+            std::num::NonZeroUsize::new(2).expect("nonzero partition"),
+        )
+        .expect("valid two-way partition")
+    });
+    targets_sharded(manifest, shard)
+}
+
+pub fn targets_sharded(
+    manifest: &str,
+    shard: Option<crate::target_shard::ShardSpec>,
+) -> Result<Vec<String>> {
     let document: toml::Value = toml::from_str(manifest)?;
     let bins = document
         .get("bin")
@@ -37,9 +51,9 @@ pub fn targets(manifest: &str, shard: Option<FuzzShard>) -> Result<Vec<String>> 
         .into_iter()
         .enumerate()
         .filter_map(|(index, name)| {
-            // Sorted alternating targets distribute the observed expensive harnesses.
-            let first = index % 2 == 0;
-            (shard.is_none() || first == (shard == Some(FuzzShard::First))).then_some(name)
+            shard
+                .is_none_or(|shard| shard.selects(index))
+                .then_some(name)
         })
         .collect();
     if selected.is_empty() {

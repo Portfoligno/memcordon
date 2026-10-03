@@ -1,5 +1,4 @@
 use std::io::Write as _;
-#[cfg(not(target_os = "macos"))]
 use std::path::Path;
 
 use memcordon::exit_mapping::error_exit_code;
@@ -7,7 +6,7 @@ use memcordon::invocation::{
     BudgetSet, BudgetToken, CleanArgs, DoctorArgs, ExecutionArgs, PlanArgs, PolicyArgs, Requirement,
 };
 #[cfg(not(target_os = "macos"))]
-use memcordon_core::write_report_atomic;
+use memcordon_core::write_report_bytes_atomic;
 use memcordon_core::{
     BackendCapabilityReport, BackoffPolicyReport, BoundaryCapability, BoundaryClass,
     BoundaryRequirement, BudgetKindReport, BudgetTokenReport, CLEAN_REPORT_SCHEMA_VERSION,
@@ -36,7 +35,52 @@ struct Resolution {
     report: PolicyEnvelopeReport,
 }
 
+fn diagnostic_phase_path(args: &ExecutionArgs) -> Option<std::path::PathBuf> {
+    #[cfg(all(windows, feature = "test-support"))]
+    {
+        args.windows_stack_phases.then(|| {
+            args.output
+                .report_path
+                .as_ref()
+                .expect("stack phase opt-in requires a report path")
+                .with_extension("phases")
+        })
+    }
+    #[cfg(not(all(windows, feature = "test-support")))]
+    {
+        let _ = args;
+        None
+    }
+}
+
+fn diagnostic_phase(path: Option<&Path>, token: &'static str) {
+    #[cfg(all(windows, feature = "test-support"))]
+    if let Some(path) = path {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("stack phase opt-in path must be writable");
+        file.write_all(token.as_bytes())
+            .expect("stack phase token must be writable");
+        file.write_all(b"\n")
+            .expect("stack phase newline must be writable");
+    }
+    #[cfg(not(all(windows, feature = "test-support")))]
+    let _ = (path, token);
+}
+
 pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
+    #[cfg(target_os = "macos")]
+    let delivery = match memcordon_platform::MacosDeliveryRuntime::new(
+        memcordon_platform::DeliveryLimits::default(),
+        memcordon_platform::WriterImage::CurrentProcess,
+    ) {
+        Ok(runtime) => runtime,
+        Err(_) => return 125,
+    };
+    let phase_path = diagnostic_phase_path(&args);
+    diagnostic_phase(phase_path.as_deref(), "execute-start");
     #[cfg(not(target_os = "macos"))]
     if let Some(path) = &args.output.report_path {
         let parent = path
@@ -58,28 +102,58 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     }
     let (program, arguments) = args.command.split_first().expect("router requires command");
     let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
+    if args.policy.private_workload_contract().is_some() {
+        if args.output.report_format != memcordon_core::ReportFormat::ResultV1 {
+            return unavailable_private_v2(presentation);
+        }
+        #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+        return unavailable_private_v2(presentation);
+    }
     #[cfg(target_os = "macos")]
     let run_origin = match memcordon_platform::macos_continuous_nanos() {
         Ok(origin) => origin,
         Err(error) => {
             return finish_error(
-                &args,
+                args,
                 &command,
                 None,
                 Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()),
                 presentation,
+                &delivery,
             );
         }
     };
-    let resolution = match resolve(&args.policy, &args.budgets) {
+    diagnostic_phase(phase_path.as_deref(), "resolve-start");
+    let resolution = match resolve(&args.policy, &args.budgets, phase_path.as_deref()) {
         Ok(value) => value,
-        Err(error) => return finish_error(&args, &command, None, *error, presentation),
+        Err(error) => {
+            return finish_error(
+                #[cfg(target_os = "macos")]
+                args,
+                #[cfg(not(target_os = "macos"))]
+                &args,
+                &command,
+                None,
+                *error,
+                presentation,
+                #[cfg(target_os = "macos")]
+                &delivery,
+            );
+        }
     };
+    diagnostic_phase(phase_path.as_deref(), "resolve-end");
     #[cfg(target_os = "macos")]
     let context = match memcordon_platform::MacosExecutionContext::owned(run_origin) {
         Ok(context) => context,
         Err(error) => {
-            return finish_error(&args, &command, Some(&resolution), error, presentation);
+            return finish_error(
+                args,
+                &command,
+                Some(&resolution),
+                error,
+                presentation,
+                &delivery,
+            );
         }
     };
     #[cfg(not(target_os = "macos"))]
@@ -107,7 +181,18 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         Err(error) => {
             #[cfg(target_os = "macos")]
             let error = Box::new(finish_context_error(context, *error));
-            return finish_error(&args, &command, Some(&resolution), *error, presentation);
+            return finish_error(
+                #[cfg(target_os = "macos")]
+                args,
+                #[cfg(not(target_os = "macos"))]
+                &args,
+                &command,
+                Some(&resolution),
+                *error,
+                presentation,
+                #[cfg(target_os = "macos")]
+                &delivery,
+            );
         }
     };
     let request = SupervisorRequest {
@@ -117,13 +202,47 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         memcordon_executable: helper,
         resolved_backend: Some(resolution.backend.clone()),
     };
+    #[cfg(all(windows, feature = "test-support"))]
+    let _stack_phase_capture = phase_path
+        .as_ref()
+        .map(|path| memcordon_platform::WindowsStackPhaseCaptureGuard::install(path.clone()));
+    diagnostic_phase(phase_path.as_deref(), "supervise-start");
     #[cfg(target_os = "macos")]
     let result = context.supervise(request);
     #[cfg(not(target_os = "macos"))]
     let result = supervise(request);
+    diagnostic_phase(phase_path.as_deref(), "supervise-end");
     match result {
-        Ok(execution) => finish_execution(&args, &command, &resolution, execution, presentation),
-        Err(error) => finish_error(&args, &command, Some(&resolution), error, presentation),
+        Ok(execution) => {
+            diagnostic_phase(phase_path.as_deref(), "finish-success-start");
+            finish_execution(
+                #[cfg(target_os = "macos")]
+                args,
+                #[cfg(not(target_os = "macos"))]
+                &args,
+                &command,
+                &resolution,
+                execution,
+                presentation,
+                #[cfg(target_os = "macos")]
+                &delivery,
+            )
+        }
+        Err(error) => {
+            diagnostic_phase(phase_path.as_deref(), "finish-error-start");
+            finish_error(
+                #[cfg(target_os = "macos")]
+                args,
+                #[cfg(not(target_os = "macos"))]
+                &args,
+                &command,
+                Some(&resolution),
+                error,
+                presentation,
+                #[cfg(target_os = "macos")]
+                &delivery,
+            )
+        }
     }
 }
 
@@ -145,8 +264,6 @@ fn bounded_helper_path(
     context: &memcordon_platform::MacosExecutionContext,
     work: Option<std::time::Duration>,
 ) -> Result<Option<std::path::PathBuf>, Box<Error>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static RESERVED: AtomicBool = AtomicBool::new(false);
     if context.interruption().is_some() {
         return Ok(None);
     }
@@ -170,24 +287,7 @@ fn bounded_helper_path(
     let Some(expiry) = expiry else {
         return Err(error());
     };
-    if RESERVED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(error());
-    }
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if std::thread::Builder::new()
-        .name("helper-resolution".into())
-        .spawn(move || {
-            let _ = sender.send(helper_path());
-            RESERVED.store(false, Ordering::Release);
-        })
-        .is_err()
-    {
-        RESERVED.store(false, Ordering::Release);
-        return Err(error());
-    }
+    let receiver = context.resolve_current_executable().map_err(|_| error())?;
     loop {
         // Cancellation leaves the existing worker responsible for its capture;
         // no replacement worker or target may be launched for this run.
@@ -197,7 +297,18 @@ fn bounded_helper_path(
         // Check completion first so an immediate deadline still enters native
         // supervision and records a truthful not-issued deadline attempt.
         match receiver.try_recv() {
-            Ok(result) => return result,
+            Ok(result) => {
+                return result.map(Some).map_err(|cause| {
+                    Box::new(
+                        Error::new(
+                            ErrorCategory::Setup,
+                            "MCSETUP-MEMCORDON-EXECUTABLE",
+                            cause.to_string(),
+                        )
+                        .with_os_error(&cause),
+                    )
+                });
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(error()),
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -249,6 +360,7 @@ fn finish_execution(
             Some(resolution.backend.clone()),
             Some(execution),
             None,
+            None,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -261,7 +373,16 @@ fn finish_execution(
                 return 125;
             }
         };
-        if let Err(error) = write_report_atomic(path, &report) {
+        let bytes = match selected_result(args, report, exit_code, None)
+            .and_then(|report| report.to_bytes())
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("could not finalize execution report: {error}");
+                return 125;
+            }
+        };
+        if let Err(error) = write_report_bytes_atomic(path, &bytes) {
             let mut out = presentation.stderr();
             presentation::write_runtime_error(&mut out, error)
                 .expect("report diagnostic should be writable");
@@ -279,6 +400,7 @@ fn finish_error(
     error: Error,
     presentation: &Presentation,
 ) -> i32 {
+    let association = error.provider_association.as_deref().cloned();
     let exit_code = error_exit_code(&error);
     let mut out = presentation.stderr();
     presentation::write_runtime_error(&mut out, &error)
@@ -288,6 +410,7 @@ fn finish_error(
             .map(|value| value.report.clone())
             .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
         let error_report = ExecutionErrorReport {
+            private_rejection: error.private_rejection.as_deref().cloned(),
             runtime: error.runtime.clone(),
             native_startup: error.native_startup.clone(),
             policy_enforcement: error.policy_enforcement.clone(),
@@ -301,7 +424,8 @@ fn finish_error(
             target_released: error.target_released,
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
-            provider_rejection: error.provider_rejection.clone(),
+            provider_rejection: error.provider_rejection.as_deref().cloned(),
+            windows_provider_rejection_v2: error.windows_provider_rejection_v2.as_deref().cloned(),
             provider_failure: error.provider_failure.clone(),
         };
         match report(
@@ -311,9 +435,19 @@ fn finish_error(
             resolution.map(|value| value.backend.clone()),
             None,
             Some(error_report),
+            error.windows_terminal_delivery.clone(),
         ) {
             Ok(report) => {
-                if let Err(report_error) = write_report_atomic(path, &report) {
+                let bytes = match selected_result(args, report, exit_code, association)
+                    .and_then(|report| report.to_bytes())
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        eprintln!("could not finalize failure report: {error}");
+                        return 125;
+                    }
+                };
+                if let Err(report_error) = write_report_bytes_atomic(path, &bytes) {
                     let mut out = presentation.stderr();
                     presentation::write_runtime_error(&mut out, report_error)
                         .expect("report diagnostic should be writable");
@@ -336,12 +470,14 @@ fn finish_error(
 
 #[cfg(target_os = "macos")]
 fn finish_execution(
-    args: &ExecutionArgs,
+    mut args: ExecutionArgs,
     command: &CommandSpec,
     resolution: &Resolution,
     execution: SupervisionExecution,
     _presentation: &Presentation,
+    delivery: &memcordon_platform::MacosDeliveryRuntime,
 ) -> i32 {
+    let report_path = args.output.report_path.take();
     let exit_code = execution.wrapper_exit_code();
     let mut diagnostics = Vec::new();
     let return_deadline = execution
@@ -350,40 +486,51 @@ fn finish_execution(
         .last()
         .and_then(|attempt| attempt.runtime.as_ref())
         .and_then(|runtime| runtime.delivery_expires);
-    deferred_warnings(args, resolution, &mut diagnostics);
+    deferred_warnings(&args, resolution, &mut diagnostics);
     if args.output.summary || matches!(exit_code, 123..=125) {
         presentation::write_summary(&mut diagnostics, execution_summary(&execution))
             .expect("memory summary serialization");
     }
-    let report = if args.output.report_path.is_some() {
+    let report = if report_path.is_some() {
         match report(
-            args,
+            &args,
             command,
             &resolution.report,
             Some(resolution.backend.clone()),
             Some(execution),
             None,
+            None,
         ) {
-            Ok(report) => Some(report),
+            Ok(report) => match selected_result(&args, report, exit_code, None) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    presentation::write_runtime_error(&mut diagnostics, error)
+                        .expect("memory error serialization");
+                    super::result_delivery::deliver(
+                        delivery,
+                        diagnostics,
+                        None,
+                        None,
+                        return_deadline,
+                    );
+                    return 125;
+                }
+            },
             Err(error) => {
                 presentation::write_runtime_error(
                     &mut diagnostics,
                     format_args!("could not construct execution report: {error}"),
                 )
                 .expect("memory error serialization");
-                super::result_delivery::deliver(diagnostics, None, None, return_deadline);
+                super::result_delivery::deliver(delivery, diagnostics, None, None, return_deadline);
                 return 125;
             }
         }
     } else {
         None
     };
-    if super::result_delivery::deliver(
-        diagnostics,
-        args.output.report_path.as_deref(),
-        report,
-        return_deadline,
-    ) {
+    if super::result_delivery::deliver(delivery, diagnostics, report_path, report, return_deadline)
+    {
         exit_code
     } else {
         125
@@ -392,12 +539,15 @@ fn finish_execution(
 
 #[cfg(target_os = "macos")]
 fn finish_error(
-    args: &ExecutionArgs,
+    mut args: ExecutionArgs,
     command: &CommandSpec,
     resolution: Option<&Resolution>,
     error: Error,
     _presentation: &Presentation,
+    delivery: &memcordon_platform::MacosDeliveryRuntime,
 ) -> i32 {
+    let report_path = args.output.report_path.take();
+    let association = error.provider_association.as_deref().cloned();
     let exit_code = error_exit_code(&error);
     let mut diagnostics = Vec::new();
     let return_deadline = error
@@ -405,15 +555,16 @@ fn finish_error(
         .as_ref()
         .and_then(|runtime| runtime.delivery_expires);
     if let Some(resolution) = resolution {
-        deferred_warnings(args, resolution, &mut diagnostics);
+        deferred_warnings(&args, resolution, &mut diagnostics);
     }
     presentation::write_runtime_error(&mut diagnostics, &error)
         .expect("memory error serialization");
-    let report = if args.output.report_path.is_some() {
+    let report = if report_path.is_some() {
         let policy = resolution
             .map(|value| value.report.clone())
             .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
         let error_report = ExecutionErrorReport {
+            private_rejection: error.private_rejection.as_deref().cloned(),
             runtime: error.runtime.clone(),
             native_startup: error.native_startup.clone(),
             policy_enforcement: error.policy_enforcement.clone(),
@@ -427,37 +578,49 @@ fn finish_error(
             target_released: error.target_released,
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
-            provider_rejection: error.provider_rejection.clone(),
+            provider_rejection: error.provider_rejection.as_deref().cloned(),
+            windows_provider_rejection_v2: error.windows_provider_rejection_v2.as_deref().cloned(),
             provider_failure: error.provider_failure.clone(),
         };
         match report(
-            args,
+            &args,
             command,
             &policy,
             resolution.map(|value| value.backend.clone()),
             None,
             Some(error_report),
+            error.windows_terminal_delivery.clone(),
         ) {
-            Ok(report) => Some(report),
+            Ok(report) => match selected_result(&args, report, exit_code, association) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    presentation::write_runtime_error(&mut diagnostics, error)
+                        .expect("memory error serialization");
+                    super::result_delivery::deliver(
+                        delivery,
+                        diagnostics,
+                        None,
+                        None,
+                        return_deadline,
+                    );
+                    return 125;
+                }
+            },
             Err(report_error) => {
                 presentation::write_runtime_error(
                     &mut diagnostics,
                     format_args!("could not construct failure report: {report_error}"),
                 )
                 .expect("memory error serialization");
-                super::result_delivery::deliver(diagnostics, None, None, return_deadline);
+                super::result_delivery::deliver(delivery, diagnostics, None, None, return_deadline);
                 return 125;
             }
         }
     } else {
         None
     };
-    if super::result_delivery::deliver(
-        diagnostics,
-        args.output.report_path.as_deref(),
-        report,
-        return_deadline,
-    ) {
+    if super::result_delivery::deliver(delivery, diagnostics, report_path, report, return_deadline)
+    {
         exit_code
     } else {
         125
@@ -494,6 +657,7 @@ fn report(
     backend: Option<BackendCapabilityReport>,
     supervision: Option<SupervisionExecution>,
     error: Option<ExecutionErrorReport>,
+    windows_terminal_delivery: Option<memcordon_core::WindowsTerminalDeliveryEvidenceV1>,
 ) -> Result<MemcordonReport, memcordon_core::ReportModelError> {
     let mut argv = Vec::with_capacity(command.arguments().len() + 1);
     argv.push(memcordon_core::NativeArgument::from_os(command.program()));
@@ -514,24 +678,51 @@ fn report(
                 .map(|attempt| &attempt.policy_enforcement)
         });
     if let Some(resolution) = enforcement
-        .and_then(memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::resolution)
+        .and_then(memcordon_core::workload_evidence::RuntimePolicyEnforcement::resolution)
     {
         policy.effective.workload = resolution;
     }
-    MemcordonReport::schema10(
-        tool_report(),
-        InvocationReport {
-            syntax: "plus-budgets-v1".to_owned(),
-            budget_tokens: budget_tokens(&args.budgets),
-            memory_token: args.budgets.memory_token().map(str::to_owned),
-            deadline_token: deadline_token(&args.budgets).map(str::to_owned),
-            argv,
-        },
-        policy,
-        backend,
-        supervision,
-        error,
-    )
+    let windows_terminal_delivery = windows_terminal_delivery.or_else(|| {
+        supervision
+            .as_ref()
+            .and_then(|execution| execution.attempts().records().last())
+            .and_then(|attempt| match &attempt.boundary_detail {
+                memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
+                    native.frontend_delivery.clone()
+                }
+                _ => None,
+            })
+    });
+    let v2_rejection = error
+        .as_ref()
+        .is_some_and(|error| error.windows_provider_rejection_v2.is_some());
+    let invocation = InvocationReport {
+        syntax: "plus-budgets-v1".to_owned(),
+        budget_tokens: budget_tokens(&args.budgets),
+        memory_token: args.budgets.memory_token().map(str::to_owned),
+        deadline_token: deadline_token(&args.budgets).map(str::to_owned),
+        argv,
+    };
+    if windows_terminal_delivery.is_some() || v2_rejection {
+        MemcordonReport::schema11(
+            tool_report(),
+            invocation,
+            policy,
+            backend,
+            supervision,
+            error,
+            windows_terminal_delivery,
+        )
+    } else {
+        MemcordonReport::schema10(
+            tool_report(),
+            invocation,
+            policy,
+            backend,
+            supervision,
+            error,
+        )
+    }
 }
 
 fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
@@ -602,8 +793,23 @@ fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
     }
 }
 
-fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, Box<Error>> {
-    let policy = policy_args.policy(budgets);
+fn resolve(
+    policy_args: &PolicyArgs,
+    budgets: &BudgetSet,
+    phase_path: Option<&Path>,
+) -> Result<Resolution, Box<Error>> {
+    let mut policy = policy_args.policy(budgets);
+    if let Some(contract) = policy_args.private_workload_contract() {
+        policy = policy
+            .with_private_workload_contract(contract.clone())
+            .map_err(|detail| {
+                Box::new(Error::new(
+                    ErrorCategory::Usage,
+                    "MCUSAGE-WORKLOAD-CONTRACT",
+                    detail,
+                ))
+            })?;
+    }
     if policy.workload_contract().is_some() && policy.boundary() != BoundaryRequirement::Sealed {
         return Err(Box::new(Error::new(
             ErrorCategory::Usage,
@@ -611,7 +817,9 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
             "a strict workload contract requires --boundary sealed",
         )));
     }
+    diagnostic_phase(phase_path, "probe-start");
     let probe = probe();
+    diagnostic_phase(phase_path, "probe-end");
     let backend = probe
         .selected_for(policy.boundary())
         .cloned()
@@ -633,7 +841,10 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
                 ),
             ))
         })?;
-    let capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
+    let mut capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
+    if policy.private_workload_contract().is_some() {
+        capability.boundary.mechanism = "linux-tcp4-private-v1".into();
+    }
     if policy.boundary() == BoundaryRequirement::Sealed
         && capability.boundary.class != BoundaryClass::Sealed
     {
@@ -722,8 +933,11 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
         dormant,
     );
     if let Some(contract) = policy.workload_contract() {
-        report.effective.workload = memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
-            memcordon_core::workload_evidence::WorkloadResolutionReportV1::Unavailable {
+        diagnostic_phase(phase_path, "workload-plan-start");
+        let planned = memcordon_platform::workload_plan(contract);
+        diagnostic_phase(phase_path, "workload-plan-end");
+        report.effective.workload = planned.unwrap_or_else(|_| {
+            memcordon_core::workload_evidence::RuntimeWorkloadResolution::Unavailable {
                 request: Some(memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract).expect("policy contains validated contract")),
                 reason: memcordon_core::workload_evidence::AdmissionAvailabilityFailure::ProviderUnavailable,
                 authorization: memcordon_core::workload_evidence::AuthorizationKnowledge::NotAuthorized,
@@ -885,7 +1099,7 @@ fn policy_report(
     PolicyEnvelopeReport {
         requested,
         effective: EffectivePolicyReport {
-            workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(
+            workload: memcordon_core::workload_evidence::RuntimeWorkloadResolution::unresolved(
                 policy.workload_contract(),
                 workload_restriction(backend.name, policy.boundary()),
             ),
@@ -948,7 +1162,7 @@ fn requested_report(
 ) -> RequestedPolicyReport {
     RequestedPolicyReport {
         workload: memcordon_core::workload_evidence::WorkloadRequestReport::from_contract(
-            args.workload_contract.as_ref(),
+            args.baseline_workload_contract(),
         ),
         boundary: args.boundary,
         memory: budgets.memory.map(|memory| RequestedMemoryPolicyReport {
@@ -1016,8 +1230,8 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
     PolicyEnvelopeReport {
         requested: requested_report(args, budgets, configured),
         effective: EffectivePolicyReport {
-            workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(
-                args.workload_contract.as_ref(), memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
+            workload: memcordon_core::workload_evidence::RuntimeWorkloadResolution::unresolved(
+                args.baseline_workload_contract(), memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
             ),
             boundary: memcordon_core::BoundaryClass::Unavailable,
             memory: budgets.memory.map(|memory| EffectiveMemoryPolicyReport {
@@ -1049,7 +1263,11 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
 }
 
 pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
-    let (backend, report) = match resolve(&args.policy, &args.budgets) {
+    #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+    if args.policy.private_workload_contract().is_some() {
+        return unavailable_private_v2(presentation);
+    }
+    let (backend, report) = match resolve(&args.policy, &args.budgets, None) {
         Ok(value) => (value.backend, value.report),
         Err(error) if error.code == "MCBOUNDARY-UNSUPPORTED" => (
             unavailable_backend_capability(),
@@ -1090,8 +1308,59 @@ pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
         },
     };
     if args.json {
-        print_json(&plan, "plan", presentation)
+        if args.operational_format {
+            let mut operational = memcordon_core::result_v1::PlanV1::from(&plan);
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            if let Some(contract) = args.policy.private_workload_contract() {
+                match memcordon_platform::private_plan(contract) {
+                    Ok(value) => operational.private_plan = Some(value),
+                    Err(error) => {
+                        presentation::write_runtime_error(&mut presentation.stderr(), error)
+                            .expect("private plan diagnostic should be writable");
+                        return 125;
+                    }
+                }
+            }
+            if let Err(error) = operational.validate() {
+                presentation::write_runtime_error(&mut presentation.stderr(), error)
+                    .expect("invalid plan diagnostic should be writable");
+                return 125;
+            }
+            print_json(&operational, "plan", presentation)
+        } else {
+            print_json(&plan, "plan", presentation)
+        }
     } else {
+        #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+        if let Some(contract) = args.policy.private_workload_contract() {
+            return match memcordon_platform::private_plan(contract) {
+                Ok(value) => {
+                    let mut out = presentation.stdout();
+                    presentation::write_label_value(
+                        &mut out,
+                        "private preparation available",
+                        value.available_for_preparation,
+                    )
+                    .expect("private plan output should be writable");
+                    presentation::write_label_value(
+                        &mut out,
+                        "authorizes launch",
+                        value.authorizes_launch,
+                    )
+                    .expect("private plan output should be writable");
+                    if let Some(conflicts) = value.conflicts {
+                        writeln!(out, "conflicts: {conflicts:?}")
+                            .expect("private plan output should be writable");
+                    }
+                    0
+                }
+                Err(error) => {
+                    presentation::write_runtime_error(&mut presentation.stderr(), error)
+                        .expect("private plan diagnostic should be writable");
+                    125
+                }
+            };
+        }
         let mut out = presentation.stdout();
         presentation::write_selected_backend(&mut out, &plan.resolution.backend.name)
             .expect("plan output should be writable");
@@ -1101,18 +1370,50 @@ pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
     }
 }
 
+fn selected_result(
+    args: &ExecutionArgs,
+    report: MemcordonReport,
+    exit_code: i32,
+    association: Option<memcordon_core::result_v1::ProviderAttemptAssociationV1>,
+) -> Result<memcordon_core::ResultReport, String> {
+    match args.output.report_format {
+        memcordon_core::ReportFormat::Legacy => Ok(memcordon_core::ResultReport::Legacy(report)),
+        memcordon_core::ReportFormat::ResultV1 => {
+            let features = [
+                ("sealed-runtime", cfg!(feature = "sealed-runtime")),
+                ("private-tcp", cfg!(feature = "private-tcp")),
+                (
+                    "windows-sealed-runtime",
+                    cfg!(feature = "windows-sealed-runtime"),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(name, _)| name.to_owned())
+            .collect();
+            let mut value = memcordon_core::ResultV1::from_legacy(&report, features)?;
+            value.outcome.wrapper_status = exit_code;
+            if association.is_some() {
+                value.provider_association = association;
+            }
+            value.validate()?;
+            Ok(memcordon_core::ResultReport::Operational(value))
+        }
+    }
+}
+
 fn unavailable_backend_capability() -> BackendCapabilityReport {
     BackendCapabilityReport {
         name: "unresolved".to_owned(),
         boundary: BoundaryCapability {
             class: BoundaryClass::Unavailable,
             mechanism: "unavailable".to_owned(),
-            limitations: vec!["certified sealed supervision is unavailable".to_owned()],
+            limitations: vec!["sealed supervision is unavailable".to_owned()],
             ..BoundaryCapability::default()
         },
         limitations: vec!["no backend satisfies the requested sealed boundary".to_owned()],
         sealed_unavailable: Some(memcordon_core::SealedUnavailableReport {
-            reason: "no certified sealed backend was selected".to_owned(),
+            reason: "no available sealed backend was selected".to_owned(),
             prerequisites: Vec::new(),
         }),
         ..BackendCapabilityReport::default()
@@ -1120,11 +1421,27 @@ fn unavailable_backend_capability() -> BackendCapabilityReport {
 }
 
 pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
+    #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+    if matches!(
+        args.workload_contract.as_ref(),
+        Some(memcordon_core::workload_contract::WorkloadContract::V2(_))
+    ) {
+        return unavailable_private_v2(presentation);
+    }
+    #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+    let private_plan = match args.workload_contract.as_ref() {
+        Some(memcordon_core::workload_contract::WorkloadContract::V2(contract)) => {
+            Some(memcordon_platform::private_plan(contract))
+        }
+        _ => None,
+    };
+    #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+    let private_discovery = memcordon_platform::private_discovery();
     let probe = probe();
     use memcordon_core::workload_discovery::DiscoveryReportV1;
     use memcordon_core::workload_evidence::{
         AdmissionAvailabilityFailure, AuthorizationKnowledge, RequestBindingV1,
-        WorkloadResolutionReportV1,
+        RuntimeWorkloadResolution,
     };
     let workload_discovery = if cfg!(any(target_os = "linux", target_os = "windows")) {
         memcordon_platform::workload_discovery()
@@ -1140,16 +1457,21 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     } else {
         DiscoveryReportV1::Unsupported
     };
-    let workload = args.workload_contract.as_ref().map(|contract| {
-        memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
-            WorkloadResolutionReportV1::Unavailable {
-                request: Some(
-                    RequestBindingV1::from_contract(contract).expect("CLI validated contract"),
-                ),
-                reason: AdmissionAvailabilityFailure::BindingUnavailable,
-                authorization: AuthorizationKnowledge::NotAuthorized,
-            }
-        })
+    let workload = args.workload_contract.as_ref().and_then(|versioned| {
+        let memcordon_core::workload_contract::WorkloadContract::V1(contract) = versioned else {
+            return None;
+        };
+        Some(
+            memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
+                RuntimeWorkloadResolution::Unavailable {
+                    request: Some(
+                        RequestBindingV1::from_contract(contract).expect("CLI validated contract"),
+                    ),
+                    reason: AdmissionAvailabilityFailure::BindingUnavailable,
+                    authorization: AuthorizationKnowledge::NotAuthorized,
+                }
+            }),
+        )
     });
     let capability = |backend: &memcordon_platform::BackendInfo| match args.requirement {
         Some(Requirement::Sealed) => {
@@ -1165,7 +1487,7 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     let available = probe.available.iter().map(capability).collect::<Vec<_>>();
     let met = workload
         .as_ref()
-        .is_none_or(|resolution| matches!(resolution, WorkloadResolutionReportV1::Planned { .. }))
+        .is_none_or(|resolution| matches!(resolution, RuntimeWorkloadResolution::Planned { .. }))
         && args.requirement.is_none_or(|required| {
             selected.as_ref().is_some_and(|backend| match required {
                 Requirement::Hard => backend
@@ -1180,6 +1502,13 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
                     backend.boundary.class == memcordon_core::BoundaryClass::Sealed
                 }
             })
+        });
+    #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+    let met = met
+        && private_plan.as_ref().is_none_or(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|plan| plan.available_for_preparation)
         });
     let report = DoctorReport {
         schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
@@ -1212,10 +1541,45 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
         workload_discovery,
     };
     if args.probe_execution {
-        return doctor_execution_probe(report, args.json, presentation);
+        return doctor_execution_probe(report, args.json, args.operational_format, presentation);
     }
     if args.json {
-        let code = print_json(&report, "doctor", presentation);
+        let code = if args.operational_format {
+            let mut capabilities = memcordon_core::result_v1::CapabilitiesV1::from(&report);
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            {
+                match private_discovery {
+                    Ok(value) => {
+                        capabilities.private_discovery = Some(value);
+                        capabilities.request_versions = vec![1, 2];
+                    }
+                    Err(reason) => capabilities.unavailable.push(UnavailableCapabilityReport {
+                        name: "linux-private-tcp".into(),
+                        reason,
+                    }),
+                }
+                if let Some(result) = private_plan {
+                    match result {
+                        Ok(value) => {
+                            capabilities.private_plan = Some(value);
+                            capabilities.request_versions = vec![1, 2];
+                        }
+                        Err(reason) => capabilities.unavailable.push(UnavailableCapabilityReport {
+                            name: "private-request-plan".into(),
+                            reason,
+                        }),
+                    }
+                }
+            }
+            if let Err(error) = capabilities.validate() {
+                presentation::write_runtime_error(&mut presentation.stderr(), error)
+                    .expect("invalid capabilities diagnostic should be writable");
+                return 125;
+            }
+            print_json(&capabilities, "doctor", presentation)
+        } else {
+            print_json(&report, "doctor", presentation)
+        };
         if code != 0 {
             return code;
         }
@@ -1239,8 +1603,43 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
                 }
             }
         }
+        #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+        if let Some(result) = &private_plan {
+            match result {
+                Ok(value) => {
+                    presentation::write_label_value(
+                        &mut out,
+                        "private preparation available",
+                        value.available_for_preparation,
+                    )
+                    .expect("private doctor output should be writable");
+                    presentation::write_label_value(
+                        &mut out,
+                        "authorizes launch",
+                        value.authorizes_launch,
+                    )
+                    .expect("private doctor output should be writable");
+                    if let Some(conflicts) = &value.conflicts {
+                        writeln!(out, "conflicts: {conflicts:?}")
+                            .expect("private doctor output should be writable");
+                    }
+                }
+                Err(error) => writeln!(out, "private request unavailable: {error}")
+                    .expect("private doctor diagnostic should be writable"),
+            }
+        }
     }
     if met { 0 } else { 125 }
+}
+
+fn unavailable_private_v2(presentation: &Presentation) -> i32 {
+    let mut out = presentation.stderr();
+    presentation::write_runtime_error(
+        &mut out,
+        "MCWORKLOAD-PRIVATE-UNAVAILABLE: this invocation requires the optional GNU Linux private TCP runtime and named operational output",
+    )
+    .expect("private V2 diagnostic should be writable");
+    125
 }
 
 #[derive(serde::Serialize)]
@@ -1253,7 +1652,12 @@ struct ExecutionProbe {
     failure: Option<String>,
 }
 
-fn doctor_execution_probe(doctor: DoctorReport, json: bool, presentation: &Presentation) -> i32 {
+fn doctor_execution_probe(
+    doctor: DoctorReport,
+    json: bool,
+    operational_format: bool,
+    presentation: &Presentation,
+) -> i32 {
     #[cfg(target_os = "macos")]
     let execution = (|| -> Result<memcordon_platform::Execution, Box<Error>> {
         if !doctor.requirement.met || doctor.requirement.kind.as_deref() == Some("sealed") {
@@ -1342,6 +1746,14 @@ fn doctor_execution_probe(doctor: DoctorReport, json: bool, presentation: &Prese
         && execution.target_exit == Some(0)
         && execution.cleanup_complete;
     if json {
+        if operational_format {
+            let capabilities = memcordon_core::result_v1::CapabilitiesV1::from(&doctor);
+            let report = serde_json::json!({"format":"memcordon.capabilities-probe","revision":1,"capabilities":capabilities,"execution":execution});
+            if print_json(&report, "doctor execution probe", presentation) != 0 {
+                return 125;
+            }
+            return if passed { 0 } else { 125 };
+        }
         #[derive(serde::Serialize)]
         struct ProbeReport {
             kind: &'static str,

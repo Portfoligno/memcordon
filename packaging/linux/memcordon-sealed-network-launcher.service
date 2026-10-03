@@ -1,0 +1,23 @@
+[Unit]
+Description=MemCordon sealed private IPv4 launch broker
+Requires=memcordon-sealed-network-launcher.socket
+After=local-fs.target
+RefuseManualStart=yes
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/memcordon-sealed-agent network-launch-broker
+User=root
+Group=root
+Delegate=yes
+KillMode=process
+StateDirectory=memcordon/sealed
+StateDirectoryMode=0700
+NoNewPrivileges=no
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

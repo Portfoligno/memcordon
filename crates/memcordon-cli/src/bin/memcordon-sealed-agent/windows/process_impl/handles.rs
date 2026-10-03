@@ -12,9 +12,43 @@ pub struct StreamSet {
 }
 
 impl StreamSet {
+    pub fn close_for_retirement(mut self) -> Result<(), String> {
+        if self.remote_lease_armed {
+            return Err("stream transfer ownership is not acknowledged".to_owned());
+        }
+        let stdin_result = self.target_stdin.close_checked();
+        let stdout_result = self.target_stdout.close_checked();
+        let stderr_result = self.target_stderr.close_checked();
+        let relay_result = self.relay_retired_event.close_checked();
+        stdin_result?;
+        stdout_result?;
+        stderr_result?;
+        relay_result
+    }
+
     pub fn create(
         frontend_process: HANDLE,
         certification_fault: Option<WindowsSealedFault>,
+    ) -> Result<Self, String> {
+        Self::create_with_relay_name(frontend_process, certification_fault, None)
+    }
+
+    pub fn create_bound(
+        frontend_process: HANDLE,
+        certification_fault: Option<WindowsSealedFault>,
+        relay_event_name: &str,
+    ) -> Result<Self, String> {
+        Self::create_with_relay_name(
+            frontend_process,
+            certification_fault,
+            Some(relay_event_name),
+        )
+    }
+
+    fn create_with_relay_name(
+        frontend_process: HANDLE,
+        certification_fault: Option<WindowsSealedFault>,
+        relay_event_name: Option<&str>,
     ) -> Result<Self, String> {
         reject_fault(certification_fault, WindowsSealedFault::StreamCreate)?;
         let (stdin_target, stdin_relay) = pipe_pair(true)?;
@@ -46,18 +80,56 @@ impl StreamSet {
                 }
             }
         }
-        // SAFETY: null security/name create one private, noninheritable,
-        // manual-reset event owned by this attempt.
-        let relay_retired_event =
-            match OwnedHandle::new(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) }) {
-                Ok(event) => event,
-                Err(error) => {
-                    for transferred in &remote {
-                        let _ = close_remote(transferred.remote_handle, frontend_process);
-                    }
-                    return Err(error);
+        let event_security = match relay_event_name
+            .map(|_| SecurityDescriptor::from_sddl("O:SYD:P(A;;GA;;;SY)"))
+            .transpose()
+        {
+            Ok(security) => security,
+            Err(error) => {
+                for transferred in &remote {
+                    let _ = close_remote(transferred.remote_handle, frontend_process);
                 }
-            };
+                return Err(error);
+            }
+        };
+        let event_attributes = event_security.as_ref().map(|security| SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security.raw(),
+            bInheritHandle: 0,
+        });
+        let event_name = relay_event_name.map(super::pipe::wide_null);
+        // SAFETY: the descriptor and name remain live for this native call;
+        // the manual-reset event is never inherited by child processes.
+        let raw_event = unsafe {
+            CreateEventW(
+                event_attributes
+                    .as_ref()
+                    .map_or(ptr::null(), |attributes| attributes),
+                1,
+                0,
+                event_name
+                    .as_ref()
+                    .map_or(ptr::null(), |name| name.as_ptr()),
+            )
+        };
+        let creation_error = io::Error::last_os_error();
+        let relay_retired_event = match OwnedHandle::new(raw_event) {
+            Ok(event) => event,
+            Err(error) => {
+                for transferred in &remote {
+                    let _ = close_remote(transferred.remote_handle, frontend_process);
+                }
+                return Err(error);
+            }
+        };
+        if relay_event_name.is_some()
+            && creation_error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32)
+        {
+            for transferred in &remote {
+                let _ = close_remote(transferred.remote_handle, frontend_process);
+            }
+            return Err("attempt relay retirement event name already exists".to_owned());
+        }
         let remote_relay_retired_event =
             match duplicate_remote(relay_retired_event.raw(), frontend_process) {
                 Ok(handle) => handle,

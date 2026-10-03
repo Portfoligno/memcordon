@@ -21,6 +21,42 @@ fn execution(values: &[&str]) -> memcordon::invocation::ExecutionArgs {
     }
 }
 
+#[test]
+fn qualification_frame_capture_requires_both_scoped_capabilities() {
+    for args in [
+        vec![
+            "--sealed",
+            "--report",
+            "report.json",
+            "--windows-qualification-frame-pipe",
+            r"\\.\pipe\memcordon-qualification-case",
+            "program",
+        ],
+        vec![
+            "--sealed",
+            "--report",
+            "report.json",
+            "--windows-qualification-frame-lease",
+            "a",
+            "program",
+        ],
+        vec![
+            "--sealed",
+            "--report",
+            "report.json",
+            "--windows-qualification-frame-pipe",
+            r"\\.\pipe\unscoped",
+            "--windows-qualification-frame-lease",
+            "a",
+            "program",
+        ],
+    ] {
+        let error =
+            route(&native(&args)).expect_err("incomplete qualification capability must fail");
+        assert_eq!(error.code, "MCUSAGE-WINDOWS-QUALIFICATION-CAPTURE");
+    }
+}
+
 fn plan(values: &[&str]) -> memcordon::invocation::PlanArgs {
     match route(&native(values)).expect("plan should parse") {
         Invocation::Plan(args) => args,
@@ -60,6 +96,60 @@ fn sealed_is_a_single_high_level_pre_command_policy() {
             "MCUSAGE-SEALED"
         );
     }
+}
+
+#[test]
+fn retired_private_plan_options_are_not_admission_inputs() {
+    let error = route(&native(&[
+        "--expected-private-plan",
+        "/tmp/old-plan.json",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
+    let error = route(&native(&[
+        "--sealed",
+        "--expected-private-plan",
+        "/tmp/old-plan.json",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
+}
+
+#[test]
+fn retired_frozen_contract_option_is_rejected() {
+    for values in [
+        ["--frozen-private-contract", "/tmp/tampered.json", "program"].as_slice(),
+        [
+            "--sealed",
+            "--frozen-private-contract",
+            "/tmp/tampered.json",
+            "program",
+        ]
+        .as_slice(),
+    ] {
+        let error = route(&native(values)).unwrap_err();
+        assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
+    }
+}
+
+#[test]
+fn retired_repeat_fixture_option_is_rejected() {
+    for values in [
+        ["--reuse-private-two-attempts", "program"].as_slice(),
+        ["--sealed", "--reuse-private-two-attempts", "program"].as_slice(),
+    ] {
+        let error = route(&native(values)).unwrap_err();
+        assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
+    }
+    let error = route(&native(&[
+        "--reuse-private-two-attempts",
+        "--reuse-private-two-attempts",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
 }
 
 #[cfg(unix)]
@@ -1545,5 +1635,27 @@ fn schema_five_success_report_uses_plus_memory_invocation() {
     assert_eq!(
         value["attempts"][0]["outcome"]["cleanup"]["direct_child_reaped"],
         true
+    );
+}
+#[test]
+fn windows_recovery_route_is_explicit_and_platform_scoped() {
+    let attempt = native(&[
+        "windows-recover",
+        "attempt",
+        &"ab".repeat(32),
+        "nonce",
+        &"cd".repeat(32),
+    ]);
+    #[cfg(windows)]
+    assert!(matches!(
+        route(&attempt),
+        Ok(Invocation::WindowsRecovery(
+            memcordon::invocation::WindowsRecoveryArgs::Attempt { .. }
+        ))
+    ));
+    #[cfg(not(windows))]
+    assert_eq!(
+        route(&attempt).unwrap_err().code,
+        "MCCLI-WINDOWS-RECOVERY-PLATFORM"
     );
 }

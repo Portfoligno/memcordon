@@ -58,17 +58,10 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
         detail: "cleanup did not converge".to_owned(),
     };
     assert_serialized_response_limit(&cleanup, memcordon_core::WINDOWS_MAX_FRAME_BYTES);
-    assert_serialized_response_limit(
-        &WindowsProviderResponseV1::QualificationReady {
-            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        },
-        memcordon_core::WINDOWS_MAX_FRAME_BYTES,
-    );
-    let discovery = memcordon_core::workload_discovery::WorkloadDiscoveryV1::authenticated(
+    let discovery = memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
         None,
         &memcordon_core::workload_registry::CallerSelector::Linux { uid: 1000 },
         memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
-        DiagnosticSha256::from_bytes([1; 32]),
         match &response {
             WindowsLauncherResponseV1::Probe {
                 provider_binding, ..
@@ -128,6 +121,51 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
     ] {
         assert!(WindowsLauncherResponseV1::frame_limit(invalid).is_err());
         assert!(WindowsProviderResponseV1::frame_limit(invalid).is_err());
+    }
+}
+
+#[test]
+fn versioned_terminal_retirement_receipt_survives_the_256_byte_prefix() {
+    use memcordon_core::{
+        WindowsAttemptTerminalDispositionV1, WindowsLauncherResponseV3, WindowsProviderResponseV3,
+        WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV2,
+    };
+
+    let receipt = WindowsTerminalRetiredV2 {
+        schema_version: 2,
+        attempt_id: "a".repeat(64),
+        nonce: "b".repeat(32),
+        request_sha256: "c".repeat(64),
+        terminal_response_sha256: "d".repeat(64),
+        disposition: WindowsAttemptTerminalDispositionV1::Posttarget,
+        provider_generation: "provider-generation".to_owned(),
+        original_boot_id: "boot".to_owned(),
+        launch_incarnation: "launch".to_owned(),
+        job_identity: "e".repeat(64),
+        owner_manifest_sha256: "f".repeat(64),
+        retirement_proof_sha256: "0".repeat(64),
+        ledger_generation: "1".repeat(64),
+        completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
+    };
+    for bytes in [
+        serde_json::to_vec(&WindowsLauncherResponseV3::TerminalRetiredV2(
+            receipt.clone(),
+        ))
+        .unwrap(),
+        serde_json::to_vec(&WindowsProviderResponseV3::TerminalRetiredV2(receipt)).unwrap(),
+    ] {
+        assert!(bytes.len() > WINDOWS_RESPONSE_PREFIX_BYTES);
+        let prefix = &bytes[..WINDOWS_RESPONSE_PREFIX_BYTES];
+        assert_eq!(
+            windows_launcher_response_frame_limit(prefix).unwrap(),
+            memcordon_core::WINDOWS_MAX_FRAME_BYTES
+        );
+        assert_eq!(
+            windows_response_frame_limit(prefix).unwrap(),
+            memcordon_core::WINDOWS_MAX_FRAME_BYTES
+        );
+        assert!(serde_json::from_slice::<WindowsLauncherResponseV3>(&bytes).is_ok());
+        assert!(serde_json::from_slice::<WindowsProviderResponseV3>(&bytes).is_ok());
     }
 }
 
@@ -262,13 +300,17 @@ fn fragmented_response_prefixes_keep_the_same_bounded_classification() {
 fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
     use memcordon_core::{WindowsLauncherResponseV1, WindowsProviderResponseV1};
 
-    let public = br#"{"kind":"qualification-ready","schema_version":2}"#;
+    let deleted_public =
+        br#"{"kind":"qualification-ready","schema_version":2,"qualification_lease":"lease"}"#;
+    let public =
+        br#"{"kind":"recovery-status","schema_version":2,"challenge":"observed","status":"ready","attempts_empty":true,"detail":"complete"}"#;
     let private =
         br#"{"kind":"certification-machine-restart","schema_version":2,"recovered":true}"#;
+    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(deleted_public).is_err());
     assert!(serde_json::from_slice::<WindowsProviderResponseV1>(public).is_ok());
     assert!(serde_json::from_slice::<WindowsLauncherResponseV1>(private).is_ok());
     for invalid in [
-        br#"{"kind":"qualification-ready","kind":"qualification-ready","schema_version":2}"#.as_slice(),
+        br#"{"kind":"recovery-status","kind":"recovery-status","schema_version":2,"challenge":"observed","status":"ready","attempts_empty":true,"detail":"complete"}"#.as_slice(),
         br#"{"kind":"certification-machine-restart","kind":"certification-machine-restart","schema_version":2,"recovered":true}"#.as_slice(),
         br#"{"kind":"attempt-retained","kind":"terminal"}"#.as_slice(),
         br#"{"kind":"not-a-response","schema_version":2}"#.as_slice(),

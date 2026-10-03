@@ -39,29 +39,21 @@ Provider startup recovers authenticated records before serving probes. A record/
 CI invokes the private provider through direct argv:
 
 ```text
-memcordon-sealed-agent package install --ephemeral-ci
+memcordon-sealed-agent package install
 memcordon-sealed-agent package verify
-memcordon-sealed-agent package upgrade --ephemeral-ci
-memcordon-sealed-agent qualify
-memcordon-sealed-agent package uninstall --ephemeral-ci
+memcordon-sealed-agent package upgrade
+memcordon-sealed-agent probe
+memcordon-sealed-agent package uninstall
 ```
 
 The endpoint remains `/run/memcordon/sealed-agent.sock`; no environment variable overrides it.
 
-## Certification evidence
+## Native observations
 
-Linux certification uploads exactly these newline-terminated JSON files:
-
-- `provider-identity.json`;
-- `qualification-receipt.json`;
-- `sealed-scenario-report.json`;
-- `sealed-concurrency-report.json`;
-- `fault-injection-report.json`;
-- `cleanup-recovery-report.json`;
-- `platform-environment.json`;
-- `provider-service-privileges.json`; and
-- `sealed-public-launch.json`.
-
-The concurrency report binds the exact mechanism and commit to two distinct authenticated attempt identities, their disjoint live cgroup memberships, target membership, a proven authorization interval overlap, and final record, cgroup, fixture, and boundary retirement. The fault-injection report uses schema 2 and binds the exact ordered crash/fault selector inventory to each attempt id, typed rejection, retirement owner, authorization marker observation, guardian reap, and final authenticated-record and cgroup absence. The privilege report proves the installed provider's exact reviewed user, group, no-new-privileges state, capability bounding set, and empty ambient capabilities. The public launch report binds the public CLI path to the same provider identity and qualification receipt and proves sealed assignment, native boundary facts, zero-exit terminal status, and complete retirement. Certification uses exact test selectors, zero skips, marker-based preauthorization faults, adversarial lineage/escape scenarios, provider/front-end/guardian loss, recovery ambiguity, package tampering, upgrade, uninstall, simultaneous attempts, and restart freshness. Missing tests or receipts fail the job.
-
-While scenarios are running, certification atomically maintains schema-2 `sealed-scenario-progress.json` with the complete ordered inventory, typed `pending`, `running`, `passed`, or `failed` state, derived counts, bounded failure detail, and any fault evidence parsed before the selector result is accepted. A failed run retains this evidence without adding an artifact file. A successful run removes it before validating the exact nine-file release artifact set above.
+Native suites retain actual concurrency, caller identity, lineage, package
+mutation, owner loss and cleanup assertions. They record
+the selected source, exact executed cases and bounded raw output, distinguishing
+execution failure, unavailable host and incomplete retirement. Saved output cannot
+grant another invocation permission. Current provider operation is described by
+[mechanism V2](sealed-linux-v2.md); optional private TCP additionally follows the
+[V2 workload contract](../docs/spec-workload-contract-v2.md).

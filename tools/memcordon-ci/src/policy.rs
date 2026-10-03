@@ -104,15 +104,6 @@ fn key(name: &str) -> Value {
     Value::String(name.to_owned())
 }
 
-fn token_fallback_source(release: &config::Release) -> String {
-    let secret = release
-        .registry_credentials
-        .fallback_token_secret
-        .as_deref()
-        .unwrap_or("MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK");
-    ["${{ secrets.", secret, " }}"].concat()
-}
-
 fn mapping<'a>(value: &'a Value, context: &str) -> Result<&'a Mapping> {
     value
         .as_mapping()
@@ -177,11 +168,33 @@ pub fn validate_upload_artifact_action_bytes(bytes: &[u8]) -> Result<()> {
     let action = mapping(&action, "artifact upload action")?;
     exact_mapping_keys(
         action,
-        &["name", "description", "inputs", "runs"],
+        &["name", "description", "inputs", "outputs", "runs"],
         "artifact upload action",
     )?;
     if scalar(action, "name").is_none() || scalar(action, "description").is_none() {
         return Err(failure("artifact upload action metadata is incomplete"));
+    }
+    let outputs = mapping(
+        action.get(key("outputs")).expect("exact keys"),
+        "artifact upload outputs",
+    )?;
+    exact_mapping_keys(
+        outputs,
+        &["artifact-id", "artifact-digest"],
+        "artifact upload outputs",
+    )?;
+    for name in ["artifact-id", "artifact-digest"] {
+        let output = mapping(
+            outputs.get(key(name)).expect("exact keys"),
+            "artifact upload output",
+        )?;
+        exact_mapping_keys(output, &["description", "value"], "artifact upload output")?;
+        let expected = format!(
+            "${{{{ steps.retry-two.outputs.{name} || steps.retry-one.outputs.{name} || steps.initial.outputs.{name} }}}}"
+        );
+        if scalar(output, "value") != Some(&expected) {
+            return Err(failure("artifact immutable output binding differs"));
+        }
     }
 
     let inputs = mapping(
@@ -549,21 +562,8 @@ const NATIVE_MATRIX: [(&str, &str); 6] = [
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
-const VERIFY_PUBLIC_MATRIX: [(&str, &str); 3] = [
-    ("linux-x64", "ubuntu-24.04"),
-    ("windows-x64", "windows-2025"),
-    ("windows-arm64", "windows-11-arm"),
-];
-
-const STRESS_MATRIX: [(&str, &str); 5] = [
-    ("linux-x64", "ubuntu-24.04"),
-    ("macos-arm64", "macos-15"),
-    ("macos-x64", "macos-15-intel"),
-    ("windows-x64", "windows-2025"),
-    ("windows-arm64", "windows-11-arm"),
-];
 const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
-
+const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 90;
 fn check_runner_matrix(
     jobs: &Mapping,
     job_name: &str,
@@ -617,205 +617,6 @@ fn check_runner_matrix(
     Ok(())
 }
 
-pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
-    exact_mapping_keys(
-        fuzz,
-        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
-        "fuzz job",
-    )?;
-    let strategy = mapping(
-        fuzz.get(key("strategy"))
-            .ok_or_else(|| failure("fuzz strategy absent"))?,
-        "fuzz strategy",
-    )?;
-    exact_mapping_keys(strategy, &["fail-fast", "matrix"], "fuzz strategy")?;
-    let matrix = mapping(
-        strategy
-            .get(key("matrix"))
-            .ok_or_else(|| failure("fuzz matrix absent"))?,
-        "fuzz matrix",
-    )?;
-    exact_mapping_keys(matrix, &["shard"], "fuzz matrix")?;
-    let expected_shards = Value::Sequence(vec![
-        Value::String("first".into()),
-        Value::String("second".into()),
-    ]);
-    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
-        || matrix.get(key("shard")) != Some(&expected_shards)
-        || fuzz.get(key("timeout-minutes")).and_then(Value::as_u64)
-            != Some(DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES)
-        || scalar(fuzz, "runs-on") != Some("ubuntu-24.04")
-    {
-        return Err(failure("fuzz shard coverage or execution bounds differ"));
-    }
-    let steps = fuzz
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("fuzz steps absent"))?;
-    let mut runs = Vec::new();
-    let mut target_cache = 0;
-    let mut target_save = 0;
-    let identities = [
-        None,
-        Some("fuzz-deps"),
-        Some("fuzz-target"),
-        Some("fuzz-tools"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ];
-    if steps.len() != identities.len() {
-        return Err(failure("fuzz ordered step inventory differs"));
-    }
-    for (index, step) in steps.iter().enumerate() {
-        let step = mapping(step, "fuzz step")?;
-        let keys: &[&str] = match index {
-            0 => &["uses", "with"],
-            1..=3 => &["id", "uses", "with"],
-            4 => &["run"],
-            5..=6 => &["if", "run"],
-            _ => &["if", "uses", "with"],
-        };
-        exact_mapping_keys(step, keys, "fuzz ordered step")?;
-        if index == 0 {
-            let with = mapping(
-                step.get(key("with")).expect("exact step keys"),
-                "fuzz checkout",
-            )?;
-            exact_mapping_keys(with, &["persist-credentials"], "fuzz checkout")?;
-            if scalar(step, "uses")
-                != Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
-                || with
-                    .get(key("persist-credentials"))
-                    .and_then(Value::as_bool)
-                    != Some(false)
-            {
-                return Err(failure("fuzz checkout differs"));
-            }
-        }
-        if scalar(step, "id") != identities[index] {
-            return Err(failure("fuzz cache restore ordering differs"));
-        }
-        if matches!(index, 1..=3)
-            && scalar(step, "uses")
-                != Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-        {
-            return Err(failure("fuzz cache restore action differs"));
-        }
-        if index >= 7 {
-            let expected = [
-                (
-                    "always() && steps.fuzz-target.outputs.cache-hit != 'true'",
-                    "${{ steps.fuzz-target.outputs.cache-primary-key }}",
-                    "target/ci\nfuzz/target\n",
-                ),
-                (
-                    "always() && steps.fuzz-tools.outputs.cache-hit != 'true'",
-                    "${{ steps.fuzz-tools.outputs.cache-primary-key }}",
-                    "target/ci-tools",
-                ),
-                (
-                    "always() && steps.fuzz-deps.outputs.cache-hit != 'true'",
-                    "${{ steps.fuzz-deps.outputs.cache-primary-key }}",
-                    "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
-                ),
-            ];
-            let (condition, cache_key, path) = expected[index - 7];
-            let with = mapping(
-                step.get(key("with")).expect("exact step keys"),
-                "fuzz cache save",
-            )?;
-            exact_mapping_keys(with, &["path", "key"], "fuzz cache save")?;
-            if scalar(step, "uses")
-                != Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-                || scalar(step, "if") != Some(condition)
-                || scalar(with, "key") != Some(cache_key)
-                || scalar(with, "path") != Some(path)
-            {
-                return Err(failure("fuzz cache save ordering or inputs differ"));
-            }
-        }
-        if matches!(index, 1 | 3) {
-            let with = mapping(
-                step.get(key("with")).expect("exact step keys"),
-                "fuzz shared cache",
-            )?;
-            exact_mapping_keys(with, &["path", "key"], "fuzz shared cache")?;
-            let (path, cache_key) = if index == 1 {
-                (
-                    "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
-                    "cargo-deps-deep-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}",
-                )
-            } else {
-                (
-                    "target/ci-tools",
-                    "cargo-tools-deep-v1-fuzz-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('ci/tools.toml', 'tools/**') }}",
-                )
-            };
-            if scalar(with, "path") != Some(path) || scalar(with, "key") != Some(cache_key) {
-                return Err(failure("fuzz shared cache inputs differ"));
-            }
-        }
-        if let Some(run) = scalar(step, "run") {
-            runs.push((run, scalar(step, "if")));
-        }
-        if scalar(step, "id") == Some("fuzz-target") {
-            let with = mapping(
-                step.get(key("with"))
-                    .ok_or_else(|| failure("fuzz cache inputs absent"))?,
-                "fuzz cache inputs",
-            )?;
-            exact_mapping_keys(with, &["path", "key"], "fuzz target cache")?;
-            if scalar(with, "key")
-                != Some(
-                    "cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}",
-                )
-                || scalar(with, "path") != Some("target/ci\nfuzz/target\n")
-                || scalar(step, "if").is_some()
-                || scalar(step, "uses")
-                    != Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-            {
-                return Err(failure("fuzz shard build cache inputs differ"));
-            }
-            target_cache += 1;
-        }
-        if let Some(with) = step.get(key("with")).and_then(Value::as_mapping)
-            && scalar(with, "key") == Some("${{ steps.fuzz-target.outputs.cache-primary-key }}")
-        {
-            if scalar(step, "uses")
-                != Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-                || scalar(step, "if")
-                    != Some("always() && steps.fuzz-target.outputs.cache-hit != 'true'")
-                || scalar(with, "path") != Some("target/ci\nfuzz/target\n")
-            {
-                return Err(failure("fuzz shard cache save differs"));
-            }
-            target_save += 1;
-        }
-    }
-    if runs
-        != [
-            ("rustup toolchain install 1.97.1 --profile minimal", None),
-            (
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
-                Some("matrix.shard == 'first'"),
-            ),
-            (
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
-                Some("matrix.shard == 'second'"),
-            ),
-        ]
-        || target_cache != 1
-        || target_save != 1
-    {
-        return Err(failure("fuzz shard invocations or cache coverage differ"));
-    }
-    Ok(())
-}
-
 fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
     check_push_and_dispatch_events(workflow, "deep CI")?;
     check_top_level_permissions(workflow)?;
@@ -852,9 +653,851 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             "deep CI fuzz timeout differs from workload deadline",
         ));
     }
-    check_fuzz_shards(fuzz)?;
-    check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
+    check_deep_shards(
+        fuzz,
+        "fuzz",
+        &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        60,
+    )?;
+    let miri = mapping(
+        jobs.get(key("miri"))
+            .ok_or_else(|| failure("deep CI Miri job is absent"))?,
+        "deep CI Miri",
+    )?;
+    check_deep_shards(miri, "miri", &["first", "second"], 60)?;
+    let planner = mapping(
+        jobs.get(key("performance-plan"))
+            .ok_or_else(|| failure("stress planner absent"))?,
+        "stress planner",
+    )?;
+    let plan_steps = ordinary_steps(planner, "stress planner")?;
+    let plan_index = plan_steps
+        .iter()
+        .position(|step| {
+            step.get(key("run")).and_then(Value::as_str)
+                == Some("./target/ci/release/memcordon-ci ci performance-plan")
+        })
+        .ok_or_else(|| failure("actual stress plan command absent"))?;
+    ordinary_driver_before_suite(plan_steps, plan_index)?;
+    for (job_name, output, condition, suite, target) in [
+        (
+            "stress",
+            "combined",
+            "has-combined",
+            "stress",
+            "target/ci/stress",
+        ),
+        (
+            "stress-packages",
+            "split",
+            "has-split",
+            "stress-packages",
+            "target/ci/stress-packages",
+        ),
+        (
+            "stress-lifecycle",
+            "split",
+            "has-split",
+            "stress-lifecycle",
+            "target/ci/stress-lifecycle",
+        ),
+    ] {
+        let job = mapping(
+            jobs.get(key(job_name))
+                .ok_or_else(|| failure("selected stress phase job absent"))?,
+            "stress phase",
+        )?;
+        if scalar(job, "needs") != Some("performance-plan")
+            || scalar(job, "if")
+                != Some(format!("needs.performance-plan.outputs.{condition} == 'true'").as_str())
+            || scalar(job, "runs-on") != Some("${{ matrix.runner }}")
+            || job.get(key("timeout-minutes")).and_then(Value::as_u64)
+                != Some(DEEP_CI_STRESS_TIMEOUT_MINUTES)
+        {
+            return Err(failure(
+                "deep CI stress timeout does not cover the complete cold workload",
+            ));
+        }
+        let strategy = mapping(
+            job.get(key("strategy"))
+                .ok_or_else(|| failure("stress strategy absent"))?,
+            "stress strategy",
+        )?;
+        let matrix = mapping(
+            strategy
+                .get(key("matrix"))
+                .ok_or_else(|| failure("stress matrix absent"))?,
+            "stress matrix",
+        )?;
+        exact_mapping_keys(matrix, &["include"], "selected stress matrix")?;
+        if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
+            || scalar(matrix, "include")
+                != Some(
+                    format!("${{{{ fromJSON(needs.performance-plan.outputs.{output}) }}}}")
+                        .as_str(),
+                )
+        {
+            return Err(failure("deep CI stress selected matrix differs"));
+        }
+        let steps = ordinary_steps(job, "stress phase")?;
+        let index = steps
+            .iter()
+            .position(|step| {
+                step.get(key("run")).and_then(Value::as_str)
+                    == Some(format!("./target/ci/release/memcordon-ci suite {suite}").as_str())
+            })
+            .ok_or_else(|| failure("stress phase execution absent"))?;
+        if steps[index].get(key("if")).is_some() {
+            return Err(failure("selected stress execution cannot be conditional"));
+        }
+        ordinary_driver_before_suite(steps, index)?;
+        let caches: Vec<_> = steps
+            .iter()
+            .filter(|step| {
+                step.get(key("id")).and_then(Value::as_str) == Some("compiled")
+                    || step.get(key("uses")).and_then(Value::as_str)
+                        == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+                        && step
+                            .get(key("with"))
+                            .and_then(|with| with.get(key("path")))
+                            .and_then(Value::as_str)
+                            == Some(target)
+            })
+            .collect();
+        if caches.len() != 2
+            || caches.iter().any(|step| {
+                step.get(key("with"))
+                    .and_then(|with| with.get(key("path")))
+                    .and_then(Value::as_str)
+                    != Some(target)
+            })
+        {
+            return Err(failure("stress phase compiled roots must remain isolated"));
+        }
+        let expected_name = if job_name == "stress" {
+            "stress-combined-${{ matrix.id }}"
+        } else if job_name == "stress-packages" {
+            "stress-packages-${{ matrix.id }}"
+        } else {
+            "stress-lifecycle-${{ matrix.id }}"
+        };
+        let uploads: Vec<_> = steps
+            .iter()
+            .filter(|step| {
+                step.get(key("uses")).and_then(Value::as_str)
+                    == Some("./.github/actions/upload-artifact")
+            })
+            .collect();
+        if uploads.len() != 1
+            || uploads[0].get(key("if")).and_then(Value::as_str) != Some("always()")
+            || uploads[0]
+                .get(key("with"))
+                .and_then(|with| with.get(key("name")))
+                .and_then(Value::as_str)
+                != Some(expected_name)
+            || uploads[0]
+                .get(key("with"))
+                .and_then(|with| with.get(key("include-hidden-files")))
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(failure(
+                "stress phase evidence must preserve phase, seed, active target and child reports on failure",
+            ));
+        }
+    }
+    let assessment = mapping(
+        jobs.get(key("stress-assessment"))
+            .ok_or_else(|| failure("stress aggregation absent"))?,
+        "stress aggregation",
+    )?;
+    let required_needs = Value::Sequence(
+        [
+            "performance-plan",
+            "stress",
+            "stress-packages",
+            "stress-lifecycle",
+        ]
+        .into_iter()
+        .map(|name| Value::String(name.into()))
+        .collect(),
+    );
+    if assessment.get(key("needs")) != Some(&required_needs)
+        || scalar(assessment, "if") != Some("always()")
+    {
+        return Err(failure(
+            "stress aggregation must collect all phase outcomes",
+        ));
+    }
+    let assessment_steps = ordinary_steps(assessment, "stress aggregation")?;
+    let assessment_index = assessment_steps
+        .iter()
+        .position(|step| {
+            step.get(key("run")).and_then(Value::as_str)
+                == Some("./target/ci/release/memcordon-ci ci aggregate-stress")
+        })
+        .ok_or_else(|| failure("actual stress aggregation command absent"))?;
+    ordinary_driver_before_suite(assessment_steps, assessment_index)?;
+    let stress = mapping(
+        jobs.get(key("stress")).expect("validated stress job"),
+        "deep CI stress",
+    )?;
+    if stress.get(key("timeout-minutes")).and_then(Value::as_u64)
+        != Some(DEEP_CI_STRESS_TIMEOUT_MINUTES)
+    {
+        return Err(failure(
+            "deep CI stress timeout does not cover the complete cold workload",
+        ));
+    }
+    let stress_steps = ordinary_steps(stress, "deep CI stress")?;
+    let mut phase_uploads = 0;
+    for step in stress_steps.iter().filter_map(Value::as_mapping) {
+        if scalar(step, "uses") != Some("./.github/actions/upload-artifact") {
+            continue;
+        }
+        let with = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("stress phase upload settings absent"))?,
+            "stress phase upload",
+        )?;
+        exact_mapping_keys(step, &["if", "uses", "with"], "stress phase upload")?;
+        exact_mapping_keys(
+            with,
+            &["name", "path", "if-no-files-found", "include-hidden-files"],
+            "stress phase upload settings",
+        )?;
+        if scalar(step, "if") != Some("always()")
+            || scalar(with, "name") != Some("stress-combined-${{ matrix.id }}")
+            || scalar(with, "if-no-files-found") != Some("warn")
+            || with
+                .get(key("include-hidden-files"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            || scalar(with, "path")
+                != Some(
+                    "target/ci/reports/stress\ntarget/ci/reports/stress-seed.txt\ntarget/ci/reports/stress-active-target.txt\ntarget/ci/reports/stress-deep_short_child_iterations.json\n",
+                )
+        {
+            return Err(failure(
+                "stress phase evidence must preserve phase, seed, active target and child reports on failure",
+            ));
+        }
+        phase_uploads += 1;
+    }
+    if phase_uploads != 1 {
+        return Err(failure(
+            "deep stress requires exactly one phase evidence upload",
+        ));
+    }
     Ok(())
+}
+
+const ORDINARY_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci";
+const ORDINARY_SOURCE_PATHS: &str =
+    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+
+fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
+    let steps = job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure(format!("{context} steps absent")))?;
+    for value in steps {
+        let step = mapping(value, context)?;
+        if step.contains_key(key("continue-on-error"))
+            || context != "publisher" && step.contains_key(key("env"))
+            || step.contains_key(key("shell"))
+        {
+            return Err(failure(
+                "ordinary native controls may not ignore failure or override environment",
+            ));
+        }
+    }
+    Ok(steps)
+}
+
+fn ordinary_driver_before_suite(steps: &[Value], suite_index: usize) -> Result<()> {
+    let builds: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.get(key("run")).and_then(Value::as_str) == Some(ORDINARY_DRIVER_BUILD)
+        })
+        .collect();
+    if builds.len() != 1 || builds[0].0 >= suite_index || builds[0].1.get(key("if")).is_some() {
+        return Err(failure(
+            "exactly one unconditional ordinary driver build must precede its native suite",
+        ));
+    }
+    Ok(())
+}
+
+fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64) -> Result<()> {
+    exact_mapping_keys(
+        job,
+        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        "deep shard job",
+    )?;
+    let strategy = mapping(
+        job.get(key("strategy"))
+            .ok_or_else(|| failure("shard strategy absent"))?,
+        "shard strategy",
+    )?;
+    exact_mapping_keys(strategy, &["fail-fast", "matrix"], "shard strategy")?;
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure("shard matrix absent"))?,
+        "shard matrix",
+    )?;
+    exact_mapping_keys(matrix, &["shard"], "shard matrix")?;
+    exact_string_sequence(
+        matrix
+            .get(key("shard"))
+            .ok_or_else(|| failure("shard inventory absent"))?,
+        shards,
+        "complete shard inventory",
+    )?;
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
+        || scalar(job, "runs-on") != Some("ubuntu-24.04")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout)
+    {
+        return Err(failure("deep shard runner or execution bounds differ"));
+    }
+    let steps = ordinary_steps(job, "deep shards")?;
+    if steps.len() != shards.len() + 10 {
+        return Err(failure("deep shard ordered step inventory differs"));
+    }
+    let mut invocations = Vec::new();
+    let mut restores = 0;
+    let mut saves = 0;
+    let mut plans = 0;
+    let mut compiled_restores = 0;
+    let mut compiled_saves = 0;
+    for (ordinal, value) in steps.iter().enumerate() {
+        let step = mapping(value, "deep shard step")?;
+        if let Some(run) = scalar(step, "run") {
+            if run.split_whitespace().any(|part| part == "suite") {
+                ordinary_driver_before_suite(steps, ordinal)?;
+                invocations.push((run, scalar(step, "if")));
+            }
+        }
+        if let Some(uses) = scalar(step, "uses") {
+            if uses.starts_with("actions/cache/") {
+                let with = mapping(
+                    step.get(key("with"))
+                        .ok_or_else(|| failure("source cache inputs absent"))?,
+                    "source cache",
+                )?;
+                exact_mapping_keys(with, &["path", "key"], "source cache")?;
+                let compiled_path = match family {
+                    "miri" => "target/ci/miri-*",
+                    "fuzz" => "fuzz/target\ntarget/ci-tools/bin\ntarget/ci-tools-build\n",
+                    _ => return Err(failure("unsupported shard family")),
+                };
+                if scalar(with, "path") == Some(compiled_path) {
+                    let context = mapping(&steps[5], "compiled input context")?;
+                    let expected_context = format!(
+                        "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard complete"
+                    );
+                    if scalar(context, "id") != Some("compiled-context")
+                        || scalar(context, "run") != Some(expected_context.as_str())
+                    {
+                        return Err(failure("compiled cache actual input context differs"));
+                    }
+                    if uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
+                        compiled_restores += 1;
+                        if ordinal != 6
+                            || scalar(step, "id") != Some("compiled")
+                            || scalar(step, "if")
+                                != Some(
+                                    "steps.compiled-context.outputs.compiled-cache-usable == 'true'",
+                                )
+                            || scalar(with, "key")
+                                != Some(
+                                    "${{ steps.compiled-context.outputs.product-key }}-${{ matrix.shard }}",
+                                )
+                        {
+                            return Err(failure("compiled shard restore identity/order differs"));
+                        }
+                    } else if uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+                    {
+                        compiled_saves += 1;
+                        let condition = match family {
+                            "miri" => {
+                                "always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true'"
+                            }
+                            "fuzz" => {
+                                "always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true'"
+                            }
+                            _ => unreachable!(),
+                        };
+                        if ordinal != steps.len() - 2
+                            || scalar(step, "if") != Some(condition)
+                            || scalar(with, "key")
+                                != Some("${{ steps.compiled.outputs.cache-primary-key }}")
+                        {
+                            return Err(failure("compiled shard quiescent save differs"));
+                        }
+                    } else {
+                        return Err(failure("compiled shard cache action differs"));
+                    }
+                    continue;
+                }
+                if scalar(with, "path") != Some(ORDINARY_SOURCE_PATHS) {
+                    return Err(failure("ordinary shard source cache paths differ"));
+                }
+                if uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
+                    restores += 1;
+                    if ordinal != 1
+                        || scalar(with, "key").is_none_or(|value| {
+                            !value.starts_with("ordinary-sources-v1-")
+                                || !value.contains("fuzz/Cargo.lock")
+                                || !value.contains("Cargo.lock")
+                        })
+                    {
+                        return Err(failure(
+                            "ordinary shard dependency identity or restore order differs",
+                        ));
+                    }
+                } else if uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
+                    saves += 1;
+                    let (condition, cache_key) = match family {
+                        "miri" => (
+                            "always() && matrix.shard == 'first' && steps.miri-deps.outputs.cache-hit != 'true'",
+                            "${{ steps.miri-deps.outputs.cache-primary-key }}",
+                        ),
+                        "fuzz" => (
+                            "always() && matrix.shard == 'quarter-one' && steps.fuzz-deps.outputs.cache-hit != 'true'",
+                            "${{ steps.fuzz-deps.outputs.cache-primary-key }}",
+                        ),
+                        _ => return Err(failure("unsupported shard family")),
+                    };
+                    if scalar(step, "if") != Some(condition)
+                        || scalar(with, "key") != Some(cache_key)
+                        || ordinal != steps.len() - 1
+                    {
+                        return Err(failure("ordinary shard source cache save differs"));
+                    }
+                } else {
+                    return Err(failure("ordinary source cache action differs"));
+                }
+            }
+            if uses == UPLOAD_ARTIFACT_ACTION {
+                plans += 1;
+                let with = mapping(
+                    step.get(key("with"))
+                        .ok_or_else(|| failure("shard plan upload absent"))?,
+                    "shard plan upload",
+                )?;
+                let expected_path = match family {
+                    "miri" => "target/ci/reports/miri",
+                    "fuzz" => "target/ci/reports/fuzz",
+                    _ => return Err(failure("unsupported shard family")),
+                };
+                if scalar(step, "if") != Some("always()")
+                    || scalar(with, "path") != Some(expected_path)
+                    || scalar(with, "if-no-files-found") != Some("warn")
+                {
+                    return Err(failure("shard plan failure evidence differs"));
+                }
+            }
+        }
+    }
+    let expected: Vec<_> = shards
+        .iter()
+        .map(|shard| match (family, *shard) {
+            ("miri", "first") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-first",
+                Some("matrix.shard == 'first'"),
+            )),
+            ("miri", "second") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-second",
+                Some("matrix.shard == 'second'"),
+            )),
+            ("fuzz", "quarter-one") => Ok((
+                "./target/ci/release/memcordon-ci suite fuzz-quarter-one",
+                Some("matrix.shard == 'quarter-one'"),
+            )),
+            ("fuzz", "quarter-two") => Ok((
+                "./target/ci/release/memcordon-ci suite fuzz-quarter-two",
+                Some("matrix.shard == 'quarter-two'"),
+            )),
+            ("fuzz", "quarter-three") => Ok((
+                "./target/ci/release/memcordon-ci suite fuzz-quarter-three",
+                Some("matrix.shard == 'quarter-three'"),
+            )),
+            ("fuzz", "quarter-four") => Ok((
+                "./target/ci/release/memcordon-ci suite fuzz-quarter-four",
+                Some("matrix.shard == 'quarter-four'"),
+            )),
+            _ => Err(failure("unsupported shard")),
+        })
+        .collect::<Result<_>>()?;
+    if invocations != expected
+        || restores != 1
+        || saves != 1
+        || plans != 1
+        || compiled_restores != 1
+        || compiled_saves != 1
+    {
+        return Err(failure(
+            "ordinary shard invocation/cache/evidence coverage differs",
+        ));
+    }
+    Ok(())
+}
+
+fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
+    let planner = mapping(
+        jobs.get(key("macos-performance-plan"))
+            .ok_or_else(|| failure("Mac performance selector absent"))?,
+        "Mac selector",
+    )?;
+    let steps = ordinary_steps(planner, "Mac selector")?;
+    let selected = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.get(key("run")).and_then(Value::as_str)
+                == Some("./target/ci/release/memcordon-ci ci performance-plan")
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 1
+        || selected[0].1.get(key("if")).is_some()
+        || selected[0].1.get(key("id")).and_then(Value::as_str) != Some("plan")
+    {
+        return Err(failure("Mac selector must run exactly once"));
+    }
+    ordinary_driver_before_suite(steps, selected[0].0)?;
+    let outputs = mapping(
+        planner
+            .get(key("outputs"))
+            .ok_or_else(|| failure("Mac selector output absent"))?,
+        "Mac selector outputs",
+    )?;
+    if scalar(outputs, "split") != Some("${{ steps.plan.outputs.macos-split }}") {
+        return Err(failure("Mac selector output differs"));
+    }
+    for (name, split, suite, phase) in [
+        (
+            "macos-combined",
+            "false",
+            "backend-macos-watchdog",
+            "combined",
+        ),
+        ("macos-native", "true", "release-macos-native", "native"),
+        (
+            "macos-acceptance",
+            "true",
+            "release-macos-acceptance",
+            "acceptance",
+        ),
+    ] {
+        let job = mapping(
+            jobs.get(key(name))
+                .ok_or_else(|| failure("selected Mac phase absent"))?,
+            name,
+        )?;
+        let condition = format!("needs.macos-performance-plan.outputs.split == '{split}'");
+        if scalar(job, "needs") != Some("macos-performance-plan")
+            || scalar(job, "if") != Some(condition.as_str())
+        {
+            return Err(failure("Mac phase selection differs"));
+        }
+        check_native_runner_matrix(
+            job,
+            &[("macos-x64", "macos-15-intel"), ("macos-arm64", "macos-15")],
+        )?;
+        let steps = ordinary_steps(job, name)?;
+        let run = format!("./target/ci/release/memcordon-ci suite {suite}");
+        let operations = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.get(key("run")).and_then(Value::as_str) == Some(run.as_str()))
+            .collect::<Vec<_>>();
+        if operations.len() != 1 || operations[0].1.get(key("if")).is_some() {
+            return Err(failure("selected Mac native phase cannot be skipped"));
+        }
+        ordinary_driver_before_suite(steps, operations[0].0)?;
+        let context = format!(
+            "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard {phase}"
+        );
+        if !steps
+            .iter()
+            .any(|step| step.get(key("run")).and_then(Value::as_str) == Some(context.as_str()))
+        {
+            return Err(failure("Mac phase cache identities must be separate"));
+        }
+        for step in steps.iter().filter(|step| {
+            step.get(key("uses"))
+                .and_then(Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+        }) {
+            if !step
+                .get(key("if"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("steps.native.outputs.cache-quiescent == 'true'")
+            {
+                return Err(failure(
+                    "Mac cache may save only after actual phase quiescence",
+                ));
+            }
+        }
+    }
+    let assessment = mapping(
+        jobs.get(key("macos-assessment"))
+            .ok_or_else(|| failure("Mac selected assessment absent"))?,
+        "Mac assessment",
+    )?;
+    if scalar(assessment, "if") != Some("always()") {
+        return Err(failure("Mac selected assessment must run after failure"));
+    }
+    exact_string_sequence(
+        assessment
+            .get(key("needs"))
+            .ok_or_else(|| failure("Mac assessment dependencies absent"))?,
+        &[
+            "macos-performance-plan",
+            "macos-combined",
+            "macos-native",
+            "macos-acceptance",
+        ],
+        "Mac assessment dependencies",
+    )?;
+    let steps = ordinary_steps(assessment, "Mac assessment")?;
+    if !steps.iter().any(|step| {
+        step.get(key("run")).and_then(Value::as_str)
+            == Some("./target/ci/release/memcordon-ci ci aggregate-macos")
+            && step.get(key("if")).is_none()
+    }) {
+        return Err(failure("Mac actual report aggregation absent"));
+    }
+    for (architecture, runner) in [("x64", "windows-2025"), ("arm64", "windows-11-arm")] {
+        for consumer in [false, true] {
+            let name = format!(
+                "windows-{}-{architecture}",
+                if consumer { "installed" } else { "payload" }
+            );
+            let job = mapping(
+                jobs.get(key(&name))
+                    .ok_or_else(|| failure("selected Windows installed graph absent"))?,
+                &name,
+            )?;
+            if scalar(job, "runs-on") != Some(runner) || job.get(key("if")).is_some() {
+                return Err(failure(
+                    "selected Windows runner or unconditional graph differs",
+                ));
+            }
+            let strategy = mapping(
+                job.get(key("strategy"))
+                    .ok_or_else(|| failure("Windows channel strategy absent"))?,
+                "Windows strategy",
+            )?;
+            let matrix = mapping(
+                strategy
+                    .get(key("matrix"))
+                    .ok_or_else(|| failure("Windows channel matrix absent"))?,
+                "Windows matrix",
+            )?;
+            exact_mapping_keys(matrix, &["include"], "Windows exact matrix")?;
+            let rows = matrix
+                .get(key("include"))
+                .and_then(Value::as_sequence)
+                .ok_or_else(|| failure("Windows channel inventory absent"))?;
+            if rows.len() != if consumer { 2 } else { 1 } {
+                return Err(failure(
+                    "Windows native and Cargo channel cardinality differs",
+                ));
+            }
+            for (ordinal, row) in rows.iter().enumerate() {
+                let row = mapping(row, "Windows row")?;
+                exact_mapping_keys(
+                    row,
+                    if consumer {
+                        &["id", "channel"]
+                    } else {
+                        &["id"]
+                    },
+                    "Windows row fields",
+                )?;
+                if scalar(row, "id") != Some(architecture)
+                    || (consumer
+                        && scalar(row, "channel")
+                            != Some(if ordinal == 0 { "native" } else { "cargo" }))
+                {
+                    return Err(failure("Windows exact native and Cargo rows differ"));
+                }
+            }
+            let steps = ordinary_steps(job, &name)?;
+            if consumer {
+                let producer = format!("windows-payload-{architecture}");
+                if scalar(job, "needs") != Some(producer.as_str()) {
+                    return Err(failure(
+                        "Windows installed consumer must use its native producer",
+                    ));
+                }
+                for channel in ["native", "cargo"] {
+                    let run = format!(
+                        "./target/ci/release/memcordon-ci release working-windows-consumer --channel {channel} --destination target/ci/windows-installed/{channel}"
+                    );
+                    let condition = format!("matrix.channel == '{channel}'");
+                    let operations = steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, step)| {
+                            step.get(key("run")).and_then(Value::as_str) == Some(run.as_str())
+                        })
+                        .collect::<Vec<_>>();
+                    if operations.len() != 1
+                        || operations[0].1.get(key("if")).and_then(Value::as_str)
+                            != Some(condition.as_str())
+                    {
+                        return Err(failure("Windows literal channel execution differs"));
+                    }
+                    ordinary_driver_before_suite(steps, operations[0].0)?;
+                }
+            } else {
+                let operations = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| {
+                        step.get(key("run")).and_then(Value::as_str)
+                            == Some(
+                                "./target/ci/release/memcordon-ci release working-windows-prepare",
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                if operations.len() != 1 || operations[0].1.get(key("if")).is_some() {
+                    return Err(failure("Windows actual source producer absent"));
+                }
+                ordinary_driver_before_suite(steps, operations[0].0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_native_runner_matrix(job: &Mapping, rows: &[(&str, &str)]) -> Result<()> {
+    if scalar(job, "runs-on") != Some("${{ matrix.runner }}") {
+        return Err(failure("native matrix runner differs"));
+    }
+    let strategy = mapping(
+        job.get(key("strategy"))
+            .ok_or_else(|| failure("native strategy absent"))?,
+        "native strategy",
+    )?;
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure("native matrix absent"))?,
+        "native matrix",
+    )?;
+    exact_mapping_keys(matrix, &["include"], "native matrix fields")?;
+    let actual = matrix
+        .get(key("include"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("native matrix include absent"))?;
+    if actual.len() != rows.len() {
+        return Err(failure("native architecture cardinality differs"));
+    }
+    for (row, (id, runner)) in actual.iter().zip(rows) {
+        let row = mapping(row, "native architecture")?;
+        exact_mapping_keys(row, &["id", "runner"], "native architecture fields")?;
+        if scalar(row, "id") != Some(*id) || scalar(row, "runner") != Some(*runner) {
+            return Err(failure("native exact architecture inventory differs"));
+        }
+    }
+    Ok(())
+}
+
+fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
+    check_push_and_dispatch_events(workflow, "native backend")?;
+    check_top_level_permissions(workflow)?;
+    let concurrency = mapping(
+        workflow
+            .get(key("concurrency"))
+            .ok_or_else(|| failure("native backend concurrency absent"))?,
+        "native backend concurrency",
+    )?;
+    if scalar(concurrency, "group") != Some("backend-certification-${{ github.ref }}")
+        || concurrency
+            .get(key("cancel-in-progress"))
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(failure(
+            "destructive native jobs may not cancel active cleanup",
+        ));
+    }
+    for (name, runner, invocation) in [
+        (
+            "standard-linux",
+            "ubuntu-24.04",
+            "./target/ci/release/memcordon-ci suite backend-linux-cgroup",
+        ),
+        (
+            "standard-windows",
+            "windows-2025",
+            "./target/ci/release/memcordon-ci suite backend-windows-job",
+        ),
+        (
+            "standard-windows-arm64",
+            "windows-11-arm",
+            "./target/ci/release/memcordon-ci suite backend-windows-job",
+        ),
+    ] {
+        let job = mapping(
+            jobs.get(key(name))
+                .ok_or_else(|| failure(format!("ordinary native job missing: {name}")))?,
+            name,
+        )?;
+        if scalar(job, "runs-on") != Some(runner)
+            || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+        {
+            return Err(failure("ordinary native runner or deadline differs"));
+        }
+        let steps = ordinary_steps(job, name)?;
+        let suites: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| {
+                value
+                    .get(key("run"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|run| run.split_whitespace().any(|part| part == "suite"))
+            })
+            .collect();
+        if suites.len() != 1
+            || suites[0].1.get(key("run")).and_then(Value::as_str) != Some(invocation)
+            || suites[0].1.get(key("if")).is_some()
+        {
+            return Err(failure(
+                "ordinary native suite is absent, substituted, or conditional",
+            ));
+        }
+        ordinary_driver_before_suite(steps, suites[0].0)?;
+    }
+    check_selected_native_forms(jobs)?;
+    Ok(())
+}
+pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
+    check_deep_shards(
+        job,
+        "fuzz",
+        &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        60,
+    )
 }
 
 fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Policy) -> Result<()> {
@@ -951,47 +1594,19 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
         .get(key("steps"))
         .and_then(Value::as_sequence)
         .ok_or_else(|| failure("macOS deadline steps missing"))?;
-    let mut fingerprint = false;
-    let mut target_cache = false;
-    let mut qualification = false;
+    let mut execution = false;
     let mut failure_artifact = false;
-    for step in steps {
-        let step = mapping(step, "macOS deadline step")?;
+    for value in steps {
+        let step = mapping(value, "macOS deadline step")?;
         if step.contains_key(key("env")) {
             return Err(failure(
                 "macOS deadline configuration must use argv, not custom environment",
             ));
         }
-        if scalar(step, "run")
-            == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
-        {
-            fingerprint = true;
+        if scalar(step, "run").is_some_and(|value| value.ends_with("suite macos-deadline")) {
+            execution = true;
         }
         if let Some(with) = step.get(key("with")).and_then(Value::as_mapping) {
-            if scalar(step, "uses").is_some_and(|value| value.starts_with("actions/cache/restore@"))
-                && scalar(with, "path").is_some_and(|value| {
-                    value.lines().any(|path| {
-                        path.starts_with("target/") && !path.starts_with("target/ci/source-home/")
-                    })
-                })
-            {
-                if !fingerprint
-                    || !scalar(with, "key")
-                        .is_some_and(|value| value.contains("target/ci/native-inputs.bin"))
-                {
-                    return Err(failure(
-                        "macOS compiled cache must follow and bind native fingerprint",
-                    ));
-                }
-                if scalar(with, "path").is_some_and(|value| {
-                    value
-                        .lines()
-                        .any(|path| path.contains("evidence") || path.ends_with("reports"))
-                }) {
-                    return Err(failure("macOS qualification evidence must not be cached"));
-                }
-                target_cache = true;
-            }
             if scalar(step, "uses") == Some(UPLOAD_ARTIFACT_ACTION)
                 && scalar(with, "path") == Some("target/ci/deadline-evidence")
                 && scalar(step, "if") == Some("always()")
@@ -999,49 +1614,13 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
                 failure_artifact = true;
             }
         }
-        if scalar(step, "run").is_some_and(|value| {
-            value.ends_with("suite macos-deadline") || value.ends_with("suite release-macos")
-        }) {
-            if !target_cache {
-                return Err(failure(
-                    "macOS deadline qualification lacks exact compiled cache setup",
-                ));
-            }
-            qualification = true;
-        }
     }
-    if !qualification || !failure_artifact {
+    if !execution || !failure_artifact {
         return Err(failure(
-            "macOS deadline qualification or failure artifacts absent",
+            "macOS deadline execution or failure artifacts absent",
         ));
     }
     Ok(())
-}
-
-fn runner_selects_self_hosted(value: &Value) -> bool {
-    match value {
-        Value::String(runner) => runner == "self-hosted",
-        Value::Sequence(runners) => runners
-            .iter()
-            .any(|runner| runner.as_str() == Some("self-hosted")),
-        _ => false,
-    }
-}
-
-fn certification_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a Vec<Value>> {
-    job.get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure(format!("{context} steps are absent")))
-}
-
-fn action_steps<'a>(steps: &'a [Value], action: &str) -> Result<Vec<&'a Mapping>> {
-    steps
-        .iter()
-        .filter_map(|value| {
-            let step = value.as_mapping()?;
-            (scalar(step, "uses") == Some(action)).then_some(Ok(step))
-        })
-        .collect()
 }
 
 fn step_with_id<'a>(steps: &'a [Value], id: &str, context: &str) -> Result<&'a Mapping> {
@@ -1058,1937 +1637,14 @@ fn step_with_id<'a>(steps: &'a [Value], id: &str, context: &str) -> Result<&'a M
     Ok(matches[0])
 }
 
-fn check_standard_certification_job(
-    job: &Mapping,
-    contract: crate::standard_contract::StandardContract,
-    release: bool,
-) -> Result<()> {
-    let context = "standard certification job";
-    let keys = if release {
-        vec!["name", "needs", "runs-on", "timeout-minutes", "steps"]
-    } else {
-        vec!["name", "runs-on", "timeout-minutes", "steps"]
-    };
-    exact_mapping_keys(job, &keys, context)?;
-    if scalar(job, "runs-on") != Some(contract.runner_label)
-        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
-        || (release && scalar(job, "needs") != Some("preflight"))
-    {
-        return Err(failure("standard certification runner/dependency differs"));
-    }
-    let steps = job
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("standard job lacks steps"))?;
-    let expected_length = if release { 10 } else { 9 };
-    if steps.len() != expected_length {
-        return Err(failure("standard job step inventory differs"));
-    }
-    let checkout_count = if release { 2 } else { 1 };
-    let ordered = [
-        (
-            "uses",
-            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-        (
-            "uses",
-            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
-        ("run", ""),
-        ("uses", "./.github/actions/upload-artifact"),
-        ("uses", "./.github/actions/upload-artifact"),
-        (
-            "uses",
-            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-        (
-            "uses",
-            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-    ];
-    for step in &steps[..checkout_count] {
-        if step.as_mapping().and_then(|step| scalar(step, "uses"))
-            != Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
-        {
-            return Err(failure(
-                "standard checkout must precede cache restoration and execution",
-            ));
-        }
-    }
-    for (step, (field, value)) in steps[checkout_count..].iter().zip(ordered) {
-        let actual = step.as_mapping().and_then(|step| scalar(step, field));
-        if actual.is_none() || (!value.is_empty() && actual != Some(value)) {
-            return Err(failure(
-                "standard checkout/cache/command/evidence step order differs",
-            ));
-        }
-    }
-    for (offset, id) in ["standard-deps", "standard-target"].into_iter().enumerate() {
-        if steps[checkout_count + offset]
-            .as_mapping()
-            .and_then(|step| scalar(step, "id"))
-            != Some(id)
-        {
-            return Err(failure("standard cache restore order differs"));
-        }
-    }
-    let expected_suite = match contract.target {
-        crate::standard_contract::StandardTarget::LinuxX64 => {
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup"
-        }
-        crate::standard_contract::StandardTarget::WindowsX64 => {
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job"
-        }
-    };
-    let commands: Vec<_> = steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter(|step| step.contains_key(key("run")))
-        .collect();
-    if commands.len() != 2 {
-        return Err(failure("standard suite invocation inventory differs"));
-    }
-    for (step, expected) in commands.into_iter().zip([
-        "rustup toolchain install 1.97.1 --profile minimal",
-        expected_suite,
-    ]) {
-        exact_mapping_keys(step, &["run"], context)?;
-        if scalar(step, "run").map(|run| run.split_whitespace().collect::<Vec<_>>())
-            != Some(expected.split_whitespace().collect())
-        {
-            return Err(failure("required standard invocation differs"));
-        }
-    }
-    const CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
-    let checkouts = action_steps(steps, CHECKOUT)?;
-    if checkouts.len() != if release { 2 } else { 1 } {
-        return Err(failure("standard checkout inventory differs"));
-    }
-    for (index, step) in checkouts.into_iter().enumerate() {
-        exact_mapping_keys(
-            step,
-            if release {
-                &["name", "id", "if", "uses", "with"]
-            } else {
-                &["id", "uses", "with"]
-            },
-            context,
-        )?;
-        let input = mapping(
-            step.get(key("with"))
-                .ok_or_else(|| failure("missing checkout inputs"))?,
-            context,
-        )?;
-        exact_mapping_keys(
-            input,
-            if release {
-                &["ref", "fetch-depth", "persist-credentials"]
-            } else {
-                &["persist-credentials"]
-            },
-            context,
-        )?;
-        if input
-            .get(key("persist-credentials"))
-            .and_then(Value::as_bool)
-            != Some(false)
-        {
-            return Err(failure("standard checkout persists credentials"));
-        }
-        if release {
-            let (id, condition, reference) = if index == 0 {
-                (
-                    "source-push",
-                    "github.event_name == 'push'",
-                    "${{ github.ref }}",
-                )
-            } else {
-                (
-                    "source-dispatch",
-                    "github.event_name == 'workflow_dispatch'",
-                    "${{ inputs.tag }}",
-                )
-            };
-            if scalar(step, "id") != Some(id)
-                || scalar(step, "if") != Some(condition)
-                || scalar(input, "ref") != Some(reference)
-                || input.get(key("fetch-depth")).and_then(Value::as_u64) != Some(0)
-            {
-                return Err(failure("standard release checkout provenance differs"));
-            }
-        } else if scalar(step, "id") != Some("source") {
-            return Err(failure("standard checkout identity differs"));
-        }
-    }
-    let domain = if release {
-        "release-standard-v1"
-    } else {
-        "backend-standard-v1"
-    };
-    let source = if release {
-        "push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}"
-    } else {
-        "${{ steps.source.outputs.commit }}"
-    };
-    let dependency_key = format!(
-        "cargo-deps-{domain}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}}}"
-    );
-    let target_key = format!(
-        "cargo-target-{domain}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-{source}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}}}"
-    );
-    let restores = action_steps(
-        steps,
-        "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-    )?;
-    let saves = action_steps(
-        steps,
-        "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-    )?;
-    if restores.len() != 2 || saves.len() != 2 {
-        return Err(failure("standard split cache inventory differs"));
-    }
-    for (id, path, cache_key) in [
-        (
-            "standard-deps",
-            "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
-            dependency_key,
-        ),
-        (
-            "standard-target",
-            "target/ci/bootstrap\ntarget/ci/standard-backend\n",
-            target_key,
-        ),
-    ] {
-        let restore = step_with_id(steps, id, context)?;
-        exact_mapping_keys(restore, &["id", "uses", "with"], context)?;
-        if !restores.contains(&restore) {
-            return Err(failure("standard cache restore action differs"));
-        }
-        let input = mapping(
-            restore
-                .get(key("with"))
-                .ok_or_else(|| failure("missing cache inputs"))?,
-            context,
-        )?;
-        exact_mapping_keys(input, &["path", "key"], context)?;
-        if scalar(input, "path") != Some(path) || scalar(input, "key") != Some(cache_key.as_str()) {
-            return Err(failure("standard cache identity differs"));
-        }
-        let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
-        let matching: Vec<_> = saves
+fn runner_selects_self_hosted(value: &Value) -> bool {
+    match value {
+        Value::String(runner) => runner == "self-hosted",
+        Value::Sequence(runners) => runners
             .iter()
-            .filter(|step| scalar(step, "if") == Some(condition.as_str()))
-            .collect();
-        if matching.len() != 1 {
-            return Err(failure("standard cache save condition differs"));
-        }
-        exact_mapping_keys(matching[0], &["if", "uses", "with"], context)?;
-        let input = mapping(
-            matching[0]
-                .get(key("with"))
-                .ok_or_else(|| failure("missing save inputs"))?,
-            context,
-        )?;
-        exact_mapping_keys(input, &["path", "key"], context)?;
-        let primary = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
-        if scalar(input, "path") != Some(path) || scalar(input, "key") != Some(primary.as_str()) {
-            return Err(failure("standard cache save identity differs"));
-        }
+            .any(|runner| runner.as_str() == Some("self-hosted")),
+        _ => false,
     }
-    let uploads = action_steps(steps, "./.github/actions/upload-artifact")?;
-    if uploads.len() != 2 {
-        return Err(failure("standard evidence upload inventory differs"));
-    }
-    let backend_artifact = match contract.target {
-        crate::standard_contract::StandardTarget::LinuxX64 => {
-            "backend-standard-linux-cgroup-v2-x64"
-        }
-        crate::standard_contract::StandardTarget::WindowsX64 => {
-            "backend-standard-windows-job-object-x64"
-        }
-    };
-    for (index, step) in uploads.into_iter().enumerate() {
-        exact_mapping_keys(
-            step,
-            if index == 0 {
-                &["uses", "with"]
-            } else {
-                &["if", "uses", "with"]
-            },
-            context,
-        )?;
-        let input = mapping(
-            step.get(key("with"))
-                .ok_or_else(|| failure("missing evidence upload inputs"))?,
-            context,
-        )?;
-        exact_mapping_keys(
-            input,
-            &[
-                "name",
-                "path",
-                "if-no-files-found",
-                "retention-days",
-                "compression-level",
-            ],
-            context,
-        )?;
-        let (name, path, missing) = if index == 0 {
-            (
-                if release {
-                    contract.release_artifact
-                } else {
-                    backend_artifact
-                }
-                .to_owned(),
-                format!(
-                    "target/ci/reports/standard/{}/{}",
-                    contract.directory, contract.report_name
-                ),
-                "error",
-            )
-        } else {
-            (
-                format!("diagnostics-standard-{}", contract.directory),
-                format!("target/ci/standard-diagnostics/{}", contract.directory),
-                "warn",
-            )
-        };
-        if scalar(input, "name") != Some(name.as_str())
-            || scalar(input, "path") != Some(path.as_str())
-            || scalar(input, "if-no-files-found") != Some(missing)
-            || input.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
-            || input.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
-            || (index == 1 && scalar(step, "if") != Some("always()"))
-        {
-            return Err(failure("standard evidence upload identity differs"));
-        }
-    }
-    Ok(())
-}
-
-fn check_certification_cache(
-    steps: &[Value],
-    restore_action: &str,
-    save_action: &str,
-    dependency_key: &str,
-    target_key: &str,
-    context: &str,
-) -> Result<()> {
-    const DEPENDENCY_PATHS: &str = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
-    const TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\n";
-    const LINUX_TARGET_PATHS: &str =
-        "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/sealed-agent\n";
-    const WINDOWS_TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n";
-    let target_paths = if context.contains("linux") {
-        LINUX_TARGET_PATHS
-    } else if context.contains("windows") {
-        WINDOWS_TARGET_PATHS
-    } else {
-        TARGET_PATHS
-    };
-
-    let restores = action_steps(steps, restore_action)?;
-    let saves = action_steps(steps, save_action)?;
-    if restores.len() != 2 || saves.len() != 2 {
-        return Err(failure(format!(
-            "{context} must contain two split cache restores and saves"
-        )));
-    }
-
-    for (id, path, expected_key) in [
-        ("certification-deps", DEPENDENCY_PATHS, dependency_key),
-        ("certification-target", target_paths, target_key),
-    ] {
-        let restore = step_with_id(steps, id, context)?;
-        exact_mapping_keys(restore, &["id", "uses", "with"], context)?;
-        if scalar(restore, "uses") != Some(restore_action) {
-            return Err(failure(format!("{context} {id} must restore a cache")));
-        }
-        let inputs = mapping(
-            restore
-                .get(key("with"))
-                .ok_or_else(|| failure(format!("{context} {id} lacks cache inputs")))?,
-            context,
-        )?;
-        exact_mapping_keys(inputs, &["path", "key"], context)?;
-        if scalar(inputs, "path") != Some(path) || scalar(inputs, "key") != Some(expected_key) {
-            return Err(failure(format!("{context} {id} cache inputs differ")));
-        }
-
-        let expected_condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
-        let expected_primary_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
-        let matching_saves: Vec<&Mapping> = saves
-            .iter()
-            .copied()
-            .filter(|step| scalar(step, "if") == Some(expected_condition.as_str()))
-            .collect();
-        if matching_saves.len() != 1 {
-            return Err(failure(format!(
-                "{context} must contain exactly one save for {id}"
-            )));
-        }
-        let save = matching_saves[0];
-        exact_mapping_keys(save, &["if", "uses", "with"], context)?;
-        let inputs = mapping(
-            save.get(key("with"))
-                .ok_or_else(|| failure(format!("{context} {id} save lacks inputs")))?,
-            context,
-        )?;
-        exact_mapping_keys(inputs, &["path", "key"], context)?;
-        if scalar(inputs, "path") != Some(path)
-            || scalar(inputs, "key") != Some(expected_primary_key.as_str())
-        {
-            return Err(failure(format!("{context} {id} cache save inputs differ")));
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn check_certification_job(
-    job: &Mapping,
-    expected_runner: &str,
-    timeout_minutes: u64,
-    checkout_count: usize,
-    dependency_key: &str,
-    target_key: &str,
-    suite_command: &str,
-    artifact_name: &str,
-    artifact_path: &str,
-    context: &str,
-) -> Result<()> {
-    if scalar(job, "runs-on") != Some(expected_runner) {
-        return Err(failure(format!(
-            "{context} must run on exact label {expected_runner}"
-        )));
-    }
-    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout_minutes) {
-        return Err(failure(format!("{context} timeout differs")));
-    }
-    let steps = certification_steps(job, context)?;
-    let windows = context.contains("windows");
-    let release_windows = context == "release windows-certification job";
-    if steps.len() != checkout_count + 7 + usize::from(windows) * 2 + usize::from(release_windows) {
-        return Err(failure(format!("{context} step count differs")));
-    }
-
-    let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
-    let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let upload_action = "./.github/actions/upload-artifact";
-    let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-
-    let checkouts = action_steps(steps, checkout_action)?;
-    if checkouts.len() != checkout_count {
-        return Err(failure(format!("{context} checkout count differs")));
-    }
-    for checkout in checkouts {
-        let inputs = mapping(
-            checkout
-                .get(key("with"))
-                .ok_or_else(|| failure(format!("{context} checkout lacks inputs")))?,
-            context,
-        )?;
-        if inputs
-            .get(key("persist-credentials"))
-            .and_then(Value::as_bool)
-            != Some(false)
-        {
-            return Err(failure(format!(
-                "{context} checkout must not persist credentials"
-            )));
-        }
-    }
-    let downloads = action_steps(steps, download_action)?;
-    if release_windows {
-        if downloads.len() != 1 {
-            return Err(failure(format!(
-                "{context} must download exactly one native archive"
-            )));
-        }
-        let inputs = mapping(
-            downloads[0]
-                .get(key("with"))
-                .ok_or_else(|| failure(format!("{context} native download lacks inputs")))?,
-            context,
-        )?;
-        exact_mapping_keys(inputs, &["name", "path"], context)?;
-        if scalar(inputs, "name") != Some("release-native-windows-${{ matrix.id }}")
-            || scalar(inputs, "path") != Some("target/ci/release-input")
-        {
-            return Err(failure(format!(
-                "{context} native archive download differs"
-            )));
-        }
-    } else if !downloads.is_empty() {
-        return Err(failure(format!(
-            "{context} must not download a native archive"
-        )));
-    }
-
-    let run_commands: Vec<&str> = steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter_map(|step| scalar(step, "run"))
-        .collect();
-    let mut expected_run_commands = vec![
-        "rustup toolchain install 1.97.1 --profile minimal",
-        suite_command,
-    ];
-    if windows {
-        expected_run_commands.extend([
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
-        ]);
-    }
-    if run_commands != expected_run_commands {
-        return Err(failure(format!("{context} run commands differ")));
-    }
-
-    check_certification_cache(
-        steps,
-        restore_action,
-        save_action,
-        dependency_key,
-        target_key,
-        context,
-    )?;
-
-    let uploads = action_steps(steps, upload_action)?;
-    if uploads.len() != 1 {
-        return Err(failure(format!("{context} artifact upload count differs")));
-    }
-    if (artifact_name.contains("linux") || artifact_name.contains("windows"))
-        && scalar(uploads[0], "if") != Some("always()")
-    {
-        return Err(failure(format!(
-            "{context} must retain sealed certification diagnostics under always()"
-        )));
-    }
-    let inputs = mapping(
-        uploads[0]
-            .get(key("with"))
-            .ok_or_else(|| failure(format!("{context} artifact lacks inputs")))?,
-        context,
-    )?;
-    let is_linux_artifact = artifact_name.contains("linux");
-    let expected_input_keys: &[&str] = if is_linux_artifact {
-        &[
-            "name",
-            "path",
-            "if-no-files-found",
-            "retention-days",
-            "compression-level",
-            "include-hidden-files",
-        ]
-    } else {
-        &[
-            "name",
-            "path",
-            "if-no-files-found",
-            "retention-days",
-            "compression-level",
-        ]
-    };
-    exact_mapping_keys(inputs, expected_input_keys, context)?;
-    if scalar(inputs, "name") != Some(artifact_name)
-        || scalar(inputs, "path") != Some(artifact_path)
-        || scalar(inputs, "if-no-files-found") != Some("error")
-        || inputs.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
-        || inputs.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
-        || (is_linux_artifact
-            && inputs
-                .get(key("include-hidden-files"))
-                .and_then(Value::as_bool)
-                != Some(true))
-    {
-        return Err(failure(format!("{context} artifact inputs differ")));
-    }
-    Ok(())
-}
-
-fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
-    check_push_and_dispatch_events(workflow, "backend certification")?;
-    check_top_level_permissions(workflow)?;
-    let concurrency = mapping(
-        workflow
-            .get(key("concurrency"))
-            .ok_or_else(|| failure("backend certification lacks concurrency"))?,
-        "backend certification concurrency",
-    )?;
-    exact_mapping_keys(
-        concurrency,
-        &["group", "cancel-in-progress"],
-        "backend certification concurrency",
-    )?;
-    if scalar(concurrency, "group") != Some("backend-certification-${{ github.ref }}")
-        || concurrency
-            .get(key("cancel-in-progress"))
-            .and_then(Value::as_bool)
-            != Some(false)
-    {
-        return Err(failure("backend certification concurrency differs"));
-    }
-    exact_mapping_keys(
-        jobs,
-        &[
-            "linux",
-            "windows-loader-production",
-            "windows-provider-lifecycle",
-            "windows-package-channel",
-            "windows-loader-lab",
-            "standard-linux",
-            "standard-windows",
-        ],
-        "backend certification jobs",
-    )?;
-    for (name, contract) in [
-        ("standard-linux", crate::standard_contract::LINUX),
-        ("standard-windows", crate::standard_contract::WINDOWS),
-    ] {
-        check_standard_certification_job(
-            mapping(
-                jobs.get(key(name))
-                    .ok_or_else(|| failure("missing standard certification job"))?,
-                name,
-            )?,
-            contract,
-            false,
-        )?;
-    }
-
-    let linux_dependency_key = "cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
-    let linux_target_key = "cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    let linux = mapping(
-        jobs.get(key("linux"))
-            .ok_or_else(|| failure("backend certification linux job is absent"))?,
-        "backend certification linux job",
-    )?;
-    exact_mapping_keys(
-        linux,
-        &["name", "runs-on", "timeout-minutes", "steps"],
-        "backend certification linux job",
-    )?;
-    check_certification_job(
-        linux,
-        "ubuntu-24.04",
-        45,
-        1,
-        linux_dependency_key,
-        linux_target_key,
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
-        "backend-linux-sealed-v2",
-        "target/ci/reports/linux-sealed-v2",
-        "backend certification linux job",
-    )?;
-
-    for job_name in [
-        "windows-loader-production",
-        "windows-provider-lifecycle",
-        "windows-package-channel",
-        "windows-loader-lab",
-    ] {
-        check_runner_matrix(
-            jobs,
-            job_name,
-            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-            job_name,
-        )?;
-    }
-    for (job_name, required_dependency) in [
-        ("windows-provider-lifecycle", "windows-loader-production"),
-        ("windows-package-channel", "windows-provider-lifecycle"),
-        ("windows-loader-lab", "windows-loader-production"),
-    ] {
-        let job = mapping(
-            jobs.get(key(job_name))
-                .ok_or_else(|| failure(format!("{job_name} job is absent")))?,
-            job_name,
-        )?;
-        if scalar(job, "needs") != Some(required_dependency) {
-            return Err(failure(format!(
-                "{job_name} does not depend on {required_dependency}"
-            )));
-        }
-    }
-    let lab = mapping(
-        jobs.get(key("windows-loader-lab"))
-            .ok_or_else(|| failure("windows-loader-lab job is absent"))?,
-        "windows-loader-lab",
-    )?;
-    if scalar(lab, "if") != Some("always() && github.event_name == 'workflow_dispatch'") {
-        return Err(failure(
-            "Windows loader lab must remain dispatch-only and run after a failed production gate",
-        ));
-    }
-
-    for contract in [
-        SplitWindowsJobContract {
-            name: "windows-loader-production",
-            suite: concat!(
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
-                "--build-context target/ci/native-inputs.bin suite windows-loader-production"
-            ),
-            artifact_name: "windows-loader-production-${{ matrix.id }}",
-            artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
-            dependency: None,
-            condition: None,
-            downloads: &[],
-            dependency_cache_id: "certification-deps",
-            target_cache_id: "certification-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
-            checkout_count: 1,
-            timeout_minutes: 45,
-        },
-        SplitWindowsJobContract {
-            name: "windows-provider-lifecycle",
-            suite: concat!(
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
-                "--build-context target/ci/native-inputs.bin suite windows-provider-lifecycle"
-            ),
-            artifact_name: "windows-provider-lifecycle-${{ matrix.id }}",
-            artifact_path: "target/ci/reports/windows-sealed-v2",
-            dependency: Some("windows-loader-production"),
-            condition: None,
-            downloads: &[(
-                ("windows-loader-production-${{ matrix.id }}"),
-                "target/ci/reports/windows-sealed-v2/loader-production",
-            )],
-            dependency_cache_id: "lifecycle-deps",
-            target_cache_id: "lifecycle-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
-            checkout_count: 1,
-            timeout_minutes: 45,
-        },
-        SplitWindowsJobContract {
-            name: "windows-package-channel",
-            suite: concat!(
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
-                "--build-context target/ci/native-inputs.bin suite windows-package-channel"
-            ),
-            artifact_name: "windows-package-channel-${{ matrix.id }}",
-            artifact_path: "target/ci/windows-sealed-cargo",
-            dependency: Some("windows-provider-lifecycle"),
-            condition: None,
-            downloads: &[(
-                "windows-provider-lifecycle-${{ matrix.id }}",
-                "target/ci/reports/windows-sealed-v2",
-            )],
-            dependency_cache_id: "package-deps",
-            target_cache_id: "package-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
-            checkout_count: 1,
-            timeout_minutes: 75,
-        },
-        SplitWindowsJobContract {
-            name: "windows-loader-lab",
-            suite: concat!(
-                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
-                "--build-context target/ci/native-inputs.bin suite windows-loader-lab"
-            ),
-            artifact_name: "windows-loader-lab-${{ matrix.id }}",
-            artifact_path: "target/ci/reports/windows-sealed-v2/loader-lab",
-            dependency: Some("windows-loader-production"),
-            condition: Some("always() && github.event_name == 'workflow_dispatch'"),
-            downloads: &[(
-                ("windows-loader-production-${{ matrix.id }}"),
-                "target/ci/reports/windows-sealed-v2/loader-production",
-            )],
-            dependency_cache_id: "lab-deps",
-            target_cache_id: "lab-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-loader-lab\n",
-            checkout_count: 1,
-            timeout_minutes: 45,
-        },
-    ] {
-        let job = mapping(
-            jobs.get(key(contract.name))
-                .ok_or_else(|| failure(format!("{} job is absent", contract.name)))?,
-            contract.name,
-        )?;
-        check_split_windows_job(job, contract)?;
-    }
-    Ok(())
-}
-
-struct SplitWindowsJobContract<'a> {
-    name: &'a str,
-    suite: &'a str,
-    artifact_name: &'a str,
-    artifact_path: &'a str,
-    dependency: Option<&'a str>,
-    condition: Option<&'a str>,
-    downloads: &'a [(&'a str, &'a str)],
-    dependency_cache_id: &'a str,
-    target_cache_id: &'a str,
-    target_cache_path: &'a str,
-    checkout_count: usize,
-    timeout_minutes: u64,
-}
-
-fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>) -> Result<()> {
-    let context = contract.name;
-    let expected_keys: &[&str] = match (contract.dependency, contract.condition) {
-        (Some(_), Some(_)) => &[
-            "name",
-            "if",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "steps",
-        ],
-        (Some(_), None) => &[
-            "name",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "steps",
-        ],
-        (None, None) => &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
-        (None, Some(_)) => return Err(failure(format!("{context} has an invalid contract"))),
-    };
-    exact_mapping_keys(job, expected_keys, context)?;
-    if scalar(job, "needs") != contract.dependency
-        || scalar(job, "if") != contract.condition
-        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(contract.timeout_minutes)
-    {
-        return Err(failure(format!(
-            "{context} dependency, condition, or timeout differs"
-        )));
-    }
-
-    let steps = certification_steps(job, context)?;
-    let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
-    let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let upload_action = "./.github/actions/upload-artifact";
-    let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-    if action_steps(steps, checkout_action)?.len() != contract.checkout_count
-        || action_steps(steps, restore_action)?.len() != 2
-        || action_steps(steps, save_action)?.len() != 2
-        || action_steps(steps, upload_action)?.len() != 1
-    {
-        return Err(failure(format!("{context} action cardinality differs")));
-    }
-    const DEPENDENCY_CACHE_PATH: &str = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
-    for (id, expected_path) in [
-        (contract.dependency_cache_id, DEPENDENCY_CACHE_PATH),
-        (contract.target_cache_id, contract.target_cache_path),
-    ] {
-        let restore = step_with_id(steps, id, context)?;
-        let inputs = restore
-            .get(key("with"))
-            .and_then(Value::as_mapping)
-            .ok_or_else(|| failure(format!("{context} {id} restore inputs are absent")))?;
-        if scalar(restore, "uses") != Some(restore_action)
-            || scalar(inputs, "path") != Some(expected_path)
-            || scalar(inputs, "key").is_none()
-        {
-            return Err(failure(format!("{context} {id} restore differs")));
-        }
-        let expected_condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
-        let expected_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
-        let matching_saves: Vec<&Mapping> = action_steps(steps, save_action)?
-            .into_iter()
-            .filter(|save| scalar(save, "if") == Some(expected_condition.as_str()))
-            .collect();
-        if matching_saves.len() != 1 {
-            return Err(failure(format!("{context} {id} cache save differs")));
-        }
-        let save_inputs = matching_saves[0]
-            .get(key("with"))
-            .and_then(Value::as_mapping)
-            .ok_or_else(|| failure(format!("{context} {id} save inputs are absent")))?;
-        if scalar(save_inputs, "path") != Some(expected_path)
-            || scalar(save_inputs, "key") != Some(expected_key.as_str())
-        {
-            return Err(failure(format!("{context} {id} save inputs differ")));
-        }
-    }
-    for checkout in action_steps(steps, checkout_action)? {
-        if checkout
-            .get(key("with"))
-            .and_then(Value::as_mapping)
-            .and_then(|inputs| inputs.get(key("persist-credentials")))
-            .and_then(Value::as_bool)
-            != Some(false)
-        {
-            return Err(failure(format!(
-                "{context} checkout must not persist credentials"
-            )));
-        }
-    }
-
-    let expected_runs = [
-        "rustup toolchain install 1.97.1 --profile minimal",
-        contract.suite,
-    ];
-    let actual_runs: Vec<&str> = steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter_map(|step| scalar(step, "run"))
-        .collect();
-    if actual_runs != expected_runs {
-        return Err(failure(format!("{context} run commands differ")));
-    }
-
-    let downloads = action_steps(steps, download_action)?;
-    if downloads.len() != contract.downloads.len() {
-        return Err(failure(format!("{context} download cardinality differs")));
-    }
-    for ((name, path), download) in contract.downloads.iter().zip(downloads) {
-        let inputs = download
-            .get(key("with"))
-            .and_then(Value::as_mapping)
-            .ok_or_else(|| failure(format!("{context} download inputs are absent")))?;
-        exact_mapping_keys(inputs, &["name", "path"], context)?;
-        if scalar(inputs, "name") != Some(*name) || scalar(inputs, "path") != Some(*path) {
-            return Err(failure(format!("{context} download inputs differ")));
-        }
-    }
-
-    for save in action_steps(steps, save_action)? {
-        let condition = scalar(save, "if")
-            .ok_or_else(|| failure(format!("{context} cache save condition is absent")))?;
-        if !condition.starts_with("always() && steps.")
-            || !condition.ends_with(".outputs.cache-hit != 'true'")
-        {
-            return Err(failure(format!("{context} cache save is not failure-safe")));
-        }
-    }
-
-    let upload = action_steps(steps, upload_action)?[0];
-    if scalar(upload, "if") != Some("always()") {
-        return Err(failure(format!(
-            "{context} artifact upload must run under always()"
-        )));
-    }
-    let inputs = upload
-        .get(key("with"))
-        .and_then(Value::as_mapping)
-        .ok_or_else(|| failure(format!("{context} artifact inputs are absent")))?;
-    exact_mapping_keys(
-        inputs,
-        &[
-            "name",
-            "path",
-            "if-no-files-found",
-            "retention-days",
-            "compression-level",
-        ],
-        context,
-    )?;
-    if scalar(inputs, "name") != Some(contract.artifact_name)
-        || scalar(inputs, "path") != Some(contract.artifact_path)
-        || scalar(inputs, "if-no-files-found") != Some("error")
-        || inputs.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
-        || inputs.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
-    {
-        return Err(failure(format!("{context} artifact inputs differ")));
-    }
-    Ok(())
-}
-
-fn named_steps<'a>(jobs: &'a Mapping, job_name: &str) -> Result<BTreeMap<&'a str, &'a Mapping>> {
-    let job = mapping(
-        jobs.get(key(job_name))
-            .ok_or_else(|| failure(format!("{job_name} job is absent")))?,
-        job_name,
-    )?;
-    let steps = job
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure(format!("{job_name} steps are absent")))?;
-    let mut named = BTreeMap::new();
-    for step in steps {
-        let step = mapping(step, "release step")?;
-        if let Some(name) = scalar(step, "name")
-            && named.insert(name, step).is_some()
-        {
-            return Err(failure(format!("duplicate release step name: {name}")));
-        }
-    }
-    Ok(named)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn require_publication_step(
-    steps: &BTreeMap<&str, &Mapping>,
-    name: &str,
-    condition: Option<&str>,
-    source: &str,
-    cargo_home: &str,
-    command: &str,
-    continue_on_error: bool,
-    id: Option<&str>,
-) -> Result<()> {
-    let step = steps
-        .get(name)
-        .ok_or_else(|| failure(format!("release publication step is absent: {name}")))?;
-    let expected_keys: Vec<&str> = if condition.is_some() {
-        let mut keys = vec!["name", "if"];
-        if id.is_some() {
-            keys.push("id");
-        }
-        if continue_on_error {
-            keys.push("continue-on-error");
-        }
-        keys.extend(["env", "run"]);
-        keys
-    } else {
-        let mut keys = vec!["name"];
-        if id.is_some() {
-            keys.push("id");
-        }
-        if continue_on_error {
-            keys.push("continue-on-error");
-        }
-        keys.extend(["env", "run"]);
-        keys
-    };
-    exact_mapping_keys(step, &expected_keys, name)?;
-    if scalar(step, "if") != condition
-        || scalar(step, "id") != id
-        || (continue_on_error
-            && step.get(key("continue-on-error")).and_then(Value::as_bool) != Some(true))
-        || scalar(step, "run") != Some(command)
-    {
-        return Err(failure(format!(
-            "release publication step shape differs: {name}"
-        )));
-    }
-    let environment = mapping(
-        step.get(key("env"))
-            .ok_or_else(|| failure(format!("publication step has no credential: {name}")))?,
-        "publication environment",
-    )?;
-    exact_mapping_keys(
-        environment,
-        &["CARGO_HOME", "CARGO_REGISTRIES_CRATES_IO_TOKEN"],
-        name,
-    )?;
-    if scalar(environment, "CARGO_REGISTRIES_CRATES_IO_TOKEN") != Some(source)
-        || scalar(environment, "CARGO_HOME") != Some(cargo_home)
-    {
-        return Err(failure(format!(
-            "publication credential source differs: {name}"
-        )));
-    }
-    Ok(())
-}
-
-fn attempt_oidc_run_command(slot: usize) -> String {
-    format!(
-        "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot {slot}"
-    )
-}
-
-fn require_oidc_attempt_step(
-    steps: &BTreeMap<&str, &Mapping>,
-    slot: usize,
-    action_id: &str,
-    continue_on_error: bool,
-) -> Result<()> {
-    let expected_id = format!("publish_oidc_{slot}");
-    require_publication_step(
-        steps,
-        &format!("Attempt crates.io OIDC publication in slot {slot}"),
-        None,
-        &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
-        &format!("target/ci/cargo-publish-home/slot-{slot}"),
-        &attempt_oidc_run_command(slot),
-        continue_on_error,
-        Some(expected_id.as_str()),
-    )
-}
-
-fn require_fallback_authorization_step(
-    steps: &BTreeMap<&str, &Mapping>,
-    slot: usize,
-) -> Result<()> {
-    let name = format!("Authorize new-crate token fallback in slot {slot}");
-    let step = steps
-        .get(name.as_str())
-        .ok_or_else(|| failure(format!("release fallback step is absent: {name}")))?;
-    exact_mapping_keys(step, &["name", "id", "if", "run"], &name)?;
-    let expected_id = format!("authorize_fallback_{slot}");
-    let expected_condition = format!("steps.publish_oidc_{slot}.outcome == 'failure'");
-    let expected_run = format!(
-        "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot {slot}"
-    );
-    if scalar(step, "id") != Some(expected_id.as_str())
-        || scalar(step, "if") != Some(expected_condition.as_str())
-        || scalar(step, "run") != Some(expected_run.as_str())
-        || step.contains_key(key("continue-on-error"))
-        || step.contains_key(key("env"))
-    {
-        return Err(failure(format!(
-            "release fallback authorization step shape differs: {name}"
-        )));
-    }
-    Ok(())
-}
-
-fn require_token_fallback_step(
-    steps: &BTreeMap<&str, &Mapping>,
-    slot: usize,
-    fallback_source: &str,
-) -> Result<()> {
-    let condition = format!(
-        "steps.authorize_fallback_{slot}.outcome == 'success' && steps.authorize_fallback_{slot}.outputs.authorized == 'true'"
-    );
-    let command = format!(
-        "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot {slot}"
-    );
-    require_publication_step(
-        steps,
-        &format!("Publish new crate with fallback credential in slot {slot}"),
-        Some(condition.as_str()),
-        fallback_source,
-        &format!("target/ci/cargo-publish-home/slot-{slot}"),
-        &command,
-        false,
-        None,
-    )
-}
-
-fn require_oidc_step(
-    steps: &BTreeMap<&str, &Mapping>,
-    name: &str,
-    condition: Option<&str>,
-    id: &str,
-    auth_action: &str,
-) -> Result<()> {
-    let step = steps
-        .get(name)
-        .ok_or_else(|| failure(format!("crates.io OIDC step is absent: {name}")))?;
-    let expected_keys = if condition.is_some() {
-        &["name", "if", "id", "uses"][..]
-    } else {
-        &["name", "id", "uses"][..]
-    };
-    exact_mapping_keys(step, expected_keys, name)?;
-    if scalar(step, "if") != condition
-        || scalar(step, "id") != Some(id)
-        || scalar(step, "uses") != Some(auth_action)
-        || step.contains_key(key("continue-on-error"))
-    {
-        return Err(failure(format!(
-            "crates.io OIDC step shape differs: {name}"
-        )));
-    }
-    Ok(())
-}
-
-fn require_github_step(steps: &BTreeMap<&str, &Mapping>, name: &str, run: &str) -> Result<()> {
-    let step = steps
-        .get(name)
-        .ok_or_else(|| failure(format!("GitHub credential step is absent: {name}")))?;
-    exact_mapping_keys(step, &["name", "env", "run"], name)?;
-    if scalar(step, "run") != Some(run) {
-        return Err(failure(format!("GitHub credential step differs: {name}")));
-    }
-    let environment = mapping(
-        step.get(key("env"))
-            .ok_or_else(|| failure(format!("GitHub credential step has no env: {name}")))?,
-        "GitHub credential environment",
-    )?;
-    exact_mapping_keys(environment, &["GITHUB_TOKEN"], name)?;
-    if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}") {
-        return Err(failure(format!("GitHub credential source differs: {name}")));
-    }
-    Ok(())
-}
-
-fn check_release_credentials(
-    jobs: &Mapping,
-    release: &config::Release,
-    auth_action: &str,
-) -> Result<()> {
-    let steps = named_steps(jobs, "publish")?;
-    let publish_job = mapping(
-        jobs.get(key("publish"))
-            .ok_or_else(|| failure("publish job is absent"))?,
-        "publish job",
-    )?;
-    let ordered_names: Vec<Option<&str>> = publish_job
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("publish steps are absent"))?
-        .iter()
-        .map(|step| step.as_mapping().and_then(|step| scalar(step, "name")))
-        .collect();
-    require_github_step(
-        &steps,
-        "Stage GitHub draft and assets",
-        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github",
-    )?;
-    require_github_step(
-        &steps,
-        "Finalize GitHub release",
-        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
-    )?;
-    let fallback_profile = release.registry_credentials.policy
-        == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback;
-    let fallback_source = token_fallback_source(release);
-    let mut previous_group_end = None;
-    for slot in 1..=release.publish_packages.len() {
-        let acquire_name = format!("Acquire crates.io token for publication slot {slot}");
-        let attempt_name = format!("Attempt crates.io OIDC publication in slot {slot}");
-        let authorize_name = format!("Authorize new-crate token fallback in slot {slot}");
-        let token_name = format!("Publish new crate with fallback credential in slot {slot}");
-        let mut group: Vec<&str> = vec![acquire_name.as_str(), attempt_name.as_str()];
-        if fallback_profile {
-            group.push(authorize_name.as_str());
-            group.push(token_name.as_str());
-        }
-        let acquire_position = ordered_names
-            .iter()
-            .position(|name| *name == Some(acquire_name.as_str()))
-            .ok_or_else(|| failure(format!("crates.io OIDC step is absent: {acquire_name}")))?;
-        let observed_group: Vec<Option<&str>> = (0..group.len())
-            .map(|offset| {
-                ordered_names
-                    .get(acquire_position + offset)
-                    .copied()
-                    .flatten()
-            })
-            .collect();
-        let expected_group: Vec<Option<&str>> = group.iter().map(|name| Some(*name)).collect();
-        if observed_group != expected_group {
-            return Err(failure(format!(
-                "crates.io publication slot {slot} is not an adjacent credential group"
-            )));
-        }
-        if previous_group_end.is_some_and(|position| acquire_position <= position) {
-            return Err(failure("crates.io publication slots are out of order"));
-        }
-        previous_group_end = Some(acquire_position + group.len() - 1);
-        let action_id = format!("crates_auth_{slot}");
-        require_oidc_step(&steps, &acquire_name, None, &action_id, auth_action)?;
-        require_oidc_attempt_step(&steps, slot, &action_id, fallback_profile)?;
-        if fallback_profile {
-            require_fallback_authorization_step(&steps, slot)?;
-            require_token_fallback_step(&steps, slot, &fallback_source)?;
-        }
-    }
-    let oidc_count = steps
-        .values()
-        .filter(|step| scalar(step, "uses") == Some(auth_action))
-        .count();
-    if oidc_count != release.publish_packages.len() {
-        return Err(failure("crates.io OIDC action slot count differs"));
-    }
-    let github_credential_steps = ["Stage GitHub draft and assets", "Finalize GitHub release"];
-    let expected_environment_steps = github_credential_steps.len()
-        + release.publish_packages.len()
-        + usize::from(fallback_profile) * release.publish_packages.len();
-    if steps
-        .values()
-        .filter(|step| step.contains_key(key("env")))
-        .count()
-        != expected_environment_steps
-    {
-        return Err(failure(
-            "publish job credential mapping count differs from profile",
-        ));
-    }
-    Ok(())
-}
-
-fn check_release_structure(
-    workflow: &Mapping,
-    jobs: &Mapping,
-    release: &config::Release,
-    toolchains: &config::Toolchains,
-    auth_action: &str,
-) -> Result<()> {
-    let events = mapping(
-        workflow
-            .get(key("on"))
-            .ok_or_else(|| failure("release workflow has no event map"))?,
-        "release events",
-    )?;
-    exact_mapping_keys(events, &["push", "workflow_dispatch"], "release events")?;
-    let push = mapping(
-        events
-            .get(key("push"))
-            .ok_or_else(|| failure("release lacks push"))?,
-        "release push",
-    )?;
-    exact_mapping_keys(push, &["tags"], "release push")?;
-    exact_string_sequence(
-        push.get(key("tags"))
-            .ok_or_else(|| failure("release push lacks tags"))?,
-        &["[0-9]+.[0-9]+.[0-9]+*"],
-        "release tags",
-    )?;
-    let dispatch = mapping(
-        events
-            .get(key("workflow_dispatch"))
-            .ok_or_else(|| failure("release lacks workflow_dispatch"))?,
-        "release dispatch",
-    )?;
-    let inputs = mapping(
-        dispatch
-            .get(key("inputs"))
-            .ok_or_else(|| failure("release dispatch lacks inputs"))?,
-        "release inputs",
-    )?;
-    let input_names: Vec<&str> = vec!["tag"];
-    exact_mapping_keys(inputs, &input_names, "release inputs")?;
-    let tag = mapping(
-        inputs
-            .get(key("tag"))
-            .ok_or_else(|| failure("release input tag is absent"))?,
-        "release tag input",
-    )?;
-    if tag.get(key("required")).and_then(Value::as_bool) != Some(true)
-        || scalar(tag, "type") != Some("string")
-    {
-        return Err(failure("release tag input must be a required string"));
-    }
-    check_top_level_permissions(workflow)?;
-    let concurrency = mapping(
-        workflow
-            .get(key("concurrency"))
-            .ok_or_else(|| failure("release lacks concurrency"))?,
-        "release concurrency",
-    )?;
-    if scalar(concurrency, "group") != Some("memcordon-release")
-        || concurrency
-            .get(key("cancel-in-progress"))
-            .and_then(Value::as_bool)
-            != Some(false)
-    {
-        return Err(failure("release publication must be globally serialized"));
-    }
-    config::validate_release_configuration_identity(release)?;
-    check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "release native")?;
-    let preflight = mapping(
-        jobs.get(key("preflight"))
-            .ok_or_else(|| failure("release preflight job is absent"))?,
-        "release preflight job",
-    )?;
-    let preflight_steps = preflight
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("release preflight steps are absent"))?;
-    let actual_run_commands: Vec<&str> = preflight_steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter_map(|step| scalar(step, "run"))
-        .collect();
-    let expected_run_commands = [
-        format!(
-            "rustup toolchain install {} --profile minimal --component clippy --component rustfmt",
-            toolchains.stable
-        ),
-        format!(
-            "rustup toolchain install {} --profile minimal",
-            toolchains.msrv
-        ),
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight".into(),
-    ];
-    if actual_run_commands.len() != expected_run_commands.len()
-        || !actual_run_commands
-            .iter()
-            .zip(&expected_run_commands)
-            .all(|(actual, expected)| *actual == expected)
-    {
-        return Err(failure("release preflight toolchain provisioning differs"));
-    }
-    let preflight_target =
-        step_with_id(preflight_steps, "preflight-target", "release preflight job")?;
-    let preflight_target_inputs = mapping(
-        preflight_target
-            .get(key("with"))
-            .ok_or_else(|| failure("release preflight target cache inputs are absent"))?,
-        "release preflight target cache inputs",
-    )?;
-    let expected_preflight_target_key = format!(
-        "cargo-target-release-v3-preflight-{}-msrv-{}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}}}",
-        toolchains.stable, toolchains.msrv
-    );
-    if scalar(preflight_target_inputs, "path") != Some("target/ci")
-        || scalar(preflight_target_inputs, "key") != Some(expected_preflight_target_key.as_str())
-    {
-        return Err(failure("release preflight target cache identity differs"));
-    }
-    let linux_dependency_key = "cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
-    let linux_target_key = "cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    let linux_job_name = "linux-certification";
-    let linux_job = mapping(
-        jobs.get(key(linux_job_name))
-            .ok_or_else(|| failure(format!("release {linux_job_name} job is absent")))?,
-        linux_job_name,
-    )?;
-    let linux_context = format!("release {linux_job_name} job");
-    exact_mapping_keys(
-        linux_job,
-        &["name", "needs", "runs-on", "timeout-minutes", "steps"],
-        &linux_context,
-    )?;
-    if scalar(linux_job, "needs") != Some("preflight") {
-        return Err(failure(format!(
-            "release {linux_job_name} must depend on preflight"
-        )));
-    }
-    check_certification_job(
-        linux_job,
-        "ubuntu-24.04",
-        75,
-        2,
-        linux_dependency_key,
-        linux_target_key,
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
-        "release-certification-linux",
-        "target/ci/reports/linux-sealed-v2",
-        &linux_context,
-    )?;
-    for job_name in [
-        "windows-loader-production",
-        "windows-provider-lifecycle",
-        "windows-package-channel",
-    ] {
-        check_runner_matrix(
-            jobs,
-            job_name,
-            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-            job_name,
-        )?;
-    }
-    for contract in [
-        SplitWindowsJobContract {
-            name: "windows-loader-production",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
-            artifact_name: "release-windows-loader-production-${{ matrix.id }}",
-            artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
-            dependency: Some("native"),
-            condition: None,
-            downloads: &[(
-                "release-native-windows-${{ matrix.id }}",
-                "target/ci/release-input",
-            )],
-            dependency_cache_id: "production-deps",
-            target_cache_id: "production-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
-            checkout_count: 2,
-            timeout_minutes: 75,
-        },
-        SplitWindowsJobContract {
-            name: "windows-provider-lifecycle",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
-            artifact_name: "release-windows-provider-lifecycle-${{ matrix.id }}",
-            artifact_path: "target/ci/reports/windows-sealed-v2/provider-lifecycle",
-            dependency: Some("windows-loader-production"),
-            condition: None,
-            downloads: &[
-                (
-                    "release-native-windows-${{ matrix.id }}",
-                    "target/ci/release-input",
-                ),
-                (
-                    "release-windows-loader-production-${{ matrix.id }}",
-                    "target/ci/reports/windows-sealed-v2/loader-production",
-                ),
-            ],
-            dependency_cache_id: "lifecycle-deps",
-            target_cache_id: "lifecycle-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
-            checkout_count: 2,
-            timeout_minutes: 75,
-        },
-        SplitWindowsJobContract {
-            name: "windows-package-channel",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
-            artifact_name: "release-windows-package-channel-${{ matrix.id }}",
-            artifact_path: "target/ci/windows-sealed-cargo",
-            dependency: Some("windows-provider-lifecycle"),
-            condition: None,
-            downloads: &[
-                (
-                    "release-native-windows-${{ matrix.id }}",
-                    "target/ci/release-input",
-                ),
-                (
-                    "release-windows-provider-lifecycle-${{ matrix.id }}",
-                    "target/ci/reports/windows-sealed-v2/provider-lifecycle",
-                ),
-                (
-                    "release-windows-loader-production-${{ matrix.id }}",
-                    "target/ci/reports/windows-sealed-v2/loader-production",
-                ),
-            ],
-            dependency_cache_id: "package-deps",
-            target_cache_id: "package-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
-            checkout_count: 2,
-            timeout_minutes: 75,
-        },
-    ] {
-        let job = mapping(
-            jobs.get(key(contract.name))
-                .ok_or_else(|| failure(format!("release {} job is absent", contract.name)))?,
-            contract.name,
-        )?;
-        check_split_windows_job(job, contract)?;
-    }
-    check_macos_deadline_job(jobs, "macos-acceptance")?;
-    let assemble = mapping(
-        jobs.get(key("assemble"))
-            .ok_or_else(|| failure("release assemble job is absent"))?,
-        "assemble job",
-    )?;
-    exact_string_sequence(
-        assemble
-            .get(key("needs"))
-            .ok_or_else(|| failure("release assemble dependencies are absent"))?,
-        &[
-            "native",
-            "miri",
-            "fuzz",
-            "linux-certification",
-            "windows-package-channel",
-            "macos-acceptance",
-            "linux-standard-certification",
-            "windows-standard-certification",
-        ],
-        "release assemble dependencies",
-    )?;
-    let assemble_steps = certification_steps(assemble, "release assemble")?;
-    let expected_steps = [
-        (
-            "uses",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        ),
-        (
-            "uses",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        ),
-        (
-            "uses",
-            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        ),
-        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
-        (
-            "run",
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
-        ),
-        ("uses", "./.github/actions/upload-artifact"),
-    ];
-    if assemble_steps.len() != expected_steps.len() {
-        return Err(failure("release assemble step inventory differs"));
-    }
-    for (step, (field, expected)) in assemble_steps.iter().zip(expected_steps) {
-        let step = mapping(step, "release assemble step")?;
-        if scalar(step, field) != Some(expected) {
-            return Err(failure("release assemble step order differs"));
-        }
-        if expected.starts_with("actions/download-artifact@") {
-            let inputs = mapping(
-                step.get(key("with"))
-                    .ok_or_else(|| failure("assemble download inputs absent"))?,
-                "assemble download inputs",
-            )?;
-            if scalar(inputs, "pattern") != Some("release-*")
-                || scalar(inputs, "path") != Some("target/ci/release-inputs")
-                || inputs.get(key("merge-multiple")) != Some(&Value::Bool(false))
-                || step.contains_key(key("if"))
-            {
-                return Err(failure(
-                    "release assemble must download every separately named producer artifact",
-                ));
-            }
-        }
-        if expected == UPLOAD_ARTIFACT_ACTION {
-            let inputs = mapping(
-                step.get(key("with"))
-                    .ok_or_else(|| failure("assemble upload inputs absent"))?,
-                "assemble upload inputs",
-            )?;
-            if scalar(inputs, "name") != Some("release-bundle")
-                || scalar(inputs, "path") != Some("target/ci/release-bundle")
-                || scalar(inputs, "if-no-files-found") != Some("error")
-                || step.contains_key(key("if"))
-            {
-                return Err(failure("release assemble bundle upload differs"));
-            }
-        }
-    }
-    for contract in [
-        crate::standard_contract::LINUX,
-        crate::standard_contract::WINDOWS,
-    ] {
-        check_standard_certification_job(
-            mapping(
-                jobs.get(key(contract.release_job))
-                    .ok_or_else(|| failure("missing release standard certification job"))?,
-                contract.release_job,
-            )?,
-            contract,
-            true,
-        )?;
-    }
-    check_rehearse_public_job(jobs, toolchains)?;
-    let publish = mapping(
-        jobs.get(key("publish"))
-            .ok_or_else(|| failure("release publish job is absent"))?,
-        "publish job",
-    )?;
-    exact_string_sequence(
-        publish
-            .get(key("needs"))
-            .ok_or_else(|| failure("publish dependencies are absent"))?,
-        &["assemble", "rehearse-public"],
-        "publish dependencies",
-    )?;
-    if publish.contains_key(key("environment")) {
-        return Err(failure("publish job names a GitHub environment"));
-    }
-    let permissions = mapping(
-        publish
-            .get(key("permissions"))
-            .ok_or_else(|| failure("publish job permissions are absent"))?,
-        "publish permissions",
-    )?;
-    exact_mapping_keys(
-        permissions,
-        &["actions", "contents", "id-token"],
-        "publish permissions",
-    )?;
-    if scalar(permissions, "actions") != Some("read")
-        || scalar(permissions, "contents") != Some("write")
-        || scalar(permissions, "id-token") != Some("write")
-    {
-        return Err(failure("publish job permissions differ"));
-    }
-    let verify = mapping(
-        jobs.get(key("verify-public"))
-            .ok_or_else(|| failure("verify-public job is absent"))?,
-        "verify-public job",
-    )?;
-    check_verify_public_job(jobs, verify, toolchains)?;
-    check_release_credentials(jobs, release, auth_action)?;
-    Ok(())
-}
-
-fn check_rehearse_public_job(jobs: &Mapping, _toolchains: &config::Toolchains) -> Result<()> {
-    let context = "release public rehearsal";
-    let job = mapping(
-        jobs.get(key("rehearse-public"))
-            .ok_or_else(|| failure("release public rehearsal job is absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(
-        job,
-        &[
-            "name",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "permissions",
-            "steps",
-        ],
-        context,
-    )?;
-    if scalar(job, "name") != Some("Release / rehearse public state / ${{ matrix.id }}")
-        || scalar(job, "needs") != Some("assemble")
-        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(90)
-    {
-        return Err(failure("release public rehearsal job identity differs"));
-    }
-    check_runner_matrix(jobs, "rehearse-public", &VERIFY_PUBLIC_MATRIX, context)?;
-    let permissions = mapping(
-        job.get(key("permissions"))
-            .ok_or_else(|| failure("release public rehearsal permissions are absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(permissions, &["contents"], context)?;
-    if scalar(permissions, "contents") != Some("read") {
-        return Err(failure("release public rehearsal permissions differ"));
-    }
-    let steps = certification_steps(job, context)?;
-    // The managed-workflow envelope validates and projects the fingerprint,
-    // inventory upload, and final audit before this payload check.
-    if steps.len() != 8 {
-        return Err(failure("release public rehearsal step inventory differs"));
-    }
-    let expected = [
-        (
-            "uses",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        ),
-        (
-            "uses",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        ),
-        (
-            "uses",
-            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        ),
-        (
-            "uses",
-            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
-        (
-            "run",
-            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json",
-        ),
-        ("uses", UPLOAD_ARTIFACT_ACTION),
-        (
-            "uses",
-            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-        ),
-    ];
-    for (step, (kind, value)) in steps.iter().zip(expected) {
-        let step = mapping(step, context)?;
-        if scalar(step, kind) != Some(value)
-            || step.contains_key(key("env"))
-            || step.contains_key(key("shell"))
-            || step.contains_key(key("continue-on-error"))
-        {
-            return Err(failure("release public rehearsal step contract differs"));
-        }
-    }
-    if scalar(mapping(&steps[0], context)?, "if") != Some("github.event_name == 'push'")
-        || scalar(mapping(&steps[1], context)?, "if")
-            != Some("github.event_name == 'workflow_dispatch'")
-        || steps[2..=5].iter().any(|step| {
-            step.as_mapping()
-                .is_none_or(|step| step.contains_key(key("if")))
-        })
-    {
-        return Err(failure(
-            "release public rehearsal conditional execution differs",
-        ));
-    }
-    let download = mapping(&steps[2], context)?;
-    let download_inputs = mapping(
-        download
-            .get(key("with"))
-            .ok_or_else(|| failure("rehearsal bundle download inputs absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(download_inputs, &["name", "path"], context)?;
-    if scalar(download_inputs, "name") != Some("release-bundle")
-        || scalar(download_inputs, "path") != Some("target/ci/release-bundle")
-    {
-        return Err(failure("rehearsal bundle download differs"));
-    }
-    let restore = mapping(&steps[3], context)?;
-    let restore_inputs = mapping(
-        restore
-            .get(key("with"))
-            .ok_or_else(|| failure("rehearsal source cache inputs absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(restore_inputs, &["path", "key"], context)?;
-    let source_paths = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
-    if scalar(restore, "id") != Some("rehearse-public-deps")
-        || scalar(restore_inputs, "path") != Some(source_paths)
-        || !scalar(restore_inputs, "key").is_some_and(|value| {
-            value.starts_with("cargo-deps-release-rehearse-public-v1-")
-                && value.contains("${{ runner.os }}-${{ runner.arch }}-1.97.1-")
-                && value.contains("hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml')")
-        })
-    {
-        return Err(failure("rehearsal source cache differs"));
-    }
-    let upload = mapping(&steps[6], context)?;
-    let upload_inputs = mapping(
-        upload
-            .get(key("with"))
-            .ok_or_else(|| failure("rehearsal evidence inputs absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(
-        upload_inputs,
-        &[
-            "name",
-            "path",
-            "if-no-files-found",
-            "retention-days",
-            "compression-level",
-        ],
-        context,
-    )?;
-    if scalar(upload, "if") != Some("always()")
-        || scalar(upload_inputs, "name") != Some("release-public-rehearsal-${{ matrix.id }}")
-        || scalar(upload_inputs, "path") != Some("target/ci/public-rehearsal/report.json")
-        || scalar(upload_inputs, "if-no-files-found") != Some("error")
-        || upload_inputs
-            .get(key("retention-days"))
-            .and_then(Value::as_u64)
-            != Some(30)
-        || upload_inputs
-            .get(key("compression-level"))
-            .and_then(Value::as_u64)
-            != Some(0)
-    {
-        return Err(failure("rehearsal evidence upload differs"));
-    }
-    let save = mapping(&steps[7], context)?;
-    let save_inputs = mapping(
-        save.get(key("with"))
-            .ok_or_else(|| failure("rehearsal source cache save inputs absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(save_inputs, &["path", "key"], context)?;
-    if scalar(save, "if")
-        != Some(
-            "always() && steps.rehearse-public-deps.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.rehearse-public-deps.outputs.cache-primary-key != ''",
-        )
-        || scalar(save_inputs, "path") != Some(source_paths)
-        || scalar(save_inputs, "key")
-            != Some("${{ steps.rehearse-public-deps.outputs.cache-primary-key }}")
-    {
-        return Err(failure("rehearsal source cache save differs"));
-    }
-    Ok(())
-}
-
-fn check_verify_public_job(
-    jobs: &Mapping,
-    job: &Mapping,
-    toolchains: &config::Toolchains,
-) -> Result<()> {
-    let context = "verify-public job";
-    exact_mapping_keys(
-        job,
-        &[
-            "name",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "permissions",
-            "steps",
-        ],
-        context,
-    )?;
-    if scalar(job, "needs") != Some("publish") {
-        return Err(failure("verify-public must depend on publish"));
-    }
-    check_runner_matrix(jobs, "verify-public", &VERIFY_PUBLIC_MATRIX, context)?;
-    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(90) {
-        return Err(failure("verify-public timeout differs"));
-    }
-    let permissions = mapping(
-        job.get(key("permissions"))
-            .ok_or_else(|| failure("verify-public permissions are absent"))?,
-        context,
-    )?;
-    exact_mapping_keys(permissions, &["contents"], context)?;
-    if scalar(permissions, "contents") != Some("read") {
-        return Err(failure("verify-public permissions differ"));
-    }
-    let steps = certification_steps(job, context)?;
-    if steps.len() != 10 {
-        return Err(failure("verify-public step count differs"));
-    }
-    let checkout = action_steps(
-        steps,
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    )?;
-    let downloads = action_steps(
-        steps,
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-    )?;
-    if checkout.len() != 2 || downloads.len() != 2 {
-        return Err(failure(
-            "verify-public checkout or release-bundle download count differs",
-        ));
-    }
-    let run_commands = steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter_map(|step| scalar(step, "run"))
-        .collect::<Vec<_>>();
-    let expected = [
-        format!(
-            "rustup toolchain install {} --profile minimal",
-            toolchains.stable
-        ),
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public".into(),
-    ];
-    if run_commands.len() != expected.len()
-        || !run_commands
-            .iter()
-            .zip(&expected)
-            .all(|(actual, expected)| *actual == expected)
-    {
-        return Err(failure("verify-public command inventory differs"));
-    }
-    let restore = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let save = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    if action_steps(steps, restore)?.len() != 2 || action_steps(steps, save)?.len() != 2 {
-        return Err(failure("verify-public split cache inventory differs"));
-    }
-    for (id, path, key_fragment) in [
-        (
-            "verify-public-deps",
-            "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
-            "cargo-deps-release-verify-public-v2-",
-        ),
-        (
-            "verify-public-target",
-            "target/ci/verify-bootstrap",
-            "cargo-target-release-verify-public-v2-",
-        ),
-    ] {
-        let restore_step = step_with_id(steps, id, context)?;
-        if scalar(restore_step, "uses") != Some(restore) {
-            return Err(failure(format!(
-                "verify-public {id} is not a cache restore"
-            )));
-        }
-        let inputs = mapping(
-            restore_step
-                .get(key("with"))
-                .ok_or_else(|| failure(format!("verify-public {id} inputs are absent")))?,
-            context,
-        )?;
-        if scalar(inputs, "path") != Some(path)
-            || !scalar(inputs, "key").is_some_and(|value| {
-                value.starts_with(key_fragment)
-                    && value.contains("${{ runner.os }}")
-                    && value.contains("${{ runner.arch }}")
-                    && value.contains("hashFiles(")
-            })
-        {
-            return Err(failure(format!("verify-public {id} cache inputs differ")));
-        }
-        let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
-        let primary_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
-        let matching_saves = action_steps(steps, save)?
-            .into_iter()
-            .filter(|step| scalar(step, "if") == Some(condition.as_str()))
-            .collect::<Vec<_>>();
-        if matching_saves.len() != 1 {
-            return Err(failure(format!("verify-public {id} cache save differs")));
-        }
-        let save_inputs = mapping(
-            matching_saves[0]
-                .get(key("with"))
-                .ok_or_else(|| failure(format!("verify-public {id} save inputs are absent")))?,
-            context,
-        )?;
-        if scalar(save_inputs, "path") != Some(path)
-            || scalar(save_inputs, "key") != Some(primary_key.as_str())
-        {
-            return Err(failure(format!(
-                "verify-public {id} cache save inputs differ"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3005,6 +1661,286 @@ fn static_run_command(command: &str) -> bool {
         && !["&&", "&", ";", "|", "$(", "`", ">", "<"]
             .iter()
             .any(|operator| command.contains(operator))
+}
+
+fn check_release_row(
+    job: &Mapping,
+    target: &str,
+    runner: &str,
+    channel: Option<&str>,
+) -> Result<()> {
+    if scalar(job, "runs-on") != Some("${{ matrix.runner }}")
+        || scalar(job, "if") != Some("needs.select.outputs.recovery-mode == 'reprepare'")
+    {
+        return Err(failure("release target host or selection differs"));
+    }
+    let rows = job
+        .get(key("strategy"))
+        .and_then(|strategy| strategy.get(key("matrix")))
+        .and_then(|matrix| matrix.get(key("include")))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("release target matrix absent"))?;
+    if rows.len() != 1
+        || rows[0].get(key("target")).and_then(Value::as_str) != Some(target)
+        || rows[0].get(key("runner")).and_then(Value::as_str) != Some(runner)
+        || rows[0].get(key("channel")).and_then(Value::as_str) != channel
+    {
+        return Err(failure("release exact target/channel/host row differs"));
+    }
+    Ok(())
+}
+
+fn check_release_structure(jobs: &Mapping) -> Result<()> {
+    for (name, value) in jobs {
+        let name = name
+            .as_str()
+            .ok_or_else(|| failure("release job name is not a string"))?;
+        let job = mapping(value, name)?;
+        if job
+            .get(key("timeout-minutes"))
+            .and_then(Value::as_u64)
+            .is_none_or(|minutes| minutes == 0 || minutes > 90)
+        {
+            return Err(failure("release operation deadline missing or excessive"));
+        }
+    }
+    let mut required = vec![
+        "select".to_owned(),
+        "packages".into(),
+        "source-checks".into(),
+        "miri".into(),
+        "fuzz".into(),
+    ];
+    for (id, target, runner) in [
+        ("linux-x64", "x86_64-unknown-linux-gnu", "ubuntu-24.04"),
+        (
+            "linux-arm64",
+            "aarch64-unknown-linux-gnu",
+            "ubuntu-24.04-arm",
+        ),
+        ("macos-x64", "x86_64-apple-darwin", "macos-15-intel"),
+        ("macos-arm64", "aarch64-apple-darwin", "macos-15"),
+        ("windows-x64", "x86_64-pc-windows-msvc", "windows-2025"),
+        ("windows-arm64", "aarch64-pc-windows-msvc", "windows-11-arm"),
+    ] {
+        let native_name = format!("native-{id}");
+        required.push(native_name.clone());
+        let native = mapping(
+            jobs.get(key(&native_name))
+                .ok_or_else(|| failure("release native target absent"))?,
+            "release native",
+        )?;
+        if scalar(native, "needs") != Some("select") {
+            return Err(failure(
+                "native producer must not wait for packages or consumers",
+            ));
+        }
+        check_release_row(native, target, runner, None)?;
+        let steps = ordinary_steps(native, "release native")?;
+        let build = steps
+            .iter()
+            .position(|step| {
+                step.get(key("run")).and_then(Value::as_str)
+                    == Some("./target/ci/release/memcordon-ci release build-target")
+            })
+            .ok_or_else(|| failure("actual native build absent"))?;
+        if steps[build].get(key("if")).is_some() {
+            return Err(failure("native build cannot be skipped"));
+        }
+        ordinary_driver_before_suite(steps, build)?;
+        let channels = if id.starts_with("windows") {
+            vec!["native", "cargo"]
+        } else {
+            vec!["both"]
+        };
+        for channel in channels {
+            let name = if channel == "both" {
+                format!("installed-{id}")
+            } else {
+                format!("installed-{id}-{channel}")
+            };
+            required.push(name.clone());
+            let job = mapping(
+                jobs.get(key(&name))
+                    .ok_or_else(|| failure("release installed channel absent"))?,
+                "installed channel",
+            )?;
+            exact_string_sequence(
+                job.get(key("needs"))
+                    .ok_or_else(|| failure("installed dependencies absent"))?,
+                &["select", "packages", &native_name],
+                "installed target-local dependencies",
+            )?;
+            check_release_row(job, target, runner, Some(channel))?;
+            let steps = ordinary_steps(job, "installed channel")?;
+            for (selected, condition) in [
+                ("native", "matrix.channel != 'cargo'"),
+                ("cargo", "matrix.channel != 'native'"),
+            ] {
+                let run = format!(
+                    "./target/ci/release/memcordon-ci release installed-consumers --channel {selected} --destination .release/installed-results/{selected}"
+                );
+                let operations: Vec<_> = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| step.get(key("run")).and_then(Value::as_str) == Some(&run))
+                    .collect();
+                if operations.len() != 1
+                    || operations[0].1.get(key("if")).and_then(Value::as_str) != Some(condition)
+                {
+                    return Err(failure("installed channel execution differs or is skipped"));
+                }
+                ordinary_driver_before_suite(steps, operations[0].0)?;
+            }
+            for step in steps.iter().filter(|step| {
+                step.get(key("uses")).and_then(Value::as_str)
+                    == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+            }) {
+                let condition = step
+                    .get(key("if"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !condition.contains("(steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true')") {
+                    return Err(failure("installed shared writer cache needs every started channel quiescent"));
+                }
+            }
+        }
+    }
+    for name in ["packages", "source-checks", "miri", "fuzz"] {
+        let job = mapping(
+            jobs.get(key(name))
+                .ok_or_else(|| failure("release check descendant absent"))?,
+            "release checks",
+        )?;
+        if scalar(job, "needs") != Some("select")
+            || scalar(job, "if") != Some("needs.select.outputs.recovery-mode == 'reprepare'")
+        {
+            return Err(failure("release check fan-out dependency differs"));
+        }
+        let steps = ordinary_steps(job, "release checks")?;
+        let verify = steps
+            .iter()
+            .position(|step| {
+                step.get(key("run")).and_then(Value::as_str)
+                    == Some("./target/ci/release/memcordon-ci release verify-source")
+            })
+            .ok_or_else(|| failure("release source identity recheck absent"))?;
+        ordinary_driver_before_suite(steps, verify)?;
+        if name == "miri" || name == "fuzz" {
+            let shards = job
+                .get(key("strategy"))
+                .and_then(|strategy| strategy.get(key("matrix")))
+                .and_then(|matrix| matrix.get(key("shard")))
+                .ok_or_else(|| failure("release shard inventory absent"))?;
+            exact_string_sequence(shards, &["first", "second"], "release complete halves")?;
+            for shard in ["first", "second"] {
+                let run = format!("./target/ci/release/memcordon-ci suite {name}-{shard}");
+                let expected = format!("matrix.shard == '{shard}'");
+                let matches: Vec<_> = steps
+                    .iter()
+                    .filter(|step| step.get(key("run")).and_then(Value::as_str) == Some(&run))
+                    .collect();
+                if matches.len() != 1
+                    || matches[0].get(key("if")).and_then(Value::as_str) != Some(&expected)
+                {
+                    return Err(failure("release complete shard coverage differs"));
+                }
+            }
+        } else if name == "source-checks" {
+            for suite in ["policy", "quality", "msrv", "supply-chain"] {
+                let run = format!("./target/ci/release/memcordon-ci suite {suite}");
+                let matches: Vec<_> = steps
+                    .iter()
+                    .filter(|step| step.get(key("run")).and_then(Value::as_str) == Some(&run))
+                    .collect();
+                if matches.len() != 1 || matches[0].get(key("if")).is_some() {
+                    return Err(failure(
+                        "release required source check absent or conditional",
+                    ));
+                }
+            }
+        }
+    }
+    let assemble = mapping(
+        jobs.get(key("assemble"))
+            .ok_or_else(|| failure("release assembly absent"))?,
+        "release assembly",
+    )?;
+    let needs = assemble
+        .get(key("needs"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("assembly dependencies absent"))?;
+    let actual: BTreeSet<_> = needs.iter().filter_map(Value::as_str).collect();
+    let expected: BTreeSet<_> = required.iter().map(String::as_str).collect();
+    if needs.len() != expected.len() || actual != expected || assemble.contains_key(key("if")) {
+        return Err(failure(
+            "assembly requires every selected producer and installed/check leaf success",
+        ));
+    }
+    let publish = mapping(
+        jobs.get(key("publish"))
+            .ok_or_else(|| failure("publisher absent"))?,
+        "publisher",
+    )?;
+    let permissions = mapping(
+        publish
+            .get(key("permissions"))
+            .ok_or_else(|| failure("publisher permissions absent"))?,
+        "publisher permissions",
+    )?;
+    exact_mapping_keys(
+        permissions,
+        &["contents", "actions", "id-token"],
+        "publisher permissions",
+    )?;
+    if scalar(permissions, "contents") != Some("write")
+        || scalar(permissions, "actions") != Some("read")
+        || scalar(permissions, "id-token") != Some("write")
+    {
+        return Err(failure("publisher permissions differ"));
+    }
+    let concurrency = mapping(
+        publish
+            .get(key("concurrency"))
+            .ok_or_else(|| failure("publication serialization absent"))?,
+        "publisher concurrency",
+    )?;
+    if scalar(concurrency, "group") != Some("memcordon-publication")
+        || concurrency
+            .get(key("cancel-in-progress"))
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(failure("publication must serialize without cancellation"));
+    }
+    let publisher_steps = ordinary_steps(publish, "publisher")?;
+    let mut writes = 0;
+    for step in publisher_steps {
+        if let Some(run) = step.get(key("run")).and_then(Value::as_str) {
+            if run == "./.release/tool/memcordon-ci release publish" {
+                writes += 1;
+            } else if run
+                != "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool"
+            {
+                return Err(failure(
+                    "publisher cannot build/test or invoke source tools",
+                ));
+            }
+        }
+        if let Some(uses) = step.get(key("uses")).and_then(Value::as_str) {
+            if !uses.starts_with("actions/download-artifact@")
+                && !uses.starts_with("rust-lang/crates-io-auth-action@")
+            {
+                return Err(failure(
+                    "publisher cannot checkout/restore cache or run another action",
+                ));
+            }
+        }
+    }
+    if writes != 1 {
+        return Err(failure("publisher needs one prepared-byte write operation"));
+    }
+    Ok(())
 }
 
 fn check_step_environment(
@@ -3070,8 +2006,7 @@ fn validate_workflow_bytes_into(
             "release-bootstrap workflow and environment references are forbidden",
         ));
     }
-    let mut document = parse_yaml(bytes)?;
-    crate::managed_workflow::validate_and_project(&mut document)?;
+    let document = parse_yaml(bytes)?;
     let workflow = mapping(&document, "workflow")?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {
         return Err(failure(format!(
@@ -3134,8 +2069,9 @@ fn validate_workflow_bytes_into(
                 "named GitHub environments are forbidden: {job_name}"
             )));
         }
-        if let Some(runner) = job.get(key("runs-on"))
-            && runner_selects_self_hosted(runner)
+        if job
+            .get(key("runs-on"))
+            .is_some_and(runner_selects_self_hosted)
         {
             return Err(failure("workflow may not select self-hosted runners"));
         }
@@ -3252,11 +2188,15 @@ fn validate_workflow_bytes_into(
                     if cache_path.contains("target/ci-tools")
                         && cache_path.lines().any(|line| {
                             let trimmed = line.trim();
-                            !trimmed.is_empty() && trimmed != "target/ci-tools"
+                            !trimmed.is_empty()
+                                && !matches!(
+                                    trimmed,
+                                    "target/ci-tools/bin" | "target/ci-tools-build" | "fuzz/target"
+                                )
                         })
                     {
                         return Err(failure(
-                            "tool binaries must use a cache separate from build targets",
+                            "tool caches must contain only final binaries and tool compilation outputs",
                         ));
                     }
                 }
@@ -3289,63 +2229,17 @@ fn validate_workflow_bytes_into(
         check_deep_ci_structure(workflow, jobs)?;
     }
     if relative == Path::new(".github/workflows/backend-certification.yml") {
-        check_backend_certification_structure(workflow, jobs)?;
+        check_standard_native_jobs(workflow, jobs)?;
+    }
+    if relative == Path::new(".github/workflows/release-current.yml") {
+        return Err(failure("duplicate release workflow identity is forbidden"));
     }
     if relative == Path::new(".github/workflows/release.yml") {
-        let release = config::release(root)?;
-        let toolchains = config::toolchains(root)?;
-        let auth_action = pins
-            .action
-            .iter()
-            .find(|pin| pin.name == "crates-io-auth")
-            .map(|pin| pin.uses.as_str())
-            .ok_or_else(|| failure("crates.io authentication action pin is absent"))?;
-        check_release_structure(workflow, jobs, &release, &toolchains, auth_action)?;
-        if text.contains("release-bootstrap") || text.contains("bootstrap-crates") {
-            return Err(failure("obsolete crates.io bootstrap path is forbidden"));
-        }
-        check_release_workflow_text(text, &release)?;
+        check_release_structure(jobs)?;
     }
     Ok(())
 }
 
-fn check_release_workflow_text(text: &str, release: &config::Release) -> Result<()> {
-    let publication_slots = release.publish_packages.len();
-    let fallback_profile = release.registry_credentials.policy
-        == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback;
-    let expected_credential_variables =
-        publication_slots + usize::from(fallback_profile) * publication_slots;
-    if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != expected_credential_variables {
-        return Err(failure(
-            "release credential text occurs outside exact step-local mappings",
-        ));
-    }
-    if text.contains("CARGO_REGISTRY_TOKEN")
-        || text.matches("release attempt-oidc").count() != publication_slots
-        || text.matches("outputs.token").count() != publication_slots
-        || text.contains("publish-next")
-        || text.contains("publish-bridge")
-        || text.contains("registry_auth")
-        || text.matches("release authorize-new-crate-fallback").count()
-            != usize::from(fallback_profile) * publication_slots
-        || text.matches("release publish-token-fallback").count()
-            != usize::from(fallback_profile) * publication_slots
-        || text.matches("secrets.").count() != usize::from(fallback_profile) * publication_slots
-        || text.contains(&token_fallback_source(release)) != fallback_profile
-    {
-        return Err(failure(
-            "release publication or credential source occurs outside canonical slots",
-        ));
-    }
-    if !fallback_profile && (text.contains("stored-token") || text.contains("oidc-fallback")) {
-        return Err(failure(
-            "steady-state workflow retains transition credential literals",
-        ));
-    }
-    Ok(())
-}
-
-/// Parses and validates untrusted workflow bytes through the production policy path.
 pub fn validate_workflow_bytes(
     root: &Path,
     relative: &Path,
@@ -3406,8 +2300,6 @@ struct RustPolicy {
     calls_current_exe: bool,
     names_proc_self_exe: bool,
     calls_env_remove: bool,
-    unreviewed_fixture_env_remove: bool,
-    in_generated_fixture_child: bool,
     subprocess_env_mutations: usize,
     standard_path_mutations: usize,
     pre_exec_calls: usize,
@@ -3415,13 +2307,6 @@ struct RustPolicy {
 }
 
 impl<'ast> Visit<'ast> for RustPolicy {
-    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
-        let previous = self.in_generated_fixture_child;
-        self.in_generated_fixture_child = function.sig.ident == "generated_fixture_child";
-        syn::visit::visit_item_fn(self, function);
-        self.in_generated_fixture_child = previous;
-    }
-
     fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = expression.func.as_ref() {
             let segments: Vec<String> = path
@@ -3481,11 +2366,6 @@ impl<'ast> Visit<'ast> for RustPolicy {
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
         if expression.method == "env_remove" {
             self.calls_env_remove = true;
-            let compiler_selector = expression.args.len() == 1
-                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "RUSTC" | "RUSTDOC"));
-            if !self.in_generated_fixture_child || !compiler_selector {
-                self.unreviewed_fixture_env_remove = true;
-            }
         }
         if expression.method == "pre_exec" {
             self.pre_exec_calls += 1;
@@ -3517,27 +2397,31 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 }
 
-fn managed_compilation_environment_boundary(relative: &Path) -> bool {
+/// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
+fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
+    !visitor.calls_env_remove
+        || [
+            Path::new("tools/memcordon-ci/src/command.rs"),
+            Path::new("tools/memcordon-ci/src/release/git.rs"),
+        ]
+        .contains(&relative)
+}
+
+fn reviewed_git_environment(relative: &Path) -> bool {
     [
-        Path::new("tools/ci-native-fingerprint.rs"),
-        Path::new("tools/memcordon-ci/src/build_context.rs"),
-        // This integration fixture injects a rejected compiler override into the seed.
-        Path::new("tools/memcordon-ci/tests/build_context.rs"),
+        Path::new("tools/memcordon-ci/src/release/git.rs"),
+        Path::new("tools/memcordon-ci/src/release/tag.rs"),
     ]
     .contains(&relative)
 }
 
-/// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
-fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
-    !visitor.calls_env_remove
-        || relative == Path::new("tools/memcordon-ci/src/command.rs")
-        || relative == Path::new("tools/memcordon-ci/src/release.rs")
-        || ([
-            Path::new("tools/memcordon-ci/tests/build_context.rs"),
-            Path::new("tools/memcordon-ci/tests/release/rehearsal.rs"),
-        ]
-        .contains(&relative)
-            && !visitor.unreviewed_fixture_env_remove)
+fn reviewed_macos_writer_image(relative: &Path) -> bool {
+    [
+        Path::new("crates/memcordon-platform/src/macos_watchdog.rs"),
+        Path::new("crates/memcordon-platform/src/macos_launch_runtime.rs"),
+        Path::new("crates/memcordon-platform/src/macos_result_delivery.rs"),
+    ]
+    .contains(&relative)
 }
 
 pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
@@ -3551,7 +2435,6 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     let mut visitor = RustPolicy::default();
     visitor.visit_file(&syntax);
     let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
-    let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
     let sealed_launch =
         Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
     let native_path_fixture = [
@@ -3563,7 +2446,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     if visitor.subprocess_env_mutations != 0
         && relative != sealed_launch
         && !native_path_fixture
-        && !managed_compilation_environment_boundary(relative)
+        && !reviewed_git_environment(relative)
     {
         visitor
             .violations
@@ -3579,7 +2462,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     }
     if relative.starts_with(Path::new("crates/memcordon-platform/src"))
         && (visitor.names_proc_self_exe
-            || (visitor.calls_current_exe && relative != macos_watchdog))
+            || (visitor.calls_current_exe && !reviewed_macos_writer_image(relative)))
     {
         visitor
             .violations
@@ -3645,7 +2528,6 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         let mut visitor = RustPolicy::default();
         visitor.visit_file(&syntax);
         let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
-        let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
         let sealed_launch =
             Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
         let native_path_fixture = [
@@ -3657,7 +2539,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
             && !native_path_fixture
-            && !managed_compilation_environment_boundary(relative)
+            && !reviewed_git_environment(&relative)
         {
             visitor
                 .violations
@@ -3676,7 +2558,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         }
         if relative.starts_with(Path::new("crates/memcordon-platform/src"))
             && (visitor.names_proc_self_exe
-                || (visitor.calls_current_exe && relative != macos_watchdog))
+                || (visitor.calls_current_exe && !reviewed_macos_writer_image(&relative)))
         {
             visitor
                 .violations
@@ -3709,6 +2591,10 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
             || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launcher.rs")
             || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/namespace.rs")
             || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs")
+            // These isolated sealed workers require inherited namespace,
+            // descriptor, or ABI custody; arbitrary private modules remain forbidden.
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/private_guardian.rs")
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/private_namespace_init.rs")
             || path
                 == Path::new(
                     "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs",
@@ -3716,6 +2602,9 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_faults.rs")
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs")
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs")
+            || path == Path::new("crates/memcordon-cli/tests/sealed_agent/native_descriptor_custody.rs")
+            // Root-native fixture owns every child/pidfd and signals no external PID.
+            || path == Path::new("crates/memcordon-cli/tests/release/native_private_owner_loss.rs")
     )
 }
 
@@ -4000,230 +2889,8 @@ fn check_cargo_configuration(root: &Path, files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn require_credential_transition_fragments(
-    root: &Path,
-    relative: &str,
-    required: &[&str],
-    forbidden: &[&str],
-) -> Result<()> {
-    let source = fs::read_to_string(root.join(relative))?;
-    for fragment in required {
-        if !source.contains(fragment) {
-            return Err(failure(format!(
-                "credential-transition v2 policy fragment is absent from {relative}: {fragment:?}"
-            )));
-        }
-    }
-    for fragment in forbidden {
-        if source.contains(fragment) {
-            return Err(failure(format!(
-                "legacy credential-transition policy fragment remains in {relative}: {fragment:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn check_credential_transition_redesign(root: &Path) -> Result<()> {
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-core/src/report.rs",
-        &[
-            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 10;",
-            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 9;",
-            "pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;",
-            "pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;",
-        ],
-        &[],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-core/src/supervision.rs",
-        &[
-            "CredentialTransitionDisposition",
-            "PreserveCallerEnvelope",
-            "LinuxSealedEvidenceV2",
-            "WindowsSealedEvidenceV2",
-            "LinuxPidNamespaceCgroupV2",
-            "WindowsJobObjectV2",
-        ],
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs",
-        &["pub const PROTOCOL_VERSION: u16 = 3;"],
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs",
-        &[
-            "pub const LAUNCH_REQUEST_VERSION: u16 = 3;",
-            "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;",
-            "CallerExecutionEnvelopeV2",
-            "LaunchBrokerRequestV2",
-            "request_digest",
-            "control_process_start_time",
-            "record_identity",
-            "request_authentication_binding",
-        ],
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs",
-        &[
-            "schema_version: 3",
-            "linux-pid-namespace-cgroup-v2",
-            "preserve-caller-envelope",
-            "setid_transition_certification_digest",
-            "sudo_transition_certification_digest",
-            "recursive_provider_request_rejected",
-        ],
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    let selectors = [
-        "sealed_setid_transition_preserves_boundary",
-        "sealed_sudo_transition_preserves_boundary",
-        "sealed_file_capability_transition_preserves_boundary",
-        "sealed_caller_no_new_privs_is_reproduced",
-        "sealed_caller_capability_bounding_set_is_reproduced",
-        "sealed_caller_mount_context_is_reproduced",
-        "sealed_recursive_provider_request_is_rejected",
-    ];
-    require_credential_transition_fragments(
-        root,
-        "crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs",
-        &selectors,
-        &[],
-    )?;
-    let artifacts = [
-        "provider-package-verification.json",
-        "provider-qualification-v2.json",
-        "setid-transition.json",
-        "sudo-transition.json",
-        "file-capability-transition.json",
-        "caller-envelope.json",
-        "mount-context.json",
-        "fault-injection.json",
-        "cleanup-leak-check.json",
-    ];
-    let mut runner_fragments = vec![
-        "linux-pid-namespace-cgroup-v2",
-        "target/ci/reports/linux-sealed-v2",
-    ];
-    runner_fragments.extend(selectors);
-    runner_fragments.extend(artifacts);
-    require_credential_transition_fragments(
-        root,
-        "tools/memcordon-ci/src/sealed_linux.rs",
-        &runner_fragments,
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    let mut release_fragments = vec![
-        "linux-pid-namespace-cgroup-v2",
-        "LinuxPidNamespaceCgroupV2",
-        "PreserveCallerEnvelope",
-    ];
-    release_fragments.extend(selectors);
-    release_fragments.extend(artifacts);
-    require_credential_transition_fragments(
-        root,
-        "tools/memcordon-ci/src/release_evidence.rs",
-        &release_fragments,
-        &["linux-pid-namespace-cgroup-v1"],
-    )?;
-    let fuzz_targets = [
-        "caller-envelope-status",
-        "capability-mask",
-        "namespace-identity",
-        "broker-protocol-v2",
-        "qualification-receipt-v2",
-        "terminal-receipt-v2",
-        "linux-evidence-v2",
-        "service-unit-policy",
-        "provider-recursion-proof",
-        "mount-context-manifest",
-    ];
-    require_credential_transition_fragments(root, "fuzz/Cargo.toml", &fuzz_targets, &[])?;
-    let planned =
-        crate::fuzz_targets::targets(&fs::read_to_string(root.join("fuzz/Cargo.toml"))?, None)?;
-    if fuzz_targets
-        .iter()
-        .any(|required| !planned.iter().any(|target| target == required))
-    {
-        return Err(failure("credential transition fuzz coverage differs"));
-    }
-    require_credential_transition_fragments(
-        root,
-        "docs/sealed-supervision.md",
-        &[
-            "linux-pid-namespace-cgroup-v2",
-            "preserve-caller-envelope",
-            "credential transitions",
-        ],
-        &[],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "docs/sealed-provider.md",
-        &[
-            "memcordon-sealed-launcher.service",
-            "NoNewPrivileges=no",
-            "provider protocol v2",
-        ],
-        &[],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "packaging/linux/memcordon.conf",
-        &[
-            "d /run/memcordon 0750 root memcordon -",
-            "f /run/memcordon-sealed-package.lock 0600 root root -",
-        ],
-        &[],
-    )?;
-    require_credential_transition_fragments(root, "spec/sealed-linux-v2.md", &artifacts, &[])?;
-    require_credential_transition_fragments(
-        root,
-        "spec/sealed-linux-v1.md",
-        &["Historical specification", "reject this mechanism"],
-        &[],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "spec/sealed-provider-protocol-v1.md",
-        &["Historical specification", "reject protocol v1"],
-        &[],
-    )?;
-    require_credential_transition_fragments(
-        root,
-        "tools/memcordon-ci/tests/release_evidence.rs",
-        &[
-            "required_credential_transition_mutants_fail_closed_and_map_to_named_tests",
-            "retain-service-nnp-on-target",
-            "force-target-nnp-regardless-of-caller",
-            "ignore-caller-capability-bounding-set",
-            "preserve-provider-capability",
-            "inherit-control-service-mount-namespace",
-            "authorize-before-mount-context-verification",
-            "allow-recursive-provider-request",
-            "accept-v1-provider",
-            "hardcode-transition-compatibility",
-            "skip-setid-certification-digest",
-            "treat-credential-change-as-boundary-loss",
-            "omit-cgroup-kill-after-credential-change",
-            "restart-before-v2-retirement",
-        ],
-        &[],
-    )?;
-    Ok(())
-}
-
 pub fn run(root: &Path) -> Result<()> {
     let policy = config::policy(root)?;
-    let release = config::release(root)?;
     for command in &policy.workflow.allowed_run_commands {
         if !static_run_command(command) {
             return Err(failure(format!(
@@ -4247,7 +2914,6 @@ pub fn run(root: &Path) -> Result<()> {
         ));
     }
     let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
-    let fallback_secret_source = token_fallback_source(&release);
     for relative in &files {
         let bytes = fs::read(root.join(relative))?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -4256,22 +2922,17 @@ pub fn run(root: &Path) -> Result<()> {
                     "legacy broad crates.io token source remains: {relative:?}"
                 )));
             }
-            let fallback_source_permitted = release.registry_credentials.policy
-                == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback
-                && (relative == Path::new(".github/workflows/release.yml")
-                    || relative == Path::new("ci/policy.toml"));
-            if text.contains(&fallback_secret_source) && !fallback_source_permitted {
-                return Err(failure(format!(
-                    "new-crate fallback token source appears outside its exact policy: {relative:?}"
-                )));
-            }
             if text.contains("CARGO_REGISTRY_TOKEN")
                 && relative != Path::new("tools/memcordon-ci/src/command.rs")
                 && relative != Path::new("tools/memcordon-ci/src/policy.rs")
-                && relative != Path::new("tools/memcordon-ci/src/release.rs")
                 && relative != Path::new("tools/memcordon-ci/tests/command.rs")
+                && relative != Path::new("tools/memcordon-ci/tests/unit/policy.rs")
                 && relative != Path::new("RELEASING.md")
                 && relative != Path::new("MAINTAINERS.md")
+                && relative != Path::new("ci/policy.toml")
+                && relative != Path::new(".github/workflows/release.yml")
+                && relative != Path::new("tools/memcordon-ci/src/release/publish.rs")
+                && relative != Path::new("tools/memcordon-ci/src/release/git.rs")
             {
                 return Err(failure(format!(
                     "legacy crates.io token interface remains outside negative policy assertions: {relative:?}"
@@ -4316,32 +2977,6 @@ pub fn run(root: &Path) -> Result<()> {
             })
         })
         .collect();
-    let release_environment: Vec<&EnvironmentDefinition> = environment_definitions
-        .iter()
-        .filter(|definition| definition.file == ".github/workflows/release.yml")
-        .collect();
-    let fallback_environment_slots = usize::from(
-        release.registry_credentials.policy
-            == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback,
-    ) * policy.workspace.publish_packages.len();
-    let expected_release_environment_count =
-        3 + policy.workspace.publish_packages.len() * 2 + fallback_environment_slots * 2;
-    if release_environment.len() != expected_release_environment_count {
-        return Err(failure(
-            "release workflow step-local environment mapping count does not match the publish package set",
-        ));
-    }
-    for name in ["Stage GitHub draft and assets", "Finalize GitHub release"] {
-        if !release_environment.iter().any(|definition| {
-            definition.step == name
-                && definition.variable == "GITHUB_TOKEN"
-                && definition.source == "${{ github.token }}"
-        }) {
-            return Err(failure(format!(
-                "release GitHub credential mapping is absent: {name}"
-            )));
-        }
-    }
     if environment_definitions != expected_environment {
         return Err(failure(format!(
             "workflow environment definitions differ from the exact allowlist: observed={environment_definitions:?} expected={expected_environment:?}"
@@ -4357,7 +2992,6 @@ pub fn run(root: &Path) -> Result<()> {
             "action pin inventory differs from workflow uses: used={used_actions:?} configured={configured_actions:?}"
         )));
     }
-    check_credential_transition_redesign(root)?;
     check_rust(root, &files)?;
     check_cargo_configuration(root, &files)?;
     check_manifests(root, &policy)?;
@@ -4374,445 +3008,5 @@ pub fn run(root: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const AUTH_ACTION: &str =
-        "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18";
-
-    fn repository_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
-    }
-
-    fn steady_workflow_fixture() -> &'static str {
-        r#"name: Release
-on:
-  push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing protected SemVer tag to publish or reconcile
-        required: true
-        type: string
-permissions:
-  contents: read
-concurrency:
-  group: memcordon-release
-  cancel-in-progress: false
-jobs:
-  publish:
-    needs:
-      - assemble
-      - rehearse-public
-    permissions:
-      actions: read
-      contents: write
-      id-token: write
-    steps:
-      - name: Stage GitHub draft and assets
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github
-      - name: Acquire crates.io token for publication slot 1
-        id: crates_auth_1
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 1
-        id: publish_oidc_1
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-1
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1
-      - name: Acquire crates.io token for publication slot 2
-        id: crates_auth_2
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 2
-        id: publish_oidc_2
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-2
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2
-      - name: Acquire crates.io token for publication slot 3
-        id: crates_auth_3
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 3
-        id: publish_oidc_3
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-3
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3
-      - name: Acquire crates.io token for publication slot 4
-        id: crates_auth_4
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 4
-        id: publish_oidc_4
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-4
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_4.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4
-      - name: Finalize GitHub release
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github
-  verify-public:
-    needs: publish
-"#
-    }
-
-    fn check_steady_fixture(text: &str) -> Result<()> {
-        let root = repository_root();
-        let fixture: Value = serde_yaml::from_str(text)?;
-        let fixture_workflow = mapping(&fixture, "steady workflow")?;
-        let fixture_jobs = mapping(
-            fixture_workflow
-                .get(key("jobs"))
-                .ok_or_else(|| failure("steady fixture jobs are absent"))?,
-            "steady jobs",
-        )?;
-        let mut document: Value =
-            serde_yaml::from_slice(include_bytes!("../../../.github/workflows/release.yml"))?;
-        {
-            let workflow = document
-                .as_mapping_mut()
-                .ok_or_else(|| failure("release workflow must be a mapping"))?;
-            workflow.insert(
-                key("on"),
-                fixture_workflow
-                    .get(key("on"))
-                    .ok_or_else(|| failure("steady fixture events are absent"))?
-                    .clone(),
-            );
-            let jobs = workflow
-                .get_mut(key("jobs"))
-                .and_then(Value::as_mapping_mut)
-                .ok_or_else(|| failure("release jobs are absent"))?;
-            let job_name = "publish";
-            jobs.insert(
-                key(job_name),
-                fixture_jobs
-                    .get(key(job_name))
-                    .ok_or_else(|| failure(format!("steady {job_name} job is absent")))?
-                    .clone(),
-            );
-        }
-        crate::managed_workflow::validate_and_project(&mut document)?;
-        let workflow = mapping(&document, "release workflow")?;
-        let jobs = mapping(
-            workflow
-                .get(key("jobs"))
-                .ok_or_else(|| failure("release jobs are absent"))?,
-            "release jobs",
-        )?;
-        let mut release = config::release(&root)?;
-        release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
-        release.registry_credentials.fallback_token_secret = None;
-        let toolchains = config::toolchains(&root)?;
-        check_release_structure(workflow, jobs, &release, &toolchains, AUTH_ACTION)
-    }
-
-    fn steady_cleanup_configuration() -> Result<(String, config::Release)> {
-        let root = repository_root();
-        let fixture: Value = serde_yaml::from_str(steady_workflow_fixture())?;
-        let fixture_workflow = mapping(&fixture, "steady workflow")?;
-        let fixture_jobs = mapping(
-            fixture_workflow
-                .get(key("jobs"))
-                .ok_or_else(|| failure("steady fixture jobs are absent"))?,
-            "steady jobs",
-        )?;
-        let mut document: Value =
-            serde_yaml::from_slice(include_bytes!("../../../.github/workflows/release.yml"))?;
-        let workflow = document
-            .as_mapping_mut()
-            .ok_or_else(|| failure("release workflow must be a mapping"))?;
-        workflow.insert(
-            key("on"),
-            fixture_workflow
-                .get(key("on"))
-                .ok_or_else(|| failure("steady fixture events are absent"))?
-                .clone(),
-        );
-        let jobs = workflow
-            .get_mut(key("jobs"))
-            .and_then(Value::as_mapping_mut)
-            .ok_or_else(|| failure("release jobs are absent"))?;
-        jobs.insert(
-            key("publish"),
-            fixture_jobs
-                .get(key("publish"))
-                .ok_or_else(|| failure("steady publish job is absent"))?
-                .clone(),
-        );
-        let text = serde_yaml::to_string(&document)?;
-        let mut release = config::release(&root)?;
-        release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
-        release.registry_credentials.fallback_token_secret = None;
-        Ok((text, release))
-    }
-
-    fn legacy_token_source() -> String {
-        ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat()
-    }
-
-    fn fallback_token_source() -> String {
-        [
-            "${{ secrets.",
-            "MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK",
-            " }}",
-        ]
-        .concat()
-    }
-
-    #[test]
-    fn exact_fallback_and_cleanup_workflow_profiles_are_accepted() {
-        let root = repository_root();
-        let policy = config::policy(&root).expect("repository policy should parse");
-        validate_workflow_bytes(
-            &root,
-            Path::new(".github/workflows/release.yml"),
-            include_bytes!("../../../.github/workflows/release.yml"),
-            &policy,
-        )
-        .expect("generic OIDC-first fallback workflow should satisfy production policy");
-        check_steady_fixture(steady_workflow_fixture())
-            .expect("cleanup steady-state workflow should satisfy structure policy");
-    }
-
-    #[test]
-    fn steady_profile_rejects_noncanonical_oidc_slots_and_token_reintroduction() {
-        let with_input = steady_workflow_fixture().replacen(
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-",
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-        with:
-          url: https://example.invalid
-",
-            1,
-        );
-        assert!(check_steady_fixture(&with_input).is_err());
-
-        let wrong_output = steady_workflow_fixture().replacen(
-            "steps.crates_auth_1.outputs.token",
-            "steps.crates_auth_2.outputs.token",
-            1,
-        );
-        assert!(check_steady_fixture(&wrong_output).is_err());
-
-        let separated_pair = steady_workflow_fixture().replacen(
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 1
-",
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - name: Attempt crates.io OIDC publication in slot 1
-",
-            1,
-        );
-        assert!(check_steady_fixture(&separated_pair).is_err());
-
-        let stored = steady_workflow_fixture().replacen(
-            "${{ steps.crates_auth_1.outputs.token }}",
-            &fallback_token_source(),
-            1,
-        );
-        assert!(check_steady_fixture(&stored).is_err());
-
-        let missing_github_mapping = steady_workflow_fixture().replacen(
-            "      - name: Stage GitHub draft and assets
-",
-            "      - name: Stage mapping removed
-",
-            1,
-        );
-        assert!(check_steady_fixture(&missing_github_mapping).is_err());
-    }
-
-    #[test]
-    fn fallback_profile_rejects_unbounded_or_cross_wired_credentials() {
-        let root = repository_root();
-        let policy = config::policy(&root).expect("repository policy should parse");
-        let exact = std::str::from_utf8(include_bytes!("../../../.github/workflows/release.yml"))
-            .expect("workflow should be UTF-8")
-            .replace("\r\n", "\n");
-        let without_continue = exact.replacen("        continue-on-error: true\n", "", 1);
-        let authorizer_step = "      - name: Authorize new-crate token fallback in slot 3\n";
-        let continued_authorizer = exact.replacen(
-            authorizer_step,
-            format!("{authorizer_step}        continue-on-error: true\n").as_str(),
-            1,
-        );
-        let token_step = "      - name: Publish new crate with fallback credential in slot 3\n";
-        let continued_token = exact.replacen(
-            token_step,
-            format!("{token_step}        continue-on-error: true\n").as_str(),
-            1,
-        );
-        let broadened_condition = exact.replacen(
-            "steps.authorize_fallback_3.outcome == 'success' && steps.authorize_fallback_3.outputs.authorized == 'true'",
-            "steps.authorize_fallback_3.outcome == 'success'",
-            1,
-        );
-        let cross_wired_source = exact.replacen(
-            fallback_token_source().as_str(),
-            "${{ steps.crates_auth_3.outputs.token }}",
-            1,
-        );
-        let package_named_step = exact.replacen(
-            "Publish new crate with fallback credential in slot 3",
-            "Publish new memcordon-windows-launch-core in slot 3",
-            1,
-        );
-        let authorizer_environment = exact.replacen(
-            "      - name: Authorize new-crate token fallback in slot 3\n        id: authorize_fallback_3\n",
-            "      - name: Authorize new-crate token fallback in slot 3\n        id: authorize_fallback_3\n        env:\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}\n",
-            1,
-        );
-        let transition_input = "      registry_auth:\n        required: true\n        type: choice\n        options:\n          - stored-token\n";
-        let with_transition_input = exact.replacen(
-            "  workflow_dispatch:\n    inputs:\n",
-            format!("  workflow_dispatch:\n    inputs:\n{transition_input}").as_str(),
-            1,
-        );
-        let legacy_variable = exact.replacen(
-            format!(
-                "          CARGO_HOME: target/ci/cargo-publish-home/slot-3\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: {}",
-                fallback_token_source()
-            )
-            .as_str(),
-            format!(
-                "          CARGO_HOME: target/ci/cargo-publish-home/slot-3\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: {}",
-                legacy_token_source()
-            )
-            .as_str(),
-            1,
-        );
-        let cases = [
-            ("OIDC attempt loses continue-on-error", without_continue),
-            ("continued authorizer", continued_authorizer),
-            ("continued token publication", continued_token),
-            ("broadened token condition", broadened_condition),
-            ("cross-wired token source", cross_wired_source),
-            ("package-named credential step", package_named_step),
-            ("authorizer gains credentials", authorizer_environment),
-            ("transition dispatch input", with_transition_input),
-            ("legacy singular-token variable", legacy_variable),
-        ];
-        for (case, invalid) in cases {
-            assert_ne!(invalid, exact, "{case} fixture mutation must apply");
-            assert!(
-                validate_workflow_bytes(
-                    &root,
-                    Path::new(".github/workflows/release.yml"),
-                    invalid.as_bytes(),
-                    &policy,
-                )
-                .is_err(),
-                "{case} fixture must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn cleanup_profile_rejects_transition_inputs_and_stored_tokens() {
-        let transition_input = "      registry_auth:\n        required: true\n        type: choice\n        options:\n          - stored-token\n          - oidc-fallback\n";
-        let with_transition_input = steady_workflow_fixture().replacen(
-            "  workflow_dispatch:\n    inputs:\n",
-            format!("  workflow_dispatch:\n    inputs:\n{transition_input}").as_str(),
-            1,
-        );
-        assert!(check_steady_fixture(&with_transition_input).is_err());
-
-        let with_stored_token = steady_workflow_fixture().replacen(
-            "${{ steps.crates_auth_1.outputs.token }}",
-            fallback_token_source().as_str(),
-            1,
-        );
-        assert!(check_steady_fixture(&with_stored_token).is_err());
-    }
-
-    #[test]
-    fn cleanup_policy_text_rejects_stale_transition_commands_and_sources() {
-        let (clean_text, release) = steady_cleanup_configuration()
-            .expect("steady cleanup configuration should be constructible");
-        check_release_workflow_text(&clean_text, &release)
-            .expect("the cleaned workflow should satisfy the OIDC-only text policy");
-
-        let stale_command = format!(
-            "{clean_text}# stale target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1 command\n"
-        );
-        let stale_authorizer = format!(
-            "{clean_text}# stale target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1 command\n"
-        );
-        let stale_secret = format!(
-            "{clean_text}# stale ${{{{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}}} mapping\n"
-        );
-        let stale_variable =
-            format!("{clean_text}# stale CARGO_REGISTRIES_CRATES_IO_TOKEN mapping\n");
-        let stale_literal = format!("{clean_text}# stale stored-token literal\n");
-        for (case, invalid) in [
-            ("token-fallback command", stale_command),
-            ("fallback authorizer command", stale_authorizer),
-            ("fallback secret source", stale_secret),
-            ("extra credential variable", stale_variable),
-            ("transition literal", stale_literal),
-        ] {
-            assert_ne!(invalid, clean_text, "{case} mutation must apply");
-            assert!(
-                check_release_workflow_text(&invalid, &release).is_err(),
-                "{case} must be rejected under the OIDC-only cleanup policy"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_policy_fixture_is_rejected() {
-        let malformed = "[workspace]\nproduction_packages = \"not-a-list\"\n";
-        assert!(toml::from_str::<config::Policy>(malformed).is_err());
-    }
-
-    #[test]
-    fn malformed_workflow_fixture_non_scalar_run_is_rejected() {
-        let document: Value = serde_yaml::from_str(
-            "jobs:\n  check:\n    steps:\n      - run:\n          command: cargo check\n",
-        )
-        .expect("fixture YAML should parse");
-        let jobs = mapping(
-            mapping(&document, "workflow")
-                .expect("workflow mapping")
-                .get(key("jobs"))
-                .expect("jobs"),
-            "jobs",
-        )
-        .expect("jobs mapping");
-        let step = jobs
-            .get(key("check"))
-            .and_then(Value::as_mapping)
-            .and_then(|job| job.get(key("steps")))
-            .and_then(Value::as_sequence)
-            .and_then(|steps| steps.first())
-            .and_then(Value::as_mapping)
-            .expect("step mapping");
-        assert!(step.get(key("run")).is_some());
-        assert!(scalar(step, "run").is_none());
-    }
-
-    #[test]
-    fn workflow_shell_operator_fixtures_are_rejected() {
-        for command in [
-            "cargo check && cargo test",
-            "cargo check | tee out",
-            "cargo &",
-        ] {
-            assert!(!static_run_command(command));
-        }
-        assert!(static_run_command("cargo check --locked"));
-    }
-
-    #[test]
-    fn workflow_event_fixture_requires_exact_keys() {
-        let mapping: Mapping = serde_yaml::from_str("push: {}\npull_request_target: {}\n")
-            .expect("mapping should parse");
-        assert!(exact_mapping_keys(&mapping, &["push", "pull_request"], "events").is_err());
-    }
-}
+#[path = "../tests/unit/policy.rs"]
+mod tests;

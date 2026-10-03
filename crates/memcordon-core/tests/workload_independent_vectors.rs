@@ -6,12 +6,90 @@ use memcordon_core::{BoundedText, BoundedVec, DiagnosticSha256, PublicProviderBi
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU64;
 
+#[path = "support/historical_registry.rs"]
+mod historical_registry;
+
 const CONTRACT_HASH: &str = "44c496721bec21fa8cc0e7e3f9dc1cd14077e263c7c2683f9ea5c2fe25b92b3c";
 const REGISTRY_HASH: &str = "a102255bf66093d7b7398a0d92a05b57007fa7cfc8cc70ee661e3e95d638fe76";
 const EFFECTIVE_HASH: &str = "2c50d523b361ef9ecb08efea05a7a09ec25fc3e29c6d5d80202d64830c284592";
 const ATTEMPT_HASH: &str = "974cebb1ed337a16b68a949070b26a331ad559b5cd32899e40c237941d73d496";
 const CHECKPOINT_HASH: &str = "3e68071a6e9971b6e0ac37ac38d43aebcddbad2487939d510e557abe1c9e7eb1";
 const CONTRACT: &str = include_str!("fixtures/workload_independent/contract.hex");
+
+// The historical fixed preimage remains intact. The new envelope changes its
+// domain and removes exactly the old saved qualification field after the
+// registry binding; this oracle uses fixture bytes, never the production codec.
+fn replace_fixed_bytes(bytes: &mut Vec<u8>, old: &[u8], new: &[u8]) {
+    assert_eq!(
+        bytes.windows(old.len()).filter(|part| *part == old).count(),
+        1
+    );
+    let position = bytes
+        .windows(old.len())
+        .position(|part| part == old)
+        .unwrap();
+    bytes.splice(position..position + old.len(), new.iter().copied());
+}
+
+fn local_registry_preimage() -> Vec<u8> {
+    let historical = bytes(include_str!("fixtures/workload_independent/registry.hex"));
+    let mut body = historical
+        .strip_prefix(b"authorization-snapshot-v1\0\0\x01")
+        .unwrap()
+        .to_vec();
+    replace_fixed_bytes(&mut body, &[0x22; 32], &[]);
+    let mut expected = b"memcordon.local-policy/revision1\0\0\x01".to_vec();
+    expected.extend_from_slice(&body);
+    expected
+}
+
+fn local_registry_digest() -> DiagnosticSha256 {
+    DiagnosticSha256::from_bytes(Sha256::digest(local_registry_preimage()).into())
+}
+
+fn local_effective_preimage() -> Vec<u8> {
+    let mut expected = bytes(include_str!("fixtures/workload_independent/effective.hex"));
+    replace_fixed_bytes(
+        &mut expected,
+        &bytes(REGISTRY_HASH),
+        local_registry_digest().bytes(),
+    );
+    expected
+}
+
+fn local_attempt_preimage() -> Vec<u8> {
+    let historical = bytes(include_str!("fixtures/workload_independent/attempt.hex"));
+    let body = historical
+        .strip_prefix(b"attempt-policy-binding-v1\0\0\x01")
+        .unwrap();
+    let registry = bytes(REGISTRY_HASH);
+    assert_eq!(
+        body.windows(registry.len())
+            .filter(|part| *part == registry)
+            .count(),
+        1
+    );
+    let position = body
+        .windows(registry.len())
+        .position(|part| part == registry)
+        .unwrap();
+    let (prefix, suffix) = body.split_at(position + registry.len());
+    let suffix = suffix.strip_prefix(&[0x22; 32]).unwrap();
+    let mut expected = b"memcordon.local-attempt-binding/revision1\0\0\x01".to_vec();
+    expected.extend_from_slice(prefix);
+    expected.extend_from_slice(suffix);
+    replace_fixed_bytes(
+        &mut expected,
+        &bytes(REGISTRY_HASH),
+        local_registry_digest().bytes(),
+    );
+    replace_fixed_bytes(
+        &mut expected,
+        &bytes(EFFECTIVE_HASH),
+        &Sha256::digest(local_effective_preimage()),
+    );
+    expected
+}
 
 fn bytes(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
@@ -68,14 +146,14 @@ fn request() -> WorkloadContractV1 {
     }
 }
 
-fn registry() -> PolicyRegistryV1 {
-    PolicyRegistryV1 {
-        schema_version: ContractVersionOne::default(),
-        profiles: bounded([ProfileDefinitionV1 {
+fn registry() -> RuntimePolicyRegistry {
+    RuntimePolicyRegistry {
+        format: "memcordon.local-policy".into(),
+        revision: 1,
+        profiles: bounded([RuntimeProfileDefinition {
             profile: BaselineProfile::LinuxUnixCreate,
             reference: BaselineProfile::LinuxUnixCreate.reference(),
             enabled: true,
-            qualification_digest: digest(0x22),
         }]),
         grants: bounded([PolicyGrantV1 {
             id: id("grant-a"),
@@ -93,19 +171,20 @@ fn registry() -> PolicyRegistryV1 {
     }
 }
 
-fn attempt() -> AttemptBindingV1 {
-    let snapshot = ProviderAdmissionSnapshotV1 {
+fn attempt() -> RuntimeAttemptBinding {
+    let snapshot = RuntimeAdmissionSnapshot {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
         request: request(),
         request_digest: DiagnosticSha256::from_bytes(bytes(CONTRACT_HASH).try_into().unwrap()),
-        registry_digest: DiagnosticSha256::from_bytes(bytes(REGISTRY_HASH).try_into().unwrap()),
-        qualification_digest: digest(0x22),
+        registry_digest: local_registry_digest(),
         admission_nonce: Nonce128([4; 16]),
         caller_invocation_reference: Nonce128([5; 16]),
         private_invocation_digest: digest(0x66),
         caller: CallerSelector::Linux { uid: 1000 },
         native_profile: BaselineProfile::LinuxUnixCreate,
     };
-    AttemptBindingV1::from_snapshot(
+    RuntimeAttemptBinding::from_snapshot(
         &snapshot,
         PublicProviderBindingV1 {
             generation: BoundedText::new("0.5.3-dev:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -146,6 +225,86 @@ fn fixed_preimages_have_independently_calculated_sha256_answers() {
 }
 
 #[test]
+fn saved_registry_cannot_activate_in_named_operational_domain() {
+    let bytes = include_bytes!("../../../fuzz/corpus/workload-registry/authorized.json");
+    let historical = historical_registry::HistoricalRegistryV1::parse(bytes).unwrap();
+    assert_eq!(
+        String::from(historical.canonical_digest().unwrap()),
+        REGISTRY_HASH
+    );
+    let mut malformed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    malformed["profiles"][0]["reference"]["semantic_digest"] = serde_json::json!("23".repeat(32));
+    assert!(
+        historical_registry::HistoricalRegistryV1::parse(&serde_json::to_vec(&malformed).unwrap())
+            .is_err()
+    );
+    assert!(RuntimePolicyRegistry::parse(bytes).is_err());
+    let mut value = serde_json::to_value(registry()).unwrap();
+    value["profiles"][0]["qualification_digest"] = serde_json::json!("22".repeat(32));
+    assert!(RuntimePolicyRegistry::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    value["profiles"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_digest");
+    value["format"] = serde_json::json!("memcordon.local-private-policy");
+    assert!(RuntimePolicyRegistry::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    value["format"] = serde_json::json!("memcordon.local-policy");
+    value["revision"] = serde_json::json!(2);
+    assert!(RuntimePolicyRegistry::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn frozen_report_binding_keeps_old_digest_and_never_becomes_operational() {
+    use memcordon_core::historical_workload_evidence::{
+        AttemptBindingV1, AttemptPolicyEnforcementV1,
+    };
+    let mut historical = serde_json::to_value(attempt()).unwrap();
+    historical.as_object_mut().unwrap().remove("format");
+    historical.as_object_mut().unwrap().remove("revision");
+    let plan = historical["plan"].as_object_mut().unwrap();
+    plan.remove("format");
+    plan.remove("revision");
+    plan.insert("registry_digest".into(), serde_json::json!(REGISTRY_HASH));
+    plan.insert(
+        "qualification_digest".into(),
+        serde_json::json!("22".repeat(32)),
+    );
+    plan.insert(
+        "effective_policy_digest".into(),
+        serde_json::json!(EFFECTIVE_HASH),
+    );
+    let binding: AttemptBindingV1 = serde_json::from_value(historical.clone()).unwrap();
+    assert_eq!(
+        String::from(binding.canonical_digest().unwrap()),
+        ATTEMPT_HASH
+    );
+    assert!(binding.plan.matches_contract(&request()));
+    assert!(serde_json::from_value::<RuntimeAttemptBinding>(historical.clone()).is_err());
+    let report = serde_json::json!({
+        "state": "authorized",
+        "admission": historical,
+        "before_authorization": {
+            "attempt_binding": ATTEMPT_HASH,
+            "digest": CHECKPOINT_HASH,
+            "controls": "linux-unix-only-socket-syscall-filter-alternate-paths-unknown",
+            "target_gated": true, "caller_verified": true, "resources_verified": true,
+            "guardian_verified": true, "epoch_verified": true, "durable": true
+        },
+        "terminal": { "state": "retired", "attempt_binding": ATTEMPT_HASH,
+            "checkpoint": CHECKPOINT_HASH, "controls_preserved": true,
+            "provider_resources_closed": true }
+    });
+    let frozen: AttemptPolicyEnforcementV1 = serde_json::from_value(report.clone()).unwrap();
+    assert!(frozen.is_consistent());
+    assert!(frozen.terminal_success());
+    assert!(serde_json::from_value::<RuntimePolicyEnforcement>(report.clone()).is_err());
+    let mut changed = report;
+    changed["admission"]["plan"]["qualification_digest"] = serde_json::json!("23".repeat(32));
+    let changed: AttemptPolicyEnforcementV1 = serde_json::from_value(changed).unwrap();
+    assert!(!changed.is_consistent());
+}
+
+#[test]
 fn independent_contract_bytes_and_all_commitment_digests_match() {
     assert_eq!(encode_contract(&request()).unwrap(), bytes(CONTRACT));
     assert_eq!(decode_contract(&bytes(CONTRACT)).unwrap(), request());
@@ -154,17 +313,18 @@ fn independent_contract_bytes_and_all_commitment_digests_match() {
         CONTRACT_HASH
     );
     assert_eq!(
-        String::from(registry().canonical_digest().unwrap()),
-        REGISTRY_HASH
+        registry().canonical_digest().unwrap(),
+        local_registry_digest()
     );
     let attempt = attempt();
     assert_eq!(
-        String::from(attempt.plan.effective_policy_digest.clone()),
-        EFFECTIVE_HASH
+        attempt.plan.effective_policy_digest.bytes(),
+        Sha256::digest(local_effective_preimage()).as_slice()
     );
+    let expected_attempt = Sha256::digest(local_attempt_preimage());
     assert_eq!(
-        String::from(attempt.canonical_digest().unwrap()),
-        ATTEMPT_HASH
+        attempt.canonical_digest().unwrap().bytes(),
+        expected_attempt.as_slice()
     );
     let checkpoint = VerifiedCheckpointV1::observed(
         &attempt,
@@ -177,7 +337,20 @@ fn independent_contract_bytes_and_all_commitment_digests_match() {
         true,
     )
     .unwrap();
-    assert_eq!(String::from(checkpoint.digest().clone()), CHECKPOINT_HASH);
+    let historical = bytes(include_str!("fixtures/workload_independent/checkpoint.hex"));
+    let old_attempt = bytes(ATTEMPT_HASH);
+    let suffix = historical
+        .strip_prefix(b"attempt-policy-enforcement-v1\0\0\x01")
+        .unwrap()
+        .strip_prefix(old_attempt.as_slice())
+        .unwrap();
+    let mut expected_checkpoint = b"attempt-policy-enforcement-v1\0\0\x01".to_vec();
+    expected_checkpoint.extend_from_slice(&expected_attempt);
+    expected_checkpoint.extend_from_slice(suffix);
+    assert_eq!(
+        checkpoint.digest().bytes(),
+        Sha256::digest(expected_checkpoint).as_slice()
+    );
 }
 
 #[test]
@@ -200,8 +373,8 @@ fn set_order_and_json_format_do_not_change_known_answers() {
     grant.approved_plans = bounded(grant.approved_plans.as_slice().iter().rev().cloned());
     registry.grants = bounded([grant]);
     assert_eq!(
-        String::from(registry.canonical_digest().unwrap()),
-        REGISTRY_HASH
+        registry.canonical_digest().unwrap(),
+        local_registry_digest()
     );
 }
 
@@ -246,8 +419,8 @@ fn semantic_changes_invalidate_commitments_and_checkpoints() {
     let mut registry = registry();
     registry.active_attempt_disposition = GrantChangeDisposition::RevokeActive;
     assert_ne!(
-        String::from(registry.canonical_digest().unwrap()),
-        REGISTRY_HASH
+        registry.canonical_digest().unwrap(),
+        local_registry_digest()
     );
     let original = attempt();
     let checkpoint = VerifiedCheckpointV1::observed(
@@ -274,7 +447,7 @@ fn semantic_changes_invalidate_commitments_and_checkpoints() {
         );
         assert!(!checkpoint.matches_binding(&mutation));
         assert!(
-            AttemptPolicyEnforcementV1::retired(mutation, checkpoint.clone(), true, true).is_err()
+            RuntimePolicyEnforcement::retired(mutation, checkpoint.clone(), true, true).is_err()
         );
     }
     for missing in 0..6 {
@@ -296,7 +469,7 @@ fn semantic_changes_invalidate_commitments_and_checkpoints() {
     }
     for (controls, resources) in [(false, false), (false, true), (true, false)] {
         assert!(
-            AttemptPolicyEnforcementV1::retired(
+            RuntimePolicyEnforcement::retired(
                 original.clone(),
                 checkpoint.clone(),
                 controls,
@@ -308,14 +481,13 @@ fn semantic_changes_invalidate_commitments_and_checkpoints() {
 }
 
 fn discovery(
-    registry: &PolicyRegistryV1,
+    registry: &RuntimePolicyRegistry,
     uid: u32,
-) -> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
-    memcordon_core::workload_discovery::WorkloadDiscoveryV1::authenticated(
+) -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String> {
+    memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
         Some((registry, &request().expected_epoch)),
         &CallerSelector::Linux { uid },
         BaselineProfile::LinuxUnixCreate,
-        digest(0x22),
         attempt().plan.provider,
         BoundedText::new("boot-a").unwrap(),
     )
@@ -386,7 +558,7 @@ fn maximal_valid_registry_errors_instead_of_truncating_complete_discovery() {
         }));
         assert!(registry.validate().is_ok());
         let encoded = serde_json::to_vec(&registry).unwrap();
-        assert!(PolicyRegistryV1::parse(&encoded).is_ok());
+        assert!(RuntimePolicyRegistry::parse(&encoded).is_ok());
         let error = discovery(&registry, 1000).unwrap_err();
         assert_eq!(error, "caller discovery exceeds public object capacity");
         // The same registry remains usable for callers with no matching grants.
@@ -411,7 +583,7 @@ fn recomputed_cross_profile_checkpoint_cannot_synthesize_admission() {
     )
     .unwrap();
     assert!(!wrong.matches_binding(&binding));
-    if let Ok(receipt) = AttemptPolicyEnforcementV1::retired(binding, wrong, true, true) {
+    if let Ok(receipt) = RuntimePolicyEnforcement::retired(binding, wrong, true, true) {
         assert!(!receipt.terminal_success());
         assert!(!receipt.is_consistent());
         assert!(receipt.resolution().is_none());
@@ -432,7 +604,7 @@ fn receipt_decoding_rejects_unknown_fields_and_false_checkpoints() {
         true,
     )
     .unwrap();
-    let receipt = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    let receipt = RuntimePolicyEnforcement::retired(binding, checkpoint, true, true).unwrap();
     let original = serde_json::to_value(&receipt).unwrap();
     for field in [
         "target_gated",
@@ -444,22 +616,22 @@ fn receipt_decoding_rejects_unknown_fields_and_false_checkpoints() {
     ] {
         let mut value = original.clone();
         value["before_authorization"][field] = serde_json::Value::Bool(false);
-        assert!(serde_json::from_value::<AttemptPolicyEnforcementV1>(value).is_err());
+        assert!(serde_json::from_value::<RuntimePolicyEnforcement>(value).is_err());
     }
     let mut unknown = original.clone();
     unknown["unrecognized"] = serde_json::Value::Bool(true);
-    assert!(serde_json::from_value::<AttemptPolicyEnforcementV1>(unknown).is_err());
+    assert!(serde_json::from_value::<RuntimePolicyEnforcement>(unknown).is_err());
     for field in ["controls_preserved", "provider_resources_closed"] {
         let mut value = original.clone();
         value["terminal"][field] = serde_json::Value::Bool(false);
-        let decoded: AttemptPolicyEnforcementV1 = serde_json::from_value(value).unwrap();
+        let decoded: RuntimePolicyEnforcement = serde_json::from_value(value).unwrap();
         assert!(!decoded.terminal_success());
         assert!(decoded.resolution().is_none());
     }
     let mut unavailable = original;
     unavailable["terminal"] =
         serde_json::json!({"state":"unavailable", "reason":"terminal-unavailable"});
-    let decoded: AttemptPolicyEnforcementV1 = serde_json::from_value(unavailable).unwrap();
+    let decoded: RuntimePolicyEnforcement = serde_json::from_value(unavailable).unwrap();
     assert!(!decoded.terminal_success());
     assert!(!decoded.matches_terminal_request(Some(&request())));
 }
@@ -541,7 +713,7 @@ fn portable_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         true,
     )
     .unwrap();
-    let receipt = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    let receipt = RuntimePolicyEnforcement::retired(binding, checkpoint, true, true).unwrap();
     assert!(receipt.terminal_success());
     let receipt_json = serde_json::to_vec(&receipt).unwrap();
     let mut seeds = vec![
@@ -656,7 +828,6 @@ fn portable_fuzz_seeds_reach_valid_and_invalid_semantic_branches() {
         &tcp,
         &CallerSelector::Linux { uid: 1000 },
         BaselineProfile::LinuxUnixCreate,
-        &digest(0x22),
     );
     assert!(denied.is_err());
 }

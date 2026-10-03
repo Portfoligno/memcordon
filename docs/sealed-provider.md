@@ -30,9 +30,10 @@ cargo install --locked memcordon
 %USERPROFILE%\.cargo\bin\memcordon-sealed-agent.exe package uninstall
 ```
 
-A verified Linux or Windows native archive contains `memcordon`,
-`memcordon-sealed-agent`, and `runtime-manifest.json` at its root (with `.exe`
-names on Windows). Its flow is equivalent:
+A verified Linux native archive contains `memcordon`,
+`memcordon-sealed-agent`, and `runtime-manifest.json` at its root. The Windows
+archive additionally contains `memcordon-target-desktop-bootstrap.exe` and
+`memcordon-session-broker.exe`. The Linux flow is equivalent:
 
 ```console
 sudo ./memcordon-sealed-agent package install
@@ -47,7 +48,7 @@ The Windows archive equivalents, again from an elevated terminal, are
 upgrade`, and `package uninstall`, plus `memcordon.exe doctor --require sealed`.
 
 `package inspect --json` is credential-free and reports the current agent,
-embedded unit or Windows service metadata digests, protocol, report schemas,
+embedded baseline-unit or Windows service metadata digests, protocol, report schemas,
 source commit, and executable digest. `package install`, `upgrade`, and
 `uninstall` remain explicit root or elevated mutations. CLI/provider version
 mismatch fails before target authorization; installation and upgrade never
@@ -57,7 +58,23 @@ download or compile a component.
 
 Linux mechanism v2 uses the fixed public local socket `/run/memcordon/sealed-agent.sock` and the root-only private broker socket `/run/memcordon/sealed-launcher.sock`. The hardened `memcordon-sealed-agent.service` control plane owns the public socket, runs with `NoNewPrivileges=yes`, authenticates the peer, captures its execution envelope, rejects callers already inside an active attempt, and never executes caller code. The minimally scoped `memcordon-sealed-launcher.service` accepts only the authenticated control service, runs with `NoNewPrivileges=no`, and creates the target from the caller's mount and privilege-transition context. A packaged tmpfiles declaration recreates `/run/memcordon` as mode `0750` `root:memcordon` before either socket activates, so reboot cannot replace the traversable public endpoint parent with a root-only directory.
 
-Windows mechanism v2 uses `MemCordonSealedControl` as restricted-service-SID LocalService on `\\.\pipe\memcordon-sealed-agent-v1` and `MemCordonSealedLauncher` as restricted-service-SID LocalSystem on `\\.\pipe\memcordon-sealed-launcher-v1`. Installation also provisions eight restricted LocalSystem, demand-start guardian slots with no required privileges or automatic restart. Each attempt leases one stopped slot and SCM starts a fresh guardian process over a nonce-derived private pipe. SCM status, pipe peer, image, token, service SID, attempt, and nonce must all agree before the launcher transfers the fixed five-capability guardian manifest. The launcher cannot create or reconfigure services, and capacity exhaustion fails before target creation without fallback. Installation uses native SCM and security-descriptor APIs, applies fixed directory and pipe ACLs, configures exact service privilege lists, starts the launcher before the control service, and persists qualification under `%ProgramData%\MemCordon\sealed`. The client verifies the server image, protocol/build/mechanism identity, and qualification before advertising capability. Caller identity and token or namespace state come from authenticated kernel objects, never authoritative request fields.
+The optional network launcher units are selected with the Linux private-tcp
+feature. Installed files alone do not grant a workload. The authenticated launcher
+independently captures the caller, resolves the current protected local grant and
+epoch, pins the approved ELF and reserves the exact target account before creating
+its private boundary. Discovery reports actual package, service and local profile
+state as advisory data.
+
+Windows uses the restricted LocalService control service and restricted
+LocalSystem launcher, with authenticated local pipes. Installation provisions eight
+demand-start guardian slots without automatic restart or required privileges.
+Each attempt owns one fresh guardian process; SCM status, pipe peer, image, token,
+service SID, attempt and nonce must agree before capability transfer. The launcher
+cannot create or reconfigure services. Fixed directory/pipe ACLs and service
+privilege lists are installed through native SCM APIs. The client independently
+verifies installed component bytes, authenticated server identity and current
+native readiness. Caller identity and native state come from authenticated kernel
+objects; saved self-test output never grants launch permission.
 
 Linux messages use the bounded binary [provider protocol v2](../spec/sealed-provider-protocol-v2.md); Windows messages use the bounded [Windows provider protocol v1](../spec/sealed-windows-provider-v1.md). Unknown versions, kinds, oversized lengths, replayed launch identities, transferred-handle mismatches, and caller-envelope mismatches are rejected before target authorization. Post-launch Windows frames bind the attempt id, nonce, and request digest. The public launch payload remains mechanism-free. Programs and arguments remain separate native values and are never represented as shell commands.
 

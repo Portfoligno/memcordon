@@ -44,6 +44,24 @@ fn payload_corruption_is_rejected() {
 }
 
 #[test]
+fn deleted_private_wire_four_is_rejected_before_payload_allocation() {
+    let frame = Frame {
+        kind: MessageKind::Launch,
+        nonce: [4; 16],
+        attempt_id: [5; 16],
+        payload: vec![1, 2, 3],
+    };
+    let mut wire = Vec::new();
+    write_frame(&mut wire, &frame).unwrap();
+    let deleted_version = 4_u16;
+    wire[..std::mem::size_of::<u16>()].copy_from_slice(&deleted_version.to_be_bytes());
+    assert_eq!(
+        read_frame(&mut wire.as_slice()),
+        Err(ProtocolError::UnsupportedVersion(deleted_version))
+    );
+}
+
+#[test]
 fn retirement_cannot_skip_empty_proof() {
     let mut machine = AttemptStateMachine::default();
     assert!(machine.transition(AttemptState::Retired).is_err());

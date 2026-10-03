@@ -4534,7 +4534,7 @@ fn assert_qualification_create_once_for_write_restricted_token(
     let mut staged = destination.as_os_str().to_os_string();
     staged.push(".new");
     let staged = std::path::PathBuf::from(staged);
-    crate::windows::qualification::publish_qualification_receipt_for_test(&destination, producer)
+    crate::windows::qualification::publish_native_fixture_result_for_test(&destination, producer)
         .unwrap_or_else(|failure| {
             panic!("{scenario} retained-handle publication failed: {failure:?}")
         });
@@ -4549,7 +4549,7 @@ fn assert_qualification_create_once_for_write_restricted_token(
         "{scenario} published a receipt with reopenable DELETE"
     );
 
-    let collision = crate::windows::qualification::publish_qualification_receipt_for_test(
+    let collision = crate::windows::qualification::publish_native_fixture_result_for_test(
         &destination,
         producer,
     )

@@ -90,7 +90,8 @@ pub enum BoundaryMechanismEvidence {
         requested: BoundaryRequirement,
     },
     LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2),
-    WindowsJobObjectV2(WindowsSealedEvidenceV2),
+    LinuxPrivateTcp4(Box<crate::private_runtime::PrivateRuntimeExecution>),
+    WindowsJobObjectV2(Box<WindowsSealedEvidenceV2>),
     MacosEndpointSecurityV1(MacosSealedEvidence),
 }
 
@@ -162,6 +163,10 @@ pub struct WindowsSealedEvidenceV2 {
     pub final_job_handles_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loader_qualification: Option<WindowsLoaderQualificationOutcomeV2>,
+    /// Frontend-only projection recorded after validated authority and ACK.
+    /// This is not a provider-native containment or retirement claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -448,6 +453,25 @@ pub fn boundary_evidence_is_consistent(
                 && native.namespace_init_reaped
                 && native.guardian_reaped
                 && native.cgroup_removed
+        }
+        BoundaryMechanismEvidence::LinuxPrivateTcp4(native) => {
+            native.validate().is_ok()
+                && launch.mechanism == "linux-tcp4-private-v1"
+                && launch.boundary_requested == BoundaryRequirement::Sealed
+                && launch.target_released == native.terminal.authorization_offset_millis.is_some()
+                && if launch.target_released {
+                    launch.boundary_effective == BoundaryClass::Sealed
+                        && launch.containment_verified_before_authorization
+                        && launch.guardian_started_before_authorization
+                        && launch.boundary_assignment_verified
+                        && launch.inherited_resources_restricted
+                } else {
+                    launch.boundary_effective == BoundaryClass::Unavailable
+                }
+                && restart_safety.sealed_boundary_retired
+                    == (native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
+                && (!restart_safety.is_safe()
+                    || native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
         }
         BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
@@ -796,8 +820,12 @@ impl Default for RestartDecisionRecord {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AttemptRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_failure: Option<crate::error::OperationalAttemptFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_execution: Option<crate::private_runtime::PrivateRuntimeExecution>,
     pub runtime: Option<crate::RuntimeEvidenceV1>,
-    pub policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
+    pub policy_enforcement: crate::workload_evidence::RuntimePolicyEnforcement,
     pub number: u64,
     pub kind: AttemptKind,
     pub phase: AttemptPhase,
@@ -898,8 +926,11 @@ impl AttemptHistory {
 }
 
 impl AttemptRecord {
-    fn is_consistent(&self) -> bool {
-        self.policy_enforcement.is_consistent()
+    pub(crate) fn is_consistent(&self) -> bool {
+        self.operational_failure
+            .as_ref()
+            .is_none_or(|failure| failure.validate().is_ok() && self.error.is_some())
+            && self.policy_enforcement.is_consistent()
             && self.target_pid.is_none_or(|pid| pid > 0)
             && self.runtime.as_ref().is_none_or(|runtime| {
                 runtime.is_consistent()
@@ -975,10 +1006,13 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wire {
+            operational_failure: Option<crate::error::OperationalAttemptFailure>,
+            private_execution: Option<crate::private_runtime::PrivateRuntimeExecution>,
             number: u64,
             runtime: Option<crate::RuntimeEvidenceV1>,
-            policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
+            policy_enforcement: crate::workload_evidence::RuntimePolicyEnforcement,
             kind: AttemptKind,
             phase: AttemptPhase,
             target_pid: Option<u32>,
@@ -995,6 +1029,8 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         }
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
+            operational_failure: wire.operational_failure,
+            private_execution: wire.private_execution,
             runtime: wire.runtime,
             number: wire.number,
             policy_enforcement: wire.policy_enforcement,

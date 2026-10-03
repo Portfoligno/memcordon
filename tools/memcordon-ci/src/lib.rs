@@ -1,27 +1,22 @@
-#![forbid(unsafe_code)]
+// Unsafe Windows calls are confined to file identity and owned-guardian adapters.
+// All other CI orchestration remains safe Rust.
+#![deny(unsafe_code)]
 
-pub mod build_context;
+pub mod bootstrap_profile;
+pub mod cache;
 pub mod capability;
-pub mod certification_context;
 pub mod command;
 pub mod config;
 pub mod fuzz_targets;
-pub mod inventory_benchmark;
-pub mod inventory_pipeline;
-pub mod inventory_profile;
-pub mod inventory_progress;
-pub mod inventory_reader;
-pub mod inventory_workers;
 pub mod line_evidence;
-pub mod managed_workflow;
 pub mod miri_targets;
-pub mod native_file_digest;
-pub mod native_profile;
+pub mod native_channel;
+pub mod native_results;
 pub mod native_test_plan;
 pub mod policy;
-pub mod producer_metadata;
-pub mod release_archive;
-pub mod release_evidence;
+pub mod preparation;
+pub mod public_reads;
+pub mod release;
 pub mod reparse_diagnostic;
 pub mod runtime_manifest;
 pub mod scenario_diagnostic;
@@ -29,11 +24,16 @@ pub mod sealed_identity;
 pub mod sealed_selector;
 pub mod standard_contract;
 pub mod standard_runner;
+pub mod stress;
+pub mod target_shard;
+pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
+pub mod windows_execution_acceptance;
+pub mod windows_installed_cases;
+pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
-pub mod windows_qualification_artifacts;
-pub mod workload_qualification;
+pub mod workflow_output;
 
 use thiserror::Error;
 
@@ -70,3 +70,8 @@ pub enum CiError {
 }
 
 pub type Result<T> = std::result::Result<T, CiError>;
+pub mod arm32_abi_helper;
+pub mod external_consumer;
+pub mod macos_performance;
+pub mod native_acceptance_catalogue;
+pub mod performance_plan;

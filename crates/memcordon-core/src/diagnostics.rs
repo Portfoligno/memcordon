@@ -146,7 +146,19 @@ impl WindowsResponseFrame for crate::WindowsProviderResponseV1 {
     }
 }
 
+impl WindowsResponseFrame for crate::WindowsProviderResponseV3 {
+    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
+        windows_response_frame_limit(prefix)
+    }
+}
+
 impl WindowsResponseFrame for crate::WindowsLauncherResponseV1 {
+    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
+        windows_launcher_response_frame_limit(prefix)
+    }
+}
+
+impl WindowsResponseFrame for crate::WindowsLauncherResponseV3 {
     fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
         windows_launcher_response_frame_limit(prefix)
     }
@@ -160,12 +172,14 @@ fn response_kind_frame_limit(remainder: &[u8], public: bool) -> Result<usize, &'
     let kind = &remainder[..end];
     if !kind
         .iter()
-        .all(|byte| byte.is_ascii_lowercase() || *byte == b'-')
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
     {
         return Err("response discriminator is not canonical");
     }
     Ok(match kind {
-        b"attempt-retained" | b"replay-pending" => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
+        b"attempt-retained" | b"attempt-retained-v2" | b"replay-pending" | b"replay-pending-v2" => {
+            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+        }
         b"qualification-rejected" if public => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
         b"workload-plan" | b"workload-discovery" if public => {
             crate::workload_limits::PUBLIC_OBJECT_BYTES

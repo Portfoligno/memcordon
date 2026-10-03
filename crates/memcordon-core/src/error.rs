@@ -9,6 +9,141 @@ use crate::{
 
 pub const PROVIDER_REJECTION_MAX_DETAIL_BYTES: usize = 8 * 1024;
 
+/// Descriptive observations copied from an actual failed operational attempt.
+/// Parsing this value cannot authorize launch, retry or native retirement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalAttemptFailure {
+    pub format: String,
+    pub revision: u32,
+    pub private_rejection: Option<crate::private_runtime::PrivateRuntimeRejection>,
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    pub provider_association: Option<crate::result_v1::ProviderAttemptAssociationV1>,
+    pub windows_rejection: Option<crate::WindowsProviderRejectionV2>,
+    pub windows_terminal_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
+}
+
+impl OperationalAttemptFailure {
+    pub fn from_error(error: &Error) -> Option<Self> {
+        if error.private_rejection.is_none()
+            && error.provider_failure.is_none()
+            && error.provider_association.is_none()
+            && error.windows_provider_rejection_v2.is_none()
+            && error.windows_terminal_delivery.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            format: "memcordon.operational-attempt-failure".into(),
+            revision: 1,
+            private_rejection: error.private_rejection.as_deref().cloned(),
+            provider_failure: error.provider_failure.clone(),
+            provider_association: error.provider_association.as_deref().cloned(),
+            windows_rejection: error.windows_provider_rejection_v2.as_deref().cloned(),
+            windows_terminal_delivery: error.windows_terminal_delivery.clone(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.format != "memcordon.operational-attempt-failure" || self.revision != 1 {
+            return Err("operational failure namespace differs".into());
+        }
+        if self.private_rejection.is_none()
+            && self.provider_failure.is_none()
+            && self.provider_association.is_none()
+            && self.windows_rejection.is_none()
+            && self.windows_terminal_delivery.is_none()
+        {
+            return Err("operational failure has no actual observations".into());
+        }
+        if let Some(rejection) = &self.private_rejection {
+            rejection.validate()?;
+            if self.provider_failure.is_some()
+                || self.provider_association.is_some()
+                || self.windows_rejection.is_some()
+                || self.windows_terminal_delivery.is_some()
+            {
+                return Err("private rejection contains foreign Windows observations".into());
+            }
+        }
+        if self
+            .windows_rejection
+            .as_ref()
+            .is_some_and(|rejection| !rejection.is_consistent())
+            || self
+                .windows_terminal_delivery
+                .as_ref()
+                .is_some_and(|delivery| !delivery.is_consistent())
+            || self.provider_failure.as_ref().is_some_and(|failure| {
+                !failure.is_consistent() || failure.projection_sha256 != failure.canonical_digest()
+            })
+            || self
+                .provider_association
+                .as_ref()
+                .is_some_and(|association| !association.provider.is_consistent())
+        {
+            return Err("operational failure observations are inconsistent".into());
+        }
+        if let (Some(failure), Some(association)) =
+            (&self.provider_failure, &self.provider_association)
+        {
+            if failure.provider_binding != association.provider
+                || failure.attempt_id != association.attempt_id
+                || failure.request_sha256 != association.request_sha256
+            {
+                return Err(
+                    "failure diagnostic differs from independently retained association".into(),
+                );
+            }
+        }
+        if let Some(rejection) = &self.windows_rejection {
+            if rejection.provider_failure != self.provider_failure {
+                return Err("Windows rejection diagnostic differs from retained failure".into());
+            }
+            if let (Some(receipt), Some(association)) =
+                (rejection.terminal_receipt(), &self.provider_association)
+            {
+                if receipt.attempt_id != String::from(association.attempt_id.clone())
+                    || receipt.request_sha256 != String::from(association.request_sha256.clone())
+                    || receipt.retirement_proof.provider_generation
+                        != association.provider.generation.as_str()
+                {
+                    return Err(
+                        "Windows receipt differs from independently retained association".into(),
+                    );
+                }
+            }
+        }
+        if let (Some(delivery), Some(association)) =
+            (&self.windows_terminal_delivery, &self.provider_association)
+        {
+            if delivery.attempt_id != String::from(association.attempt_id.clone())
+                || delivery.request_sha256 != String::from(association.request_sha256.clone())
+            {
+                return Err(
+                    "Windows delivery differs from independently retained association".into(),
+                );
+            }
+        }
+        if let (Some(delivery), Some(receipt)) = (
+            &self.windows_terminal_delivery,
+            self.windows_rejection
+                .as_ref()
+                .and_then(|rejection| rejection.terminal_receipt()),
+        ) {
+            if delivery.attempt_id != receipt.attempt_id
+                || delivery.request_sha256 != receipt.request_sha256
+                || delivery.nonce != receipt.nonce
+            {
+                return Err("Windows delivery differs from retained receipt".into());
+            }
+        }
+        crate::bounded_json_bytes(self, crate::result_v1::RESULT_MAX_BYTES, false)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Observations from native helper startup, separate from the primary error and
 /// from the authority required to authorize or retire a workload. This optional
 /// V1 extension appears only on failed envelopes; strict older consumers may
@@ -407,9 +542,11 @@ pub enum ErrorCategory {
 #[derive(Clone, Debug, Error)]
 #[error("{message} ({code})")]
 pub struct Error {
+    pub private_rejection: Option<Box<crate::private_runtime::PrivateRuntimeRejection>>,
+    pub provider_association: Option<Box<crate::result_v1::ProviderAttemptAssociationV1>>,
     pub runtime: Option<crate::RuntimeEvidenceV1>,
     pub native_startup: Option<NativeStartupDiagnosticV1>,
-    pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
+    pub policy_enforcement: Option<crate::workload_evidence::RuntimePolicyEnforcement>,
     pub category: ErrorCategory,
     pub code: &'static str,
     pub message: String,
@@ -426,13 +563,19 @@ pub struct Error {
     pub restart_safety: Option<RestartSafetyProof>,
     pub initial_spawn_failure: Option<InitialSpawnFailure>,
     pub boundary_setup_failure: Option<BoundarySetupFailure>,
-    pub provider_rejection: Option<ProviderRejectionEvidence>,
+    /// Indirect because this error is propagated through nested native supervisor frames.
+    pub provider_rejection: Option<Box<ProviderRejectionEvidence>>,
+    /// Indirect for the same bounded-stack reason; report projection remains by value.
+    pub windows_provider_rejection_v2: Option<Box<crate::WindowsProviderRejectionV2>>,
+    pub windows_terminal_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
 }
 
 impl Error {
     pub fn new(category: ErrorCategory, code: &'static str, message: impl Into<String>) -> Self {
         Self {
+            private_rejection: None,
+            provider_association: None,
             category,
             code,
             message: message.into(),
@@ -450,11 +593,21 @@ impl Error {
             initial_spawn_failure: None,
             boundary_setup_failure: None,
             provider_rejection: None,
+            windows_provider_rejection_v2: None,
+            windows_terminal_delivery: None,
             provider_failure: None,
             policy_enforcement: None,
             native_startup: None,
             runtime: None,
         }
+    }
+
+    pub fn provider_rejection(&self) -> Option<&ProviderRejectionEvidence> {
+        self.provider_rejection.as_deref()
+    }
+
+    pub fn windows_provider_rejection_v2(&self) -> Option<&crate::WindowsProviderRejectionV2> {
+        self.windows_provider_rejection_v2.as_deref()
     }
 
     pub fn with_os_error(mut self, error: &std::io::Error) -> Self {
@@ -499,7 +652,7 @@ impl Error {
             .filter(|_| rejection.is_consistent())
         {
             self.policy_enforcement = Some(
-                crate::workload_evidence::AttemptPolicyEnforcementV1::NotAuthorized {
+                crate::workload_evidence::RuntimePolicyEnforcement::NotAuthorized {
                     request: admission.request.clone(),
                     rejection: admission.rejection.clone(),
                 },
@@ -508,7 +661,30 @@ impl Error {
         self.os_code = rejection.os_code;
         self.target_released = rejection.target_released;
         self.restart_safety = Some(rejection.restart_safety.clone());
-        self.provider_rejection = Some(rejection);
+        self.provider_rejection = Some(Box::new(rejection));
+        self
+    }
+
+    pub fn with_windows_provider_rejection_v2(
+        mut self,
+        rejection: crate::WindowsProviderRejectionV2,
+    ) -> Self {
+        if let Some(admission) = rejection
+            .workload_admission
+            .as_ref()
+            .filter(|_| rejection.is_consistent())
+        {
+            self.policy_enforcement = Some(
+                crate::workload_evidence::RuntimePolicyEnforcement::NotAuthorized {
+                    request: admission.request.clone(),
+                    rejection: admission.rejection.clone(),
+                },
+            );
+        }
+        self.os_code = rejection.os_code;
+        self.target_released = rejection.target_released;
+        self.restart_safety = Some(rejection.restart_safety.clone());
+        self.windows_provider_rejection_v2 = Some(Box::new(rejection));
         self
     }
 }

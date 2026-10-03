@@ -3,8 +3,7 @@ use memcordon_core::{
     RestartCondition, RestartSafetyProof,
 };
 use memcordon_platform::{
-    BackendInfo, BoundaryQualification, BoundarySupport, ProbeReport, SealedAvailability,
-    capabilities,
+    BackendInfo, BoundaryReadiness, BoundarySupport, ProbeReport, SealedAvailability, capabilities,
 };
 use std::time::Duration;
 
@@ -263,62 +262,30 @@ fn post_attempt_backend_drift_retains_typed_runtime_evidence() {
 }
 
 #[cfg(all(windows, feature = "test-support"))]
-fn windows_qualification() -> memcordon_core::WindowsQualificationReceiptV1 {
-    memcordon_core::WindowsQualificationReceiptV1 {
-        schema_version: memcordon_core::WINDOWS_QUALIFICATION_SCHEMA_VERSION,
+fn windows_probe() -> memcordon_core::WindowsProviderProbeV1 {
+    memcordon_core::WindowsProviderProbeV1 {
+        format: "memcordon.windows-provider-probe".into(),
+        revision: 1,
         provider_identity: format!(
             "memcordon-sealed-agent-windows-v1:{}",
             env!("CARGO_PKG_VERSION")
         ),
-        control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
-        launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
-        guardian_pool_identity: "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
-            .to_owned(),
-        package_verified: true,
-        public_pipe_security_verified: true,
-        private_pipe_security_verified: true,
-        control_service_privileges_verified: true,
-        launcher_service_privileges_verified: true,
-        guardian_slot_tokens_verified: true,
-        guardian_slot_loader_verified: true,
-        guardian_capacity_verified: true,
-        caller_token_authentication_verified: true,
-        restricted_caller_token_verified: true,
-        primary_token_duplication_verified: true,
-        create_process_as_user_verified: true,
-        job_list_supported: true,
-        handle_list_supported: true,
-        nested_host_job_supported: true,
-        kill_on_close_verified: true,
-        breakaway_denied: true,
-        completion_port_verified: true,
-        guardian_verified: true,
-        frontend_loss_cleanup_verified: true,
-        alternate_token_child_contained: true,
-        nested_child_job_contained: true,
-        recursive_provider_request_denied: true,
-        exact_handle_inheritance_verified: true,
-        active_processes_zero_verified: true,
-        relays_retired_verified: true,
-        recovery_complete: true,
-        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
-            memcordon_core::WindowsLoaderReadyEvidenceV1 {
-                schema_version: 1,
-                launch_plan_sha256:
-                    "b0d52f6c6974566b7077fc0ff7c14f68aa640e5dff36d4cef3d916a616047995".to_owned(),
-                launch_plan_json: None,
-                elapsed_millis: 1,
-            },
-        ),
-        qualified: true,
+        provider_binding: memcordon_core::PublicProviderBindingV1 {
+            generation: memcordon_core::BoundedText::new("test-generation").unwrap(),
+            source_commit: memcordon_core::BoundedText::new(&"ab".repeat(20)).unwrap(),
+            runtime_manifest_sha256: memcordon_core::DiagnosticSha256::from_bytes([7; 32]),
+        },
+        launcher_authenticated: true,
+        recovery_clear: true,
+        attempts_empty: true,
     }
 }
 
 #[cfg(all(windows, feature = "test-support"))]
 #[test]
 fn windows_sealed_preflight_and_runtime_capabilities_are_canonical_and_strict() {
-    let qualification = windows_qualification();
-    assert!(qualification.is_consistent());
+    let qualification = windows_probe();
+    assert!(qualification.validate().is_ok());
 
     let selected = memcordon_platform::test_support::windows_preflight_backend_capabilities(
         qualification.clone(),
@@ -332,19 +299,7 @@ fn windows_sealed_preflight_and_runtime_capabilities_are_canonical_and_strict() 
         Metric::Native,
     ));
 
-    let boundary_qualification = selected
-        .boundary_qualification
-        .as_ref()
-        .expect("qualified sealed capability must retain qualification data");
-    assert_eq!(
-        boundary_qualification.provider_identity,
-        format!(
-            "memcordon-sealed-agent-windows-v1:{}",
-            env!("CARGO_PKG_VERSION")
-        )
-    );
-    assert!(!boundary_qualification.receipt_digest.is_empty());
-    assert_eq!(boundary_qualification.mechanism, "windows-job-object-v2");
+    assert!(selected.boundary_qualification.is_none());
     assert_eq!(selected.boundary.mechanism, "windows-job-object-v2");
     assert_eq!(
         selected.startup_containment,
@@ -390,20 +345,7 @@ fn windows_sealed_preflight_and_runtime_capabilities_are_canonical_and_strict() 
         )
     );
 
-    let mut qualification_drift = observed;
-    qualification_drift
-        .boundary_qualification
-        .as_mut()
-        .expect("observed sealed capability must retain qualification data")
-        .receipt_digest
-        .push('0');
-    assert!(
-        !memcordon_platform::test_support::backend_selection_matches(
-            &selected,
-            &qualification_drift,
-            Metric::Native,
-        )
-    );
+    assert!(observed.boundary_qualification.is_none());
 }
 
 #[cfg(feature = "test-support")]
@@ -550,9 +492,8 @@ fn boundary_selection_does_not_conflate_default_and_sealed_backends() {
                     workload_empty_proof: true,
                     ..BoundaryCapability::default()
                 },
-                qualification: BoundaryQualification {
+                observation: BoundaryReadiness {
                     provider_identity: "fixture-provider".to_owned(),
-                    receipt_digest: "ab".repeat(32),
                     mechanism: "fixture-sealed".to_owned(),
                 },
             },

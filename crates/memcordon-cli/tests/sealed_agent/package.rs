@@ -123,6 +123,67 @@ fn compiled_package_metadata_uses_split_control_and_launcher_identities() {
 }
 
 #[test]
+fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
+    let network_service =
+        include_str!("../../../../packaging/linux/memcordon-sealed-network-launcher.service");
+    let network_socket =
+        include_str!("../../../../packaging/linux/memcordon-sealed-network-launcher.socket");
+    let templates = crate::package::network_launcher_templates_for_test();
+    assert_eq!(templates, (network_service, network_socket));
+    crate::package::verify_compiled_metadata_for_test().unwrap();
+
+    assert!(semantic_lines(network_service).contains(&"RefuseManualStart=yes"));
+    assert!(semantic_lines(network_service).contains(&"NoNewPrivileges=no"));
+    assert!(semantic_lines(network_service).contains(&"AmbientCapabilities="));
+    assert!(semantic_lines(network_service).contains(
+        &"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN"
+    ));
+    assert!(
+        semantic_lines(network_service)
+            .contains(&"RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK")
+    );
+    assert!(!network_service.contains("CAP_NET_RAW"));
+    assert!(
+        semantic_lines(network_socket)
+            .contains(&"ListenStream=/run/memcordon/sealed-network-launcher.sock")
+    );
+    assert!(semantic_lines(network_socket).contains(&"SocketMode=0600"));
+    assert!(semantic_lines(network_socket).contains(&"SocketUser=root"));
+    assert!(semantic_lines(network_socket).contains(&"SocketGroup=root"));
+
+    use memcordon_core::runtime_manifest::{
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest, SealedRuntime,
+    };
+    let component = |id: &str, role| RuntimeComponentRecord {
+        id: id.into(),
+        path: if role == RuntimeComponentRole::PublicCli {
+            "memcordon"
+        } else {
+            "memcordon-sealed-agent"
+        }
+        .into(),
+        role,
+        size: 4,
+        mode: 0o755,
+        sha256: memcordon_core::workload_codec::hash_bytes(b"test").into(),
+    };
+    let manifest = RuntimeManifest::linux(
+        env!("CARGO_PKG_VERSION").into(),
+        "ab".repeat(20),
+        "x86_64-unknown-linux-gnu".into(),
+        vec![
+            component("public-cli", RuntimeComponentRole::PublicCli),
+            component("sealed-agent", RuntimeComponentRole::SealedAgent),
+        ],
+    )
+    .unwrap();
+    let SealedRuntime::Included { profiles, .. } = manifest.sealed else {
+        panic!("Linux baseline runtime is no longer included");
+    };
+    assert_eq!(profiles, ["linux-unix-create-v1"]);
+}
+
+#[test]
 fn package_metadata_semantics_are_identical_with_crlf_checkout() {
     let unit = "[Unit]\nDescription=provider\n\n[Service]\nUser=root\n";
     let crlf = unit.replace('\n', "\r\n");

@@ -1493,6 +1493,45 @@ pub(super) enum TargetDesktopBootstrapMessageV1 {
 }
 
 impl TargetDesktopLease {
+    pub(super) fn owner_binding(&self) -> (WindowsProcessIdentityV1, String, u64, u64) {
+        (
+            self.bootstrap_identity.clone(),
+            self.holder_binding.binding_sha256.clone(),
+            self.bootstrap_job.handle() as usize as u64,
+            self.bootstrap_process.raw() as usize as u64,
+        )
+    }
+
+    pub(super) fn close_checked(&mut self) -> Result<(), String> {
+        // The bootstrap is a separate Job/owner. Its signaled process handle
+        // must be observed before either native authority handle is closed.
+        // SAFETY: this lease owns the live bootstrap process handle.
+        let wait = unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) };
+        if wait == WAIT_TIMEOUT {
+            self.bootstrap_job
+                .terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)?;
+            // SAFETY: same owned process handle remains live.
+            if unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) } != WAIT_OBJECT_0
+            {
+                return Err("target desktop bootstrap did not retire".to_owned());
+            }
+        } else if wait != WAIT_OBJECT_0 {
+            return Err("target desktop bootstrap wait failed".to_owned());
+        }
+        let connection_result = self
+            .connection_lease
+            .as_mut()
+            .map_or(Ok(()), OwnedHandle::close_checked);
+        if connection_result.is_ok() {
+            self.connection_lease = None;
+        }
+        let job_result = self.bootstrap_job.close_checked();
+        let process_result = self.bootstrap_process.close_checked();
+        connection_result?;
+        job_result?;
+        process_result
+    }
+
     pub(super) fn loader_qualification(
         &self,
     ) -> Option<memcordon_core::WindowsLoaderQualificationOutcomeV2> {
@@ -1829,7 +1868,9 @@ impl TargetDesktopLease {
 impl Drop for TargetDesktopLease {
     fn drop(&mut self) {
         drop(self.connection_lease.take());
-        if unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) } == WAIT_TIMEOUT {
+        if !self.bootstrap_process.raw().is_null()
+            && unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) } == WAIT_TIMEOUT
+        {
             let _ = self
                 .bootstrap_job
                 .terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS);

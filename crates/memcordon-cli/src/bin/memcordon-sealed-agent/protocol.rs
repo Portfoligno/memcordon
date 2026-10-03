@@ -19,6 +19,10 @@ pub enum MessageKind {
     BrokerAuthenticate = 7,
     WorkloadPlan = 8,
     WorkloadDiscovery = 9,
+    PrivateLaunch = 10,
+    PrivateBrokerLaunch = 11,
+    PrivatePlan = 12,
+    PrivateDiscovery = 13,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -28,6 +32,10 @@ pub enum MessageKind {
     BrokerAuthenticated = 107,
     WorkloadPlanReceipt = 108,
     WorkloadDiscoveryReceipt = 109,
+    PrivateTerminal = 110,
+    PrivateRejected = 113,
+    PrivatePlanReceipt = 111,
+    PrivateDiscoveryReceipt = 112,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -44,6 +52,10 @@ impl TryFrom<u16> for MessageKind {
             7 => Ok(Self::BrokerAuthenticate),
             8 => Ok(Self::WorkloadPlan),
             9 => Ok(Self::WorkloadDiscovery),
+            10 => Ok(Self::PrivateLaunch),
+            11 => Ok(Self::PrivateBrokerLaunch),
+            12 => Ok(Self::PrivatePlan),
+            13 => Ok(Self::PrivateDiscovery),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -53,6 +65,10 @@ impl TryFrom<u16> for MessageKind {
             107 => Ok(Self::BrokerAuthenticated),
             108 => Ok(Self::WorkloadPlanReceipt),
             109 => Ok(Self::WorkloadDiscoveryReceipt),
+            110 => Ok(Self::PrivateTerminal),
+            113 => Ok(Self::PrivateRejected),
+            111 => Ok(Self::PrivatePlanReceipt),
+            112 => Ok(Self::PrivateDiscoveryReceipt),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }
@@ -94,12 +110,19 @@ impl std::fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 pub fn read_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
+    read_frame_version(reader, PROTOCOL_VERSION)
+}
+
+fn read_frame_version(
+    reader: &mut impl Read,
+    expected_version: u16,
+) -> Result<Frame, ProtocolError> {
     let mut header = [0_u8; HEADER_LENGTH];
     reader
         .read_exact(&mut header)
         .map_err(|error| ProtocolError::Io(error.kind()))?;
     let version = u16::from_be_bytes([header[0], header[1]]);
-    if version != PROTOCOL_VERSION {
+    if version != expected_version {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
     let kind = MessageKind::try_from(u16::from_be_bytes([header[2], header[3]]))?;
@@ -131,6 +154,14 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), ProtocolError> {
+    write_frame_version(writer, frame, PROTOCOL_VERSION)
+}
+
+fn write_frame_version(
+    writer: &mut impl Write,
+    frame: &Frame,
+    version: u16,
+) -> Result<(), ProtocolError> {
     let total = HEADER_LENGTH
         .checked_add(frame.payload.len())
         .ok_or(ProtocolError::FrameTooLarge(usize::MAX))?;
@@ -140,7 +171,7 @@ pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), Protoco
     let total = u32::try_from(total).map_err(|_| ProtocolError::FrameTooLarge(total))?;
     let payload_digest = Sha256::digest(&frame.payload);
     writer
-        .write_all(&PROTOCOL_VERSION.to_be_bytes())
+        .write_all(&version.to_be_bytes())
         .and_then(|()| writer.write_all(&(frame.kind as u16).to_be_bytes()))
         .and_then(|()| writer.write_all(&total.to_be_bytes()))
         .and_then(|()| writer.write_all(&frame.nonce))

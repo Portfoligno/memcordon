@@ -1,6 +1,30 @@
 use memcordon_ci::miri_targets::{MiriTarget, plan};
 use serde_json::{Value, json};
 
+#[test]
+fn complete_harness_shards_are_disjoint_and_preserve_authoritative_plan() {
+    use memcordon_ci::miri_targets::{MiriShard, plan_shard};
+    let data = metadata(
+        json!({}),
+        vec![
+            target("core", "lib", true, true, &[]),
+            target("integration", "test", true, false, &[]),
+            target("example", "example", true, false, &[]),
+            target("bench", "bench", true, false, &[]),
+            target("binary", "bin", true, false, &[]),
+        ],
+    );
+    let first = plan_shard(&data, "core", MiriShard::First).unwrap();
+    let second = plan_shard(&data, "core", MiriShard::Second).unwrap();
+    assert!(first.iter().all(|target| !second.contains(target)));
+    let mut joined = first;
+    joined.extend(second);
+    joined.sort();
+    assert_eq!(joined, plan(&data, "core").unwrap());
+    let single = metadata(json!({}), vec![target("core", "lib", true, false, &[])]);
+    assert!(plan_shard(&single, "core", MiriShard::Second).is_err());
+}
+
 fn target(name: &str, kind: &str, test: bool, doctest: bool, required: &[&str]) -> Value {
     json!({"name":name,"kind":[kind],"test":test,"doctest":doctest,"required-features":required})
 }

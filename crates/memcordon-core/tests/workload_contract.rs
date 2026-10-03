@@ -29,14 +29,13 @@ fn request() -> WorkloadContractV1 {
         },
     }
 }
-fn registry() -> PolicyRegistryV1 {
+fn registry() -> RuntimePolicyRegistry {
     let mut profiles = BoundedVec::default();
     profiles
-        .try_push(ProfileDefinitionV1 {
+        .try_push(RuntimeProfileDefinition {
             profile: BaselineProfile::LinuxUnixCreate,
             reference: BaselineProfile::LinuxUnixCreate.reference(),
             enabled: true,
-            qualification_digest: digest(),
         })
         .unwrap();
     let mut callers = BoundedVec::default();
@@ -57,8 +56,9 @@ fn registry() -> PolicyRegistryV1 {
             approved_plans,
         })
         .unwrap();
-    PolicyRegistryV1 {
-        schema_version: ContractVersionOne::default(),
+    RuntimePolicyRegistry {
+        format: "memcordon.local-policy".into(),
+        revision: 1,
         profiles,
         grants,
         active_attempt_disposition: GrantChangeDisposition::DrainExisting,
@@ -71,18 +71,18 @@ fn admit(value: &WorkloadContractV1, caller: u32) -> Result<(), AdmissionRejecti
         value,
         &CallerSelector::Linux { uid: caller },
         BaselineProfile::LinuxUnixCreate,
-        &digest(),
     )
     .map(|_| ())
 }
 
-fn frozen() -> ProviderAdmissionSnapshotV1 {
+fn frozen() -> RuntimeAdmissionSnapshot {
     let request = request();
-    ProviderAdmissionSnapshotV1 {
+    RuntimeAdmissionSnapshot {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
         request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
         request,
         registry_digest: registry().canonical_digest().unwrap(),
-        qualification_digest: digest(),
         admission_nonce: Nonce128([4; 16]),
         caller_invocation_reference: Nonce128([5; 16]),
         private_invocation_digest: digest(),
@@ -91,9 +91,9 @@ fn frozen() -> ProviderAdmissionSnapshotV1 {
     }
 }
 
-fn attempt_binding() -> AttemptBindingV1 {
+fn attempt_binding() -> RuntimeAttemptBinding {
     let source = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    AttemptBindingV1::from_snapshot(
+    RuntimeAttemptBinding::from_snapshot(
         &frozen(),
         memcordon_core::PublicProviderBindingV1 {
             generation: memcordon_core::BoundedText::new(&format!("0.5.3-dev:{source}")).unwrap(),
@@ -108,12 +108,29 @@ fn attempt_binding() -> AttemptBindingV1 {
 }
 
 #[test]
+fn foreign_attempt_envelopes_do_not_associate_with_a_local_snapshot() {
+    let binding = attempt_binding();
+    assert!(binding.matches_snapshot(&frozen()));
+    let mut foreign = binding.clone();
+    foreign.format = "attempt-policy-binding-v1".into();
+    assert!(!foreign.matches_snapshot(&frozen()));
+    assert!(foreign.canonical_digest().is_err());
+    let mut foreign = binding.clone();
+    foreign.revision = 2;
+    assert!(!foreign.matches_snapshot(&frozen()));
+    assert!(foreign.canonical_digest().is_err());
+    let mut foreign = binding;
+    foreign.plan.format = "legacy-plan".into();
+    assert!(!foreign.matches_snapshot(&frozen()));
+}
+
+#[test]
 fn planned_response_rejects_effective_policy_and_pending_check_substitution() {
     let mut pending = BoundedVec::default();
     for check in PENDING_PRELAUNCH_CHECKS {
         pending.try_push(check).unwrap();
     }
-    let planned = WorkloadResolutionReportV1::Planned {
+    let planned = RuntimeWorkloadResolution::Planned {
         binding: attempt_binding().plan,
         effective: EffectiveWorkloadPolicyV1 {
             profile: BaselineProfile::LinuxUnixCreate,
@@ -131,7 +148,7 @@ fn planned_response_rejects_effective_policy_and_pending_check_substitution() {
         "pending",
     ] {
         let mut changed = planned.clone();
-        let WorkloadResolutionReportV1::Planned {
+        let RuntimeWorkloadResolution::Planned {
             binding,
             effective,
             pending,
@@ -172,8 +189,7 @@ fn terminal_requires_exact_attempt_restart_boot_and_frozen_caller_invocation_ref
     )
     .unwrap();
     let terminal =
-        AttemptPolicyEnforcementV1::retired(binding.clone(), checkpoint.clone(), true, true)
-            .unwrap();
+        RuntimePolicyEnforcement::retired(binding.clone(), checkpoint.clone(), true, true).unwrap();
     assert!(terminal.valid_native_terminal(
         Some(&request()),
         BaselineProfile::LinuxUnixCreate,
@@ -206,13 +222,13 @@ fn terminal_requires_exact_attempt_restart_boot_and_frozen_caller_invocation_ref
     changed.caller_invocation_reference = Nonce128([6; 16]);
     assert!(!changed.matches_snapshot(&frozen()));
     assert!(!checkpoint.matches_binding(&changed));
-    assert!(AttemptPolicyEnforcementV1::retired(changed, checkpoint, true, true).is_err());
+    assert!(RuntimePolicyEnforcement::retired(changed, checkpoint, true, true).is_err());
     let serialized = serde_json::to_value(&terminal).unwrap();
     assert!(!serialized.to_string().contains("private_invocation_digest"));
     assert!(!serialized.to_string().contains("1000"));
     let mut changed = serialized;
     changed["before_authorization"]["target_gated"] = false.into();
-    assert!(serde_json::from_value::<AttemptPolicyEnforcementV1>(changed).is_err());
+    assert!(serde_json::from_value::<RuntimePolicyEnforcement>(changed).is_err());
 }
 
 #[test]
@@ -287,6 +303,84 @@ fn successful_tcp_rejects_but_qualified_denial_is_admitted() {
         rejection.conflicts.as_slice()[0].requirement,
         Some(id("tcp"))
     );
+}
+
+#[test]
+fn exact_tcp_peer_scope_rejects_nonloopback_and_mapped_addresses() {
+    let cases = [
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [127, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [192, 0, 2, 1],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::AttemptPrivateStack,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::AttemptPrivateStack,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [192, 0, 2, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+    ];
+    for (scope, family, endpoint, valid) in cases {
+        let mut value = request();
+        let mut operations = BoundedVec::default();
+        operations.try_push(TcpOperation::Create).unwrap();
+        operations.try_push(TcpOperation::Connect).unwrap();
+        value
+            .requirements
+            .try_push(RequirementV1::Tcp {
+                id: id("tcp"),
+                family,
+                operations: TcpOperations::new(operations).unwrap(),
+                scope,
+                local_ports: LocalPortRequirement::KernelAssigned,
+                peer: TcpPeerRequirement::ExactAddress { endpoint },
+            })
+            .unwrap();
+        assert_eq!(value.validate().is_ok(), valid);
+    }
 }
 
 #[test]

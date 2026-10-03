@@ -4,6 +4,8 @@
 mod admission;
 #[path = "sealed_agent/native_workload_admission.rs"]
 mod native_workload_admission;
+#[path = "sealed_agent/policy_activation_v2.rs"]
+mod policy_activation_v2;
 #[path = "../src/bin/memcordon-sealed-agent/policy_registry.rs"]
 mod policy_registry;
 #[path = "sealed_agent/policy_revocation.rs"]
@@ -25,6 +27,10 @@ mod state;
 #[cfg(target_os = "linux")]
 #[path = "../src/bin/memcordon-sealed-agent/linux/mod.rs"]
 mod linux;
+
+#[cfg(target_os = "linux")]
+#[path = "../src/bin/memcordon-sealed-agent/private_policy_fixture_schema.rs"]
+mod private_policy_fixture_schema;
 
 #[cfg(target_os = "windows")]
 #[path = "../src/bin/memcordon-sealed-agent/windows/mod.rs"]
@@ -62,10 +68,39 @@ mod linux_service;
 mod linux_startup;
 #[path = "sealed_agent/namespace_startup.rs"]
 mod namespace_startup;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_descriptor_custody.rs"]
+mod native_descriptor_custody;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_entrypoint.rs"]
+mod native_entrypoint;
+#[cfg(target_os = "linux")]
+#[path = "release/native_private_image_inputs.rs"]
+mod native_private_image_inputs;
+#[path = "sealed_agent/native_private_namespace_init.rs"]
+mod native_private_namespace_init;
+#[cfg(target_os = "linux")]
+#[path = "release/native_private_owner_loss.rs"]
+mod native_private_owner_loss;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_private_tcp.rs"]
+mod native_private_tcp;
 #[path = "sealed_agent/package.rs"]
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]
 mod package_verification;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_attempt.rs"]
+mod private_attempt;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_guardian.rs"]
+mod private_guardian;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_v4_relay_terminal.rs"]
+mod private_v4_relay_terminal;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_version_recovery.rs"]
+mod private_version_recovery;
 #[path = "sealed_agent/protocol.rs"]
 mod protocol_tests;
 #[path = "sealed_agent/rejection.rs"]
@@ -88,9 +123,6 @@ mod windows_postauthorization_retirement;
 #[path = "sealed_agent/windows_qualification.rs"]
 mod windows_qualification;
 #[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_qualification_artifacts.rs"]
-mod windows_qualification_artifacts;
-#[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_replay_retention.rs"]
 mod windows_replay_retention;
 #[cfg(target_os = "windows")]
@@ -102,3 +134,6 @@ mod windows_service_manager;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_token.rs"]
 mod windows_token;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_v3_fixture.rs"]
+mod windows_v3_fixture;

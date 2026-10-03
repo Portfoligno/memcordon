@@ -1,5 +1,11 @@
 use std::process::Command;
 
+// A sibling spawn can inherit a writable fixture descriptor until exec closes
+// it, even when the copying thread has already closed its own descriptor.
+// Keep executable materialization and every spawn in this test binary in one
+// lifecycle domain instead of retrying ETXTBSY or weakening inspection checks.
+static EXECUTABLE_LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn agent(arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_memcordon-sealed-agent"))
         .args(arguments)
@@ -9,6 +15,7 @@ fn agent(arguments: &[&str]) -> std::process::Output {
 
 #[test]
 fn windows_companions_have_safe_exact_version_contracts() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
     for (component, executable) in [
         (
             "memcordon-target-desktop-bootstrap",
@@ -38,6 +45,7 @@ fn windows_companions_have_safe_exact_version_contracts() {
 
 #[test]
 fn companion_version_and_help_are_administrative_and_exact() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
     let version = agent(&["--version"]);
     assert!(version.status.success());
     assert_eq!(
@@ -51,8 +59,8 @@ fn companion_version_and_help_are_administrative_and_exact() {
     for command in [
         "package inspect [--json]",
         "package verify [--json]",
-        "package install [--ephemeral-ci]",
-        "package upgrade [--ephemeral-ci]",
+        "package install [--ephemeral-ci [--archive-path A --archive-certificate CERT]]",
+        "package upgrade [--ephemeral-ci [--archive-path A --archive-certificate CERT]]",
         "package uninstall [--ephemeral-ci]",
     ] {
         assert!(help.contains(command), "agent help omits {command}");
@@ -63,6 +71,7 @@ fn companion_version_and_help_are_administrative_and_exact() {
 
 #[test]
 fn package_inspection_is_credential_free_and_machine_readable() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
     let output = agent(&["package", "inspect", "--json"]);
     assert!(
         output.status.success(),
@@ -132,4 +141,111 @@ fn package_inspection_is_credential_free_and_machine_readable() {
         assert!(!value.is_empty());
         assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bare_inspection_does_not_infer_package_custody_from_a_hard_linked_build() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("memcordon-sealed-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_memcordon-sealed-agent"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::hard_link(&executable, directory.path().join("cargo-output-link")).unwrap();
+    let output = Command::new(&executable)
+        .args(["package", "inspect", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inspection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inspection["schema_version"], 5);
+    assert_eq!(inspection["compiled_metadata_valid"], true);
+
+    let manifest = directory.path().join("runtime-manifest.json");
+    std::fs::write(&manifest, b"{}\n").unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = Command::new(&executable)
+        .args(["package", "inspect", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "package source is not an exact regular artifact"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn package_inspection_preserves_source_mode_and_manifest_nofollow_checks() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for unsafe_executable_mode in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("memcordon-sealed-agent");
+        std::fs::copy(env!("CARGO_BIN_EXE_memcordon-sealed-agent"), &executable).unwrap();
+        let mode = if unsafe_executable_mode { 0o775 } else { 0o755 };
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(mode)).unwrap();
+        let manifest = directory.path().join("runtime-manifest.json");
+        if unsafe_executable_mode {
+            std::fs::write(&manifest, b"{}\n").unwrap();
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        } else {
+            symlink(directory.path().join("absent-manifest-target"), &manifest).unwrap();
+        }
+        let output = Command::new(&executable)
+            .args(["package", "inspect", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8(output.stderr).unwrap();
+        if unsafe_executable_mode {
+            assert_eq!(
+                diagnostic.trim(),
+                "package source is not an exact regular artifact"
+            );
+        } else {
+            assert!(
+                diagnostic.starts_with("package source open "),
+                "{diagnostic}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn package_inspection_never_falls_back_from_a_present_invalid_manifest() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("memcordon-sealed-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_memcordon-sealed-agent"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manifest = directory.path().join("runtime-manifest.json");
+    std::fs::write(&manifest, b"{}\n").unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = Command::new(&executable)
+        .args(["package", "inspect", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "invalid package manifest was ignored"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "invalid package emitted inspection authority"
+    );
+    assert!(!output.stderr.is_empty());
 }

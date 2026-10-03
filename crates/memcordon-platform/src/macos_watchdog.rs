@@ -283,6 +283,56 @@ pub fn run_attempt(
     signal_source: &SignalSource,
     context: crate::supervisor::AttemptContext,
 ) -> Result<Execution, Error> {
+    run_attempt_with_runtime(
+        policy,
+        command,
+        memcordon_executable,
+        signal_source,
+        None,
+        context,
+    )
+}
+
+pub(crate) fn run_attempt_with_runtime(
+    policy: Policy,
+    command: &CommandSpec,
+    memcordon_executable: &std::path::Path,
+    signal_source: &SignalSource,
+    runtime: Option<&crate::macos_launch::LaunchRuntime>,
+    context: crate::supervisor::AttemptContext,
+) -> Result<Execution, Error> {
+    let owned;
+    let runtime = match runtime {
+        Some(runtime) => runtime,
+        None => {
+            owned = crate::macos_launch::LaunchRuntime::new(256).map_err(|error| {
+                Error::new(
+                    ErrorCategory::Setup,
+                    "MCSETUP-LAUNCH-RUNTIME",
+                    error.to_string(),
+                )
+            })?;
+            &owned
+        }
+    };
+    run_attempt_in(
+        policy,
+        command,
+        memcordon_executable,
+        signal_source,
+        runtime,
+        context,
+    )
+}
+
+pub(crate) fn run_attempt_in(
+    policy: Policy,
+    command: &CommandSpec,
+    memcordon_executable: &std::path::Path,
+    signal_source: &SignalSource,
+    runtime: &crate::macos_launch::LaunchRuntime,
+    context: crate::supervisor::AttemptContext,
+) -> Result<Execution, Error> {
     if inspection_obligations() != 0 {
         return Err(Error::new(
             ErrorCategory::Setup,
@@ -349,11 +399,11 @@ pub fn run_attempt(
     let boot_identity = crate::macos_deadline::boot_identity()
         .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
     let retained_owner = std::cell::RefCell::new(None::<memcordon_core::OwnerIdentity>);
-    let runtime = |release,
-                   target_pid,
-                   terminal,
-                   force,
-                   complete|
+    let runtime_evidence = |release,
+                            target_pid,
+                            terminal,
+                            force,
+                            complete|
      -> Result<memcordon_core::RuntimeEvidenceV1, Error> {
         let retired = crate::macos_deadline::continuous_nanos().map_err(|error| {
             Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
@@ -401,13 +451,16 @@ pub fn run_attempt(
         })
     };
     let launch_result = crate::macos_launch::launch_controlled(
+        runtime,
         command,
         memcordon_executable,
         startup_deadline,
         startup_cleanup_deadline,
         work_expiry,
-        policy.limit_grace,
-        policy.signal_grace,
+        crate::macos_launch::LaunchGrace {
+            limit: policy.limit_grace,
+            signal: policy.signal_grace,
+        },
         signal_source,
     );
     if let Err(startup) = &launch_result {
@@ -478,6 +531,7 @@ pub fn run_attempt(
                     },
                 );
             return Ok(Execution {
+                private_execution: None,
                 policy_enforcement: Default::default(),
                 outcome: if !expired {
                     RunOutcome::Interrupted {
@@ -531,7 +585,7 @@ pub fn run_attempt(
                     .diagnostic
                     .launcher_pid
                     .and_then(std::num::NonZeroU32::new),
-                runtime: Some(runtime(
+                runtime: Some(runtime_evidence(
                     startup.release.clone(),
                     startup
                         .diagnostic
@@ -539,7 +593,7 @@ pub fn run_attempt(
                         .and_then(std::num::NonZeroU32::new),
                     startup
                         .cancellation_observed
-                        .map_or_else(|| crate::macos_deadline::continuous_nanos(), Ok)
+                        .map_or_else(crate::macos_deadline::continuous_nanos, Ok)
                         .map_err(|error| {
                             Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
                         })?,
@@ -548,7 +602,7 @@ pub fn run_attempt(
                     } else {
                         startup
                             .cancellation_force
-                            .map_or_else(|| crate::macos_deadline::continuous_nanos(), Ok)
+                            .map_or_else(crate::macos_deadline::continuous_nanos, Ok)
                             .map_err(|error| {
                                 Error::new(
                                     ErrorCategory::Monitor,
@@ -596,7 +650,7 @@ pub fn run_attempt(
         };
         failure.cgroup_verified_before_release = startup.diagnostic.release_sent;
         if let Ok(now) = crate::macos_deadline::continuous_nanos() {
-            failure.runtime = runtime(
+            failure.runtime = runtime_evidence(
                 startup.release.clone(),
                 startup
                     .diagnostic
@@ -723,7 +777,6 @@ pub fn run_attempt(
     let mut pending_signal = None;
     let terminate_and_cleanup = |child: &mut Child,
                                  stored: &mut Option<ChildTermination>,
-                                 root,
                                  known: &mut HashSet<ProcessIdentity>,
                                  inventory_query: &mut Option<u64>,
                                  signal,
@@ -733,7 +786,6 @@ pub fn run_attempt(
             &guardian,
             child,
             stored,
-            root,
             known,
             inventory_query,
             (signal, grace),
@@ -895,7 +947,6 @@ pub fn run_attempt(
                                 let cleanup = terminate_and_cleanup(
                                     &mut child,
                                     &mut stored_status,
-                                    root_pid,
                                     &mut known,
                                     &mut inventory_query,
                                     if policy.limit_grace.is_zero() {
@@ -927,11 +978,8 @@ pub fn run_attempt(
                     }
                 }
             }
-            Some(Err(error)) => {
-                if cycle_error.is_none() {
-                    cycle_error = Some(error);
-                }
-            }
+            Some(Err(error)) if cycle_error.is_none() => cycle_error = Some(error),
+            Some(Err(_)) => {}
         }
 
         if let Some(deadline) = policy.deadline {
@@ -968,7 +1016,6 @@ pub fn run_attempt(
                 let cleanup = terminate_and_cleanup(
                     &mut child,
                     &mut stored_status,
-                    root_pid,
                     &mut known,
                     &mut inventory_query,
                     if effective_grace.is_zero() {
@@ -1009,7 +1056,6 @@ pub fn run_attempt(
             let cleanup = terminate_and_cleanup(
                 &mut child,
                 &mut stored_status,
-                root_pid,
                 &mut known,
                 &mut inventory_query,
                 libc::SIGKILL,
@@ -1039,7 +1085,6 @@ pub fn run_attempt(
             let cleanup = terminate_and_cleanup(
                 &mut child,
                 &mut stored_status,
-                root_pid,
                 &mut known,
                 &mut inventory_query,
                 signal,
@@ -1116,7 +1161,6 @@ pub fn run_attempt(
                 let cleanup = terminate_and_cleanup(
                     &mut child,
                     &mut stored_status,
-                    root_pid,
                     &mut known,
                     &mut inventory_query,
                     libc::SIGKILL,
@@ -1196,7 +1240,7 @@ pub fn run_attempt(
     };
     let (launch, restart_safety, boundary_detail) =
         crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
-    let mut runtime = runtime(
+    let mut runtime = runtime_evidence(
         memcordon_core::ReleaseEvidence::Issued {
             at: release_tick,
             exec_confirmed: true,
@@ -1218,6 +1262,7 @@ pub fn run_attempt(
         );
     }
     Ok(Execution {
+        private_execution: None,
         policy_enforcement: Default::default(),
         outcome,
         backend,
@@ -1298,7 +1343,6 @@ fn retire_workload(
     guardian: &crate::macos_launch::Guardian,
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
-    _root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
     inventory_query: &mut Option<u64>,
     termination: (i32, Duration),
@@ -1406,7 +1450,6 @@ fn cleanup_after_direct_exit(
             guardian,
             child,
             stored,
-            root_pid,
             known,
             inventory_query,
             (libc::SIGKILL, Duration::ZERO),
@@ -1417,7 +1460,6 @@ fn cleanup_after_direct_exit(
                 guardian,
                 child,
                 stored,
-                root_pid,
                 known,
                 inventory_query,
                 (libc::SIGKILL, Duration::ZERO),
@@ -1912,6 +1954,27 @@ fn process_virtual_size(pid: i32) -> Result<u64, io::Error> {
     }
     // SAFETY: the exact-size successful call initialized the structure.
     Ok(unsafe { task.assume_init() }.virtual_size)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn native_thread_count() -> io::Result<usize> {
+    let mut task = MaybeUninit::<ProcTaskInfo>::zeroed();
+    let size = i32::try_from(size_of::<ProcTaskInfo>()).map_err(io::Error::other)?;
+    // SAFETY: the held output is writable for the exact native structure; query
+    // this test process and interpret only an exact-size successful result.
+    let read = unsafe {
+        proc_pidinfo(
+            std::process::id() as i32,
+            PROC_PIDTASKINFO,
+            0,
+            task.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(unsafe { task.assume_init() }.thread_count).map_err(io::Error::other)
 }
 
 const fn metric_name(metric: Metric) -> &'static str {

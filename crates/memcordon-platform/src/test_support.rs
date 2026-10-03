@@ -1,4 +1,312 @@
 //! Native containment used only by black-box process tests.
+
+#[cfg(target_os = "linux")]
+#[path = "private_network_source.rs"]
+mod private_network_source;
+
+#[cfg(target_os = "linux")]
+#[path = "private_unix_detector.rs"]
+mod private_unix_detector;
+
+#[cfg(target_os = "linux")]
+#[path = "private_host_network_source.rs"]
+mod private_host_network_source;
+
+#[cfg(target_os = "linux")]
+pub use private_host_network_source::HostNetworkWatchV1;
+
+#[cfg(not(target_os = "linux"))]
+pub struct HostNetworkWatchV1 {
+    pins: [(u64, u64); 4],
+}
+#[cfg(not(target_os = "linux"))]
+impl HostNetworkWatchV1 {
+    pub fn start() -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host continuity observation requires native GNU Linux",
+        ))
+    }
+    pub fn object_pins(&self) -> &[(u64, u64); 4] {
+        &self.pins
+    }
+    pub fn finish(self) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host continuity observation requires native GNU Linux",
+        ))
+    }
+}
+
+/// Actual bounded positive detector sources from isolated observer namespaces.
+#[cfg(target_os = "linux")]
+pub fn private_sample_unix_detector(
+    challenge: [u8; 32],
+) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    private_unix_detector::sample(challenge)
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_sample_network_namespace(
+    pid: u32,
+    start_ticks: u64,
+) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    private_network_source::sample(pid, start_ticks)
+}
+
+#[cfg(unix)]
+pub fn private_observer_monotonic_ns() -> std::io::Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one valid timespec owned by this call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seconds = u64::try_from(time.tv_sec).map_err(std::io::Error::other)?;
+    let nanos = u64::try_from(time.tv_nsec).map_err(std::io::Error::other)?;
+    if nanos >= 1_000_000_000 {
+        return Err(std::io::Error::other(
+            "native monotonic clock nanoseconds differ",
+        ));
+    }
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or_else(|| std::io::Error::other("native monotonic clock overflow"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_observer_clock_ticks_per_second() -> std::io::Result<u64> {
+    // SAFETY: sysconf queries one supported scalar without pointer operands.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(ticks)
+        .ok()
+        .filter(|ticks| *ticks > 0)
+        .ok_or_else(|| std::io::Error::other("native clock ticks query failed"))
+}
+
+/// Spawn the root-controlled public CLI gate with exact nonroot credentials
+/// and retained control endpoints. Ownership ends immediately after spawn,
+/// so the root parent cannot accidentally mask a child's control-socket EOF.
+#[cfg(target_os = "linux")]
+pub fn spawn_private_public_child(
+    mut command: std::process::Command,
+    uid: u32,
+    gid: u32,
+    gate_reader: std::os::fd::OwnedFd,
+    gate_writer: std::os::fd::OwnedFd,
+    reuse: Option<std::os::fd::OwnedFd>,
+) -> std::io::Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
+    if uid == 0
+        || gid == 0
+        || gate_reader.as_raw_fd() < 3
+        || gate_writer.as_raw_fd() < 3
+        || reuse.as_ref().is_some_and(|fd| fd.as_raw_fd() < 3)
+    {
+        return Err(std::io::Error::other(
+            "public child credential/control identity differs",
+        ));
+    }
+    // Duplicate all endpoints away from fixed destinations before fork. This
+    // prevents a destination mapping from clobbering another source endpoint.
+    let duplicate = |fd: &std::os::fd::OwnedFd| -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: fd is held throughout this call, and successful fcntl returns
+        // a new exclusively owned descriptor with close-on-exec set.
+        let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    };
+    let reader = duplicate(&gate_reader)?;
+    let reuse = reuse.as_ref().map(duplicate).transpose()?;
+    let writer = gate_writer.as_raw_fd();
+    configure_child_setup(
+        &mut command,
+        ChildSetup::PublicCredentialsAndGate {
+            uid,
+            gid,
+            reader,
+            reuse,
+            writer,
+        },
+    );
+    command.spawn()
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_public_gate_byte(fd: i32) -> std::io::Result<u8> {
+    if fd != 3 {
+        return Err(std::io::Error::other("public gate descriptor differs"));
+    }
+    // SAFETY: read is given a valid one-byte mutable buffer. Descriptor 3 is
+    // not closed here; CLOEXEC retires it at the dedicated child's exec.
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut byte = 0_u8;
+        let count = libc::read(fd, (&raw mut byte).cast(), 1);
+        let error = std::io::Error::last_os_error();
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count != 1 {
+            return Err(error);
+        }
+        Ok(byte)
+    }
+}
+
+/// Retain a pidfd while independently reading the matching process starttime.
+/// Duplicate one exact live descriptor and measure its socket metadata. The
+/// retained pidfd and two starttime checks reject PID reuse; failure is not a
+/// guessed socket type. The copied descriptor is closed on every return.
+#[cfg(target_os = "linux")]
+pub fn private_observe_process_socket(
+    pid: u32,
+    start_time: u64,
+    target_fd: i32,
+) -> std::io::Result<(u64, i32, i32)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    if pid == 0 || start_time == 0 || target_fd < 0 {
+        return Err(std::io::Error::other("socket source identity incomplete"));
+    }
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let check = || -> std::io::Result<()> {
+        let stat = std::fs::read_to_string(&stat_path)?;
+        let (head, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| std::io::Error::other("socket source stat malformed"))?;
+        let (observed_pid, _) = head
+            .split_once(" (")
+            .ok_or_else(|| std::io::Error::other("socket source PID absent"))?;
+        let observed_start = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| std::io::Error::other("socket source start absent"))?;
+        if observed_pid.parse::<u32>().map_err(std::io::Error::other)? != pid
+            || observed_start
+                .parse::<u64>()
+                .map_err(std::io::Error::other)?
+                != start_time
+        {
+            return Err(std::io::Error::other("socket source identity changed"));
+        }
+        Ok(())
+    };
+    // SAFETY: each successful syscall creates one exclusively owned descriptor.
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if raw_pidfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    check()?;
+    let raw_copy =
+        unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), target_fd, 0) } as i32;
+    if raw_copy < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let copy = unsafe { OwnedFd::from_raw_fd(raw_copy) };
+    let file = std::fs::File::from(copy);
+    let inode = file.metadata()?.ino();
+    let measure = |option| -> std::io::Result<i32> {
+        let mut value = 0_i32;
+        let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: getsockopt writes only the live scalar and length slots.
+        if unsafe {
+            libc::getsockopt(
+                file.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &raw mut size,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if size as usize != std::mem::size_of_val(&value) {
+            return Err(std::io::Error::other("socket option scalar size differs"));
+        }
+        Ok(value)
+    };
+    let kind = measure(libc::SO_TYPE)?;
+    let domain = measure(libc::SO_DOMAIN)?;
+    check()?;
+    if inode == 0 {
+        return Err(std::io::Error::other("socket source inode is zero"));
+    }
+    Ok((inode, kind, domain))
+}
+
+/// Retain a pidfd while independently reading the matching process starttime.
+/// ESRCH, disappearance, reuse, or readiness proves that recorded identity is
+/// no longer running; a live matching identity returns false.
+#[cfg(target_os = "linux")]
+pub fn private_recorded_process_exited(pid: u32, start_time: u64) -> std::io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if pid == 0 || start_time == 0 {
+        return Err(std::io::Error::other("process identity incomplete"));
+    }
+    // SAFETY: pidfd_open reads one positive PID without signalling it.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(true);
+        }
+        return Err(error);
+    }
+    // SAFETY: the successful syscall returned a new exclusively owned fd.
+    let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let stat = match std::fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat"),
+    ) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let (header, fields) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| std::io::Error::other("proc stat delimiter differs"))?;
+    let (observed_pid, _) = header
+        .split_once(" (")
+        .ok_or_else(|| std::io::Error::other("proc stat header differs"))?;
+    let observed_pid = observed_pid.parse::<u32>().map_err(std::io::Error::other)?;
+    let observed_start = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::other("proc starttime absent"))?
+        .parse::<u64>()
+        .map_err(std::io::Error::other)?;
+    if observed_pid != pid {
+        return Err(std::io::Error::other("proc stat PID differs"));
+    }
+    if observed_start != start_time {
+        return Ok(true);
+    }
+    let mut poll = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid retained descriptor and writable record.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ready == 1 && poll.revents & libc::POLLIN != 0)
+}
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::control_fixture::{
     buffered_child_status_does_not_delay_inventory,
@@ -213,8 +521,8 @@ pub fn sealed_terminal_v2_is_valid(payload: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn sealed_qualification_v2_is_valid(payload: &[u8]) -> Result<(), String> {
-    crate::sealed::client::parse_qualification(payload).map(|_| ())
+pub fn sealed_readiness_is_valid(payload: &[u8]) -> Result<(), String> {
+    crate::sealed::client::parse_readiness(payload).map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -259,17 +567,15 @@ pub fn linux_probe_from_results(
 ) -> crate::ProbeReport {
     crate::linux_cgroup::compose_probe(
         standard,
-        provider.map(
-            |(provider_identity, receipt_digest)| crate::sealed::client::ProbeReceipt {
+        provider.map(|(provider_identity, observation_digest)| {
+            crate::sealed::client::ProbeReceipt {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 provider_identity,
                 control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
                 launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
-                setid_transition_certification_digest: receipt_digest.clone(),
-                sudo_transition_certification_digest: receipt_digest.clone(),
-                receipt_digest,
-            },
-        ),
+                observation_digest,
+            }
+        }),
     )
 }
 
@@ -301,20 +607,20 @@ pub fn backend_selection_drift_execution(
 
 #[cfg(windows)]
 pub fn windows_preflight_backend_capabilities(
-    qualification: memcordon_core::WindowsQualificationReceiptV1,
+    observation: memcordon_core::WindowsProviderProbeV1,
 ) -> memcordon_core::BackendCapabilityReport {
     crate::capabilities_for(
-        &crate::windows_job::info_from_qualification(qualification),
+        &crate::windows_job::info_from_probe(observation),
         memcordon_core::BoundaryRequirement::Sealed,
     )
 }
 
 #[cfg(windows)]
 pub fn windows_runtime_backend_capabilities(
-    qualification: memcordon_core::WindowsQualificationReceiptV1,
+    observation: memcordon_core::WindowsProviderProbeV1,
 ) -> memcordon_core::BackendCapabilityReport {
     crate::capabilities_for(
-        &crate::sealed::windows::info(qualification),
+        &crate::sealed::windows::info(observation),
         memcordon_core::BoundaryRequirement::Sealed,
     )
 }
@@ -531,6 +837,151 @@ impl ProcessIdentity {
             .map(|_| ())
             .map_err(|error| error.error)
     }
+}
+
+/// Query-only handles retained by the Windows installed-fixture leak observer.
+/// The unique staged image path keeps the observation specific to one case.
+#[cfg(windows)]
+pub struct WindowsImageProcess {
+    pub identity: ProcessIdentity,
+    _handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WindowsImageProcess {
+    /// Observe retirement of the original held process, independently of PID reuse.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: this owner retains a live process handle with SYNCHRONIZE access.
+        match unsafe { WaitForSingleObject(self._handle.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageProcess>> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        QueryFullProcessImageNameW,
+    };
+
+    let expected = std::fs::canonicalize(image)?
+        .to_string_lossy()
+        .to_lowercase();
+    let expected_name = image
+        .file_name()
+        .ok_or_else(|| io::Error::other("fixture image has no filename"))?
+        .to_string_lossy()
+        .to_lowercase();
+    // SAFETY: a process snapshot has no mutable external buffers.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: snapshot is a new owned handle and is closed on all exits.
+    let _snapshot_owner = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: the Windows enumeration API initializes the remaining fields.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+        .expect("Windows process entry size fits u32");
+    // SAFETY: snapshot and entry are valid for enumeration.
+    let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    if !found {
+        return Err(io::Error::last_os_error());
+    }
+    let mut matching = Vec::new();
+    while found {
+        let name_len = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
+        if name == expected_name {
+            // SAFETY: query-only access to an enumerated PID.
+            let raw = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    entry.th32ProcessID,
+                )
+            };
+            if raw.is_null() {
+                // A matching image that cannot be inspected is never interpreted as absent.
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: OpenProcess returned one owned non-null handle.
+            let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+            let mut units = [0u16; 32768];
+            let mut length = u32::try_from(units.len()).expect("image path buffer fits u32");
+            // SAFETY: handle and path buffer are valid, with writable length.
+            if unsafe { QueryFullProcessImageNameW(raw, 0, units.as_mut_ptr(), &mut length) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let observed = std::fs::canonicalize(Path::new(&String::from_utf16_lossy(
+                &units[..length as usize],
+            )))?
+            .to_string_lossy()
+            .to_lowercase();
+            if observed == expected {
+                let mut creation = FILETIME::default();
+                let mut exit = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+                // SAFETY: all FILETIME outputs are writable and handle remains open.
+                if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) }
+                    == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                matching.push(WindowsImageProcess {
+                    identity: ProcessIdentity {
+                        pid: entry.th32ProcessID,
+                        birth: (u128::from(creation.dwHighDateTime) << 32)
+                            | u128::from(creation.dwLowDateTime),
+                    },
+                    _handle: handle,
+                });
+            }
+        }
+        // SAFETY: snapshot and entry remain valid for the next query.
+        found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: GetLastError reads this thread's immediately preceding enumeration result.
+    let enumeration_error = unsafe { GetLastError() };
+    if enumeration_error != ERROR_NO_MORE_FILES {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(enumeration_error).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(matching)
+}
+
+#[cfg(windows)]
+pub fn windows_available_memory_bytes() -> io::Result<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: Windows fills the initialized structure after its exact size is supplied.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>())
+        .expect("Windows memory status size fits u32");
+    // SAFETY: the pointer refers to a writable MEMORYSTATUSEX.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(status.ullAvailPhys)
 }
 
 #[cfg(target_os = "linux")]
@@ -805,6 +1256,14 @@ impl OuterTestBoundary {
 enum ChildSetup {
     Session,
     InheritDescriptor(std::os::fd::OwnedFd),
+    #[cfg(target_os = "linux")]
+    PublicCredentialsAndGate {
+        uid: u32,
+        gid: u32,
+        reader: std::os::fd::OwnedFd,
+        reuse: Option<std::os::fd::OwnedFd>,
+        writer: std::os::fd::RawFd,
+    },
 }
 
 /// Retain an owned CLOEXEC endpoint and inherit it only in this command's child.
@@ -833,7 +1292,8 @@ pub fn inherit_test_descriptor(
 #[cfg(unix)]
 fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
     use std::os::fd::AsRawFd;
-    // SAFETY: the callback performs only async-signal-safe setsid/fcntl calls.
+    // SAFETY: the callback performs only async-signal-safe native credential,
+    // session and descriptor calls.
     // The captured OwnedFd retains endpoint ownership for the Command lifetime.
     unsafe {
         command.pre_exec(move || {
@@ -848,6 +1308,34 @@ fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
                     let flags = libc::fcntl(raw, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                ChildSetup::PublicCredentialsAndGate {
+                    uid,
+                    gid,
+                    reader,
+                    reuse,
+                    writer,
+                } => {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(*gid, *gid, *gid) != 0
+                        || libc::setresuid(*uid, *uid, *uid) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(reader.as_raw_fd(), 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if *writer != 3 {
+                        libc::close(*writer);
+                    }
+                    if let Some(fd) = reuse {
+                        if libc::dup2(fd.as_raw_fd(), 4) < 0 || libc::fcntl(4, libc::F_SETFD, 0) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                 }
             }

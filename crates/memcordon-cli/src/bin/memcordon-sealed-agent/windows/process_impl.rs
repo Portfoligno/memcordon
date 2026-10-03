@@ -28,20 +28,17 @@ use memcordon_windows_launch_core::{
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{
     CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-    ERROR_INVALID_HANDLE, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, FILETIME, GENERIC_READ, GENERIC_WRITE,
+    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
-use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile,
-};
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, FreeSid, RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SecurityImpersonation, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
-    TOKEN_QUERY_SOURCE, TokenImpersonation,
+    DuplicateTokenEx, RevertToSelf, SECURITY_ATTRIBUTES, SecurityImpersonation,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE,
+    TokenImpersonation,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,

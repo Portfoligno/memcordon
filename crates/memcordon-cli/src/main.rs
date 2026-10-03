@@ -27,6 +27,12 @@ fn main() {
     } else {
         argv
     };
+    #[cfg(target_os = "windows")]
+    if let [command, pid, birth] = argv.as_slice() {
+        if command == "__observe-windows-guardian" {
+            std::process::exit(commands::windows_guardian_observation(pid, birth));
+        }
+    }
     if let Some(internal) = commands::route_internal(&argv) {
         let code = match internal {
             Ok(internal) => commands::execute_internal(internal),
@@ -40,6 +46,7 @@ fn main() {
     let presentation = Presentation::automatic();
     let code = match route(&argv) {
         Ok(Invocation::Execute(args)) => commands::execute(args, &presentation),
+        Ok(Invocation::WindowsRecovery(args)) => commands::windows_recovery(args),
         Ok(Invocation::Doctor(args)) => commands::doctor(args, &presentation),
         Ok(Invocation::Plan(args)) => commands::plan(args, &presentation),
         Ok(Invocation::Clean(args)) => commands::clean(args, &presentation),

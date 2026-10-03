@@ -182,22 +182,21 @@ pub fn probe() -> ProbeReport {
 
 pub(crate) fn info() -> BackendInfo {
     match crate::sealed::windows::probe() {
-        Ok(qualification) => info_from_qualification(qualification),
+        Ok(observation) => info_from_probe(observation),
         Err(reason) => info_with_sealed(crate::backend::SealedAvailability::Unavailable {
-            reason: format!("Windows sealed provider is not installed or qualified: {reason}"),
+            reason: format!("Windows sealed provider is not installed or ready: {reason}"),
             prerequisites: vec![
                 "matching memcordon-sealed-agent.exe package installation".to_owned(),
-                "qualified MemCordonSealedControl and MemCordonSealedLauncher services".to_owned(),
-                "native creation-time Job-list and exact handle-list certification".to_owned(),
+                "authenticated MemCordonSealedControl and MemCordonSealedLauncher services"
+                    .to_owned(),
+                "protected installed runtime inventory and clear recovery state".to_owned(),
             ],
         }),
     }
 }
 
-pub(crate) fn info_from_qualification(
-    qualification: memcordon_core::WindowsQualificationReceiptV1,
-) -> BackendInfo {
-    info_with_sealed(crate::sealed::windows::availability(qualification))
+pub(crate) fn info_from_probe(observation: memcordon_core::WindowsProviderProbeV1) -> BackendInfo {
+    info_with_sealed(crate::sealed::windows::availability(observation))
 }
 
 pub(crate) fn info_with_sealed(sealed: crate::backend::SealedAvailability) -> BackendInfo {
@@ -573,6 +572,7 @@ pub fn run_attempt(
         crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
         policy_enforcement: Default::default(),
+        private_execution: None,
         outcome,
         backend,
         child_pid: std::num::NonZeroU32::new(child_pid),

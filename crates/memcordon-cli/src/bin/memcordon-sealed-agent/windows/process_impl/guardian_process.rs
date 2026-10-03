@@ -560,6 +560,14 @@ impl GuardianProcess {
     pub const fn raw(&self) -> HANDLE {
         self.process.raw()
     }
+
+    pub fn close_for_retirement(mut self) -> Result<(), String> {
+        // SAFETY: this instance owns the exact guardian process handle.
+        if unsafe { WaitForSingleObject(self.process.raw(), 0) } != WAIT_OBJECT_0 {
+            return Err("guardian process has not signaled retirement".to_owned());
+        }
+        self.process.close_checked()
+    }
 }
 
 pub(super) fn acquire_guardian_slot() -> Result<GuardianSlotLease, String> {

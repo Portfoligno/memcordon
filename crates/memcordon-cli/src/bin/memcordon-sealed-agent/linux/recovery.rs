@@ -10,7 +10,8 @@ use super::{CGROUP_ROOT, STATE_ROOT};
 
 pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024
     + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
-    + memcordon_core::workload_limits::CONTRACT_BYTES as u64;
+    + memcordon_core::workload_limits::CONTRACT_BYTES as u64
+    + super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64;
 
 pub fn recover() -> Result<Vec<String>, String> {
     recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT))
@@ -46,6 +47,22 @@ fn recover_records(
     authenticated: &mut BTreeSet<OsString>,
     ambiguous: &mut Vec<String>,
 ) -> Result<(), String> {
+    let reservations = fs::read_dir(state_root)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for entry in reservations {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
+            && !recover_account_reservation(state_root, cgroup_root, &entry)?
+        {
+            ambiguous.push(name.to_string_lossy().into_owned());
+        }
+    }
+    // Refresh after retiring a known pre-allocation journal, avoiding stale
+    // directory entries and preserving every unreclaimed uncertain owner.
     let entries = fs::read_dir(state_root)
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -77,6 +94,12 @@ fn recover_records(
 
     for entry in entries {
         let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
+        {
+            continue;
+        }
         if name.to_str().is_some_and(|name| {
             name.strip_suffix(".new")
                 .is_some_and(super::cgroup::valid_attempt_identity)
@@ -103,6 +126,18 @@ fn recover_records(
         if !integrity_valid(&record)
             || record.lines().find_map(|line| line.strip_prefix("cgroup=")) != Some(identity)
         {
+            ambiguous.push(identity.to_owned());
+            continue;
+        }
+        if record.starts_with("format=memcordon.private-native-journal\nrevision=1\n") {
+            if super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes())
+                .is_ok_and(|record| record.attempt_id.as_str() == identity)
+            {
+                // A V4 attempt may have released the target and owns more than
+                // a cgroup. Until its terminal ledger can be reconstructed,
+                // preserve every protected resource for explicit recovery.
+                authenticated.insert(name.clone());
+            }
             ambiguous.push(identity.to_owned());
             continue;
         }
@@ -133,6 +168,199 @@ fn recover_records(
         fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Reclaim a fully written reservation only after creator loss and boundary absence.
+/// Its journal must be absent or validate as allocation-only state with no native
+/// resources. Malformed or torn records remain quarantined and grant no permission.
+fn recover_account_reservation(
+    state_root: &Path,
+    cgroup_root: &Path,
+    entry: &fs::DirEntry,
+) -> Result<bool, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reservation {
+        format: String,
+        revision: u32,
+        user_namespace_device: u64,
+        user_namespace_inode: u64,
+        uid: u32,
+        attempt: [u8; 16],
+        owner_pid: libc::pid_t,
+        owner_birth: u64,
+        boot_identity: String,
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(state_root)
+        .map_err(|error| error.to_string())?;
+    let directory_metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if directory_metadata.uid() != 0 || directory_metadata.mode() & 0o022 != 0 {
+        return Ok(false);
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(entry.path())
+    {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let held = file.metadata().map_err(|error| error.to_string())?;
+    if !held.is_file()
+        || held.uid() != 0
+        || held.nlink() != 1
+        || held.mode() & 0o7777 != 0o600
+        || held.len() > 4096
+    {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 4096
+        || memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes).is_err()
+    {
+        return Ok(false);
+    }
+    let reservation: Reservation = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    if reservation.format != "memcordon.account-reservation"
+        || reservation.revision != 1
+        || reservation.user_namespace_device == 0
+        || reservation.user_namespace_inode == 0
+        || reservation.uid == 0
+        || !canonical_boot_identity(&reservation.boot_identity)
+        || reservation.owner_pid <= 0
+        || reservation.owner_birth == 0
+        || reservation.attempt == [0; 16]
+        || entry.file_name()
+            != OsString::from(format!(
+                "account-{}-{}-{}.reservation",
+                reservation.user_namespace_device,
+                reservation.user_namespace_inode,
+                reservation.uid
+            ))
+    {
+        return Ok(false);
+    }
+    let boot =
+        fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| error.to_string())?;
+    if reservation.boot_identity == boot.trim() {
+        match super::envelope::process_start_time(reservation.owner_pid) {
+            Ok(birth) if birth == reservation.owner_birth => return Ok(false),
+            Ok(birth) if birth > reservation.owner_birth => (),
+            Ok(_) => return Ok(false),
+            Err(_)
+                if !Path::new("/proc")
+                    .join(reservation.owner_pid.to_string())
+                    .exists() =>
+            {
+                ()
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    let identity: String = reservation
+        .attempt
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    for path in [
+        state_root.join(format!("{identity}.new")),
+        cgroup_root.join(&identity),
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return Ok(false),
+        }
+    }
+    let journal = state_root.join(&identity);
+    match fs::symlink_metadata(&journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == 0
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o7777 == 0o600 =>
+        {
+            let bytes = read_record_no_follow(&journal)?;
+            let record =
+                match super::private_attempt::PrivateAttemptRecordV4::parse(bytes.as_bytes()) {
+                    Ok(record) => record,
+                    Err(_) => return Ok(false),
+                };
+            if record.attempt_id.as_str() != identity
+                || record.boot_identity.as_str() != reservation.boot_identity
+                || record.phase != super::private_attempt::PrivateAttemptPhase::Allocated
+                || record.target.is_some()
+                || record.namespace_init.is_some()
+                || record.guardian.is_some()
+                || record.network_namespace_inode.is_some()
+                || record.gated_facts.is_some()
+            {
+                return Ok(false);
+            }
+            let current = fs::symlink_metadata(&journal).map_err(|error| error.to_string())?;
+            if (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            ) != (
+                current.dev(),
+                current.ino(),
+                current.len(),
+                current.mtime(),
+                current.mtime_nsec(),
+            ) {
+                return Ok(false);
+            }
+            fs::remove_file(&journal).map_err(|error| error.to_string())?;
+            directory.sync_all().map_err(|error| error.to_string())?;
+        }
+        _ => return Ok(false),
+    }
+    let current = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+    if (
+        current.dev(),
+        current.ino(),
+        current.len(),
+        current.mtime(),
+        current.mtime_nsec(),
+    ) != (
+        held.dev(),
+        held.ino(),
+        held.len(),
+        held.mtime(),
+        held.mtime_nsec(),
+    ) {
+        return Ok(false);
+    }
+    fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+    directory.sync_all().map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn canonical_boot_identity(value: &str) -> bool {
+    let shape = "00000000-0000-0000-0000-000000000000";
+    value.len() == shape.len()
+        && value.bytes().zip(shape.bytes()).all(|(actual, expected)| {
+            if expected == b'-' {
+                actual == b'-'
+            } else {
+                actual.is_ascii_digit() || (b'a'..=b'f').contains(&actual)
+            }
+        })
+        && value
+            .bytes()
+            .any(|byte| (b'1'..=b'9').contains(&byte) || (b'a'..=b'f').contains(&byte))
 }
 
 fn interrupted_transition_is_recoverable(
@@ -172,6 +400,11 @@ fn interrupted_transition_is_recoverable(
     {
         return Ok(false);
     }
+    if canonical.starts_with("version=4\n")
+        || canonical.starts_with("format=memcordon.private-native-journal\n")
+    {
+        return Ok(false);
+    }
     if canonical
         .lines()
         .find_map(|line| line.strip_prefix("frontend-pid="))
@@ -185,6 +418,11 @@ fn interrupted_transition_is_recoverable(
         Ok(record) => record,
         Err(_) => return Ok(false),
     };
+    if interrupted.starts_with("version=4\n")
+        || interrupted.starts_with("format=memcordon.private-native-journal\n")
+    {
+        return Ok(false);
+    }
     if interrupted
         .lines()
         .find_map(|line| line.strip_prefix("cgroup="))
@@ -282,5 +520,9 @@ pub(crate) fn read_record_no_follow(path: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn integrity_valid(record: &str) -> bool {
-    super::attempt::parse_durable_policy(record).is_ok()
+    if record.starts_with("format=memcordon.private-native-journal\nrevision=1\n") {
+        super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes()).is_ok()
+    } else {
+        super::attempt::parse_durable_policy(record).is_ok()
+    }
 }

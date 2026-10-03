@@ -53,19 +53,19 @@ impl RequestBindingV1 {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlanBindingV1 {
+pub struct RuntimePlanBinding {
+    pub format: String,
+    pub revision: u32,
     pub request: RequestBindingV1,
     pub registry_digest: DiagnosticSha256,
-    pub qualification_digest: DiagnosticSha256,
     pub provider: PublicProviderBindingV1,
     pub boot_identity: BoundedText<128>,
     pub effective_policy_digest: DiagnosticSha256,
 }
-impl PlanBindingV1 {
-    pub fn from_authorized(
+impl RuntimePlanBinding {
+    pub fn from_local_grant(
         request: &WorkloadContractV1,
         registry_digest: DiagnosticSha256,
-        qualification_digest: DiagnosticSha256,
         provider: PublicProviderBindingV1,
         boot_identity: BoundedText<128>,
     ) -> Result<Self, String> {
@@ -85,9 +85,10 @@ impl PlanBindingV1 {
         effective.digest(&registry_digest)?;
         crate::workload_codec::encode_ceiling(&mut effective, &ceiling)?;
         Ok(Self {
+            format: "memcordon.local-plan".into(),
+            revision: 1,
             request,
             registry_digest,
-            qualification_digest,
             provider,
             boot_identity,
             effective_policy_digest: crate::workload_codec::hash_bytes(&effective.finish()),
@@ -95,10 +96,9 @@ impl PlanBindingV1 {
     }
 
     pub fn matches_contract(&self, contract: &WorkloadContractV1) -> bool {
-        Self::from_authorized(
+        Self::from_local_grant(
             contract,
             self.registry_digest.clone(),
-            self.qualification_digest.clone(),
             self.provider.clone(),
             self.boot_identity.clone(),
         )
@@ -137,8 +137,10 @@ pub const PENDING_PRELAUNCH_CHECKS: [PrelaunchCheck; 7] = [
 ];
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AttemptBindingV1 {
-    pub plan: PlanBindingV1,
+pub struct RuntimeAttemptBinding {
+    pub format: String,
+    pub revision: u32,
+    pub plan: RuntimePlanBinding,
     pub attempt_id: BoundedText<128>,
     pub restart_attempt: u64,
     pub admission_nonce: Nonce128,
@@ -197,12 +199,12 @@ impl<'de> Deserialize<'de> for False {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum WorkloadResolutionReportV1 {
+pub enum RuntimeWorkloadResolution {
     LegacyUnspecified {
         restrictions: BaselineRestrictionObservationV1,
     },
     Planned {
-        binding: PlanBindingV1,
+        binding: RuntimePlanBinding,
         effective: EffectiveWorkloadPolicyV1,
         pending: BoundedVec<PrelaunchCheck, 32>,
     },
@@ -212,7 +214,7 @@ pub enum WorkloadResolutionReportV1 {
         target_authorized: False,
     },
     Admitted {
-        binding: AttemptBindingV1,
+        binding: RuntimeAttemptBinding,
         effective: EffectiveWorkloadPolicyV1,
         preauthorization: DiagnosticSha256,
     },
@@ -228,7 +230,7 @@ pub struct WorkloadAdmissionRejectionV1 {
     pub request: RequestBindingV1,
     pub rejection: AdmissionRejectionV1,
 }
-impl WorkloadResolutionReportV1 {
+impl RuntimeWorkloadResolution {
     pub fn valid_plan_response(
         &self,
         contract: &WorkloadContractV1,
@@ -312,7 +314,7 @@ pub enum PolicyTerminalEvidenceV1 {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum AttemptPolicyEnforcementV1 {
+pub enum RuntimePolicyEnforcement {
     #[default]
     LegacyUnspecified,
     NotAuthorized {
@@ -320,7 +322,7 @@ pub enum AttemptPolicyEnforcementV1 {
         rejection: AdmissionRejectionV1,
     },
     Authorized {
-        admission: Box<AttemptBindingV1>,
+        admission: Box<RuntimeAttemptBinding>,
         before_authorization: VerifiedCheckpointV1,
         terminal: PolicyTerminalEvidenceV1,
     },
@@ -393,22 +395,23 @@ fn text(encoder: &mut crate::workload_codec::Encoder, value: &str) -> Result<(),
     encoder.count(value.len())?;
     encoder.raw(value.as_bytes())
 }
-impl AttemptBindingV1 {
+impl RuntimeAttemptBinding {
     pub fn matches_snapshot(
         &self,
-        snapshot: &crate::workload_registry::ProviderAdmissionSnapshotV1,
+        snapshot: &crate::workload_registry::RuntimeAdmissionSnapshot,
     ) -> bool {
-        snapshot.validate().is_ok()
+        self.format == "memcordon.local-attempt-binding"
+            && self.revision == 1
+            && snapshot.validate().is_ok()
             && self.admission_nonce == snapshot.admission_nonce
             && self.plan.matches_contract(&snapshot.request)
             && self.caller_invocation_reference == snapshot.caller_invocation_reference
             && self.plan.registry_digest == snapshot.registry_digest
-            && self.plan.qualification_digest == snapshot.qualification_digest
             && RequestBindingV1::from_contract(&snapshot.request)
                 .is_ok_and(|request| request == self.plan.request)
     }
     pub fn from_snapshot(
-        snapshot: &crate::workload_registry::ProviderAdmissionSnapshotV1,
+        snapshot: &crate::workload_registry::RuntimeAdmissionSnapshot,
         provider: PublicProviderBindingV1,
         boot_identity: BoundedText<128>,
         attempt_id: BoundedText<128>,
@@ -422,10 +425,11 @@ impl AttemptBindingV1 {
             return Err("provider/boot/attempt binding unavailable".into());
         }
         Ok(Self {
-            plan: PlanBindingV1::from_authorized(
+            format: "memcordon.local-attempt-binding".into(),
+            revision: 1,
+            plan: RuntimePlanBinding::from_local_grant(
                 &snapshot.request,
                 snapshot.registry_digest.clone(),
-                snapshot.qualification_digest.clone(),
                 provider,
                 boot_identity,
             )?,
@@ -436,8 +440,15 @@ impl AttemptBindingV1 {
         })
     }
     pub fn canonical_digest(&self) -> Result<DiagnosticSha256, String> {
+        if self.format != "memcordon.local-attempt-binding"
+            || self.revision != 1
+            || self.plan.format != "memcordon.local-plan"
+            || self.plan.revision != 1
+        {
+            return Err("local attempt binding format differs".into());
+        }
         let mut encoder = crate::workload_codec::Encoder::new(
-            b"attempt-policy-binding-v1",
+            b"memcordon.local-attempt-binding/revision1",
             crate::workload_limits::PUBLIC_OBJECT_BYTES,
         )?;
         let request = &self.plan.request;
@@ -451,7 +462,6 @@ impl AttemptBindingV1 {
         encoder.raw(&request.epoch.service_instance.0)?;
         encoder.u64(request.epoch.revision.get())?;
         encoder.digest(&self.plan.registry_digest)?;
-        encoder.digest(&self.plan.qualification_digest)?;
         text(&mut encoder, self.plan.provider.generation.as_str())?;
         text(&mut encoder, self.plan.provider.source_commit.as_str())?;
         encoder.digest(&self.plan.provider.runtime_manifest_sha256)?;
@@ -486,7 +496,7 @@ fn checkpoint_digest(
     Ok(crate::workload_codec::hash_bytes(&encoder.finish()))
 }
 impl VerifiedCheckpointV1 {
-    pub fn matches_binding(&self, binding: &AttemptBindingV1) -> bool {
+    pub fn matches_binding(&self, binding: &RuntimeAttemptBinding) -> bool {
         baseline_for(&binding.plan.request.profile)
             .is_some_and(|profile| self.controls == baseline_observation(profile))
             && binding.canonical_digest().is_ok_and(|digest| {
@@ -497,7 +507,7 @@ impl VerifiedCheckpointV1 {
     // Each independently observed gate is required; none may default to verified.
     #[allow(clippy::too_many_arguments)]
     pub fn observed(
-        binding: &AttemptBindingV1,
+        binding: &RuntimeAttemptBinding,
         controls: BaselineRestrictionObservationV1,
         target_gated: bool,
         caller_verified: bool,
@@ -525,8 +535,8 @@ impl VerifiedCheckpointV1 {
         &self.digest
     }
 }
-impl AttemptPolicyEnforcementV1 {
-    pub fn resolution(&self) -> Option<WorkloadResolutionReportV1> {
+impl RuntimePolicyEnforcement {
+    pub fn resolution(&self) -> Option<RuntimeWorkloadResolution> {
         if !self.is_consistent() {
             return None;
         }
@@ -537,7 +547,7 @@ impl AttemptPolicyEnforcementV1 {
                 ..
             } => {
                 let profile = baseline_for(&admission.plan.request.profile)?;
-                Some(WorkloadResolutionReportV1::Admitted {
+                Some(RuntimeWorkloadResolution::Admitted {
                     binding: admission.as_ref().clone(),
                     effective: EffectiveWorkloadPolicyV1 {
                         profile,
@@ -548,14 +558,14 @@ impl AttemptPolicyEnforcementV1 {
                 })
             }
             Self::NotAuthorized { request, rejection } => {
-                Some(WorkloadResolutionReportV1::Rejected {
+                Some(RuntimeWorkloadResolution::Rejected {
                     binding: request.clone(),
                     rejection: rejection.clone(),
                     target_authorized: False::default(),
                 })
             }
             Self::AuthorizationUncertain { request, failure } => {
-                Some(WorkloadResolutionReportV1::Unavailable {
+                Some(RuntimeWorkloadResolution::Unavailable {
                     request: request.clone(),
                     reason: *failure,
                     authorization: AuthorizationKnowledge::Unknown,
@@ -610,7 +620,7 @@ impl AttemptPolicyEnforcementV1 {
     }
 
     pub fn retired(
-        binding: AttemptBindingV1,
+        binding: RuntimeAttemptBinding,
         checkpoint: VerifiedCheckpointV1,
         controls_preserved: bool,
         provider_resources_closed: bool,

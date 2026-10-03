@@ -8,6 +8,11 @@ use memcordon_core::{
 use std::cell::Cell;
 
 #[test]
+fn native_terminal_pipe_rejects_truncated_payload() {
+    assert!(crate::windows::qualification::terminal_frame_truncation_canary().unwrap());
+}
+
+#[test]
 fn attempt_record_store_validates_typed_preauthorization_abort_before_publication() {
     let digest = "ab".repeat(32);
     let process_identity = WindowsProcessIdentityV1 {
@@ -23,7 +28,7 @@ fn attempt_record_store_validates_typed_preauthorization_abort_before_publicatio
     )
     .unwrap();
     record.guardian_identity = Some(process_identity.clone());
-    record.target_identity = Some(process_identity);
+    record.target_identity = Some(process_identity.clone());
     record.state = crate::windows::record::WindowsAttemptStateV1::TargetCreatedSuspended;
     record.resume_attempted = true;
 
@@ -61,7 +66,9 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
     )
     .unwrap();
     record.guardian_identity = Some(process_identity.clone());
-    record.target_identity = Some(process_identity);
+    record.target_identity = Some(process_identity.clone());
+    record.nonce = nonce.to_owned();
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &process_identity);
     record.state = crate::windows::record::WindowsAttemptStateV1::Terminating;
     record.target_released = true;
     record.cleanup_state.termination_requested = true;
@@ -93,31 +100,13 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
         Some(crate::windows::record::WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
     );
 
-    let rejection = memcordon_core::ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
-        phase: memcordon_core::BoundarySetupPhase::Retirement,
-        detail: "certification rejection after fallback cleanup".to_owned(),
-        os_code: None,
-        loader_qualification: None,
-        target_created: true,
-        target_released: true,
-        cleanup_attempted: true,
-        restart_safety: memcordon_core::RestartSafetyProof {
-            direct_child_reaped: true,
-            workload_empty: Some(true),
-            helpers_reaped: true,
-            containment_removed: true,
-            containment_incapable_of_live_members: true,
-            sealed_boundary_retired: true,
-            errors: Vec::new(),
-        },
-        terminal_ack_required: true,
-        terminal_receipt: None,
-    };
-    let response = memcordon_core::WindowsLauncherResponseV1::Reject {
+    let rejection = super::windows_v3_fixture::preauthorization_rejection(
+        &record,
+        "MCSEALED-WINDOWS-LAUNCH",
+        memcordon_core::BoundarySetupPhase::Retirement,
+        true,
+    );
+    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
         schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
@@ -125,7 +114,7 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
-    let replayed: memcordon_core::WindowsLauncherResponseV1 =
+    let replayed: memcordon_core::WindowsLauncherResponseV3 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
@@ -158,7 +147,9 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
     )
     .unwrap();
     record.guardian_identity = Some(process_identity.clone());
-    record.target_identity = Some(process_identity);
+    record.target_identity = Some(process_identity.clone());
+    record.nonce = nonce.to_owned();
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &process_identity);
     record.state = crate::windows::record::WindowsAttemptStateV1::Terminating;
     record.authorization_unix_millis = Some(1);
     record.resume_attempted = true;
@@ -179,60 +170,14 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
     );
     assert!(record.cleanup_state.final_handles_closed);
     record.validate_for_store_for_test().unwrap();
-    let restart_safety = memcordon_core::RestartSafetyProof {
-        direct_child_reaped: true,
-        workload_empty: Some(true),
-        helpers_reaped: true,
-        containment_removed: true,
-        containment_incapable_of_live_members: true,
-        sealed_boundary_retired: true,
-        errors: Vec::new(),
-    };
-    let terminal = memcordon_core::WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
-        attempt_id: record.attempt_id.clone(),
-        nonce: nonce.to_owned(),
-        request_sha256: record.request_sha256.clone(),
-        child_pid: 91,
-        duration_millis: 1,
-        authorization_offset_millis: 1,
-        job_total_processes: 1,
-        job_process_identities: vec![WindowsProcessIdentityV1 {
-            process_id: 91,
-            creation_time_100ns: 123_987_456,
-        }],
-        cleanup_process_creation: None,
-        outcome: memcordon_core::RunOutcome::Exited {
-            child: memcordon_core::ChildTermination::ExitCode { code: 1 },
-            peak: None,
-            cleanup: memcordon_core::CleanupSummary::default(),
-        },
-        restart_safety: restart_safety.clone(),
-        boundary_detail: memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(
-            memcordon_core::WindowsSealedEvidenceV2 {
-                target_released: true,
-                ..Default::default()
-            },
-        ),
-    };
-    let rejection = memcordon_core::ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
-        phase: memcordon_core::BoundarySetupPhase::Retirement,
-        detail: "certification rejection after completed posttarget cleanup".to_owned(),
-        os_code: None,
-        loader_qualification: None,
-        target_created: true,
-        target_released: true,
-        cleanup_attempted: true,
-        restart_safety,
-        terminal_ack_required: true,
-        terminal_receipt: Some(Box::new(terminal)),
-    };
-    let response = memcordon_core::WindowsLauncherResponseV1::Reject {
+    let rejection = super::windows_v3_fixture::postauthorization_failure(
+        &mut record,
+        process_identity,
+        true,
+        "MCSEALED-WINDOWS-LAUNCH",
+        memcordon_core::BoundarySetupPhase::Retirement,
+    );
+    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
         schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
@@ -240,11 +185,12 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
-    let replayed: memcordon_core::WindowsLauncherResponseV1 =
+    let replayed: memcordon_core::WindowsLauncherResponseV3 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
-        serde_json::to_value(response).unwrap()
+        serde_json::from_str::<serde_json::Value>(&response.terminal_authority_json().unwrap())
+            .unwrap()
     );
 
     let retired = record.terminal_retired_receipt(nonce).unwrap();
@@ -480,6 +426,75 @@ fn failed_terminal_ack_preserves_primary_and_secondary_evidence() {
         .unwrap_err();
     assert!(acknowledgment_only.starts_with("MCSEALED-WINDOWS-TERMINAL-ACKNOWLEDGMENT"));
     assert!(!acknowledgment_only.contains("primary semantic failure"));
+}
+
+#[test]
+fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
+    use memcordon_core::{
+        WindowsProviderResponseV3, WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV1,
+        WindowsTerminalRetiredV2,
+    };
+
+    let attempt_id = "a".repeat(64);
+    let nonce = "bound-nonce";
+    let request_sha256 = "b".repeat(64);
+    let terminal_response_sha256 = "c".repeat(64);
+    let retired = WindowsTerminalRetiredV2 {
+        schema_version: 2,
+        attempt_id: attempt_id.clone(),
+        nonce: nonce.to_owned(),
+        request_sha256: request_sha256.clone(),
+        terminal_response_sha256: terminal_response_sha256.clone(),
+        disposition: WindowsAttemptTerminalDispositionV1::Posttarget,
+        provider_generation: "generation".to_owned(),
+        original_boot_id: "boot".to_owned(),
+        launch_incarnation: "launch".to_owned(),
+        job_identity: "d".repeat(64),
+        owner_manifest_sha256: "e".repeat(64),
+        retirement_proof_sha256: "f".repeat(64),
+        ledger_generation: "0".repeat(64),
+        completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
+    };
+    let confirm = |response| {
+        crate::windows::qualification::confirm_terminal_retirement_response(
+            response,
+            &attempt_id,
+            nonce,
+            &request_sha256,
+            &terminal_response_sha256,
+        )
+    };
+    confirm(WindowsProviderResponseV3::TerminalRetiredV2(
+        retired.clone(),
+    ))
+    .unwrap();
+
+    let mut wrong_digest = retired.clone();
+    wrong_digest.terminal_response_sha256 = "1".repeat(64);
+    assert_eq!(
+        confirm(WindowsProviderResponseV3::TerminalRetiredV2(wrong_digest)).unwrap_err(),
+        "provider did not confirm exact terminal retirement"
+    );
+    let mut missing_proof = retired.clone();
+    missing_proof.retirement_proof_sha256.clear();
+    assert_eq!(
+        confirm(WindowsProviderResponseV3::TerminalRetiredV2(missing_proof)).unwrap_err(),
+        "provider did not confirm exact terminal retirement"
+    );
+    assert_eq!(
+        confirm(WindowsProviderResponseV3::TerminalRetired(
+            WindowsTerminalRetiredV1 {
+                schema_version: 1,
+                attempt_id: attempt_id.clone(),
+                nonce: nonce.to_owned(),
+                request_sha256: request_sha256.clone(),
+                terminal_response_sha256: terminal_response_sha256.clone(),
+                disposition: WindowsAttemptTerminalDispositionV1::Posttarget,
+            }
+        ))
+        .unwrap_err(),
+        "provider did not confirm exact terminal retirement"
+    );
 }
 
 #[test]

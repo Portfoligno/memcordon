@@ -3,16 +3,16 @@ use memcordon_core::{
     BoundaryMechanismEvidence, BoundarySetupPhase, ChildTermination, CleanupSummary,
     CredentialTransitionDisposition, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
     SupervisionErrorRecord, SupervisionPhase, WINDOWS_MAX_JOB_PROCESS_IDENTITIES,
-    WINDOWS_QUALIFICATION_SCHEMA_VERSION, WindowsAttemptRetainedV1, WindowsAttemptStateV1,
-    WindowsAttemptTerminalDispositionV1, WindowsCleanupProcessCreationEvidenceV1,
-    WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1,
-    WindowsLaunchBrokerRequestV1, WindowsLauncherResponseV1, WindowsProcessIdentityV1,
+    WindowsAttemptRetainedV1, WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1,
+    WindowsCleanupProcessCreationEvidenceV1, WindowsDurableAttemptRecordV1,
+    WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1, WindowsLaunchBrokerRequestV1,
+    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsProviderProbeV1,
     WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1, WindowsPublicFrameFailureV1,
-    WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1,
-    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1,
-    WindowsReplayPendingV1, WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1,
-    WindowsStreamRoleV1, WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1,
-    WindowsTerminalRetiredV1, WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
+    WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsRelayEventV1,
+    WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1, WindowsReplayPendingV1,
+    WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
+    WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
+    WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
     WindowsTerminalizationStatusV1, decode_windows_command_line, encode_windows_command_line,
     encode_windows_environment_block, parse_and_authenticate_windows_attempt_record,
     parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
@@ -46,53 +46,22 @@ fn authenticate_signed_attempt_record(
     )
 }
 
-fn qualification() -> WindowsQualificationReceiptV1 {
-    WindowsQualificationReceiptV1 {
-        schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
+fn probe() -> WindowsProviderProbeV1 {
+    WindowsProviderProbeV1 {
+        format: "memcordon.windows-provider-probe".into(),
+        revision: 1,
         provider_identity: format!(
             "memcordon-sealed-agent-windows-v1:{}",
             env!("CARGO_PKG_VERSION")
         ),
-        control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
-        launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
-        guardian_pool_identity: "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
-            .to_owned(),
-        package_verified: true,
-        public_pipe_security_verified: true,
-        private_pipe_security_verified: true,
-        control_service_privileges_verified: true,
-        launcher_service_privileges_verified: true,
-        guardian_slot_tokens_verified: true,
-        guardian_slot_loader_verified: true,
-        guardian_capacity_verified: true,
-        caller_token_authentication_verified: true,
-        restricted_caller_token_verified: true,
-        primary_token_duplication_verified: true,
-        create_process_as_user_verified: true,
-        job_list_supported: true,
-        handle_list_supported: true,
-        nested_host_job_supported: true,
-        kill_on_close_verified: true,
-        breakaway_denied: true,
-        completion_port_verified: true,
-        guardian_verified: true,
-        frontend_loss_cleanup_verified: true,
-        alternate_token_child_contained: true,
-        nested_child_job_contained: true,
-        recursive_provider_request_denied: true,
-        exact_handle_inheritance_verified: true,
-        active_processes_zero_verified: true,
-        relays_retired_verified: true,
-        recovery_complete: true,
-        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
-            memcordon_core::WindowsLoaderReadyEvidenceV1 {
-                schema_version: 1,
-                launch_plan_sha256: sha256(b"production-plan"),
-                launch_plan_json: None,
-                elapsed_millis: 1,
-            },
-        ),
-        qualified: true,
+        provider_binding: memcordon_core::PublicProviderBindingV1 {
+            generation: memcordon_core::BoundedText::new("native-fixture-generation").unwrap(),
+            source_commit: memcordon_core::BoundedText::new(&sha256(b"source identity")).unwrap(),
+            runtime_manifest_sha256: memcordon_core::DiagnosticSha256::from_bytes([7; 32]),
+        },
+        launcher_authenticated: true,
+        recovery_clear: true,
+        attempts_empty: true,
     }
 }
 
@@ -500,17 +469,33 @@ fn windows_environment_rejects_malformed_and_duplicate_drive_entries() {
 }
 
 #[test]
-fn windows_qualification_requires_every_native_predicate() {
-    let canonical = qualification();
-    assert!(canonical.is_consistent());
-
-    let mut missing_guardian = canonical.clone();
-    missing_guardian.guardian_verified = false;
-    assert!(!missing_guardian.is_consistent());
-
-    let mut stale_schema = canonical;
-    stale_schema.schema_version = WINDOWS_QUALIFICATION_SCHEMA_VERSION + 1;
-    assert!(!stale_schema.is_consistent());
+fn windows_probe_requires_named_identity_and_actual_live_service_facts() {
+    let canonical = probe();
+    canonical.validate().unwrap();
+    let mut no_launcher = canonical.clone();
+    no_launcher.launcher_authenticated = false;
+    assert!(no_launcher.validate().is_err());
+    let mut pending_recovery = canonical.clone();
+    pending_recovery.recovery_clear = false;
+    assert!(pending_recovery.validate().is_err());
+    let mut wrong_namespace = canonical.clone();
+    wrong_namespace.format = "memcordon.saved-qualification".into();
+    assert!(wrong_namespace.validate().is_err());
+    let mut stale_revision = canonical.clone();
+    stale_revision.revision += 1;
+    assert!(stale_revision.validate().is_err());
+    let mut absent_source = canonical.clone();
+    absent_source.provider_binding.source_commit =
+        memcordon_core::BoundedText::new(&"0".repeat(std::mem::size_of::<[u8; 32]>() * 2)).unwrap();
+    assert!(absent_source.validate().is_err());
+    let mut absent_manifest = canonical.clone();
+    absent_manifest.provider_binding.runtime_manifest_sha256 =
+        memcordon_core::DiagnosticSha256::from_bytes([0; 32]);
+    assert!(absent_manifest.validate().is_err());
+    let mut busy = canonical;
+    busy.attempts_empty = false;
+    busy.validate()
+        .expect("busy is a real live observation, not a permission failure");
 }
 
 #[test]
@@ -521,6 +506,29 @@ fn windows_protocol_rejects_unknown_fields() {
         "unexpected": true
     });
     assert!(serde_json::from_value::<WindowsProviderRequestV1>(value).is_err());
+}
+
+#[test]
+fn windows_protocol_rejects_retired_qualification_ingress_and_probe_shapes() {
+    for message in [
+        "qualification-begin",
+        "qualification-acquire",
+        "qualification-authorize-child",
+        "qualification-witness",
+        "qualification-end",
+    ] {
+        let value = serde_json::json!({"message": message, "schema_version": memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION});
+        assert!(
+            serde_json::from_value::<memcordon_core::WindowsProviderRequestV3>(value).is_err(),
+            "{message} is retired before request dispatch"
+        );
+    }
+    let old_probe = serde_json::json!({"kind":"probe", "schema_version":memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION, "qualification":{}, "provider_binding":probe().provider_binding});
+    assert!(
+        serde_json::from_value::<memcordon_core::WindowsProviderResponseV3>(old_probe).is_err()
+    );
+    let new_probe = serde_json::json!({"kind":"probe", "schema_version":memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION, "observation":probe()});
+    assert!(serde_json::from_value::<memcordon_core::WindowsProviderResponseV3>(new_probe).is_ok());
 }
 
 #[test]
@@ -1050,9 +1058,7 @@ fn windows_terminal_process_identity_inventory_is_bounded_and_unique() {
             cleanup: CleanupSummary::default(),
         },
         restart_safety: RestartSafetyProof::default(),
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(
-            WindowsSealedEvidenceV2::default(),
-        ),
+        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::default()),
     };
     assert!(receipt.process_identity_inventory_is_bounded());
     receipt
@@ -1174,35 +1180,38 @@ fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
             sealed_boundary_retired: true,
             errors: Vec::new(),
         },
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(WindowsSealedEvidenceV2 {
-            schema_version: 2,
-            service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
-            caller_token_authenticated: true,
-            initial_target_token_matches_caller: true,
-            credential_transition_disposition:
-                CredentialTransitionDisposition::PreserveCallerEnvelope,
-            job_membership_independent_of_token: true,
-            job_created: true,
-            job_limits_verified: true,
-            kill_on_close_verified: true,
-            breakaway_denied: true,
-            completion_port_associated: true,
-            guardian_ready: true,
-            target_created_suspended: true,
-            job_list_applied_at_creation: true,
-            handle_list_applied_at_creation: true,
-            target_job_membership_verified: true,
-            target_still_suspended_during_verification: true,
-            inherited_handles_verified: true,
-            target_released: true,
-            terminate_job_invoked: true,
-            active_processes_zero: true,
-            direct_target_reaped: true,
-            relays_retired: true,
-            guardian_reaped: true,
-            final_job_handles_closed: true,
-            loader_qualification: None,
-        }),
+        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
+            WindowsSealedEvidenceV2 {
+                schema_version: 2,
+                service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
+                caller_token_authenticated: true,
+                initial_target_token_matches_caller: true,
+                credential_transition_disposition:
+                    CredentialTransitionDisposition::PreserveCallerEnvelope,
+                job_membership_independent_of_token: true,
+                job_created: true,
+                job_limits_verified: true,
+                kill_on_close_verified: true,
+                breakaway_denied: true,
+                completion_port_associated: true,
+                guardian_ready: true,
+                target_created_suspended: true,
+                job_list_applied_at_creation: true,
+                handle_list_applied_at_creation: true,
+                target_job_membership_verified: true,
+                target_still_suspended_during_verification: true,
+                inherited_handles_verified: true,
+                target_released: true,
+                terminate_job_invoked: true,
+                active_processes_zero: true,
+                direct_target_reaped: true,
+                relays_retired: true,
+                guardian_reaped: true,
+                final_job_handles_closed: true,
+                loader_qualification: None,
+                frontend_delivery: None,
+            },
+        )),
     }
 }
 

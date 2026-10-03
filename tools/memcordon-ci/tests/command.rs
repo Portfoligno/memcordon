@@ -1,64 +1,67 @@
+use memcordon_ci::command::CommandSpec;
 use std::ffi::OsStr;
 use std::process::Command;
+use std::time::Duration;
 
 #[test]
-fn workspace_metadata_removes_registry_credentials_with_and_without_a_context() {
-    use memcordon_ci::{build_context::ValidatedBuildContext, policy::workspace_metadata_command};
-    use std::fs;
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().canonicalize().unwrap();
-    fs::create_dir(root.join("ci")).unwrap();
-    fs::write(
-        root.join("ci/toolchains.toml"),
-        include_bytes!("../../../ci/toolchains.toml"),
+fn private_native_command_explicitly_removes_actions_token() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let command = CommandSpec::new(
+        "/usr/libexec/memcordon-sealed-agent",
+        root,
+        Duration::from_secs(1),
     )
+    .args(["package", "inspect", "--json"])
+    .materialize()
     .unwrap();
-    let toolchains = memcordon_ci::config::toolchains(&root).unwrap();
-    let bin = root.join("sysroot/bin");
-    fs::create_dir_all(&bin).unwrap();
-    let cargo = bin.join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
-    fs::write(&cargo, b"fixture tool\n").unwrap();
-    let encode = |value: &OsStr| hex::encode(value.as_encoded_bytes());
-    let manifest = root.join("context.json");
-    fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
-        "environment": [[encode(OsStr::new("PATH")), encode(bin.as_os_str())]],
-        "toolchains": {toolchains.stable: cargo}, "input_roots": [bin], "discovery_roots": [],
-        "inputs": [{"path": encode(cargo.as_os_str()), "kind": "file", "mode": 0, "digest": "fixture"}],
-        "worker": {}
-    })).unwrap()).unwrap();
-    let context = ValidatedBuildContext::read(&manifest).unwrap();
-    let spec = workspace_metadata_command(&root).unwrap();
-    for context in [Some(&context), None] {
-        let command = spec.materialize(context).unwrap();
-        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
-        for credential in ["CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"] {
-            if context.is_some() {
-                assert!(
-                    !environment.contains_key(OsStr::new(credential)),
-                    "managed metadata must omit credentials from its closed environment"
-                );
-            } else {
-                assert_eq!(
-                    environment.get(OsStr::new(credential)),
-                    Some(&None),
-                    "standalone metadata must explicitly remove inherited credentials"
-                );
-            }
-        }
+    for credential in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+    ] {
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(credential)),
+            Some((OsStr::new(credential), None))
+        );
     }
 }
 
 #[test]
-fn explicit_toolchain_invocations_preserve_native_argv_without_a_context() {
-    use memcordon_ci::command::CommandSpec;
+fn workspace_metadata_removes_registry_credentials() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    std::fs::create_dir(root.join("ci")).unwrap();
+    std::fs::write(
+        root.join("ci/toolchains.toml"),
+        include_bytes!("../../../ci/toolchains.toml"),
+    )
+    .unwrap();
+    let command = memcordon_ci::policy::workspace_metadata_command(root)
+        .unwrap()
+        .materialize()
+        .unwrap();
+    for credential in ["CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"] {
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(credential)),
+            Some((OsStr::new(credential), None))
+        );
+    }
+}
+
+#[test]
+fn explicit_toolchain_invocations_preserve_native_argv() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let rustup = root.join("tool path/rustup");
     let tool = root.join("tool path/cargo-fuzz");
-    let deadline = std::time::Duration::from_secs(1);
+    let deadline = Duration::from_secs(1);
     let cargo = CommandSpec::cargo(&rustup, root, "nightly", deadline)
         .args(["test", "argument with spaces"])
-        .materialize(None)
+        .materialize()
         .unwrap();
     assert_eq!(cargo.get_program(), rustup);
     assert_eq!(
@@ -67,7 +70,7 @@ fn explicit_toolchain_invocations_preserve_native_argv_without_a_context() {
     );
     let fuzz = CommandSpec::toolchain_program(&rustup, root, "nightly", &tool, deadline)
         .args(["fuzz", "build"])
-        .materialize(None)
+        .materialize()
         .unwrap();
     assert_eq!(
         fuzz.get_args().collect::<Vec<_>>(),
@@ -81,177 +84,62 @@ fn explicit_toolchain_invocations_preserve_native_argv_without_a_context() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn enrolled_auxiliaries_use_closed_toolchain_context_but_workloads_keep_their_environment() {
-    use memcordon_ci::{build_context::ValidatedBuildContext, command::CommandSpec};
-    use std::fs;
-    use std::os::unix::ffi::OsStrExt;
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().canonicalize().unwrap();
-    let bin = root.join("sysroot/bin");
-    fs::create_dir_all(&bin).unwrap();
-    let cargo = bin.join("cargo");
-    std::os::unix::fs::symlink("/usr/bin/env", &cargo).unwrap();
-    let fuzz = root.join("target/ci-tools/bin/cargo-fuzz");
-    fs::create_dir_all(fuzz.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink("/usr/bin/env", &fuzz).unwrap();
-    let audit = fuzz.with_file_name("cargo-audit");
-    let deny = fuzz.with_file_name("cargo-deny");
-    for tool in [&audit, &deny] {
-        std::os::unix::fs::symlink("/usr/bin/env", tool).unwrap();
-    }
-    let hex = |value: &OsStr| {
-        value
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let manifest = root.join("context.json");
-    fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
-        "environment": [[hex(OsStr::new("PATH")), hex(OsStr::new("/usr/bin"))]],
-        "toolchains": {"nightly": cargo}, "input_roots": [root], "discovery_roots": [],
-        "inputs": ([&cargo, &fuzz, &audit, &deny].map(|tool| serde_json::json!({"path": hex(tool.as_os_str()), "kind": "symlink", "mode": 0, "digest": "fixture"}))),
-        "worker": {}
-    })).unwrap()).unwrap();
-    let context = ValidatedBuildContext::read(&manifest).unwrap();
-    for (spec, (tool, arguments)) in memcordon_ci::command::supply_chain_commands(&root, "nightly")
+fn supply_chain_tools_preserve_selected_pin_and_workloads_use_native_argv() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (spec, basename) in memcordon_ci::command::supply_chain_commands(root, "nightly")
         .into_iter()
-        .zip([
-            (&audit, ["audit", "--deny", "warnings"]),
-            (&deny, ["--config", "ci/deny.toml", "check"]),
-        ])
+        .zip(["cargo-audit", "cargo-deny"])
     {
-        let command = spec.materialize(Some(&context)).unwrap();
-        assert_eq!(command.get_program(), tool);
-        assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
-        assert!(
-            command
-                .get_envs()
-                .any(|(key, value)| key == "RUSTUP_TOOLCHAIN"
-                    && value == Some(OsStr::new("nightly")))
-        );
-        let standalone = spec.materialize(None).unwrap();
+        let command = spec.materialize().unwrap();
+        assert_eq!(command.get_program(), "rustup");
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(&arguments[..2], ["run", "nightly"]);
         assert_eq!(
-            standalone.get_args().take(3).collect::<Vec<_>>(),
-            [OsStr::new("run"), OsStr::new("nightly"), tool.as_os_str()]
+            std::path::Path::new(arguments[2]).file_stem(),
+            Some(OsStr::new(basename))
         );
+        assert_eq!(command.get_current_dir(), Some(root));
     }
-    let deadline = std::time::Duration::from_secs(1);
-    for spec in [
-        CommandSpec::cargo(root.join("absolute/rustup"), &root, "nightly", deadline),
-        CommandSpec::toolchain_program("rustup", &root, "nightly", &fuzz, deadline),
-        CommandSpec::toolchain_program("rustup", &root, "nightly", &audit, deadline),
-        CommandSpec::toolchain_program("rustup", &root, "nightly", &deny, deadline),
-    ] {
-        let mut command = spec.materialize(Some(&context)).unwrap();
-        assert_eq!(command.get_current_dir(), Some(root.as_path()));
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "native recorder failed: status {:?}, stderr {:?}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = String::from_utf8(output.stdout).unwrap();
-        let environment: std::collections::BTreeMap<_, _> = output
-            .lines()
-            .map(|line| line.split_once('=').unwrap())
-            .collect();
-        assert_eq!(environment.get("RUSTUP_TOOLCHAIN"), Some(&"nightly"));
-        assert_eq!(environment.get("CARGO_NET_OFFLINE"), Some(&"true"));
-        assert_eq!(
-            environment.get("RUSTC").copied(),
-            bin.join("rustc").to_str()
-        );
-        assert_eq!(
-            environment.get("RUSTDOC").copied(),
-            bin.join("rustdoc").to_str()
-        );
-        assert_eq!(
-            std::env::split_paths(environment.get("PATH").unwrap()).next(),
-            Some(bin.clone())
-        );
-        assert_eq!(
-            environment.len(),
-            5,
-            "ambient variables must not reach a managed compiler"
-        );
-    }
-    let unknown = fuzz.with_file_name("cargo-other");
-    std::os::unix::fs::symlink("/usr/bin/env", &unknown).unwrap();
-    let mut data: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
-    data["inputs"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({
-            "path": hex(unknown.as_os_str()), "kind": "symlink", "mode": 0, "digest": "fixture"
-        }));
-    data["inputs"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|input| input["path"] != hex(audit.as_os_str()));
-    fs::write(&manifest, serde_json::to_vec(&data).unwrap()).unwrap();
-    let restricted = ValidatedBuildContext::read(&manifest).unwrap();
-    for tool in [&unknown, &audit] {
-        let error = CommandSpec::toolchain_program("rustup", &root, "nightly", tool, deadline)
-            .materialize(Some(&restricted))
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unenrolled toolchain executable")
-        );
-    }
-    let workload = CommandSpec::new("workload", &root, deadline)
-        .arg("payload")
-        .materialize(Some(&context))
+    let workload = CommandSpec::new("workload", root, Duration::from_secs(1))
+        .arg("payload with spaces")
+        .materialize()
         .unwrap();
     assert_eq!(workload.get_program(), "workload");
-    assert_eq!(workload.get_args().collect::<Vec<_>>(), ["payload"]);
-    assert!(
-        workload
-            .get_envs()
-            .all(|(key, _)| key == "CARGO_REGISTRY_TOKEN"
-                || key == "CARGO_REGISTRIES_CRATES_IO_TOKEN")
+    assert_eq!(
+        workload.get_args().collect::<Vec<_>>(),
+        ["payload with spaces"]
     );
+    assert!(!workload.get_envs().any(|(_, value)| value.is_some()));
 }
 
 #[test]
-fn subprocesses_expose_exactly_one_selected_cargo_capability_interface() {
-    for inherit_crates_io_token in [false, true] {
-        let mut spec = memcordon_ci::command::CommandSpec::new(
-            "memcordon-ci-command-policy-fixture",
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-            std::time::Duration::from_secs(1),
-        );
-        if inherit_crates_io_token {
-            spec = spec.inherit_crates_io_registry_token();
-        }
-        let mut command = Command::new("memcordon-ci-command-policy-fixture");
-        spec.apply_environment(&mut command);
-        let environment_state = |name: &str| {
-            command
-                .get_envs()
-                .find(|(key, _)| *key == OsStr::new(name))
-                .map(|(_, value)| value)
-        };
+fn subprocesses_unconditionally_exclude_registry_and_actions_credentials() {
+    let spec = CommandSpec::new(
+        "memcordon-ci-command-policy-fixture",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        Duration::from_secs(1),
+    );
+    let mut command = Command::new("memcordon-ci-command-policy-fixture");
+    spec.apply_environment(&mut command);
+    let environment_state = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(name))
+            .map(|(_, value)| value)
+    };
+    for credential in [
+        "CARGO_REGISTRY_TOKEN",
+        "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+    ] {
         assert_eq!(
-            environment_state("CARGO_REGISTRY_TOKEN"),
+            environment_state(credential),
             Some(None),
-            "the legacy singular-token interface must always be removed"
-        );
-        assert_eq!(
-            environment_state("CARGO_REGISTRIES_CRATES_IO_TOKEN"),
-            if inherit_crates_io_token {
-                None
-            } else {
-                Some(None)
-            },
-            "the standard crates.io variable must follow the selected capability only"
+            "{credential} must be excluded"
         );
     }
 }

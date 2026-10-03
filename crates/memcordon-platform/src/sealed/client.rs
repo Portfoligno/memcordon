@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -13,6 +13,15 @@ use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
 const VERSION: u16 = 3;
+#[path = "private_client.rs"]
+mod private_client;
+#[path = "private_relay.rs"]
+mod private_relay;
+pub(crate) use private_client::private_backend_run;
+pub use private_client::{PrivateFrontendExecution, private_discovery, private_plan, private_run};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use private_relay::NativeByteRelayProbe;
 const HEADER_LENGTH: usize = 72;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_NATIVE_VALUE: usize = 64 * 1024;
@@ -25,103 +34,13 @@ pub struct ProbeReceipt {
     pub provider_identity: String,
     pub control_service_identity: String,
     pub launcher_service_identity: String,
-    pub receipt_digest: String,
-    pub setid_transition_certification_digest: String,
-    pub sudo_transition_certification_digest: String,
+    pub observation_digest: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct QualificationReceipt {
-    schema_version: u32,
-    workload_profile: memcordon_core::workload_contract::ProfileRef,
-    workload_profile_probe_verified: bool,
-    version: String,
-    mechanism: String,
-    provider_identity: String,
-    control_service_identity: String,
-    launcher_service_identity: String,
-    receipt_digest: String,
-    unified_cgroup_v2: bool,
-    private_cgroup_subtree: bool,
-    clone3: bool,
-    clone3_into_cgroup: bool,
-    pid_namespace: bool,
-    mount_namespace: bool,
-    cgroup_namespace: bool,
-    pidfd: bool,
-    close_range: bool,
-    guardian_outside_boundary: bool,
-    target_gated: bool,
-    assignment_verified: bool,
-    inherited_descriptors_verified: bool,
-    spawn_error_reporting_verified: bool,
-    frontend_loss_authority_verified: bool,
-    cgroup_kill: bool,
-    workload_empty: bool,
-    helpers_reaped: bool,
-    boundary_retired: bool,
-    recovery_complete: bool,
-    split_control_and_launcher_services: bool,
-    launcher_no_new_privs_disabled: bool,
-    caller_mount_namespace_reproduction_verified: bool,
-    caller_no_new_privs_reproduction_verified: bool,
-    caller_capability_bounding_set_reproduction_verified: bool,
-    initial_provider_capabilities_absent: bool,
-    credential_transition_disposition: String,
-    setid_transition_certification_digest: String,
-    sudo_transition_certification_digest: String,
-    post_transition_cgroup_membership_verified: bool,
-    post_transition_pid_namespace_verified: bool,
-    post_transition_cleanup_verified: bool,
-    recursive_provider_request_rejected: bool,
-}
-
-impl QualificationReceipt {
-    fn is_complete(&self) -> bool {
-        self.schema_version == 3
-            && self.workload_profile
-                == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
-            && self.workload_profile_probe_verified
-            && self.mechanism == "linux-pid-namespace-cgroup-v2"
-            && self.provider_identity == "memcordon-sealed-agent-v2"
-            && self.control_service_identity == "memcordon-sealed-agent.service:v2"
-            && self.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
-            && valid_sha256(&self.receipt_digest)
-            && self.unified_cgroup_v2
-            && self.private_cgroup_subtree
-            && self.clone3
-            && self.clone3_into_cgroup
-            && self.pid_namespace
-            && self.mount_namespace
-            && self.cgroup_namespace
-            && self.pidfd
-            && self.close_range
-            && self.guardian_outside_boundary
-            && self.target_gated
-            && self.assignment_verified
-            && self.inherited_descriptors_verified
-            && self.spawn_error_reporting_verified
-            && self.frontend_loss_authority_verified
-            && self.cgroup_kill
-            && self.workload_empty
-            && self.helpers_reaped
-            && self.boundary_retired
-            && self.recovery_complete
-            && self.split_control_and_launcher_services
-            && self.launcher_no_new_privs_disabled
-            && self.caller_mount_namespace_reproduction_verified
-            && self.caller_no_new_privs_reproduction_verified
-            && self.caller_capability_bounding_set_reproduction_verified
-            && self.initial_provider_capabilities_absent
-            && self.credential_transition_disposition == "preserve-caller-envelope"
-            && valid_sha256(&self.setid_transition_certification_digest)
-            && valid_sha256(&self.sudo_transition_certification_digest)
-            && self.post_transition_cgroup_membership_verified
-            && self.post_transition_pid_namespace_verified
-            && self.post_transition_cleanup_verified
-            && self.recursive_provider_request_rejected
-    }
+pub(crate) fn parse_readiness(
+    payload: &[u8],
+) -> Result<memcordon_core::runtime_readiness::ReadinessObservation, String> {
+    memcordon_core::runtime_readiness::ReadinessObservation::parse(payload)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -131,19 +50,9 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub(crate) fn parse_qualification(payload: &[u8]) -> Result<QualificationReceipt, String> {
-    let receipt: QualificationReceipt =
-        serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-    if receipt.is_complete() {
-        Ok(receipt)
-    } else {
-        Err("provider qualification receipt is incomplete or incompatible".to_owned())
-    }
-}
-
 #[allow(dead_code)]
 pub struct TerminalReceipt {
-    pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
+    pub policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement,
     pub schema_version: u32,
     pub mechanism: String,
     pub status: Option<i32>,
@@ -200,33 +109,6 @@ pub enum TerminalExecFailureClass {
 pub enum LaunchError {
     Transport(String),
     Rejected(Box<memcordon_core::ProviderRejectionEvidence>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectionCleanupV1 {
-    attempted: bool,
-    direct_child_reaped: bool,
-    workload_empty: Option<bool>,
-    helpers_reaped: bool,
-    containment_removed: bool,
-    sealed_boundary_retired: bool,
-    errors: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectionV1 {
-    #[serde(default)]
-    workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
-    schema_version: u32,
-    code: String,
-    phase: memcordon_core::BoundarySetupPhase,
-    detail: String,
-    os_code: Option<i32>,
-    target_created: bool,
-    target_released: bool,
-    cleanup: RejectionCleanupV1,
 }
 
 #[allow(
@@ -316,7 +198,7 @@ pub fn run(
             "terminal workload binding differs from the exact request",
         ));
     }
-    if let memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+    if let memcordon_core::workload_evidence::RuntimePolicyEnforcement::Authorized {
         admission,
         ..
     } = &terminal.policy_enforcement
@@ -422,7 +304,7 @@ pub fn run(
         provider_identity: qualification.provider_identity.clone(),
         control_service_identity: qualification.control_service_identity.clone(),
         launcher_service_identity: qualification.launcher_service_identity.clone(),
-        cgroup_identity_digest: qualification.receipt_digest.clone(),
+        cgroup_identity_digest: qualification.observation_digest.clone(),
         cgroup_created: true,
         cgroup_owned_by_provider: true,
         memory_configuration_verified: true,
@@ -453,6 +335,7 @@ pub fn run(
         cgroup_removed: terminal.boundary_retired,
     };
     Ok(crate::backend::Execution {
+        private_execution: None,
         policy_enforcement: terminal.policy_enforcement.clone(),
         outcome,
         backend: crate::linux_cgroup::sealed_info(qualification),
@@ -676,74 +559,7 @@ pub(crate) fn launch(
 pub(crate) fn parse_rejection(
     payload: &[u8],
 ) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
-    const MAX_CODE_BYTES: usize = 128;
-    const MAX_DETAIL_BYTES: usize = 8 * 1024;
-    const MAX_CLEANUP_ERRORS: usize = 16;
-    const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
-    let receipt: RejectionV1 =
-        serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-    if receipt.schema_version != 1
-        || receipt.code.is_empty()
-        || receipt.code.len() > MAX_CODE_BYTES
-        || !receipt
-            .code
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
-        || receipt.detail.len() > MAX_DETAIL_BYTES
-        || receipt.detail.contains('\0')
-        || receipt.target_released && !receipt.target_created
-        || receipt.cleanup.errors.len() > MAX_CLEANUP_ERRORS
-        || receipt
-            .cleanup
-            .errors
-            .iter()
-            .any(|error| error.len() > MAX_CLEANUP_ERROR_BYTES || error.contains('\0'))
-    {
-        return Err("typed rejection fields violate protocol bounds".to_owned());
-    }
-    if !receipt.cleanup.attempted
-        && (receipt.cleanup.direct_child_reaped
-            || receipt.cleanup.workload_empty.is_some()
-            || receipt.cleanup.helpers_reaped
-            || receipt.cleanup.containment_removed
-            || receipt.cleanup.sealed_boundary_retired
-            || !receipt.cleanup.errors.is_empty())
-    {
-        return Err("typed rejection cleanup evidence is contradictory".to_owned());
-    }
-    if receipt.cleanup.sealed_boundary_retired
-        && (!receipt.cleanup.direct_child_reaped
-            || receipt.cleanup.workload_empty != Some(true)
-            || !receipt.cleanup.helpers_reaped
-            || !receipt.cleanup.containment_removed
-            || !receipt.cleanup.errors.is_empty())
-    {
-        return Err("typed rejection retirement evidence is incomplete".to_owned());
-    }
-    Ok(memcordon_core::ProviderRejectionEvidence {
-        workload_admission: receipt.workload_admission,
-        provider_failure: None,
-        schema_version: receipt.schema_version,
-        code: receipt.code,
-        phase: receipt.phase,
-        detail: receipt.detail,
-        os_code: receipt.os_code,
-        loader_qualification: None,
-        target_created: receipt.target_created,
-        target_released: receipt.target_released,
-        cleanup_attempted: receipt.cleanup.attempted,
-        restart_safety: memcordon_core::RestartSafetyProof {
-            direct_child_reaped: receipt.cleanup.direct_child_reaped,
-            workload_empty: receipt.cleanup.workload_empty,
-            helpers_reaped: receipt.cleanup.helpers_reaped,
-            containment_removed: receipt.cleanup.containment_removed,
-            containment_incapable_of_live_members: receipt.cleanup.workload_empty == Some(true),
-            sealed_boundary_retired: receipt.cleanup.sealed_boundary_retired,
-            errors: receipt.cleanup.errors,
-        },
-        terminal_ack_required: false,
-        terminal_receipt: None,
-    })
+    memcordon_core::provider_rejection_wire::RejectionWireV1::parse_evidence(payload)
 }
 
 fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static str {
@@ -775,20 +591,20 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
     }
 }
 
-pub fn workload_discovery()
--> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+pub fn workload_discovery() -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String>
+{
     verify_endpoint()?;
     let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
     verify_peer(&stream)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
+    let mut stream = super::verification_exchange::DeadlineStream::new(
+        &mut stream,
+        super::verification_exchange::VERIFIED_EXCHANGE_BUDGET,
+    )
+    .map_err(|error| error.to_string())?;
     let nonce = nonce()?;
     write_frame(&mut stream, 9, nonce, [0; 16], &[])?;
-    let frame = read_frame(&mut stream)?;
+    let frame = read_frame(&mut stream)
+        .map_err(|error| format!("workload discovery response nonce={nonce:02x?}: {error}"))?;
     if frame.kind != 109
         || frame.nonce != nonce
         || frame.attempt != [0; 16]
@@ -797,7 +613,7 @@ pub fn workload_discovery()
         return Err("discovery receipt identity or size differs".into());
     }
     memcordon_core::workload_contract::reject_duplicate_json_keys(&frame.payload)?;
-    let discovery: memcordon_core::workload_discovery::WorkloadDiscoveryV1 =
+    let discovery: memcordon_core::workload_discovery::WorkloadDiscovery =
         serde_json::from_slice(&frame.payload).map_err(|error| error.to_string())?;
     if !discovery.validate(memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate) {
         return Err("discovery profile differs".into());
@@ -813,18 +629,17 @@ pub fn workload_discovery()
 
 pub fn workload_plan(
     contract: &memcordon_core::workload_contract::WorkloadContractV1,
-) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
-    use memcordon_core::workload_evidence::WorkloadResolutionReportV1;
+) -> Result<memcordon_core::workload_evidence::RuntimeWorkloadResolution, String> {
+    use memcordon_core::workload_evidence::RuntimeWorkloadResolution;
     contract.validate()?;
     verify_endpoint()?;
     let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
     verify_peer(&stream)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
+    let mut stream = super::verification_exchange::DeadlineStream::new(
+        &mut stream,
+        super::verification_exchange::VERIFIED_EXCHANGE_BUDGET,
+    )
+    .map_err(|error| error.to_string())?;
     let nonce = nonce()?;
     let payload = serde_json::to_vec(contract).map_err(|error| error.to_string())?;
     if payload.len() > memcordon_core::workload_limits::CONTRACT_BYTES {
@@ -840,7 +655,7 @@ pub fn workload_plan(
         return Err("workload plan receipt identity or size differs".into());
     }
     memcordon_core::workload_contract::reject_duplicate_json_keys(&frame.payload)?;
-    let response: WorkloadResolutionReportV1 =
+    let response: RuntimeWorkloadResolution =
         serde_json::from_slice(&frame.payload).map_err(|error| error.to_string())?;
     if !response.valid_plan_response(
         contract,
@@ -849,7 +664,7 @@ pub fn workload_plan(
         return Err("workload plan request or effective binding differs".into());
     }
     match &response {
-        WorkloadResolutionReportV1::Planned { binding, .. } => {
+        RuntimeWorkloadResolution::Planned { binding, .. } => {
             super::linux_runtime::verify(&binding.provider)?;
             let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
                 .map_err(|error| error.to_string())?;
@@ -857,8 +672,8 @@ pub fn workload_plan(
                 return Err("workload plan boot binding differs".into());
             }
         }
-        WorkloadResolutionReportV1::Rejected { .. }
-        | WorkloadResolutionReportV1::Unavailable { .. } => {}
+        RuntimeWorkloadResolution::Rejected { .. }
+        | RuntimeWorkloadResolution::Unavailable { .. } => {}
         _ => return Err("workload plan returned an execution state".into()),
     }
     Ok(response)
@@ -886,7 +701,7 @@ pub fn probe() -> Result<ProbeReceipt, String> {
     if kind != 101 || returned_nonce != nonce || attempt != [0; 16] {
         return Err("provider probe receipt identity mismatch".to_owned());
     }
-    let receipt = parse_qualification(&payload)?;
+    let receipt = parse_readiness(&payload)?;
     validate_exact_provider_pairing(
         env!("CARGO_PKG_VERSION"),
         &receipt.version,
@@ -898,9 +713,7 @@ pub fn probe() -> Result<ProbeReceipt, String> {
         provider_identity: receipt.provider_identity,
         control_service_identity: receipt.control_service_identity,
         launcher_service_identity: receipt.launcher_service_identity,
-        receipt_digest: receipt.receipt_digest,
-        setid_transition_certification_digest: receipt.setid_transition_certification_digest,
-        sudo_transition_certification_digest: receipt.sudo_transition_certification_digest,
+        observation_digest: receipt.observation_digest,
     })
 }
 
@@ -1157,6 +970,16 @@ fn encoded_frame(
     attempt: [u8; 16],
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
+    encoded_frame_for_version(VERSION, kind, nonce, attempt, payload)
+}
+
+fn encoded_frame_for_version(
+    version: u16,
+    kind: u16,
+    nonce: [u8; 16],
+    attempt: [u8; 16],
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let total = HEADER_LENGTH
         .checked_add(payload.len())
@@ -1165,7 +988,7 @@ fn encoded_frame(
         return Err("frame exceeds protocol limit".to_owned());
     }
     let total = u32::try_from(total).map_err(|_| "frame exceeds protocol limit".to_owned())?;
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&kind.to_be_bytes());
     bytes.extend_from_slice(&total.to_be_bytes());
     bytes.extend_from_slice(&nonce);
@@ -1238,7 +1061,7 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
     let mechanism = take_terminal_field(&mut fields, "mechanism")?.to_owned();
     let policy_bytes = take_terminal_field(&mut fields, "policy-enforcement")?.as_bytes();
     memcordon_core::workload_contract::reject_duplicate_json_keys(policy_bytes)?;
-    let policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1 =
+    let policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement =
         serde_json::from_slice(policy_bytes).map_err(|error| error.to_string())?;
     if !policy_enforcement.is_consistent() {
         return Err("terminal policy enforcement differs".into());
@@ -1400,7 +1223,7 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         && (receipt.deadline_exceeded
             || !matches!(
                 &receipt.policy_enforcement,
-                memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+                memcordon_core::workload_evidence::RuntimePolicyEnforcement::Authorized {
                     terminal:
                         memcordon_core::workload_evidence::PolicyTerminalEvidenceV1::Retired {
                             controls_preserved: true,
@@ -1463,7 +1286,7 @@ fn nonce() -> Result<[u8; 16], String> {
 }
 
 fn write_frame(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     kind: u16,
     nonce: [u8; 16],
     attempt: [u8; 16],
@@ -1494,12 +1317,19 @@ struct WireFrame {
     payload: Vec<u8>,
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<WireFrame, String> {
+fn read_frame(stream: &mut impl Read) -> Result<WireFrame, String> {
+    read_frame_for_version(stream, VERSION)
+}
+
+fn read_frame_for_version(
+    stream: &mut impl Read,
+    expected_version: u16,
+) -> Result<WireFrame, String> {
     let mut header = [0_u8; HEADER_LENGTH];
     stream
         .read_exact(&mut header)
         .map_err(|error| error.to_string())?;
-    if u16::from_be_bytes([header[0], header[1]]) != VERSION {
+    if u16::from_be_bytes([header[0], header[1]]) != expected_version {
         return Err("unsupported provider protocol".to_owned());
     }
     let kind = u16::from_be_bytes([header[2], header[3]]);

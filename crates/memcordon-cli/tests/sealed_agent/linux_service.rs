@@ -1,9 +1,33 @@
 #![cfg(all(target_os = "linux", feature = "test-support"))]
 
-use crate::linux::qualification::QualificationReceipt;
 use crate::protocol::{Frame, MessageKind};
 use crate::rejection::{RejectionPhaseV1, RejectionV1};
+use memcordon_core::runtime_readiness::ReadinessObservation;
 use std::path::Path;
+
+#[test]
+fn public_transport_preserves_ordinary_wire_version() {
+    use crate::protocol::write_frame;
+    use std::os::unix::net::UnixStream;
+
+    for kind in [MessageKind::Launch, MessageKind::Probe] {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let expected = Frame {
+            kind,
+            nonce: [5; 16],
+            attempt_id: [7; 16],
+            payload: vec![1, 2, 3],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        crate::linux::transport::send(&writer, &bytes, &[]).unwrap();
+        let (observed, descriptors, version) =
+            crate::linux::transport::receive_public(&reader).unwrap();
+        assert_eq!(observed, expected);
+        assert!(descriptors.is_empty());
+        assert_eq!(version, crate::protocol::PROTOCOL_VERSION);
+    }
+}
 
 const PEER_PID: libc::pid_t = 100;
 const MEMBER_PID: libc::pid_t = 200;
@@ -50,18 +74,23 @@ fn recursive_inventory(proc_root: &Path, cgroup_root: &Path) -> Result<bool, Str
     crate::linux::service::peer_inside_active_attempt_for_test(PEER_PID, proc_root, cgroup_root)
 }
 
-fn qualification() -> QualificationReceipt {
-    QualificationReceipt {
+pub(super) fn readiness() -> ReadinessObservation {
+    let mut observation = ReadinessObservation {
+        format: "memcordon.runtime-readiness".into(),
+        revision: 1,
         workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
             .reference(),
         workload_profile_probe_verified: true,
-        schema_version: 2,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         provider_identity: "memcordon-sealed-agent-v2".to_owned(),
         control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
         launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
-        receipt_digest: "0".repeat(64),
+        observation_digest: String::new(),
+        success_child_status: Some(0),
+        missing_target_child_status: Some(127),
+        profile_child_status: Some(0),
+        caller_envelope_digest: Some("ab".repeat(32)),
         unified_cgroup_v2: true,
         private_cgroup_subtree: true,
         clone3: true,
@@ -89,32 +118,28 @@ fn qualification() -> QualificationReceipt {
         caller_capability_bounding_set_reproduction_verified: true,
         initial_provider_capabilities_absent: true,
         credential_transition_disposition: "preserve-caller-envelope".to_owned(),
-        setid_transition_certification_digest: "1".repeat(64),
-        sudo_transition_certification_digest: "2".repeat(64),
-        post_transition_cgroup_membership_verified: true,
-        post_transition_pid_namespace_verified: true,
-        post_transition_cleanup_verified: true,
-        recursive_provider_request_rejected: true,
-    }
+    };
+    observation.observation_digest = observation.digest_facts().expect("fixture facts serialize");
+    observation
 }
 
 #[test]
-fn probe_returns_the_cached_startup_qualification_without_requalifying() {
+fn probe_returns_cached_startup_observations_without_spawning_another_probe() {
     let request = Frame {
         kind: MessageKind::Probe,
         nonce: [7; 16],
         attempt_id: [0; 16],
         payload: Vec::new(),
     };
-    let qualification = qualification();
+    let observation = readiness();
 
-    let response =
-        crate::linux::service::cached_probe_response_for_test(&request, 0, &qualification);
+    let response = crate::linux::service::cached_probe_response_for_test(&request, 0, &observation);
 
     assert_eq!(response.kind, MessageKind::ProbeReceipt);
     assert_eq!(response.nonce, request.nonce);
     assert_eq!(response.attempt_id, request.attempt_id);
-    assert_eq!(response.payload, qualification.render().into_bytes());
+    assert_eq!(response.payload, observation.render().into_bytes());
+    ReadinessObservation::parse(&response.payload).expect("actual named observation parses");
 }
 
 #[test]
@@ -126,8 +151,7 @@ fn probe_with_descriptors_receives_a_typed_rejection() {
         payload: Vec::new(),
     };
 
-    let response =
-        crate::linux::service::cached_probe_response_for_test(&request, 1, &qualification());
+    let response = crate::linux::service::cached_probe_response_for_test(&request, 1, &readiness());
 
     assert_eq!(response.kind, MessageKind::Rejected);
     assert_eq!(response.nonce, request.nonce);

@@ -44,22 +44,29 @@ fn malformed_or_empty_inventory_cannot_silently_lose_coverage() {
 fn workflow_requires_complete_static_shards_and_cache_inputs() {
     let workflow = include_str!("../../../.github/workflows/deep-ci.yml");
     let validate = |source: &str| {
-        let mut yaml: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
-        memcordon_ci::managed_workflow::validate_and_project(&mut yaml)?;
-        memcordon_ci::policy::check_fuzz_shards(yaml["jobs"]["fuzz"].as_mapping().unwrap())
+        let yaml: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        memcordon_ci::policy::check_deep_fuzz_shards(yaml["jobs"]["fuzz"].as_mapping().unwrap())
     };
     validate(workflow).unwrap();
     for (from, to) in [
-        ("shard: [first, second]", "shard: [first]"),
-        ("shard: [first, second]", "shard: [first, first]"),
-        ("matrix.shard == 'second'", "matrix.shard == 'first'"),
-        ("suite fuzz-second", "suite fuzz-first"),
-        ("fail-fast: false", "fail-fast: true"),
-        ("${{ matrix.shard }}-nightly", "nightly"),
-        ("'Cargo.toml', 'Cargo.lock', '.cargo/**'", "'Cargo.lock'"),
         (
-            "always() && steps.fuzz-target",
-            "success() && steps.fuzz-target",
+            "shard: [quarter-one, quarter-two, quarter-three, quarter-four]",
+            "shard: [quarter-one]",
+        ),
+        (
+            "shard: [quarter-one, quarter-two, quarter-three, quarter-four]",
+            "shard: [quarter-one, quarter-one, quarter-three, quarter-four]",
+        ),
+        (
+            "matrix.shard == 'quarter-two'",
+            "matrix.shard == 'quarter-one'",
+        ),
+        ("suite fuzz-quarter-two", "suite fuzz-quarter-one"),
+        ("fail-fast: false", "fail-fast: true"),
+        ("'fuzz/Cargo.lock', 'fuzz/Cargo.toml'", "'fuzz/Cargo.toml'"),
+        (
+            "always() && matrix.shard == 'quarter-one' && steps.fuzz-deps",
+            "success() && matrix.shard == 'quarter-one' && steps.fuzz-deps",
         ),
     ] {
         assert!(workflow.contains(from));
@@ -68,8 +75,7 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             "accepted {to}"
         );
     }
-    let mut yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
-    memcordon_ci::managed_workflow::validate_and_project(&mut yaml).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
     let baseline = yaml["jobs"]["fuzz"].as_mapping().unwrap();
     for (name, value) in [
         ("timeout-minutes", serde_yaml::Value::Number(90.into())),
@@ -78,22 +84,22 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
     ] {
         let mut job = baseline.clone();
         job.insert(name.into(), value);
-        assert!(memcordon_ci::policy::check_fuzz_shards(&job).is_err());
+        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
     }
     let steps_key = serde_yaml::Value::String("steps".into());
     let count = baseline[&steps_key].as_sequence().unwrap().len();
     for index in 0..count {
         let mut job = baseline.clone();
         job[&steps_key].as_sequence_mut().unwrap().remove(index);
-        assert!(memcordon_ci::policy::check_fuzz_shards(&job).is_err());
+        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
         let mut job = baseline.clone();
         job[&steps_key].as_sequence_mut().unwrap()[index]
             .as_mapping_mut()
             .unwrap()
             .insert("continue-on-error".into(), true.into());
-        assert!(memcordon_ci::policy::check_fuzz_shards(&job).is_err());
+        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
     }
     let mut job = baseline.clone();
     job[&steps_key].as_sequence_mut().unwrap().swap(5, 7);
-    assert!(memcordon_ci::policy::check_fuzz_shards(&job).is_err());
+    assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
 }

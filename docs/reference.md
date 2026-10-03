@@ -192,7 +192,13 @@ In plan JSON, backoff configuration is under `request.restart.backoff`.
 `resolution.backoff_sample_ms` contains the first calculated wait when restart
 is enabled and is otherwise empty.
 
-Machine-readable consumers must inspect `schema_version`.
+New machine-readable consumers can select `--report-format result-v1`,
+`plan --plan-format plan-v1`, and `doctor --capability-format capabilities-v1`.
+These envelopes use explicit `format` and `revision` fields. Plan and capability
+outputs always declare `authorizes_launch: false`. Supported numeric execution,
+plan and doctor formats retain their historical meanings; they cannot contain
+new local admission or private execution facts. An incompatible format request
+rejects before native allocation.
 
 Ordinary `doctor` does not launch a target. `--probe-execution` explicitly runs
 a five-second-deadline native probe on macOS and checks helper readiness,
@@ -276,7 +282,7 @@ completion, explicit deadline, interruption, or a monitoring/cleanup failure.
 Bounded runtime reservations retain unresolved reaping obligations instead of
 silently releasing ownership. The
 [macOS native launch specification](../spec/macos-native-launch-v1.md) describes
-the protocol, resource limits, diagnostics, and qualification boundary.
+the protocol, resource limits, diagnostics, and native ownership boundary.
 
 ## Memory metrics
 
@@ -445,17 +451,32 @@ hostile-code security sandbox. On macOS, a descendant that deliberately escapes
 into another session can also leave the sampled workload boundary.
 ## Sealed supervision
 
-`--sealed` requires certified process-boundary setup, independent cleanup authority, and terminal emptiness proof. It fails before target authorization if unavailable and never falls back. See [sealed supervision](sealed-supervision.md) for the normative threat model and exclusions.
+`--sealed` requires actual process-boundary setup, independent cleanup ownership,
+and terminal emptiness observations. It fails before target authorization if
+unavailable and never falls back. See [sealed supervision](sealed-supervision.md)
+for the normative threat model and exclusions.
 
 ## Sealed provider distribution
 
-`cargo install --locked memcordon` installs exactly two default binaries:
-`memcordon` and `memcordon-sealed-agent`. Test fixtures are feature-gated and
-are not installed by default. Linux and Windows native archives contain those
-same two runtime components plus `runtime-manifest.json`; macOS archives
-contain only the public CLI and mark sealed packaging not applicable. Windows
-manifests bind provider protocol 1, mechanism `windows-job-object-v2`, and
-qualification schema 1.
+`cargo install --locked memcordon` builds only the public CLI. Optional native
+provider builds select `sealed-runtime` on Linux, `private-tcp` for Linux private
+TCP, or `windows-sealed-runtime` on Windows. Test fixtures are separately gated.
+Default archives contain `memcordon` plus measured package/runtime metadata;
+explicit provider distributions contain these components:
+
+| Target | Runtime components |
+| --- | --- |
+| linux-x64 | memcordon, memcordon-sealed-agent |
+| linux-arm64 | memcordon, memcordon-sealed-agent |
+| macos-arm64 | memcordon |
+| macos-x64 | memcordon |
+| windows-x64 | memcordon.exe, memcordon-sealed-agent.exe, memcordon-target-desktop-bootstrap.exe, memcordon-session-broker.exe |
+| windows-arm64 | memcordon.exe, memcordon-sealed-agent.exe, memcordon-target-desktop-bootstrap.exe, memcordon-session-broker.exe |
+
+The macOS manifest marks provider packaging not included. Current Windows
+manifests describe generic provider contract 3, public/private wire versions 3/3,
+and mechanism `windows-job-object-v2`. Runtime manifests describe actual selected
+components and protocols; they contain no qualification reference.
 
 The provider remains an explicit root or elevated installation:
 

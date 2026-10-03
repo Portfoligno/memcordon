@@ -4,6 +4,46 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Added
+
+- Linux policy administrators can apply and inspect named local-policy activation
+  documents with exact grant, epoch and execution-identity references.
+- `--workload-contract` recognizes schema-2 Linux contracts. `plan` and `doctor`
+  report availability for the requested profile and execution identity. Registry
+  entries and successful parsing do not authorize a command to start. The optional
+  private TCP provider supports attempt-owned IPv4 loopback namespaces with either
+  preserved caller identity or an explicit administrator-defined target identity.
+- Named `result-v1`, `plan-v1` and `capabilities-v1` output formats retain actual
+  runtime, native termination and cleanup observations. Planning and capabilities
+  are explicitly advisory.
+
+### Fixed
+
+- Linux sealed-provider installation and upgrades no longer reject the newly
+  installed package during service startup because its transaction is still
+  marked unfinished. Failed activation retains validated rollback support.
+- Linux workload discovery and planning allow up to 60 seconds for fresh
+  provider verification, avoiding false connection timeouts when checking the
+  installed binary takes longer than five seconds.
+- Windows sealed failure reports correctly classify Job Object and target
+  errors as launch, monitoring or cleanup failures and retain the captured
+  Windows error code.
+- Workload contracts reject non-loopback addresses declared as host-shared
+  loopback peers and ambiguous IPv4-mapped IPv6 exact peers.
+- Source builds generate identical embedded policy bytes from LF and CRLF
+  checkouts, preserving the reviewed policy digest and strict validation.
+
+### Compatibility
+
+- Default Cargo installations and default native archives contain only the public
+  CLI. Linux and Windows provider companions require explicit platform features.
+- New local admission and private execution facts require the named output
+  formats; incompatible numeric-format selections reject before native allocation.
+  Supported historical execution, plan and doctor schemas remain readable.
+- Old qualification-bearing policy activation records are rejected. Administrators
+  must explicitly apply the new local-policy envelopes; saved self-test output or
+  release certificates cannot authorize installed workloads.
+
 ## [0.5.6-rc.33] - 2026-09-24
 
 ### Fixed

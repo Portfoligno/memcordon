@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{Frame, MessageKind, write_frame};
+use crate::protocol::{Frame, MessageKind, PROTOCOL_VERSION, write_frame};
 use crate::rejection::RejectionV1;
 
 pub fn serve() -> Result<(), String> {
@@ -14,6 +14,9 @@ pub fn serve() -> Result<(), String> {
     crate::policy_registry::start_service_instance()?;
     configure_subreaper()?;
     let qualification = super::launcher::probe().map_err(|error| {
+        // Transport and decoding failures may carry free-form I/O text. Give
+        // every launcher readiness failure a stable owner code before persistence.
+        let error = format!("MCSEALED-LAUNCHER-QUALIFICATION: {error}");
         record_startup_failure(super::startup::StartupPhase::Qualification, &error)
     })?;
     let listener = activated_listener().map_err(|error| {
@@ -118,7 +121,7 @@ fn activated_listener() -> Result<UnixListener, String> {
 
 fn handle(
     stream: &mut UnixStream,
-    qualification: &super::qualification::QualificationReceipt,
+    qualification: &super::qualification::ReadinessObservation,
 ) -> Result<(), String> {
     let credentials = peer_credentials(stream)?;
     if credentials.uid == u32::MAX {
@@ -126,24 +129,52 @@ fn handle(
     }
     let groups = peer_groups(credentials.pid)?;
     authorize_peer(credentials, &groups)?;
-    let (request, descriptors) = super::transport::receive(stream)?;
-    let response = match request.kind {
-        MessageKind::Probe => probe_response(&request, descriptors.len(), qualification)?,
-        MessageKind::WorkloadDiscovery => workload_discovery_response(
-            &request,
-            descriptors.len(),
-            credentials.uid,
-            qualification,
-        )?,
-        MessageKind::WorkloadPlan => {
-            workload_plan_response(&request, descriptors.len(), credentials.uid, qualification)?
+    let (request, descriptors, version) = super::transport::receive_public(stream)?;
+    super::retired_state::require_provider_registrations_absent()?;
+    let response = match (version, request.kind) {
+        (PROTOCOL_VERSION, MessageKind::Probe) => {
+            probe_response(&request, descriptors.len(), qualification)?
         }
-        MessageKind::Launch => {
+        (PROTOCOL_VERSION, MessageKind::WorkloadDiscovery) => {
+            workload_discovery_response(&request, descriptors.len(), credentials.uid)?
+        }
+        (PROTOCOL_VERSION, MessageKind::WorkloadPlan) => {
+            workload_plan_response(&request, descriptors.len(), credentials.uid)?
+        }
+        (PROTOCOL_VERSION, MessageKind::PrivatePlan) => {
+            super::private_runtime::plan(&request, descriptors.len(), credentials.uid)?
+        }
+        (PROTOCOL_VERSION, MessageKind::PrivateDiscovery) => {
+            super::private_runtime::discovery(&request, descriptors.len(), credentials.uid)?
+        }
+        (PROTOCOL_VERSION, MessageKind::Launch) => {
             match launch_response(request.clone(), descriptors, credentials, groups) {
                 Ok(response) => response,
                 Err(rejection) => {
                     journal_rejection(request.attempt_id, &rejection);
                     rejected(&request, &rejection)?
+                }
+            }
+        }
+        (PROTOCOL_VERSION, MessageKind::PrivateLaunch) => {
+            if peer_inside_active_attempt(credentials.pid)? {
+                rejected_text(
+                    &request,
+                    "MCSEALED-RECURSIVE-PROVIDER-REQUEST",
+                    "caller is already inside an owned attempt",
+                )?
+            } else {
+                match super::private_runtime::forward_public(
+                    stream,
+                    &request,
+                    descriptors,
+                    credentials.pid,
+                    credentials.uid,
+                    credentials.gid,
+                    &groups,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => rejected_text(&request, "MCSEALED-PRIVATE-INGRESS", &error)?,
                 }
             }
         }
@@ -160,27 +191,26 @@ fn workload_discovery_response(
     request: &Frame,
     descriptor_count: usize,
     uid: u32,
-    qualification: &super::qualification::QualificationReceipt,
 ) -> Result<Frame, String> {
     if descriptor_count != 0 || request.attempt_id != [0; 16] || !request.payload.is_empty() {
         return Err("workload discovery must not carry resources or an attempt".into());
     }
-    let lease = crate::policy_registry::native::Lease::acquire()?;
-    let activation = lease.read()?;
-    let qualification_digest = memcordon_core::DiagnosticSha256::try_from(
-        memcordon_core::BoundedText::new(&qualification.receipt_digest).map_err(str::to_owned)?,
-    )
-    .map_err(str::to_owned)?;
+    let lease = discovery_phase(request, "registry-acquire", || {
+        crate::policy_registry::native::Lease::acquire()
+    })?;
+    let activation = discovery_phase(request, "registry-read", || lease.read())?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map_err(|error| error.to_string())?;
-    let discovery = memcordon_core::workload_discovery::WorkloadDiscoveryV1::authenticated(
+    let provider = discovery_phase(request, "installed-binding", || {
+        super::runtime_manifest::installed_binding()
+    })?;
+    let discovery = memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
         activation
             .as_ref()
             .map(|activation| (&activation.registry, &activation.epoch)),
         &memcordon_core::workload_registry::CallerSelector::Linux { uid },
         memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
-        qualification_digest,
-        super::runtime_manifest::installed_binding()?,
+        provider,
         memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
     )?;
     Ok(Frame {
@@ -191,36 +221,62 @@ fn workload_discovery_response(
     })
 }
 
+/// Bounded fields only: no registry contents, grants, credentials or payload.
+/// Diagnostics preserve phase deadlines and never authorize a receipt.
+fn discovery_phase<T>(
+    request: &Frame,
+    phase: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let started = std::time::Instant::now();
+    let nonce = format!("{:02x?}", request.nonce);
+    eprintln!(
+        "sealed discovery phase nonce={nonce} pid={} phase={phase} state=begin",
+        std::process::id()
+    );
+    let result = operation();
+    eprintln!(
+        "sealed discovery phase nonce={nonce} pid={} phase={phase} state={} elapsed_ms={}",
+        std::process::id(),
+        if result.is_ok() { "complete" } else { "failed" },
+        started.elapsed().as_millis()
+    );
+    result
+}
+
 fn workload_plan_response(
     request: &Frame,
     descriptor_count: usize,
     uid: u32,
-    qualification: &super::qualification::QualificationReceipt,
 ) -> Result<Frame, String> {
     use memcordon_core::workload_evidence::*;
     use memcordon_core::workload_registry::*;
     if descriptor_count != 0 || request.attempt_id != [0; 16] {
         return Err("workload plan must not allocate an attempt or carry descriptors".into());
     }
-    let contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&request.payload)?;
+    let contract =
+        match memcordon_core::workload_contract::WorkloadContract::parse(&request.payload)? {
+            memcordon_core::workload_contract::WorkloadContract::V1(contract) => contract,
+            memcordon_core::workload_contract::WorkloadContract::V2(_) => {
+                return rejected_text(
+                    request,
+                    "MCSEALED-WORKLOAD-V2-UNAVAILABLE",
+                    "qualified private V2 plan ingress has been retired",
+                );
+            }
+        };
     let binding = RequestBindingV1::from_contract(&contract)?;
-    let result = (|| -> Result<WorkloadResolutionReportV1, String> {
+    let result = (|| -> Result<RuntimeWorkloadResolution, String> {
         let lease = crate::policy_registry::native::Lease::acquire()?;
         let activation = lease.read()?.ok_or("policy activation absent")?;
-        let qualification_digest = memcordon_core::DiagnosticSha256::try_from(
-            memcordon_core::BoundedText::new(&qualification.receipt_digest)
-                .map_err(str::to_owned)?,
-        )
-        .map_err(str::to_owned)?;
         if let Err(rejection) = resolve(
             &activation.registry,
             &activation.epoch,
             &contract,
             &CallerSelector::Linux { uid },
             BaselineProfile::LinuxUnixCreate,
-            &qualification_digest,
         ) {
-            return Ok(WorkloadResolutionReportV1::Rejected {
+            return Ok(RuntimeWorkloadResolution::Rejected {
                 binding: binding.clone(),
                 rejection,
                 target_authorized: False::default(),
@@ -229,10 +285,9 @@ fn workload_plan_response(
         let provider = super::runtime_manifest::installed_binding()?;
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|error| error.to_string())?;
-        let plan = PlanBindingV1::from_authorized(
+        let plan = RuntimePlanBinding::from_local_grant(
             &contract,
             activation.registry_digest,
-            qualification_digest,
             provider,
             memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
         )?;
@@ -250,12 +305,12 @@ fn workload_plan_response(
                 .try_push(check)
                 .expect("fixed prelaunch check inventory fits");
         }
-        Ok(WorkloadResolutionReportV1::Planned { binding: plan, effective: EffectiveWorkloadPolicyV1 {
+        Ok(RuntimeWorkloadResolution::Planned { binding: plan, effective: EffectiveWorkloadPolicyV1 {
             profile: BaselineProfile::LinuxUnixCreate, ceiling: BaselineProfile::LinuxUnixCreate.ceiling(),
             restriction: BaselineRestrictionObservationV1::LinuxUnixOnlySocketSyscallFilterAlternatePathsUnknown,
         }, pending })
     })();
-    let response = result.unwrap_or(WorkloadResolutionReportV1::Unavailable {
+    let response = result.unwrap_or(RuntimeWorkloadResolution::Unavailable {
         request: Some(binding),
         reason: AdmissionAvailabilityFailure::BindingUnavailable,
         authorization: AuthorizationKnowledge::NotAuthorized,
@@ -268,10 +323,12 @@ fn workload_plan_response(
     })
 }
 
+/// Return launcher readiness observations for a descriptor-free probe request.
+/// This response neither allocates nor authorizes a workload.
 fn probe_response(
     request: &Frame,
     descriptor_count: usize,
-    qualification: &super::qualification::QualificationReceipt,
+    qualification: &super::qualification::ReadinessObservation,
 ) -> Result<Frame, String> {
     if descriptor_count != 0 {
         return rejected_text(
@@ -292,7 +349,7 @@ fn probe_response(
 pub fn cached_probe_response_for_test(
     request: &Frame,
     descriptor_count: usize,
-    qualification: &super::qualification::QualificationReceipt,
+    qualification: &super::qualification::ReadinessObservation,
 ) -> Frame {
     probe_response(request, descriptor_count, qualification)
         .expect("fixed probe rejection must fit the bounded protocol")
@@ -492,12 +549,6 @@ pub fn acquire_package_lease() -> Result<std::fs::File, String> {
 
 pub fn acquire_legacy_package_lease() -> Result<std::fs::File, String> {
     acquire_lease(LEGACY_PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
-}
-
-pub fn acquire_qualification_lease() -> Result<std::fs::File, String> {
-    acquire_lease(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate).map_err(|error| {
-        format!("MCSEALED-QUALIFICATION-LEASE: provider attempt is active: {error}")
-    })
 }
 
 fn acquire_lease(path: &str, access: LeaseAccess) -> Result<std::fs::File, String> {

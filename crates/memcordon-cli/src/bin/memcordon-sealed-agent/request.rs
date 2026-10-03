@@ -55,6 +55,14 @@ pub struct LaunchRequestV2 {
     pub descriptors: Vec<DescriptorPurpose>,
 }
 
+/// Inputs for held native target setup. This value grants no permission and
+/// has no wire decoder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativePrivateLaunchInput {
+    pub contract: memcordon_core::workload_contract::WorkloadContractV2,
+    pub launch: LaunchRequestV2,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum DescriptorPurpose {
@@ -65,6 +73,7 @@ pub enum DescriptorPurpose {
     FrontendLiveness = 5,
     CallerMountNamespace = 6,
     CallerRoot = 7,
+    VerifiedExecutable = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

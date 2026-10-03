@@ -7,8 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-support")]
@@ -20,13 +20,12 @@ use serde::{Deserialize, Serialize};
 
 const STARTUP: Duration = Duration::from_secs(5);
 const FRAME_LIMIT: usize = 4096;
-const RESERVED: i32 = i32::MIN;
-static CHILDREN: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
-static DEPENDENCIES: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
-static REAPER: OnceLock<Result<(), String>> = OnceLock::new();
-type SpawnOperation = Box<dyn FnOnce() + Send>;
-static SPAWNER: OnceLock<Result<std::sync::mpsc::SyncSender<SpawnOperation>, String>> =
-    OnceLock::new();
+#[path = "macos_launch_runtime.rs"]
+mod runtime;
+pub use runtime::LaunchRuntime;
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_runtime_fixture.rs"]
+mod runtime_fixture;
 #[cfg(feature = "test-support")]
 std::thread_local! {
     static RUNNING_GUARDIAN_LOSS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
@@ -38,70 +37,49 @@ std::thread_local! {
     static WATCHDOG_HEARTBEATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Slots are reserved before spawn. Drop transfers an unreaped PID by one atomic
-/// store to the permanent runtime, without allocation, locking, killing or waiting.
-pub(crate) struct Child {
+struct UnreapedChild {
     pid: i32,
-    slot: usize,
-    status: Option<ExitStatus>,
-    remote: Option<Arc<Mutex<Channel>>>,
+}
+struct ProcessGroupLease {
+    leader: i32,
+}
+struct LocalChild {
+    kernel: UnreapedChild,
+    group: ProcessGroupLease,
+    retirement: runtime::Ticket,
+}
+struct GuardianTarget {
+    pid: i32,
+}
+struct GuardianSession {
+    channel: Arc<Mutex<Channel>>,
+    cancellation: UnixStream,
+}
+struct GuardianChild {
+    session: GuardianSession,
+    target: GuardianTarget,
+    observed_status: std::cell::Cell<Option<ExitStatus>>,
+    reaped_status: Option<ExitStatus>,
+}
+enum ChildOwner {
+    Local(LocalChild),
+    Guardian(GuardianChild),
 }
 
-fn reserve() -> io::Result<usize> {
-    REAPER
-        .get_or_init(|| {
-            std::thread::Builder::new()
-                .name("memcordon-native-reaper".into())
-                .spawn(|| {
-                    loop {
-                        for (index, slot) in CHILDREN.iter().enumerate() {
-                            let value = slot.load(Ordering::Acquire);
-                            if value < 0 && value != RESERVED {
-                                let dependency = DEPENDENCIES[index].load(Ordering::Acquire);
-                                if dependency > 0
-                                    && CHILDREN.iter().any(|entry| {
-                                        entry.load(Ordering::Acquire).checked_abs()
-                                            == Some(dependency)
-                                    })
-                                {
-                                    continue;
-                                }
-                                let mut status = 0;
-                                // SAFETY: only the runtime owns this abandoned, unreaped child.
-                                let result =
-                                    unsafe { libc::waitpid(-value, &mut status, libc::WNOHANG) };
-                                if result > 0
-                                    || (result < 0
-                                        && io::Error::last_os_error().raw_os_error()
-                                            == Some(libc::ECHILD))
-                                {
-                                    DEPENDENCIES[index].store(0, Ordering::Release);
-                                    slot.store(0, Ordering::Release);
-                                }
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                })
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map_err(|error| io::Error::other(error.clone()))?;
-    CHILDREN
-        .iter()
-        .position(|slot| {
-            slot.compare_exchange(0, RESERVED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-        .ok_or_else(|| {
-            io::Error::other("native reaper capacity exhausted by outstanding cleanup obligations")
-        })
+/// A local waitable child and a guardian-owned target have distinct owners.
+/// The cached public status records actual reap, never terminal observation.
+pub(crate) struct Child {
+    pid: i32,
+    status: Option<ExitStatus>,
+    owner: ChildOwner,
 }
 
 impl Child {
     pub(crate) fn id(&self) -> u32 {
-        self.pid as u32
+        (match &self.owner {
+            ChildOwner::Local(local) => local.kernel.pid,
+            ChildOwner::Guardian(remote) => remote.target.pid,
+        }) as u32
     }
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.try_wait_until(Instant::now() + Duration::from_millis(100))
@@ -110,25 +88,37 @@ impl Child {
         if self.status.is_some() {
             return Ok(self.status);
         }
-        if let Some(remote) = &self.remote {
+        if let ChildOwner::Guardian(remote) = &mut self.owner {
             let mut channel = remote
+                .session
+                .channel
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
             self.status = channel
                 .poll_child_status_until(true, deadline)?
                 .map(ExitStatus::from_raw);
+            remote.reaped_status = self.status;
             return Ok(self.status);
+        }
+        let ChildOwner::Local(local) = &self.owner else {
+            unreachable!()
+        };
+        if !local.retirement.owns_child() {
+            return Err(io::Error::other("local child ownership lost"));
         }
         let mut status = 0;
         // SAFETY: this handle owns the unreaped child and never waits synchronously.
-        let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+        let result = unsafe { libc::waitpid(local.kernel.pid, &mut status, libc::WNOHANG) };
         if result < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                local.retirement.ownership_lost(&error);
+            }
+            return Err(error);
         }
         if result == self.pid {
             self.status = Some(ExitStatus::from_raw(status));
-            DEPENDENCIES[self.slot].store(0, Ordering::Release);
-            CHILDREN[self.slot].store(0, Ordering::Release);
+            local.retirement.complete()?;
         }
         Ok(self.status)
     }
@@ -139,13 +129,23 @@ impl Child {
         if self.status.is_some() {
             return Ok(self.status);
         }
-        if let Some(remote) = &self.remote {
+        if let ChildOwner::Guardian(remote) = &self.owner {
             let mut channel = remote
+                .session
+                .channel
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            return channel
+            let status = channel
                 .poll_child_status_until(false, deadline)
-                .map(|raw| raw.map(ExitStatus::from_raw));
+                .map(|raw| raw.map(ExitStatus::from_raw))?;
+            remote.observed_status.set(status);
+            return Ok(status);
+        }
+        let ChildOwner::Local(local) = &self.owner else {
+            unreachable!()
+        };
+        if !local.retirement.owns_child() {
+            return Err(io::Error::other("local child ownership lost"));
         }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         // SAFETY: WNOWAIT pins the child's identity until workload signalling ends.
@@ -158,7 +158,11 @@ impl Child {
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                local.retirement.ownership_lost(&error);
+            }
+            return Err(error);
         }
         // SAFETY: successful waitid initialized the supplied siginfo storage.
         let info = unsafe { info.assume_init() };
@@ -166,10 +170,18 @@ impl Child {
             return Ok(None);
         }
         let raw = match info.si_code {
+            // Darwin can return a held stop notification even with WEXITED.
+            // It preserves wait ownership and carries no terminal/reap proof.
+            libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED => return Ok(None),
             libc::CLD_EXITED => info.si_status << 8,
             libc::CLD_KILLED => info.si_status,
             libc::CLD_DUMPED => info.si_status | 0x80,
-            _ => return Err(io::Error::other("unexpected child observation code")),
+            code => {
+                return Err(io::Error::other(format!(
+                    "unexpected child observation code {code} for owned pid {} status {}",
+                    info.si_pid, info.si_status
+                )));
+            }
         };
         Ok(Some(ExitStatus::from_raw(raw)))
     }
@@ -177,14 +189,27 @@ impl Child {
         if self.status.is_some() {
             return Ok(());
         }
-        if let Some(remote) = &self.remote {
+        if let ChildOwner::Guardian(remote) = &self.owner {
             let mut channel = remote
+                .session
+                .channel
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
             return channel.send(Message::Stop, Instant::now() + Duration::from_millis(100));
         }
+        let ChildOwner::Local(local) = &self.owner else {
+            unreachable!()
+        };
+        if !local.retirement.owns_child() {
+            return Err(io::Error::other(
+                "local child ownership lost; signalling refused",
+            ));
+        }
+        // A cooperating owner must not signal after an external waiter has
+        // consumed the actual child. Terminal observation keeps our pin intact.
+        self.observe()?;
         // SAFETY: the unreaped owned leader pins this dedicated process group.
-        if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == 0 {
+        if unsafe { libc::kill(-local.group.leader, libc::SIGKILL) } == 0 {
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -214,8 +239,16 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        if self.status.is_none() && self.remote.is_none() {
-            CHILDREN[self.slot].store(-self.pid, Ordering::Release);
+        if self.status.is_none() {
+            if let ChildOwner::Guardian(remote) = &self.owner {
+                // A held session socket disconnect requests the guardian's
+                // normal owned cancellation path. No RPC, lock or target PID
+                // signal occurs in this destructor.
+                let _ = remote
+                    .session
+                    .cancellation
+                    .shutdown(std::net::Shutdown::Both);
+            }
         }
     }
 }
@@ -721,9 +754,7 @@ impl Channel {
     fn receive(&mut self, deadline: Instant) -> io::Result<Option<Message>> {
         loop {
             if let Some(admission) = &self.admission {
-                if let Err(error) = admission.check() {
-                    return Err(error);
-                }
+                admission.check()?;
             }
             let received_before = self.received;
             match self.receive_available()? {
@@ -983,14 +1014,27 @@ pub fn protocol_expectation_fixture(case: u8) -> io::Result<()> {
 }
 
 fn native_spawn(
+    runtime: &LaunchRuntime,
     path: &Path,
     args: &[OsString],
     endpoint: RawFd,
     quiet: bool,
     deadline: Instant,
 ) -> io::Result<Child> {
-    native_spawn_context(path, args, endpoint, quiet, deadline, None, None, None)
-        .map_err(|failure| failure.error)
+    native_spawn_context(
+        path,
+        args,
+        endpoint,
+        quiet,
+        deadline,
+        NativeSpawnContext {
+            runtime,
+            context: None,
+            auxiliary: None,
+            admission: None,
+        },
+    )
+    .map_err(|failure| failure.error)
 }
 
 struct NativeSpawnFailure {
@@ -1014,19 +1058,31 @@ impl NativeSpawnFailure {
     }
 }
 
+struct NativeSpawnContext<'a> {
+    runtime: &'a LaunchRuntime,
+    context: Option<crate::macos_envelope::Envelope>,
+    auxiliary: Option<(RawFd, std::os::fd::OwnedFd)>,
+    admission: Option<&'a crate::signal::LaunchAdmission>,
+}
+
 fn native_spawn_context(
     path: &Path,
     args: &[OsString],
     endpoint: RawFd,
     quiet: bool,
     deadline: Instant,
-    context: Option<crate::macos_envelope::Envelope>,
-    auxiliary: Option<(RawFd, std::os::fd::OwnedFd)>,
-    admission: Option<&crate::signal::LaunchAdmission>,
+    spawn_context: NativeSpawnContext<'_>,
 ) -> Result<Child, NativeSpawnFailure> {
+    let NativeSpawnContext {
+        runtime,
+        context,
+        auxiliary,
+        admission,
+    } = spawn_context;
     if let Some(admission) = admission {
         admission.check()?;
     }
+    let ticket = runtime.reserve()?;
     let expires = crate::macos_deadline::add(
         crate::macos_deadline::continuous_nanos()?,
         deadline.saturating_duration_since(Instant::now()),
@@ -1043,49 +1099,33 @@ fn native_spawn_context(
     let path = path.to_owned();
     let args = args.to_vec();
     let environment = std::env::vars_os().collect::<Vec<_>>();
-    let worker = SPAWNER
-        .get_or_init(|| {
-            let (send, receive) = std::sync::mpsc::sync_channel::<SpawnOperation>(1);
-            std::thread::Builder::new()
-                .name("memcordon-native-spawn".into())
-                .spawn(move || {
-                    while let Ok(operation) = receive.recv() {
-                        operation();
-                    }
-                })
-                .map_err(|error| error.to_string())?;
-            Ok(send)
-        })
-        .as_ref()
-        .map_err(|error| io::Error::other(error.clone()))?;
     let (send, receive) = std::sync::mpsc::sync_channel(1);
-    worker
-        .try_send(Box::new(move || {
-            if Instant::now() >= deadline {
-                return;
+    runtime.enqueue(Box::new(move || {
+        if Instant::now() >= deadline {
+            return;
+        }
+        let result = native_spawn_owned(
+            &path,
+            &args,
+            endpoint,
+            quiet,
+            source,
+            environment,
+            SpawnEnvelope {
+                ticket,
+                context,
+                auxiliary,
+                target: false,
+            },
+        );
+        if let Err(returned) = send.send(result) {
+            if let Ok(child) = returned.0 {
+                // This worker creates only an unconfigured helper; no target
+                // configuration has crossed its private lease yet.
+                let _ = child.kill();
             }
-            let result = native_spawn_owned(
-                &path,
-                &args,
-                endpoint,
-                quiet,
-                source,
-                environment,
-                SpawnEnvelope {
-                    context,
-                    auxiliary,
-                    target: false,
-                },
-            );
-            if let Err(returned) = send.send(result) {
-                if let Ok(child) = returned.0 {
-                    // This worker creates only an unconfigured helper; no target
-                    // configuration has crossed its private lease yet.
-                    let _ = child.kill();
-                }
-            }
-        }))
-        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "native spawn slot busy"))?;
+        }
+    }))?;
     loop {
         if let Some(admission) = admission {
             admission.check().map_err(NativeSpawnFailure::pending)?;
@@ -1111,6 +1151,7 @@ fn native_spawn_context(
 }
 
 struct SpawnEnvelope {
+    ticket: runtime::Ticket,
     context: Option<crate::macos_envelope::Envelope>,
     auxiliary: Option<(RawFd, std::os::fd::OwnedFd)>,
     target: bool,
@@ -1126,10 +1167,12 @@ fn native_spawn_owned(
     envelope: SpawnEnvelope,
 ) -> io::Result<Child> {
     let SpawnEnvelope {
+        ticket,
         context,
         auxiliary,
         target,
     } = envelope;
+    ticket.begin()?;
     let source = if let Some(context) = &context {
         crate::macos_envelope::duplicate(
             source.as_raw_fd(),
@@ -1162,7 +1205,6 @@ fn native_spawn_owned(
         .map(|item| item.as_ptr().cast_mut())
         .collect::<Vec<_>>();
     envp.push(std::ptr::null_mut());
-    let slot = reserve()?;
     let result = (|| {
         let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
         let mut attributes = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
@@ -1259,18 +1301,18 @@ fn native_spawn_owned(
     })();
     match result {
         Ok(pid) => {
-            CHILDREN[slot].store(pid, Ordering::Release);
+            ticket.publish(pid);
             Ok(Child {
                 pid,
-                slot,
                 status: None,
-                remote: None,
+                owner: ChildOwner::Local(LocalChild {
+                    kernel: UnreapedChild { pid },
+                    group: ProcessGroupLease { leader: pid },
+                    retirement: ticket,
+                }),
             })
         }
-        Err(error) => {
-            CHILDREN[slot].store(0, Ordering::Release);
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1615,14 +1657,27 @@ pub(crate) fn launch(
     )
 }
 
+pub(crate) struct LaunchGrace {
+    pub limit: Duration,
+    pub signal: Duration,
+}
+
+struct LaunchConfiguration<'a> {
+    runtime: Option<&'a LaunchRuntime>,
+    fault: Option<LaunchFault>,
+    work: Option<u64>,
+    grace: Duration,
+    signal: Option<(&'a crate::signal::SignalSource, Duration)>,
+}
+
 pub(crate) fn launch_controlled(
+    runtime: &LaunchRuntime,
     command: &CommandSpec,
     image: &Path,
     deadline: Instant,
     cleanup_deadline: Instant,
     work: Option<u64>,
-    grace: Duration,
-    signal_grace: Duration,
+    grace: LaunchGrace,
     signal: &crate::signal::SignalSource,
 ) -> Result<Launch, Box<StartupError>> {
     // The restart coordinator calls again only after proven retirement. Clearing
@@ -1639,10 +1694,13 @@ pub(crate) fn launch_controlled(
         image,
         deadline,
         cleanup_deadline,
-        fault,
-        work,
-        grace,
-        Some((signal, signal_grace)),
+        LaunchConfiguration {
+            runtime: Some(runtime),
+            fault,
+            work,
+            grace: grace.limit,
+            signal: Some((signal, grace.signal)),
+        },
     )
 }
 
@@ -1659,10 +1717,13 @@ pub(crate) fn launch_with_deadline(
         image,
         deadline,
         cleanup_deadline,
-        None,
-        work,
-        grace,
-        None,
+        LaunchConfiguration {
+            runtime: None,
+            fault: None,
+            work,
+            grace,
+            signal: None,
+        },
     )
 }
 
@@ -1678,10 +1739,13 @@ fn launch_inner(
         image,
         deadline,
         cleanup_deadline,
-        fault,
-        None,
-        Duration::ZERO,
-        None,
+        LaunchConfiguration {
+            runtime: None,
+            fault,
+            work: None,
+            grace: Duration::ZERO,
+            signal: None,
+        },
     )
 }
 
@@ -1690,11 +1754,15 @@ fn launch_configured(
     image: &Path,
     deadline: Instant,
     cleanup_deadline: Instant,
-    fault: Option<LaunchFault>,
-    work: Option<u64>,
-    grace: Duration,
-    signal: Option<(&crate::signal::SignalSource, Duration)>,
+    configuration: LaunchConfiguration<'_>,
 ) -> Result<Launch, Box<StartupError>> {
+    let LaunchConfiguration {
+        runtime,
+        fault,
+        work,
+        grace,
+        signal,
+    } = configuration;
     let signal_grace = signal.map_or(Duration::ZERO, |(_, grace)| grace);
     let signal = signal.map(|(signal, _)| signal);
     use memcordon_core::{
@@ -1738,6 +1806,10 @@ fn launch_configured(
         }));
     }
     let result = (|| {
+        let runtime = match runtime {
+            Some(runtime) => runtime.clone(),
+            None => LaunchRuntime::new(256)?,
+        };
         if let Some(signal) = signal {
             signal.admission.check()?;
         }
@@ -1765,6 +1837,7 @@ fn launch_configured(
             crate::macos_envelope::duplicate(envelope_receive.as_raw_fd(), 3)?,
         );
         let (parent, endpoint) = private_pair()?;
+        let cancellation = parent.try_clone()?;
         let channel = Arc::new(Mutex::new(Channel::new(parent, run)?));
         let mut args = vec![
             OsString::from("__macos-guardian-envelope-v1"),
@@ -1782,9 +1855,12 @@ fn launch_configured(
             endpoint.as_raw_fd(),
             true,
             deadline,
-            Some(envelope),
-            Some(auxiliary),
-            signal.map(|signal| &signal.admission),
+            NativeSpawnContext {
+                runtime: &runtime,
+                context: Some(envelope),
+                auxiliary: Some(auxiliary),
+                admission: signal.map(|signal| &signal.admission),
+            },
         )
         .map_err(|failure| {
             pending_capture_or_creation = failure.pending;
@@ -1974,9 +2050,16 @@ fn launch_configured(
         drop(control);
         Ok(Child {
             pid,
-            slot: 0,
             status: None,
-            remote: Some(channel),
+            owner: ChildOwner::Guardian(GuardianChild {
+                session: GuardianSession {
+                    channel,
+                    cancellation,
+                },
+                target: GuardianTarget { pid },
+                observed_status: std::cell::Cell::new(None),
+                reaped_status: None,
+            }),
         })
     })();
     match result {
@@ -2223,6 +2306,7 @@ enum InventoryCodecReply {
 }
 
 struct InventoryLane {
+    startup_deadline: Instant,
     decoder_send: std::sync::mpsc::SyncSender<InventoryCodecRequest>,
     decoder_receive: std::sync::mpsc::Receiver<io::Result<InventoryCodecReply>>,
     encoding: bool,
@@ -2238,10 +2322,22 @@ struct InventoryLane {
     incoming: Vec<u8>,
     pending: bool,
     stopping: bool,
+    // Declaration order keeps the client live until Child Drop has transferred
+    // any unresolved native obligation to its initialized reaper.
+    _runtime: LaunchRuntime,
 }
 
 impl InventoryLane {
     fn start(image: &Path, run: u64, deadline: Instant) -> io::Result<Self> {
+        let runtime = LaunchRuntime::new(256)?;
+        Self::start_in(&runtime, image, run, deadline)
+    }
+    fn start_in(
+        runtime: &LaunchRuntime,
+        image: &Path,
+        run: u64,
+        deadline: Instant,
+    ) -> io::Result<Self> {
         let (decoder_send, decoder_requests) =
             std::sync::mpsc::sync_channel::<InventoryCodecRequest>(1);
         let (decoder_results, decoder_receive) = std::sync::mpsc::sync_channel(1);
@@ -2284,10 +2380,12 @@ impl InventoryLane {
             endpoint.as_raw_fd().to_string().into(),
             run.to_string().into(),
         ];
-        let child = native_spawn(image, &args, endpoint.as_raw_fd(), true, deadline)?;
+        let child = native_spawn(runtime, image, &args, endpoint.as_raw_fd(), true, deadline)?;
         drop(endpoint);
         stream.set_nonblocking(true)?;
         let mut lane = Self {
+            _runtime: runtime.clone(),
+            startup_deadline: deadline,
             decoder_send,
             decoder_receive,
             encoding: false,
@@ -2306,7 +2404,7 @@ impl InventoryLane {
         };
         loop {
             if Instant::now() >= deadline {
-                lane.cancel_owned();
+                let _ = lane.cancel_owned();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "inspector readiness expired",
@@ -2316,7 +2414,7 @@ impl InventoryLane {
                 Ok(Some(_)) => break,
                 Ok(None) => {}
                 Err(error) => {
-                    lane.cancel_owned();
+                    let _ = lane.cancel_owned();
                     return Err(error);
                 }
             }
@@ -2462,17 +2560,23 @@ impl InventoryLane {
         Ok(self.child.try_wait()?.is_some())
     }
 
-    fn cancel_owned(&mut self) {
+    fn cancel_owned(&mut self) -> io::Result<()> {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        // Startup has not authorized any workload. If native helper retirement
-        // stalls, this guardian remains its custodian while the frontend returns
-        // its independently bounded incomplete-startup result.
+        // Signal only the currently owned child. Errors never become an
+        // unbounded retry or a claim of retirement. Drop transfers an unresolved
+        // native obligation to the initialized runtime's retained reaper.
+        self.child.kill()?;
         loop {
-            let _ = self.child.kill();
-            if self.child.try_wait().is_ok_and(|status| status.is_some()) {
-                break;
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            if Instant::now() >= self.startup_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "inspector native retirement remains owned after startup deadline",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -2679,6 +2783,7 @@ fn guardian_main(
     command: &[OsString],
     envelope: crate::macos_envelope::Envelope,
 ) -> io::Result<i32> {
+    let runtime = LaunchRuntime::new(256)?;
     let queue = unsafe { libc::kqueue() };
     if queue < 0 {
         return Err(io::Error::last_os_error());
@@ -2781,11 +2886,12 @@ fn guardian_main(
     let inspector_deadline = Instant::now()
         .checked_add(Duration::from_nanos(startup.saturating_sub(now)))
         .ok_or_else(|| io::Error::other("inspector startup deadline range"))?;
-    let mut normal = InventoryLane::start(&image, control.run, inspector_deadline)?;
-    let emergency = match InventoryLane::start(&image, control.run, inspector_deadline) {
+    let mut normal = InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)?;
+    let emergency = match InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)
+    {
         Ok(lane) => lane,
         Err(error) => {
-            normal.cancel_owned();
+            let _ = normal.cancel_owned();
             return Err(error);
         }
     };
@@ -2812,83 +2918,83 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let mut resume_send = Some(resume_send);
     // One reserved creation operation. Its publication remains owned even after startup expiry.
-    std::thread::Builder::new()
-        .name("memcordon-guardian-spawn".into())
-        .spawn(move || {
-            let result = (|| {
-                let mut args = vec![
-                    OsString::from("__macos-launcher"),
-                    endpoint.as_raw_fd().to_string().into(),
-                    run.to_string().into(),
-                    OsString::from("--"),
-                ];
-                args.extend(command);
-                let source = unsafe { libc::fcntl(endpoint.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-                if source < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: uniquely owns the just-created duplicate through the native call.
-                let source = unsafe { std::os::fd::OwnedFd::from_raw_fd(source) };
-                if crate::macos_deadline::continuous_nanos()? >= startup {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "spawn admission expired",
-                    ));
-                }
-                let mut channel = Channel::new(parent, run)?;
-                let settings = envelope.settings.clone();
-                let child = native_spawn_owned(
-                    &image,
-                    &args,
-                    endpoint.as_raw_fd(),
-                    false,
-                    source,
-                    std::env::vars_os().collect(),
-                    SpawnEnvelope {
-                        context: Some(envelope),
-                        auxiliary: None,
-                        target: true,
-                    },
-                )?;
-                #[cfg(feature = "test-support")]
-                if hold_spawn {
-                    let _ = held_send.send(child.pid);
-                    let _ = resume_receive.recv();
-                }
-                // Target inherited the caller dispositions while gated. Only the guardian
-                // now selects single-owner reaping and orphan-group survival behavior.
-                unsafe {
-                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
-                }
-                // Publication is mandatory even when the setup lease expired during
-                // creation. The event loop adopts this child exclusively for cancellation.
-                let remaining = crate::macos_deadline::continuous_nanos()
-                    .map(|now| startup.saturating_sub(now))
-                    .unwrap_or(0);
-                #[cfg(feature = "test-support")]
-                let remaining = if release_after_cancel {
-                    u64::try_from(Duration::from_secs(1).as_nanos()).expect("bounded mutation wait")
-                } else {
-                    remaining
-                };
-                let _ = channel.send(
-                    Message::RestoreSignal { settings },
-                    Instant::now() + Duration::from_nanos(remaining),
-                );
-                #[cfg(feature = "test-support")]
-                if release_after_cancel {
-                    // Deliberately restore the forbidden late authorization so the
-                    // real gated-child marker oracle must reject this mutation.
-                    let deadline = Instant::now() + Duration::from_secs(1);
-                    channel.expect(Message::Ready, deadline)?;
-                    channel.send(Message::Release, deadline)?;
-                    let _ = channel.receive(deadline);
-                }
-                Ok((child, channel))
-            })();
-            let _ = spawn_send.send(result);
-        })?;
+    let ticket = runtime.reserve()?;
+    runtime.enqueue(Box::new(move || {
+        let result = (|| {
+            let mut args = vec![
+                OsString::from("__macos-launcher"),
+                endpoint.as_raw_fd().to_string().into(),
+                run.to_string().into(),
+                OsString::from("--"),
+            ];
+            args.extend(command);
+            let source = unsafe { libc::fcntl(endpoint.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if source < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: uniquely owns the just-created duplicate through the native call.
+            let source = unsafe { std::os::fd::OwnedFd::from_raw_fd(source) };
+            if crate::macos_deadline::continuous_nanos()? >= startup {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "spawn admission expired",
+                ));
+            }
+            let mut channel = Channel::new(parent, run)?;
+            let settings = envelope.settings.clone();
+            let child = native_spawn_owned(
+                &image,
+                &args,
+                endpoint.as_raw_fd(),
+                false,
+                source,
+                std::env::vars_os().collect(),
+                SpawnEnvelope {
+                    ticket,
+                    context: Some(envelope),
+                    auxiliary: None,
+                    target: true,
+                },
+            )?;
+            #[cfg(feature = "test-support")]
+            if hold_spawn {
+                let _ = held_send.send(child.pid);
+                let _ = resume_receive.recv();
+            }
+            // Target inherited the caller dispositions while gated. Only the guardian
+            // now selects single-owner reaping and orphan-group survival behavior.
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            }
+            // Publication is mandatory even when the setup lease expired during
+            // creation. The event loop adopts this child exclusively for cancellation.
+            let remaining = crate::macos_deadline::continuous_nanos()
+                .map(|now| startup.saturating_sub(now))
+                .unwrap_or(0);
+            #[cfg(feature = "test-support")]
+            let remaining = if release_after_cancel {
+                u64::try_from(Duration::from_secs(1).as_nanos()).expect("bounded mutation wait")
+            } else {
+                remaining
+            };
+            let _ = channel.send(
+                Message::RestoreSignal { settings },
+                Instant::now() + Duration::from_nanos(remaining),
+            );
+            #[cfg(feature = "test-support")]
+            if release_after_cancel {
+                // Deliberately restore the forbidden late authorization so the
+                // real gated-child marker oracle must reject this mutation.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                channel.expect(Message::Ready, deadline)?;
+                channel.send(Message::Release, deadline)?;
+                let _ = channel.receive(deadline);
+            }
+            Ok((child, channel))
+        })();
+        let _ = spawn_send.send(result);
+    }))?;
     let mut target: Option<Child> = None;
     let mut launcher: Option<Channel> = None;
     let mut witness = None;
@@ -4017,10 +4123,13 @@ pub fn cancellation_fault(
         image,
         deadline,
         deadline + Duration::from_secs(3),
-        Some(fault),
-        None,
-        Duration::ZERO,
-        Some((&signal, Duration::from_millis(100))),
+        LaunchConfiguration {
+            runtime: None,
+            fault: Some(fault),
+            work: None,
+            grace: Duration::ZERO,
+            signal: Some((&signal, Duration::from_millis(100))),
+        },
     );
     let startup = match result {
         Err(error) => error,
@@ -4054,7 +4163,10 @@ pub fn disarm_timeout(image: &Path) -> Result<(), String> {
         .retire(Instant::now() + Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
     let pid = launch.guardian.child.pid;
-    let slot = launch.guardian.child.slot;
+    let obligation = match &launch.guardian.child.owner {
+        ChildOwner::Local(local) => local.retirement.observer(),
+        ChildOwner::Guardian(_) => unreachable!("guardian process is a local child"),
+    };
     // SAFETY: fixture owns the live guardian and pins it through its runtime slot.
     if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
         return Err(io::Error::last_os_error().to_string());
@@ -4065,15 +4177,13 @@ pub fn disarm_timeout(image: &Path) -> Result<(), String> {
     // SAFETY: resume the deliberately stopped, still-unreaped fixture guardian.
     unsafe { libc::kill(pid, libc::SIGCONT) };
     let deadline = Instant::now() + Duration::from_secs(1);
-    while CHILDREN[slot].load(Ordering::Acquire).checked_abs() == Some(pid)
-        && Instant::now() < deadline
-    {
+    while obligation.pending() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
     if result.is_ok() || elapsed > Duration::from_millis(250) {
         return Err("disarm timeout fell through to blocking destruction".into());
     }
-    if CHILDREN[slot].load(Ordering::Acquire).checked_abs() == Some(pid) {
+    if obligation.pending() {
         return Err("runtime did not discharge abandoned guardian reaping".into());
     }
     Ok(())
@@ -4313,7 +4423,7 @@ fn process_inspector_stall(image: &Path) -> Result<(), String> {
     let mut emergency = match InventoryLane::start(image, 73, deadline) {
         Ok(lane) => lane,
         Err(error) => {
-            normal.cancel_owned();
+            let _ = normal.cancel_owned();
             return Err(error.to_string());
         }
     };
@@ -4348,9 +4458,9 @@ fn process_inspector_stall(image: &Path) -> Result<(), String> {
         }
         Ok(())
     })();
-    normal.cancel_owned();
-    emergency.cancel_owned();
-    result
+    let normal_cleanup = normal.cancel_owned().map_err(|error| error.to_string());
+    let emergency_cleanup = emergency.cancel_owned().map_err(|error| error.to_string());
+    result.and(normal_cleanup).and(emergency_cleanup)
 }
 
 /// Disposable fixture frontend. Its caller kills this process after the atomic
@@ -4849,31 +4959,35 @@ fn timer_progress(
 
 #[cfg(feature = "test-support")]
 pub fn resource_recovery(image: &Path) -> Result<(), String> {
+    let capacity = 256;
+    let runtime = LaunchRuntime::new(capacity).map_err(|error| error.to_string())?;
     let drain = Instant::now() + Duration::from_secs(2);
-    while CHILDREN
-        .iter()
-        .any(|slot| slot.load(Ordering::Acquire) != 0)
-    {
+    while runtime.outstanding() != 0 {
         if Instant::now() >= drain {
             return Err("preexisting native reaping obligations did not retire".into());
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     let mut reserved = Vec::new();
-    while let Ok(slot) = reserve() {
-        reserved.push(slot);
+    while let Ok(ticket) = runtime.reserve() {
+        reserved.push(ticket);
     }
-    let exhausted = reserved.len() == CHILDREN.len();
+    let exhausted = reserved.len() == capacity;
     let capacity_deadline = Instant::now() + Duration::from_millis(250);
-    let rejected = launch(
+    let rejected = launch_configured(
         &CommandSpec::new(image).args(["__execution-probe"]),
         image,
         capacity_deadline,
         capacity_deadline,
+        LaunchConfiguration {
+            runtime: Some(&runtime),
+            fault: None,
+            work: None,
+            grace: Duration::ZERO,
+            signal: None,
+        },
     );
-    for slot in reserved {
-        CHILDREN[slot].store(0, Ordering::Release);
-    }
+    drop(reserved);
     match rejected {
         Err(error)
             if error.diagnostic.guardian_pid.is_none()
@@ -4892,11 +5006,18 @@ pub fn resource_recovery(image: &Path) -> Result<(), String> {
     let baseline = descriptor_count()?;
     for _ in 0..12 {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut attempt = launch(
+        let mut attempt = launch_configured(
             &CommandSpec::new(image).args(["__execution-probe"]),
             image,
             deadline,
             deadline,
+            LaunchConfiguration {
+                runtime: Some(&runtime),
+                fault: None,
+                work: None,
+                grace: Duration::ZERO,
+                signal: None,
+            },
         )
         .map_err(|error| error.error.to_string())?;
         attempt
@@ -4907,19 +5028,26 @@ pub fn resource_recovery(image: &Path) -> Result<(), String> {
             .guardian
             .disarm(deadline)
             .map_err(|error| error.to_string())?;
-        let diagnostic = startup_fault(
+        let diagnostic = launch_configured(
             &CommandSpec::new(image).args(["__execution-probe"]),
             image,
-            LaunchFault::GuardianBeforeArm,
-        )?;
-        if diagnostic.release_sent {
+            deadline,
+            deadline,
+            LaunchConfiguration {
+                runtime: Some(&runtime),
+                fault: Some(LaunchFault::GuardianBeforeArm),
+                work: None,
+                grace: Duration::ZERO,
+                signal: None,
+            },
+        )
+        .err()
+        .ok_or("failed fixture unexpectedly completed admission")?;
+        if diagnostic.diagnostic.release_sent {
             return Err("failed fixture released target".into());
         }
     }
-    let retained = CHILDREN
-        .iter()
-        .filter(|slot| slot.load(Ordering::Acquire) != 0)
-        .count();
+    let retained = runtime.outstanding();
     let current = descriptor_count()?;
     if retained != 0 || current != baseline {
         return Err(format!(

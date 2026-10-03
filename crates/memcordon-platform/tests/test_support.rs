@@ -2,6 +2,50 @@ use std::fs;
 
 use memcordon_platform::test_support::ProcessIdentity;
 
+#[cfg(windows)]
+#[test]
+#[ignore = "child fixture selected explicitly by windows_held_identity_observes_original_process_retirement"]
+fn windows_held_identity_child_fixture() {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_held_identity_observes_original_process_retirement() {
+    struct ChildOwner(std::process::Child);
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let image = std::env::current_exe().unwrap();
+    let mut child = ChildOwner(
+        std::process::Command::new(&image)
+            .args([
+                "--ignored",
+                "--exact",
+                "windows_held_identity_child_fixture",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let held = memcordon_platform::test_support::windows_processes_for_image(&image)
+        .unwrap()
+        .into_iter()
+        .find(|process| process.identity.pid == child.0.id())
+        .unwrap();
+    assert_ne!(held.identity.birth, 0);
+    assert!(!held.has_exited().unwrap());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(held.has_exited().unwrap());
+    // The held native object remains observable after process-table retirement.
+    assert!(held.has_exited().unwrap());
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 use memcordon_platform::test_support::unix_session_member_from_stat;
 

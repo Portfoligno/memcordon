@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use memcordon_testkit::{ObservedOutput, run_with_deadline};
+use memcordon_testkit::{ObservedOutput, run_with_deadline_output_limit};
 
 use crate::{CiError, Result};
 
@@ -12,7 +12,6 @@ pub struct CommandSpec {
     program: PathBuf,
     arguments: Vec<OsString>,
     toolchain: Option<ToolchainInvocation>,
-    credential_policy: CredentialPolicy,
     current_dir: PathBuf,
     deadline: Duration,
 }
@@ -28,26 +27,18 @@ enum ToolchainInvocation {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CredentialPolicy {
-    RemoveInherited,
-    InheritCratesIoToken,
-}
-
 impl CommandSpec {
     pub fn new(program: impl Into<PathBuf>, current_dir: &Path, deadline: Duration) -> Self {
         Self {
             program: program.into(),
             arguments: Vec::new(),
             toolchain: None,
-            credential_policy: CredentialPolicy::RemoveInherited,
             current_dir: current_dir.to_path_buf(),
             deadline,
         }
     }
 
-    /// Cargo compilation with explicit toolchain ownership. `rustup` is used
-    /// only outside a managed build; managed builds select measured executables.
+    /// Cargo compilation through the explicitly selected rustup toolchain.
     pub fn cargo(
         rustup: impl Into<PathBuf>,
         current_dir: &Path,
@@ -91,16 +82,14 @@ impl CommandSpec {
         self
     }
 
-    pub fn inherit_crates_io_registry_token(mut self) -> Self {
-        self.credential_policy = CredentialPolicy::InheritCratesIoToken;
-        self
-    }
-
     pub fn apply_environment(&self, command: &mut Command) {
+        command
+            .env_remove("GH_TOKEN")
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL");
         command.env_remove("CARGO_REGISTRY_TOKEN");
-        if self.credential_policy == CredentialPolicy::RemoveInherited {
-            command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
-        }
+        command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        command.env_remove("GITHUB_TOKEN");
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
@@ -123,27 +112,9 @@ impl CommandSpec {
         }
     }
 
-    pub fn materialize(
-        &self,
-        context: Option<&crate::build_context::ValidatedBuildContext>,
-    ) -> Result<Command> {
-        let mut command = match (&self.toolchain, context) {
-            (Some(ToolchainInvocation::Cargo { toolchain }), Some(context)) => {
-                context.cargo_command(toolchain, &self.arguments, &self.current_dir)?
-            }
-            (
-                Some(ToolchainInvocation::Program {
-                    toolchain,
-                    executable,
-                }),
-                Some(context),
-            ) => context.toolchain_command(
-                toolchain,
-                executable,
-                &self.arguments,
-                &self.current_dir,
-            )?,
-            (invocation, _) => {
+    pub fn materialize(&self) -> Result<Command> {
+        let mut command = match &self.toolchain {
+            invocation => {
                 let mut command = Command::new(&self.program);
                 match invocation {
                     Some(ToolchainInvocation::Cargo { toolchain }) => {
@@ -166,21 +137,23 @@ impl CommandSpec {
     }
 
     pub fn output(&self) -> Result<ObservedOutput> {
-        let mut command = self.materialize(crate::build_context::active())?;
+        let mut command = self.materialize()?;
         eprintln!("ci subprocess program: {:?}", command.get_program());
         for argument in command.get_args() {
             eprintln!("ci subprocess argument: {argument:?}");
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
-        run_with_deadline(&mut command, self.deadline).map_err(Into::into)
+        run_with_deadline_output_limit(&mut command, self.deadline, 16 * 1024 * 1024)
+            .map_err(Into::into)
     }
 
     /// Capture a subprocess for callers that own a machine-readable protocol.
     /// Materialization, credential removal, and the deadline remain identical
     /// to `output`; only invocation diagnostics are suppressed.
     pub fn output_quiet(&self) -> Result<ObservedOutput> {
-        let mut command = self.materialize(crate::build_context::active())?;
-        run_with_deadline(&mut command, self.deadline).map_err(Into::into)
+        let mut command = self.materialize()?;
+        run_with_deadline_output_limit(&mut command, self.deadline, 16 * 1024 * 1024)
+            .map_err(Into::into)
     }
 }
 
@@ -209,9 +182,7 @@ impl PackageOutput {
         } else {
             root.join(target)
         };
-        Ok(Self {
-            target: crate::build_context::environment::paths::command_output_path(&target)?,
-        })
+        Ok(Self { target })
     }
 
     pub fn archive_directory(&self) -> PathBuf {
@@ -222,7 +193,14 @@ impl PackageOutput {
         let mut command = rustup_cargo(
             root,
             stable,
-            ["package", "--locked", "--no-verify", "--target-dir"],
+            [
+                "package",
+                "--locked",
+                "--no-verify",
+                "--registry",
+                "crates-io",
+                "--target-dir",
+            ],
             Duration::from_secs(30 * 60),
         )
         .arg(&self.target);

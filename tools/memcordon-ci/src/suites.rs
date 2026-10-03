@@ -1,21 +1,16 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use serde::Serialize;
+use std::time::{Duration, Instant};
 
 use memcordon_ci::capability;
 use memcordon_ci::standard_contract::{CargoTestTarget, HardBackendScenario};
 
 use crate::command::{CommandSpec, git, rustup_cargo, supply_chain_commands};
 use crate::config;
-use crate::{CiError, Result, Suite, policy, release};
+use crate::{CiError, Result, Suite, policy};
 
 const CARGO_DEADLINE: Duration = Duration::from_secs(15 * 60);
-// The deep child loop retains its 30-minute runtime budget; allow a bounded
-// five minutes for Cargo compilation and launch outside that measured loop.
-const DEEP_CHILD_STRESS_DEADLINE: Duration = Duration::from_secs(35 * 60);
 const CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 fn cargo(
@@ -44,59 +39,113 @@ fn cargo_with_deadline(
 }
 
 fn quality(root: &Path, stable: &str) -> Result<()> {
-    cargo(root, stable, "fmt", ["--all", "--", "--check"])?;
-    cargo(
-        root,
-        stable,
-        "check",
-        [
-            "--target-dir",
-            "target/ci/quality",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--locked",
-        ],
-    )?;
-    cargo(
-        root,
-        stable,
-        "clippy",
-        [
-            "--target-dir",
-            "target/ci/quality",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--locked",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
-    cargo(
-        root,
-        stable,
-        "metadata",
-        ["--locked", "--format-version", "1"],
-    )?;
-    let policy = config::policy(root)?;
-    for package in policy.workspace.publish_packages {
-        let arguments = vec![
-            OsString::from("--target-dir"),
-            OsString::from("target/ci/quality"),
-            OsString::from("--package"),
-            OsString::from(package),
-            OsString::from("--lib"),
-            OsString::from("--all-features"),
-            OsString::from("--locked"),
-            OsString::from("--"),
-            OsString::from("-D"),
-            OsString::from("warnings"),
-        ];
-        cargo(root, stable, "rustdoc", arguments)?;
-    }
-    Ok(())
+    let layout = crate::performance_plan::PerformancePlan::read(root)?
+        .quality
+        .selected;
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    let reports = root.join("target/ci/reports/quality");
+    fs::create_dir_all(&reports)?;
+    let reports = tempfile::Builder::new()
+        .prefix("operations-")
+        .tempdir_in(&reports)?
+        .keep();
+    let first = reports.join("metadata");
+    let second = reports.join("compile");
+    fs::create_dir(&first)?;
+    fs::create_dir(&second)?;
+    let packages = config::policy(root)?.workspace.publish_packages;
+    crate::preparation::complete_lanes(
+        layout,
+        || {
+            crate::preparation::observed(
+                rustup_cargo(
+                    root,
+                    stable,
+                    ["fmt", "--all", "--", "--check"],
+                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                ),
+                &first,
+                "format",
+            )?;
+            crate::preparation::observed(
+                rustup_cargo(
+                    root,
+                    stable,
+                    ["metadata", "--locked", "--format-version", "1"],
+                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                ),
+                &first,
+                "metadata",
+            )
+        },
+        || {
+            crate::preparation::observed(
+                rustup_cargo(
+                    root,
+                    stable,
+                    [
+                        "check",
+                        "--target-dir",
+                        "target/ci/quality",
+                        "--workspace",
+                        "--all-targets",
+                        "--all-features",
+                        "--locked",
+                    ],
+                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                ),
+                &second,
+                "check",
+            )?;
+            crate::preparation::observed(
+                rustup_cargo(
+                    root,
+                    stable,
+                    [
+                        "clippy",
+                        "--target-dir",
+                        "target/ci/quality",
+                        "--workspace",
+                        "--all-targets",
+                        "--all-features",
+                        "--locked",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                ),
+                &second,
+                "clippy",
+            )?;
+            for package in packages {
+                let arguments = vec![
+                    OsString::from("rustdoc"),
+                    OsString::from("--target-dir"),
+                    OsString::from("target/ci/quality"),
+                    OsString::from("--package"),
+                    OsString::from(&package),
+                    OsString::from("--lib"),
+                    OsString::from("--all-features"),
+                    OsString::from("--locked"),
+                    OsString::from("--"),
+                    OsString::from("-D"),
+                    OsString::from("warnings"),
+                ];
+                crate::preparation::observed(
+                    rustup_cargo(
+                        root,
+                        stable,
+                        arguments,
+                        crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                    ),
+                    &second,
+                    &package,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn msrv(root: &Path, version: &str) -> Result<()> {
@@ -126,21 +175,13 @@ fn native(root: &Path, stable: &str, release_mode: bool) -> Result<()> {
 }
 
 fn install_tool(root: &Path, stable: &str, name: &str, version: &str) -> Result<()> {
-    let arguments = vec![
-        OsString::from(name),
-        OsString::from("--locked"),
-        OsString::from("--version"),
-        OsString::from(version),
-        OsString::from("--root"),
-        root.join("target").join("ci-tools").into_os_string(),
-    ];
-    cargo_with_deadline(
-        root,
-        stable,
-        "install",
-        arguments,
-        Duration::from_secs(10 * 60),
-    )?;
+    let _ = stable;
+    let profile = match name {
+        "cargo-fuzz" => crate::bootstrap_profile::BootstrapProfile::Fuzz,
+        "cargo-audit" | "cargo-deny" => crate::bootstrap_profile::BootstrapProfile::SupplyChain,
+        _ => return Err(CiError::Message("unsupported auxiliary tool".into())),
+    };
+    crate::preparation::ensure_auxiliary_tool(root, profile, name, version)?;
     Ok(())
 }
 
@@ -161,7 +202,12 @@ fn supply_chain(root: &Path, stable: &str) -> Result<()> {
     Ok(())
 }
 
-fn miri(root: &Path, nightly: &str) -> Result<()> {
+fn miri(
+    root: &Path,
+    nightly: &str,
+    shard: Option<memcordon_ci::miri_targets::MiriShard>,
+    target_directory: &Path,
+) -> Result<()> {
     CommandSpec::new("rustup", root, Duration::from_secs(10 * 60))
         .args([
             "toolchain",
@@ -180,16 +226,31 @@ fn miri(root: &Path, nightly: &str) -> Result<()> {
         "metadata",
         ["--format-version", "1", "--no-deps", "--locked"],
     )?;
-    for target in memcordon_ci::miri_targets::plan(&metadata, "memcordon-core")? {
+    let targets = match shard {
+        Some(shard) => memcordon_ci::miri_targets::plan_shard(&metadata, "memcordon-core", shard)?,
+        None => memcordon_ci::miri_targets::plan(&metadata, "memcordon-core")?,
+    };
+    let name = match shard {
+        Some(memcordon_ci::miri_targets::MiriShard::First) => "first.json",
+        Some(_) => "second.json",
+        None => "all.json",
+    };
+    write_plan(
+        root,
+        "miri",
+        name,
+        &serde_json::json!({"planner_version": 1, "package": "memcordon-core", "shard_index": shard.map(|s| s.spec().index()), "shard_count": shard.map(|s| s.spec().count()), "targets": targets}),
+    )?;
+    for target in targets {
         let mut arguments = vec![
-            "test",
-            "--target-dir",
-            "target/ci/miri",
-            "--package",
-            "memcordon-core",
-            "--locked",
+            OsString::from("test"),
+            OsString::from("--target-dir"),
+            target_directory.as_os_str().to_owned(),
+            OsString::from("--package"),
+            OsString::from("memcordon-core"),
+            OsString::from("--locked"),
         ];
-        arguments.extend(target.arguments());
+        arguments.extend(target.arguments().into_iter().map(OsString::from));
         // Each original harness remains intact, including its inter-test races.
         // The normal 900-second command deadline applies independently to it.
         cargo(root, nightly, "miri", arguments)?;
@@ -201,11 +262,27 @@ fn fuzz(
     root: &Path,
     stable: &str,
     nightly: &str,
-    shard: Option<memcordon_ci::fuzz_targets::FuzzShard>,
+    shard: Option<memcordon_ci::target_shard::ShardSpec>,
 ) -> Result<()> {
-    let targets = memcordon_ci::fuzz_targets::targets(
+    let targets = memcordon_ci::fuzz_targets::targets_sharded(
         &std::fs::read_to_string(root.join("fuzz").join("Cargo.toml"))?,
         shard,
+    )?;
+    let name = match shard.map(|s| (s.index(), s.count())) {
+        None => "all.json",
+        Some((0, 2)) => "first.json",
+        Some((1, 2)) => "second.json",
+        Some((0, 4)) => "quarter-one.json",
+        Some((1, 4)) => "quarter-two.json",
+        Some((2, 4)) => "quarter-three.json",
+        Some((3, 4)) => "quarter-four.json",
+        _ => return Err(CiError::Message("unsupported managed fuzz shard".into())),
+    };
+    write_plan(
+        root,
+        "fuzz",
+        name,
+        &serde_json::json!({"planner_version": 1, "shard_index": shard.map(|s| s.index()), "shard_count": shard.map(|s| s.count()), "targets": targets}),
     )?;
     cargo(
         root,
@@ -228,11 +305,7 @@ fn fuzz(
     CommandSpec::new("rustup", root, Duration::from_secs(10 * 60))
         .args(["toolchain", "install", nightly, "--profile", "minimal"])
         .run()?;
-    let cargo_fuzz = root
-        .join("target")
-        .join("ci-tools")
-        .join("bin")
-        .join("cargo-fuzz");
+    let cargo_fuzz = crate::preparation::auxiliary_tool(root, "cargo-fuzz")?;
     for target in &targets {
         CommandSpec::toolchain_program("rustup", root, nightly, &cargo_fuzz, CARGO_DEADLINE)
             .args([
@@ -267,106 +340,21 @@ fn fuzz(
     Ok(())
 }
 
-fn stress(root: &Path, stable: &str) -> Result<()> {
-    let reports = root.join("target").join("ci").join("reports");
-    fs::create_dir_all(&reports)?;
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-        ^ u64::from(std::process::id());
-    fs::write(reports.join("stress-seed.txt"), format!("{seed}\n"))?;
-    for package in [
-        "memcordon-core",
-        "memcordon-windows-launch-core",
-        "memcordon-platform",
-        "memcordon",
-        "memcordon-testkit",
-        "memcordon-ci",
-        "memcordon-windows-loader-lab",
-    ] {
-        fs::write(
-            reports.join("stress-active-target.txt"),
-            format!("package={package}\n"),
-        )?;
-        cargo(
-            root,
-            stable,
-            "test",
-            [
-                "--target-dir",
-                "target/ci/stress",
-                "--package",
-                package,
-                "--all-targets",
-                "--all-features",
-                "--locked",
-                "--release",
-            ],
-        )?;
-    }
-    fs::write(
-        reports.join("stress-active-target.txt"),
-        "package-suite=complete\n",
-    )?;
-    let probe = capability::probe(
-        root,
-        stable,
-        &root.join("target").join("ci").join("stress"),
-        CARGO_DEADLINE,
-    )?;
-    if cfg!(target_os = "linux") && capability::selected(&probe).is_none() {
-        eprintln!(
-            "deep backend-dependent stress is unavailable on this runner; mandatory protected backend certification remains authoritative: {probe}"
-        );
-        return Ok(());
-    }
-    capability::require_selected(&probe)?;
-    cargo_with_deadline(
-        root,
-        stable,
-        "test",
-        [
-            "--target-dir",
-            "target/ci/stress",
-            "--package",
-            "memcordon",
-            "--features",
-            "test-fixtures",
-            "--test",
-            "stress",
-            "--release",
-            "--locked",
-            "--",
-            "deep_short_children_are_bounded_reaped_and_observed",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
-        DEEP_CHILD_STRESS_DEADLINE,
-    )?;
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(
-        reports.join("stress-deep_short_child_iterations.json"),
-    )?)?;
-    if report.get("seed").and_then(serde_json::Value::as_u64) != Some(seed) {
-        return Err(CiError::Message(
-            "stress report did not preserve the selected seed".to_owned(),
-        ));
-    }
-    println!("stress seed: {seed} (recorded in the stress report)");
+fn write_plan(root: &Path, family: &str, name: &str, value: &serde_json::Value) -> Result<()> {
+    let directory = root.join("target/ci/reports").join(family);
+    fs::create_dir_all(&directory)?;
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    fs::write(directory.join(name), bytes)?;
     Ok(())
 }
 
-#[derive(Serialize)]
-struct CertificationReport<'a> {
-    schema: u32,
-    backend: &'a str,
-    certified: bool,
-    tests_run: u32,
-    tests_skipped: u32,
-    scenarios: Vec<&'a str>,
-    commit: String,
-    runner_class: &'a str,
+fn shard(index: usize, count: usize) -> memcordon_ci::target_shard::ShardSpec {
+    memcordon_ci::target_shard::ShardSpec::new(
+        index,
+        std::num::NonZeroUsize::new(count).expect("nonzero suite shard"),
+    )
+    .expect("valid suite shard")
 }
 
 fn certification_cargo(
@@ -437,53 +425,23 @@ fn run_hard_scenario(
     capability::require_exact_standard_test_success(&output, scenario.exact_name)
 }
 
-fn certification(
-    root: &Path,
-    rustup: &Path,
-    stable: &str,
-    backend: &str,
-    platform_matches: bool,
-    inherited_context: Option<memcordon_ci::certification_context::CertificationContext>,
-) -> Result<()> {
-    use memcordon_ci::certification_context::CertificationContext;
-    use memcordon_ci::standard_contract::{
-        StandardCertificationReportV3, StandardContract, StandardRuntimeEvidence, validate_report,
+fn backend_suite(root: &Path, rustup: &Path, stable: &str, backend: &str) -> Result<()> {
+    let expected_os = match backend {
+        "linux-cgroup-v2" => "linux",
+        "windows-job-object" => "windows",
+        _ => return Err(CiError::Message("unknown standard backend".into())),
     };
-    let contract = StandardContract::for_backend(backend)?;
-    let reports = contract.report_directory(root);
-    fs::create_dir_all(&reports)?;
-    let final_path = reports.join(contract.report_name);
-    if final_path.exists() {
-        fs::remove_file(&final_path)?;
-    }
-    let candidate = reports.join("candidate.json");
-    if candidate.exists() {
-        fs::remove_file(&candidate)?;
-    }
-    contract.require_native()?;
-    if !platform_matches {
-        return Err(CiError::Message(
-            "wrong standard certification platform".into(),
-        ));
-    }
-    let context = match inherited_context {
-        Some(context) => context,
-        None => CertificationContext::capture(root, contract.contract_id)?,
-    };
-    context.validate(contract.contract_id)?;
-    let source = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
-        .map_err(|error| CiError::Message(error.to_string()))?;
-    if source.trim() != context.source_commit {
-        return Err(CiError::Message("delegated checkout changed".into()));
+    if std::env::consts::OS != expected_os {
+        return Err(CiError::Message("wrong native backend platform".into()));
     }
     let started = std::time::Instant::now();
     let remaining = || {
         CERTIFICATION_DEADLINE
             .checked_sub(started.elapsed())
             .filter(|time| !time.is_zero())
-            .ok_or_else(|| CiError::Message("standard suite deadline exhausted".into()))
+            .ok_or_else(|| CiError::Message("native backend suite deadline exhausted".into()))
     };
-    let output = certification_cargo(
+    let probe = certification_cargo(
         root,
         rustup,
         stable,
@@ -502,9 +460,14 @@ fn certification(
         ],
         remaining()?.min(CARGO_DEADLINE),
     )?;
-    let probe = serde_json::from_slice(&output)?;
-    capability::require_certified_standard_backend(&probe, backend)?;
-    for scenario in contract.scenarios() {
+    capability::require_certified_standard_backend(&serde_json::from_slice(&probe)?, backend)?;
+    let scenarios = memcordon_ci::standard_contract::hard_backend_scenarios(backend)?;
+    if scenarios.is_empty() {
+        return Err(CiError::Message(
+            "native backend suite has no scenarios".into(),
+        ));
+    }
+    for scenario in scenarios {
         run_hard_scenario(
             root,
             rustup,
@@ -513,69 +476,6 @@ fn certification(
             remaining()?.min(CARGO_DEADLINE),
         )?;
     }
-    // Each fact is justified jointly by the ordinary probe and the exact mandatory scenarios.
-    let runtime = match contract.target {
-        memcordon_ci::standard_contract::StandardTarget::LinuxX64 => {
-            StandardRuntimeEvidence::Linux {
-                unified_cgroup_v2: true,
-                delegated_boundary: true,
-                memory_controller: true,
-                memory_max_round_trip: true,
-                memory_swap_max: true,
-                cgroup_kill: true,
-            }
-        }
-        memcordon_ci::standard_contract::StandardTarget::WindowsX64 => {
-            StandardRuntimeEvidence::Windows {
-                job_memory_limit: true,
-                kill_on_close: true,
-                suspended_assignment: true,
-                nested_job: true,
-                completion_port: true,
-            }
-        }
-    };
-    let hosted = context.provenance.is_some();
-    let tests = contract.results();
-    let report = StandardCertificationReportV3 {
-        schema: 3,
-        contract_id: contract.contract_id.into(),
-        contract_sha256: contract.digest()?,
-        boundary: memcordon_core::BoundaryRequirement::Standard,
-        backend: backend.into(),
-        target: contract.rust_target.into(),
-        certified: true,
-        commit: context.source_commit.clone(),
-        runner_class: if hosted {
-            "ephemeral-certified"
-        } else {
-            "local"
-        }
-        .into(),
-        runner_provider: if hosted { "github-hosted" } else { "local" }.into(),
-        runner_label: if hosted { contract.runner_label } else { "" }.into(),
-        provenance: context.provenance,
-        runtime,
-        tests_run: u32::try_from(tests.len())
-            .map_err(|_| CiError::Message("too many standard tests".into()))?,
-        tests_skipped: 0,
-        tests,
-    };
-    validate_report(&report, contract, &context.source_commit, None)?;
-    remaining()?;
-    let mut bytes = serde_json::to_vec_pretty(&report)?;
-    bytes.push(b'\n');
-    let mut temporary = tempfile::NamedTempFile::new_in(&reports)?;
-    std::io::Write::write_all(&mut temporary, &bytes)?;
-    temporary.as_file().sync_all()?;
-    let destination = if backend == "linux-cgroup-v2" {
-        candidate
-    } else {
-        final_path
-    };
-    temporary
-        .persist_noclobber(destination)
-        .map_err(|error| CiError::Io(error.error))?;
     Ok(())
 }
 
@@ -604,25 +504,18 @@ fn resolve_rustup() -> Result<PathBuf> {
         .ok_or_else(|| CiError::Message("could not resolve rustup to an absolute path".to_owned()))
 }
 
-fn launch_delegated_linux_certification(root: &Path) -> Result<()> {
-    use memcordon_ci::certification_context::CertificationContext;
-    use memcordon_ci::standard_contract::LINUX;
-    let reports = LINUX.report_directory(root);
-    fs::create_dir_all(&reports)?;
-    for name in [LINUX.report_name, "candidate.json"] {
-        let path = reports.join(name);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+fn launch_delegated_linux_backend(root: &Path) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(CiError::Message(
+            "Linux backend suite requires native Linux".into(),
+        ));
     }
-    LINUX.require_native()?;
     let uid = current_uid(root)?;
     if uid == "0" {
         return Err(CiError::Message(
-            "Linux certification must start unprivileged".into(),
+            "Linux backend suite must start unprivileged".into(),
         ));
     }
-    let context = CertificationContext::capture(root, LINUX.contract_id)?;
     let directory = tempfile::Builder::new()
         .prefix("memcordon-standard-")
         .suffix(".service")
@@ -630,26 +523,18 @@ fn launch_delegated_linux_certification(root: &Path) -> Result<()> {
     let unit = directory
         .path()
         .file_name()
-        .ok_or_else(|| CiError::Message("missing unit basename".into()))?
+        .ok_or_else(|| CiError::Message("missing owned unit basename".into()))?
         .to_os_string();
-    let unit_text = unit
+    let text = unit
         .to_str()
-        .ok_or_else(|| CiError::Message("invalid unit encoding".into()))?;
-    if !unit_text.ends_with(".service")
-        || !unit_text
+        .ok_or_else(|| CiError::Message("invalid owned unit encoding".into()))?;
+    if !text.ends_with(".service")
+        || !text
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(CiError::Message("invalid owned delegation unit".into()));
     }
-    let context_path = directory.path().join("context.json");
-    let mut context_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&context_path)?;
-    let mut bytes = serde_json::to_vec(&context)?;
-    bytes.push(b'\n');
-    std::io::Write::write_all(&mut context_file, &bytes)?;
     let rustup = resolve_rustup()?;
     let executable = std::env::current_exe()?;
     let mut arguments: Vec<OsString> = [
@@ -668,8 +553,8 @@ fn launch_delegated_linux_certification(root: &Path) -> Result<()> {
     .map(OsString::from)
     .collect();
     arguments.push(unit.clone());
-    arguments.extend(["--uid"].map(OsString::from));
-    arguments.push(OsString::from(&uid));
+    arguments.push("--uid".into());
+    arguments.push(uid.clone().into());
     arguments.extend(
         [
             "--property",
@@ -693,46 +578,23 @@ fn launch_delegated_linux_certification(root: &Path) -> Result<()> {
     arguments.push(root.as_os_str().to_os_string());
     arguments.push("--".into());
     arguments.push(executable.into_os_string());
-    arguments.extend(["delegated-linux-certification", "--rustup"].map(OsString::from));
+    arguments.extend(["delegated-linux-backend", "--rustup"].map(OsString::from));
     arguments.push(rustup.into_os_string());
     arguments.push("--uid".into());
     arguments.push(uid.into());
-    arguments.push("--context-file".into());
-    arguments.push(context_path.into_os_string());
     let mut lease = memcordon_ci::standard_runner::DelegatedUnitLease::new(root, unit)?;
     let execution = CommandSpec::new("/usr/bin/sudo", root, Duration::from_secs(65 * 60))
         .args(arguments)
         .run();
     let retirement = lease.retire();
-    drop(context_file);
-    let context_cleanup = directory.close();
-    memcordon_ci::standard_runner::finish_delegation(execution, retirement, context_cleanup)?;
-    let candidate = reports.join("candidate.json");
-    let bytes = memcordon_ci::standard_runner::read_bounded_regular(&candidate)?;
-    let report = serde_json::from_slice(&bytes)?;
-    memcordon_ci::standard_contract::validate_report(&report, LINUX, &context.source_commit, None)?;
-    if report.provenance != context.provenance {
-        return Err(CiError::Message(
-            "candidate provenance differs from originating context".into(),
-        ));
-    }
-    memcordon_ci::standard_runner::publish_candidate(
-        &candidate,
-        &reports.join(LINUX.report_name),
-        &bytes,
-    )?;
+    memcordon_ci::standard_runner::finish_delegation(execution, retirement, directory.close())?;
     Ok(())
 }
 
-pub fn delegated_linux_certification(
-    root: &Path,
-    rustup: &Path,
-    expected_uid: &str,
-    context_file: &Path,
-) -> Result<()> {
+pub fn delegated_linux_backend(root: &Path, rustup: &Path, expected_uid: &str) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(CiError::Message(
-            "delegated Linux certification invoked on wrong platform".into(),
+            "delegated Linux backend invoked on wrong platform".into(),
         ));
     }
     let uid = current_uid(root)?;
@@ -741,25 +603,8 @@ pub fn delegated_linux_certification(
             "delegation did not preserve unprivileged uid".into(),
         ));
     }
-    let expected_uid = uid
-        .parse()
-        .map_err(|_| CiError::Message("invalid context owner uid".into()))?;
-    let bytes = memcordon_ci::standard_runner::read_bounded_regular_owned(
-        context_file,
-        Some(expected_uid),
-    )?;
-    let context: memcordon_ci::certification_context::CertificationContext =
-        serde_json::from_slice(&bytes)?;
-    context.validate(memcordon_ci::standard_contract::LINUX.contract_id)?;
     let toolchains = config::toolchains(root)?;
-    certification(
-        root,
-        rustup,
-        &toolchains.stable,
-        "linux-cgroup-v2",
-        true,
-        Some(context),
-    )
+    backend_suite(root, rustup, &toolchains.stable, "linux-cgroup-v2")
 }
 
 fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
@@ -811,7 +656,7 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             )?;
             capability::require_exact_standard_test_success(&output, scenario)?;
         }
-        for scenario in memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS {
+        for scenario in crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS {
             let output = cargo(
                 root,
                 stable,
@@ -860,7 +705,7 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         )?;
         let mut admission = Vec::new();
         for (package, feature, scenario) in
-            memcordon_ci::release_evidence::MACOS_ADMISSION_SCENARIOS
+            crate::native_acceptance_catalogue::MACOS_ADMISSION_SCENARIOS
         {
             let output = cargo(
                 root,
@@ -890,7 +735,8 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             serde_json::to_vec_pretty(&admission)?,
         )?;
         let mut mutations = Vec::new();
-        for (package, target, scenario) in memcordon_ci::release_evidence::MACOS_MUTATION_SCENARIOS
+        for (package, target, scenario) in
+            crate::native_acceptance_catalogue::MACOS_MUTATION_SCENARIOS
         {
             let output = cargo(
                 root,
@@ -916,7 +762,7 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             mutations.push(serde_json::json!({"package": package, "target": target, "scenario": scenario, "executed": 1, "passed": 1}));
         }
         let mut inventory = serde_json::to_vec_pretty(
-            &serde_json::json!({"schema_version": 1, "native_scenarios": memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS, "writer_barrier_scenarios": 3, "mutations": mutations}),
+            &serde_json::json!({"schema_version": 1, "native_scenarios": crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS, "writer_barrier_scenarios": 3, "mutations": mutations}),
         )?;
         inventory.push(b'\n');
         fs::write(evidence.join("native-inventory.json"), inventory)?;
@@ -966,7 +812,8 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
     result
 }
 
-fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
+pub fn release_macos_native(root: &Path, stable: &str) -> Result<()> {
+    memcordon_ci::macos_performance::require_native_host(root, stable)?;
     if !cfg!(target_os = "macos") {
         return Err(CiError::Message(
             "macOS acceptance was invoked on the wrong platform".to_owned(),
@@ -975,11 +822,11 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
     for (target, scenarios) in [
         (
             "lifecycle",
-            memcordon_ci::release_evidence::MACOS_LIFECYCLE_SCENARIOS,
+            crate::native_acceptance_catalogue::MACOS_LIFECYCLE_SCENARIOS,
         ),
         (
             "macos_remediation",
-            memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS,
+            crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS,
         ),
     ] {
         for scenario in scenarios {
@@ -1007,6 +854,41 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             capability::require_exact_standard_test_success(&output, scenario)?;
         }
     }
+    macos_deadline(root, stable)?;
+    write_macos_report(
+        root,
+        "release-macos-native.json",
+        crate::native_acceptance_catalogue::MACOS_LIFECYCLE_SCENARIOS
+            .iter()
+            .chain(crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS)
+            .copied()
+            .collect(),
+    )
+}
+
+pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
+    memcordon_ci::macos_performance::require_native_host(root, stable)?;
+    if !cfg!(target_os = "macos") {
+        return Err(CiError::Message(
+            "macOS acceptance invoked on wrong platform".into(),
+        ));
+    }
+    cargo(
+        root,
+        stable,
+        "build",
+        [
+            "--locked",
+            "--package",
+            "memcordon",
+            "--features",
+            "test-fixtures",
+            "--bin",
+            "memcordon-test-fixture",
+            "--target-dir",
+            "target/ci/backend-macos",
+        ],
+    )?;
     // This isolated candidate-package installation never replaces the user's verifier.
     cargo(
         root,
@@ -1050,31 +932,143 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             "installed macOS package did not enforce its deadline".into(),
         ));
     }
-    macos_deadline(root, stable)?;
-    let scenarios = memcordon_ci::release_evidence::macos_scenarios();
+    let fixture = root.join("target/ci/backend-macos/debug/memcordon-test-fixture");
+    let measured = |path: &Path| -> Result<memcordon_ci::external_consumer::MeasuredExecutable> {
+        let path = fs::canonicalize(path)?;
+        Ok(memcordon_ci::external_consumer::MeasuredExecutable {
+            sha256: memcordon_ci::release::artifacts::checksum(
+                &memcordon_ci::release::artifacts::read_file(&path)?,
+            ),
+            path,
+        })
+    };
+    let spec = memcordon_ci::external_consumer::ExternalConsumerSpec {
+        format: "memcordon.external-consumer".into(),
+        revision: 1,
+        target: memcordon_ci::release::distribution::native_target()?.into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        runtime_features: Vec::new(),
+        selection: memcordon_ci::external_consumer::Selection::MeasuredCli,
+        selected_inputs: Vec::new(),
+        cli: measured(&installed)?,
+        workload: measured(&fixture)?,
+        working_directory: fs::canonicalize(root)?,
+        arguments: ["exit", "--code", "0"]
+            .into_iter()
+            .map(|argument| memcordon_core::NativeArgument::from_os(std::ffi::OsStr::new(argument)))
+            .collect(),
+        requested_contract: memcordon_ci::external_consumer::RequestedContract::Standard,
+        report_format: "result-v1".into(),
+        report_revision: 1,
+        expected_outcome: memcordon_core::result_v1::OutcomeKindV1::Completed,
+        expected_native_termination: Some(memcordon_core::ChildTermination::ExitCode { code: 0 }),
+        expected_wrapper_status: 0,
+        coverage: memcordon_ci::external_consumer::ExpectedCoverage::Bytes {
+            stdout_sha256: memcordon_ci::release::artifacts::checksum(b""),
+            stderr_sha256: memcordon_ci::release::artifacts::checksum(b""),
+        },
+        outer_deadline_millis: 30_000,
+    };
+    let operation = tempfile::Builder::new()
+        .prefix("memcordon-macos-acceptance-")
+        .tempdir_in("/tmp")?
+        .keep();
+    let raw = operation.join("external");
+    let assessment = memcordon_ci::external_consumer::run(&spec, &raw);
+    let reports = root.join("target/ci/reports");
+    fs::create_dir_all(&reports)?;
+    let retained = reports.join(
+        operation
+            .file_name()
+            .expect("native temporary operation has a basename"),
+    );
+    fs::create_dir(&retained)?;
+    // Preserve every actual raw file, including partial observations on error.
+    // The retained /tmp operation also survives an artifact collection error.
+    if raw.try_exists()? {
+        for entry in fs::read_dir(&raw)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                return Err(CiError::Message(
+                    "external native diagnostics contains a non-file".into(),
+                ));
+            }
+            fs::copy(entry.path(), retained.join(entry.file_name()))?;
+        }
+    }
+    let assessment = assessment?;
+    if !assessment.passed() {
+        return Err(CiError::Message(
+            "installed macOS typed consumer execution, collection or retirement failed".into(),
+        ));
+    }
+    write_macos_report(
+        root,
+        "release-macos-acceptance.json",
+        vec![
+            "installed_package_execution_probe_and_deadline",
+            "installed_package_typed_external_consumer",
+        ],
+    )
+}
+
+fn write_macos_report(root: &Path, filename: &str, scenarios: Vec<&str>) -> Result<()> {
     let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(error.to_string()))?
         .trim()
         .to_owned();
-    let report = CertificationReport {
-        schema: 1,
-        backend: "macos-watchdog",
-        certified: true,
-        tests_run: u32::try_from(scenarios.len()).expect("static scenario count fits"),
+    let report = memcordon_ci::native_results::NativeTestReport {
+        schema_version: 1,
+        backend: "macos-watchdog".into(),
+        tests_run: scenarios.len(),
         tests_skipped: 0,
-        scenarios,
-        commit,
-        runner_class: "hosted-release-acceptance",
+        tests: scenarios
+            .into_iter()
+            .map(|name| memcordon_ci::native_results::NativeTestResult {
+                name: name.into(),
+                result: memcordon_ci::native_results::NativeTestOutcome::Passed,
+            })
+            .collect(),
+        source_commit: commit,
     };
     let reports = root.join("target").join("ci").join("reports");
     fs::create_dir_all(&reports)?;
-    let mut bytes = serde_json::to_vec_pretty(&report)?;
+    let mut bytes = if let Some(phase) = match filename {
+        "release-macos-native.json" => Some("native"),
+        "release-macos-acceptance.json" => Some("acceptance"),
+        _ => None,
+    } {
+        serde_json::to_vec_pretty(&memcordon_ci::macos_performance::MacosPhaseReport {
+            format: "memcordon.macos-executed-phase".into(),
+            revision: 1,
+            host_os: std::env::consts::OS.into(),
+            host_arch: std::env::consts::ARCH.into(),
+            phase: phase.into(),
+            native: report,
+        })?
+    } else {
+        serde_json::to_vec_pretty(&report)?
+    };
     bytes.push(b'\n');
-    fs::write(reports.join("backend-macos-watchdog.json"), bytes)?;
+    fs::write(reports.join(filename), bytes)?;
     Ok(())
 }
 
-pub fn run(root: &Path, suite: Suite) -> Result<()> {
+/// Complete sequential compatibility form. Optional job splitting changes
+/// scheduling only; each selected phase remains required by the workflow.
+pub fn release_macos(root: &Path, stable: &str) -> Result<()> {
+    release_macos_native(root, stable)?;
+    release_macos_acceptance(root, stable)?;
+    write_macos_report(
+        root,
+        "backend-macos-watchdog.json",
+        crate::native_acceptance_catalogue::macos_scenarios(),
+    )
+}
+
+pub(crate) struct SuiteOptions;
+
+pub fn run(root: &Path, suite: Suite, _options: SuiteOptions) -> Result<()> {
     let toolchains = config::toolchains(root)?;
     match suite {
         Suite::Policy => policy::run(root),
@@ -1082,66 +1076,88 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
         Suite::Msrv => msrv(root, &toolchains.msrv),
         Suite::Native => native(root, &toolchains.stable, false),
         Suite::SupplyChain => supply_chain(root, &toolchains.stable),
-        Suite::Miri => miri(root, &toolchains.miri),
+        Suite::Miri => miri(root, &toolchains.miri, None, Path::new("target/ci/miri")),
+        Suite::MiriFirst => miri(
+            root,
+            &toolchains.miri,
+            Some(memcordon_ci::miri_targets::MiriShard::First),
+            Path::new("target/ci/miri-first"),
+        ),
+        Suite::MiriSecond => miri(
+            root,
+            &toolchains.miri,
+            Some(memcordon_ci::miri_targets::MiriShard::Second),
+            Path::new("target/ci/miri-second"),
+        ),
         Suite::Fuzz => fuzz(root, &toolchains.stable, &toolchains.miri, None),
         Suite::FuzzFirst => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
-            Some(memcordon_ci::fuzz_targets::FuzzShard::First),
+            Some(shard(0, 2)),
         ),
         Suite::FuzzSecond => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
-            Some(memcordon_ci::fuzz_targets::FuzzShard::Second),
+            Some(shard(1, 2)),
         ),
-        Suite::Stress => stress(root, &toolchains.stable),
-        Suite::BackendLinuxCgroup => launch_delegated_linux_certification(root),
-        Suite::BackendLinuxSealedV2 => crate::sealed_linux::certify(root, &toolchains.stable),
-        Suite::BackendWindowsJob => certification(
+        Suite::FuzzQuarterOne => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(shard(0, 4)),
+        ),
+        Suite::FuzzQuarterTwo => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(shard(1, 4)),
+        ),
+        Suite::FuzzQuarterThree => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(shard(2, 4)),
+        ),
+        Suite::FuzzQuarterFour => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(shard(3, 4)),
+        ),
+        Suite::Stress => memcordon_ci::stress::combined(root, &toolchains.stable),
+        Suite::StressPackages => memcordon_ci::stress::packages(
+            root,
+            &toolchains.stable,
+            Path::new("target/ci/stress-packages"),
+        ),
+        Suite::StressLifecycle => memcordon_ci::stress::lifecycle(
+            root,
+            &toolchains.stable,
+            Path::new("target/ci/stress-lifecycle"),
+        )
+        .map(|_| ()),
+        Suite::BackendLinuxCgroup => launch_delegated_linux_backend(root),
+        Suite::BackendLinuxPrivate => memcordon_ci::release::linux_installed_consumer::run_working(
+            root,
+            &root.join("target/ci/private-installed"),
+        ),
+        Suite::BackendWindowsSealed => {
+            memcordon_ci::release::windows_installed_consumer::run_working(
+                root,
+                &root.join("target/ci/windows-installed"),
+            )
+        }
+        Suite::BackendWindowsJob => backend_suite(
             root,
             Path::new("rustup"),
             &toolchains.stable,
             "windows-job-object",
-            cfg!(target_os = "windows"),
-            None,
         ),
-        Suite::BackendWindowsSealedV2 => crate::sealed_windows::certify(root, &toolchains.stable),
-        Suite::WindowsLoaderProduction => {
-            crate::sealed_windows::loader_production(root, &toolchains.stable)
-        }
-        Suite::WindowsProviderLifecycle => {
-            crate::sealed_windows::provider_lifecycle(root, &toolchains.stable)
-        }
-        Suite::WindowsPackageChannel => {
-            crate::sealed_windows::package_certify(root, &toolchains.stable)?;
-            crate::sealed_windows::channel_parity(root, &toolchains.stable)
-        }
-        Suite::WindowsLoaderLab => crate::sealed_windows::loader_lab(root, &toolchains.stable),
-        Suite::PackageWindowsSealed => {
-            crate::sealed_windows::package_certify(root, &toolchains.stable)
-        }
-        Suite::ChannelParityWindowsSealed => {
-            crate::sealed_windows::channel_parity(root, &toolchains.stable)
-        }
-        Suite::BackendMacosWatchdog => macos_acceptance(root, &toolchains.stable),
+        Suite::BackendMacosWatchdog => release_macos(root, &toolchains.stable),
+        Suite::ReleaseMacosNative => release_macos_native(root, &toolchains.stable),
+        Suite::ReleaseMacosAcceptance => release_macos_acceptance(root, &toolchains.stable),
         Suite::MacosDeadline => macos_deadline(root, &toolchains.stable),
-        Suite::ReleasePreflight => {
-            release::preflight(root)?;
-            policy::run(root)?;
-            quality(root, &toolchains.stable)?;
-            msrv(root, &toolchains.msrv)?;
-            supply_chain(root, &toolchains.stable)?;
-            release::validate_packages(root)
-        }
-        Suite::ReleaseNative => release::native_asset(root),
-        Suite::ReleaseMacos => {
-            if !cfg!(target_os = "macos") {
-                return Err(CiError::Message("release-macos requires macOS".to_owned()));
-            }
-            native(root, &toolchains.stable, true)?;
-            macos_acceptance(root, &toolchains.stable)
-        }
     }
 }

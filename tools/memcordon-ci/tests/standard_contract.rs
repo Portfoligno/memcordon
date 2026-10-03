@@ -1,4 +1,4 @@
-use memcordon_ci::standard_contract::{LINUX, WINDOWS};
+use memcordon_ci::standard_contract::hard_backend_scenarios;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -19,32 +19,34 @@ fn historical_standard_floor_is_an_independent_ordered_prefix() {
         "458977466aeb36b47a51e002f06aa5c6bb9eb3a7"
     );
     assert_eq!(floor.scenarios.len(), 39);
-    for (contract, baseline, total, ignored) in [(LINUX, 22, 23, 19), (WINDOWS, 17, 17, 12)] {
+    for (backend, baseline, total, ignored) in [
+        ("linux-cgroup-v2", 22, 23, 19),
+        ("windows-job-object", 17, 17, 12),
+    ] {
         let expected: Vec<_> = floor
             .scenarios
             .iter()
-            .filter(|row| row[0] == contract.backend_name)
+            .filter(|row| row[0] == backend)
             .collect();
         assert_eq!(expected.len(), baseline);
-        let actual = contract.results();
+        let actual = hard_backend_scenarios(backend).unwrap();
         assert_eq!(actual.len(), total);
-        assert_eq!(
-            actual.iter().filter(|row| row.ignored_selected).count(),
-            ignored
-        );
-        let unique: std::collections::BTreeSet<_> = actual.iter().map(|row| &row.name).collect();
+        assert_eq!(actual.iter().filter(|row| row.ignored).count(), ignored);
+        let unique: std::collections::BTreeSet<_> =
+            actual.iter().map(|row| row.public_name).collect();
         assert_eq!(unique.len(), actual.len());
         for (old, new) in expected.into_iter().zip(&actual) {
-            assert_eq!(new.name, old[1]);
-            assert_eq!(new.package, old[2]);
-            assert_eq!(new.required_features, [old[3].clone()]);
-            assert_eq!(new.test_binary, old[4]);
+            let (package, feature, binary) = new.cargo_target();
+            assert_eq!(new.public_name, old[1]);
+            assert_eq!(package, old[2]);
+            assert_eq!(feature, old[3]);
+            assert_eq!(binary, old[4]);
             assert_eq!(new.exact_name, old[5]);
-            assert_eq!(new.ignored_selected.to_string(), old[6]);
+            assert_eq!(new.ignored.to_string(), old[6]);
         }
         if total != baseline {
             assert_eq!(
-                actual[baseline].name,
+                actual[baseline].public_name,
                 "linux_standard_success_reports_guardian_started_before_authorization"
             );
         }

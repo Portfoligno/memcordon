@@ -35,7 +35,14 @@ impl InterruptionWait for SignalSource {
         request: &SupervisorRequest,
         context: AttemptContext,
     ) -> Result<AttemptExecution, Box<Error>> {
-        run_unix_attempt(request, self, context).map_err(Box::new)
+        run_unix_attempt(
+            request,
+            self,
+            context,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .map_err(Box::new)
     }
 }
 
@@ -49,14 +56,16 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
         request: &SupervisorRequest,
         context: AttemptContext,
     ) -> Result<AttemptExecution, Box<Error>> {
+        #[cfg(feature = "test-support")]
+        crate::windows_stack_diagnostics::phase("execute-attempt-entry");
         if !windows_standard_route_selected(request.policy.boundary(), None) {
-            return attempt_execution(crate::sealed::windows::run(
-                &request.policy,
-                &request.command,
-                self,
-                context,
-            )?)
-            .map_err(Box::new);
+            #[cfg(feature = "test-support")]
+            crate::windows_stack_diagnostics::phase("sealed-run-call");
+            let execution =
+                crate::sealed::windows::run(&request.policy, &request.command, self, context)?;
+            #[cfg(feature = "test-support")]
+            crate::windows_stack_diagnostics::phase("sealed-run-return");
+            return attempt_execution(execution).map_err(Box::new);
         }
         let execution = crate::windows_job::run_attempt(
             request.policy.clone(),
@@ -94,9 +103,6 @@ pub fn certify_windows_platform_mutant(
                     mutant_route_standard,
                 },
             )
-        }
-        memcordon_core::WindowsSealedMutant::AdvertiseWithoutCertificate => {
-            crate::sealed::windows::certify_qualification_predicate_mutant(mutant)
         }
         _ => None,
     }
@@ -153,14 +159,7 @@ pub fn capabilities_for(
     requirement: BoundaryRequirement,
 ) -> BackendCapabilityReport {
     let (boundary_qualification, sealed_unavailable) = match &info.boundary_support.sealed {
-        crate::backend::SealedAvailability::Available { qualification, .. } => (
-            Some(memcordon_core::BoundaryQualificationReport {
-                provider_identity: qualification.provider_identity.clone(),
-                receipt_digest: qualification.receipt_digest.clone(),
-                mechanism: qualification.mechanism.clone(),
-            }),
-            None,
-        ),
+        crate::backend::SealedAvailability::Available { .. } => (None, None),
         crate::backend::SealedAvailability::Unavailable {
             reason,
             prerequisites,
@@ -274,15 +273,42 @@ pub fn macos_supervise_from(
 pub struct MacosExecutionContext {
     origin: u64,
     signal: SignalSource,
+    launch: crate::macos_launch::LaunchRuntime,
+}
+
+#[cfg(target_os = "macos")]
+impl InterruptionWait for MacosExecutionContext {
+    fn wait(&self, duration: Duration) -> std::io::Result<Option<i32>> {
+        self.signal.wait(duration)
+    }
+    fn execute_attempt(
+        &self,
+        request: &SupervisorRequest,
+        context: AttemptContext,
+    ) -> Result<AttemptExecution, Box<Error>> {
+        run_unix_attempt(request, &self.signal, context, Some(&self.launch)).map_err(Box::new)
+    }
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::result_large_err)]
 impl MacosExecutionContext {
     pub fn owned(origin: u64) -> Result<Self, Error> {
+        let launch = crate::macos_launch::LaunchRuntime::new(256).map_err(Self::signal_error)?;
+        Self::owned_with_runtime(origin, launch)
+    }
+
+    pub fn owned_with_runtime(
+        origin: u64,
+        launch: crate::macos_launch::LaunchRuntime,
+    ) -> Result<Self, Error> {
         Self::validate_origin(origin)?;
         let signal = SignalSource::install().map_err(Self::signal_error)?;
-        Ok(Self { origin, signal })
+        Ok(Self {
+            origin,
+            signal,
+            launch,
+        })
     }
 
     pub fn host_managed(
@@ -290,10 +316,21 @@ impl MacosExecutionContext {
         snapshot: crate::CallerSignalSnapshot,
         cancellation: crate::CancellationHandle,
     ) -> Result<Self, Error> {
+        let launch = crate::macos_launch::LaunchRuntime::new(256).map_err(Self::signal_error)?;
+        Self::host_managed_with_runtime(origin, snapshot, cancellation, launch)
+    }
+
+    pub fn host_managed_with_runtime(
+        origin: u64,
+        snapshot: crate::CallerSignalSnapshot,
+        cancellation: crate::CancellationHandle,
+        launch: crate::macos_launch::LaunchRuntime,
+    ) -> Result<Self, Error> {
         Self::validate_origin(origin)?;
         Ok(Self {
             origin,
             signal: SignalSource::host(snapshot, cancellation).map_err(Self::signal_error)?,
+            launch,
         })
     }
 
@@ -319,14 +356,19 @@ impl MacosExecutionContext {
         self.signal.take()
     }
 
+    pub fn resolve_current_executable(
+        &self,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<std::path::PathBuf>>> {
+        self.launch.resolve_current_executable()
+    }
+
     pub fn finish(self) -> Result<(), Error> {
         self.signal.finish().map_err(Self::signal_error)
     }
 
     pub fn supervise(self, request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
-        let result = validate_resolved_backend(&request).and_then(|backend| {
-            supervise_with_origin(request, &self.signal, backend, Some(self.origin))
-        });
+        let result = validate_resolved_backend(&request)
+            .and_then(|backend| supervise_with_origin(request, &self, backend, Some(self.origin)));
         Self::finish_result(result, self.finish())
     }
 
@@ -336,11 +378,12 @@ impl MacosExecutionContext {
         command: &CommandSpec,
         helper: &std::path::Path,
     ) -> Result<Execution, Error> {
-        let result = crate::macos_watchdog::run_attempt(
+        let result = crate::macos_watchdog::run_attempt_in(
             policy,
             command,
             helper,
             &self.signal,
+            &self.launch,
             AttemptContext {
                 macos_run_origin_ns: Some(self.origin),
                 macos_work_expires_ns: None,
@@ -370,10 +413,16 @@ impl MacosExecutionContext {
 #[cfg(target_os = "windows")]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("supervise-entry");
     let resolved_backend = validate_resolved_backend(&request)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("backend-validated");
     let console = crate::windows_job::ConsoleControl::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-CONSOLE", error.to_string()).with_os_error(&error)
     })?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("console-installed");
     supervise_with(request, &console, resolved_backend)
 }
 
@@ -454,6 +503,8 @@ fn supervise_with_origin<I: InterruptionWait>(
     resolved_backend: Option<BackendCapabilityReport>,
     supplied_origin: Option<u64>,
 ) -> Result<SupervisionExecution, Error> {
+    #[cfg(all(windows, feature = "test-support"))]
+    crate::windows_stack_diagnostics::phase("supervise-loop-entry");
     let started = Instant::now();
     #[cfg(target_os = "macos")]
     let run_origin = match supplied_origin {
@@ -556,7 +607,11 @@ fn supervise_with_origin<I: InterruptionWait>(
             )
             .map_err(model_error);
         }
+        #[cfg(all(windows, feature = "test-support"))]
+        crate::windows_stack_diagnostics::phase("execute-attempt-call");
         let result = signal.execute_attempt(&request, context);
+        #[cfg(all(windows, feature = "test-support"))]
+        crate::windows_stack_diagnostics::phase("execute-attempt-return");
         match result {
             Err(error) => {
                 let error = *error;
@@ -593,7 +648,18 @@ fn supervise_with_origin<I: InterruptionWait>(
                     .map_err(model_error);
                 }
                 let number = history.total.checked_add(1).ok_or_else(counter_error)?;
-                if error.target_released != error.authorization_offset.is_some() {
+                let recovered_without_clock = error.target_released
+                    && error.authorization_offset.is_none()
+                    && error.windows_provider_rejection_v2.as_ref().is_some_and(|rejection| {
+                        rejection.is_consistent()
+                            && rejection.terminal_receipt().is_some_and(|receipt| matches!(
+                                receipt.payload,
+                                memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure { resume_attempted: true, .. }
+                            ))
+                    });
+                if error.target_released != error.authorization_offset.is_some()
+                    && !recovered_without_clock
+                {
                     return Err(Error::new(
                         ErrorCategory::Monitor,
                         "MCRESTART-AUTHORIZATION-EVIDENCE",
@@ -610,11 +676,13 @@ fn supervise_with_origin<I: InterruptionWait>(
                 history
                     .append(
                         AttemptRecord {
+                            operational_failure: memcordon_core::OperationalAttemptFailure::from_error(&error),
+                            private_execution: None,
                             runtime: error.runtime.clone(),
                             number,
                             policy_enforcement: error.policy_enforcement.clone().unwrap_or_else(|| {
                                 request.policy.workload_contract().map_or_else(Default::default, |contract|
-                                    memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::AuthorizationUncertain {
+                                    memcordon_core::workload_evidence::RuntimePolicyEnforcement::AuthorizationUncertain {
                                         request: Some(memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract).expect("policy workload is validated")),
                                         failure: memcordon_core::workload_evidence::AdmissionAvailabilityFailure::TerminalUnavailable,
                                     })
@@ -801,6 +869,8 @@ fn supervise_with_origin<I: InterruptionWait>(
                 history
                     .append(
                         AttemptRecord {
+                            operational_failure: None,
+                            private_execution: attempt.execution.private_execution,
                             runtime: attempt.execution.runtime,
                             number,
                             kind,
@@ -916,9 +986,19 @@ fn run_unix_attempt(
     request: &SupervisorRequest,
     signal: &SignalSource,
     context: AttemptContext,
+    #[cfg(target_os = "macos")] runtime: Option<&crate::macos_launch::LaunchRuntime>,
 ) -> Result<AttemptExecution, Error> {
     #[cfg(target_os = "linux")]
     if request.policy.boundary() == BoundaryRequirement::Sealed {
+        if let Some(contract) = request.policy.private_workload_contract() {
+            return attempt_execution(crate::sealed::client::private_backend_run(
+                &request.policy,
+                &request.command,
+                contract,
+                context,
+                signal,
+            )?);
+        }
         return attempt_execution(crate::sealed::client::run(
             &request.policy,
             &request.command,
@@ -951,11 +1031,12 @@ fn run_unix_attempt(
         context,
     )?;
     #[cfg(target_os = "macos")]
-    let execution = crate::macos_watchdog::run_attempt(
+    let execution = crate::macos_watchdog::run_attempt_with_runtime(
         request.policy.clone(),
         &request.command,
         helper,
         signal,
+        runtime,
         context,
     )?;
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -1143,6 +1224,8 @@ fn finish_backend_selection_drift(
     history
         .append(
             AttemptRecord {
+                operational_failure: None,
+                private_execution: attempt.execution.private_execution,
                 runtime: attempt.execution.runtime,
                 number,
                 policy_enforcement: attempt.execution.policy_enforcement,
@@ -1254,6 +1337,7 @@ pub(crate) fn test_backend_selection_drift_execution(
         metric,
         AttemptExecution {
             execution: Execution {
+                private_execution: None,
                 policy_enforcement: Default::default(),
                 outcome: RunOutcome::Exited {
                     child: memcordon_core::ChildTermination::ExitCode { code: 0 },
@@ -1380,7 +1464,7 @@ fn error_record(
         } else {
             None
         },
-        provider_rejection: error.provider_rejection.clone(),
+        provider_rejection: error.provider_rejection.as_deref().cloned(),
         backend_selection_drift: None,
     }
 }

@@ -1,4 +1,4 @@
-name: Backend Certification
+name: Native backend tests
 
 on:
   push:
@@ -12,6 +12,408 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  macos-performance-plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      split: ${{ steps.plan.outputs.macos-split }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: plan
+        run: ./target/ci/release/memcordon-ci ci performance-plan
+
+  macos-combined:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.split == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-x64
+            runner: macos-15-intel
+          - id: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-sources-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined
+      - id: compiled
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: macos-compiled-v1-${{ steps.context.outputs.product-key }}
+      - id: native
+        run: ./target/ci/release/memcordon-ci suite backend-macos-watchdog
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-combined-${{ matrix.id }}
+          path: target/ci/reports
+          if-no-files-found: error
+          include-hidden-files: true
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: ${{ steps.compiled.outputs.cache-primary-key }}
+      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  macos-native:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.split == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-x64
+            runner: macos-15-intel
+          - id: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-sources-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native
+      - id: compiled
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: macos-compiled-v1-${{ steps.context.outputs.product-key }}
+      - id: native
+        run: ./target/ci/release/memcordon-ci suite release-macos-native
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-native-${{ matrix.id }}
+          path: target/ci/reports
+          if-no-files-found: error
+          include-hidden-files: true
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: ${{ steps.compiled.outputs.cache-primary-key }}
+      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  macos-acceptance:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.split == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-x64
+            runner: macos-15-intel
+          - id: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-sources-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard acceptance
+      - id: compiled
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: macos-compiled-v1-${{ steps.context.outputs.product-key }}
+      - id: native
+        run: ./target/ci/release/memcordon-ci suite release-macos-acceptance
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-acceptance-${{ matrix.id }}
+          path: target/ci/reports
+          if-no-files-found: error
+          include-hidden-files: true
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/backend-macos
+          key: ${{ steps.compiled.outputs.cache-primary-key }}
+      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  macos-assessment:
+    if: always()
+    needs: [macos-performance-plan, macos-combined, macos-native, macos-acceptance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: macos-*
+          path: target/ci/macos-artifacts
+          digest-mismatch: error
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci ci aggregate-macos
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-assessment
+          path: target/ci/reports/macos-assessment.json
+          if-no-files-found: error
+          include-hidden-files: true
+
+  windows-payload-x64:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{id: x64}]
+    steps: &windows-working-producer
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: &windows-working-source-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: working-windows-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete
+      - id: products
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: &windows-working-product-paths |
+            target/ci-build/product
+            target/ci/native
+          key: working-windows-products-${{ steps.context.outputs.product-key }}
+      - id: build
+        run: ./target/ci/release/memcordon-ci release working-windows-prepare
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-prepared-${{ matrix.id }}
+          path: target/ci/windows-prepared
+          if-no-files-found: error
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *windows-working-product-paths
+          key: ${{ steps.products.outputs.cache-primary-key }}
+      - if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.sources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *windows-working-source-paths
+          key: ${{ steps.sources.outputs.cache-primary-key }}
+
+  windows-payload-arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{id: arm64}]
+    steps: *windows-working-producer
+
+  windows-installed-x64:
+    needs: windows-payload-x64
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{id: x64, channel: native}, {id: x64, channel: cargo}]
+    steps: &windows-working-consumer
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-prepared-${{ matrix.id }}
+          path: target/ci/windows-prepared
+          digest-mismatch: error
+      - id: sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *windows-working-source-paths
+          key: working-windows-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: context
+        if: matrix.channel == 'cargo'
+        run: ./target/ci/release/memcordon-ci release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload
+      - id: consumers
+        if: matrix.channel == 'cargo' && steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: working-windows-consumers-${{ steps.context.outputs.consumer-key }}
+      - id: native
+        if: matrix.channel == 'native'
+        run: ./target/ci/release/memcordon-ci release working-windows-consumer --channel native --destination target/ci/windows-installed/native
+      - id: cargo
+        if: matrix.channel == 'cargo'
+        run: ./target/ci/release/memcordon-ci release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-installed-${{ matrix.id }}-${{ matrix.channel }}
+          path: target/ci/windows-installed
+          if-no-files-found: error
+          include-hidden-files: true
+      - if: always() && matrix.channel == 'cargo' && steps.context.outputs.compiled-cache-usable == 'true' && steps.cargo.outputs.cache-quiescent == 'true' && steps.consumers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: ${{ steps.consumers.outputs.cache-primary-key }}
+      - if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.sources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *windows-working-source-paths
+          key: ${{ steps.sources.outputs.cache-primary-key }}
+
+  windows-installed-arm64:
+    needs: windows-payload-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{id: arm64, channel: native}, {id: arm64, channel: cargo}]
+    steps: *windows-working-consumer
+
+  private-linux:
+    name: Linux private TCP / ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: private-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ordinary-sources-private-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build ordinary CI driver
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: private-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete
+      - id: private-compiled
+        if: steps.private-context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci-build
+            target/ci-consumers
+            target/ci/native
+          key: private-native-v1-${{ steps.private-context.outputs.product-key }}
+      - id: private-run
+        run: ./target/ci/release/memcordon-ci suite backend-linux-private
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: private-installed-${{ matrix.id }}
+          path: target/ci/private-installed
+          if-no-files-found: error
+          include-hidden-files: true
+      - if: always() && steps.private-context.outputs.compiled-cache-usable == 'true' && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci-build
+            target/ci-consumers
+            target/ci/native
+          key: ${{ steps.private-compiled.outputs.cache-primary-key }}
+      - if: always() && steps.private-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.private-deps.outputs.cache-primary-key }}
+
   standard-linux:
     name: Linux standard cgroup v2 / x64
     runs-on: ubuntu-24.04
@@ -25,67 +427,35 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ordinary-sources-v1-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: standard-target
-        if: steps.build-context-prepare.outcome == 'success'
+      - name: Build ordinary CI driver
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: backend-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
+      - id: backend-compiled
+        if: steps.backend-context.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: managed-v2-cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: backend-standard-linux-cgroup-v2-x64
-          path: target/ci/reports/standard/linux-x64/backend-linux-cgroup-v2.json
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: diagnostics-standard-linux-x64
-          path: target/ci/standard-diagnostics/linux-x64
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          path: target/ci/standard-backend
+          key: backend-outputs-v1-${{ steps.backend-context.outputs.product-key }}
+      - id: backend-run
+        run: ./target/ci/release/memcordon-ci suite backend-linux-cgroup
+      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: ${{ steps.standard-target.outputs.cache-primary-key }}
+          path: target/ci/standard-backend
+          key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
       - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
   standard-windows:
@@ -101,476 +471,77 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ordinary-sources-v1-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: standard-target
-        if: steps.build-context-prepare.outcome == 'success'
+      - name: Build ordinary CI driver
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: backend-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
+      - id: backend-compiled
+        if: steps.backend-context.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: managed-v2-cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: backend-standard-windows-job-object-x64
-          path: target/ci/reports/standard/windows-x64/backend-windows-job-object.json
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: diagnostics-standard-windows-x64
-          path: target/ci/standard-diagnostics/windows-x64
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          path: target/ci/standard-backend
+          key: backend-outputs-v1-${{ steps.backend-context.outputs.product-key }}
+      - id: backend-run
+        run: ./target/ci/release/memcordon-ci suite backend-windows-job
+      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: ${{ steps.standard-target.outputs.cache-primary-key }}
+          path: target/ci/standard-backend
+          key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
       - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
-  linux:
-    name: Linux sealed provider v2
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - id: certification-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: certification-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/sealed-agent
-          key: managed-v2-cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: backend-linux-sealed-v2
-          path: target/ci/reports/linux-sealed-v2
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-          include-hidden-files: true
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/sealed-agent
-          key: ${{ steps.certification-target.outputs.cache-primary-key }}
-      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
-
-  windows-provider-lifecycle:
-    name: Windows provider lifecycle / ${{ matrix.id }}
-    needs: windows-loader-production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-      - id: lifecycle-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: lifecycle-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: managed-v2-cargo-target-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: ${{ steps.lifecycle-target.outputs.cache-primary-key }}
-      - if: always() && steps.lifecycle-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.lifecycle-deps.outputs.cache-primary-key }}
-
-  windows-package-channel:
-    name: Windows package channel / ${{ matrix.id }}
-    needs: windows-provider-lifecycle
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+  standard-windows-arm64:
+    name: Windows standard Job Object / arm64
+    runs-on: windows-11-arm
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2
-      - id: package-deps
+      - id: standard-deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ordinary-sources-v1-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: package-target
-        if: steps.build-context-prepare.outcome == 'success'
+      - name: Build ordinary CI driver
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: backend-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
+      - id: backend-compiled
+        if: steps.backend-context.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: managed-v2-cargo-target-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - name: Certify packaged Cargo channel
-        env:
-          CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
-      - if: always()
-        uses: ./.github/actions/upload-artifact
+          path: target/ci/standard-backend
+          key: backend-outputs-v1-${{ steps.backend-context.outputs.product-key }}
+      - id: backend-run
+        run: ./target/ci/release/memcordon-ci suite backend-windows-job
+      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          name: windows-package-channel-${{ matrix.id }}
-          path: target/ci/windows-sealed-cargo
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          path: target/ci/standard-backend
+          key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
+      - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: ${{ steps.package-target.outputs.cache-primary-key }}
-      - if: always() && steps.package-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.package-deps.outputs.cache-primary-key }}
-
-  windows-loader-lab:
-    name: Windows loader lab / ${{ matrix.id }}
-    if: always() && github.event_name == 'workflow_dispatch'
-    needs: windows-loader-production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-      - id: lab-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: lab-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-loader-lab
-          key: managed-v2-cargo-target-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: windows-loader-lab-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-lab
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.lab-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lab-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-loader-lab
-          key: ${{ steps.lab-target.outputs.cache-primary-key }}
-      - if: always() && steps.lab-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.lab-deps.outputs.cache-primary-key }}
-
-  windows-loader-production:
-    name: Windows loader production / ${{ matrix.id }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-            inventory-trace: false
-          - id: arm64
-            runner: windows-11-arm
-            inventory-trace: true
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - id: certification-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: trace-volume-qualification
-        if: matrix.inventory-trace
-        run: ./ci-native-fingerprint.exe --qualify-trace-volume
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-trace.etl
-            target/ci/reports/inventory-observation/v1/**/inventory-wpr-*.log
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: certification-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: managed-v2-cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: ${{ steps.certification-target.outputs.cache-primary-key }}
-      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.standard-deps.outputs.cache-primary-key }}

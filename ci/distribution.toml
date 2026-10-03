@@ -1,0 +1,40 @@
+format = "memcordon.distribution"
+revision = 1
+packages = ["memcordon-core", "memcordon-windows-launch-core", "memcordon-platform", "memcordon"]
+public_consumer = false
+
+[[targets]]
+target = "x86_64-unknown-linux-gnu"
+features = []
+binaries = ["memcordon"]
+units = []
+
+[[targets]]
+target = "aarch64-unknown-linux-gnu"
+features = []
+binaries = ["memcordon"]
+units = []
+
+[[targets]]
+target = "x86_64-apple-darwin"
+features = []
+binaries = ["memcordon"]
+units = []
+
+[[targets]]
+target = "aarch64-apple-darwin"
+features = []
+binaries = ["memcordon"]
+units = []
+
+[[targets]]
+target = "x86_64-pc-windows-msvc"
+features = []
+binaries = ["memcordon"]
+units = []
+
+[[targets]]
+target = "aarch64-pc-windows-msvc"
+features = []
+binaries = ["memcordon"]
+units = []

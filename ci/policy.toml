@@ -21,147 +21,81 @@ required_public_matrix = [
   "windows-arm64",
 ]
 self_extracting_shell_allowlist = []
+environment_allowlist = [
+  { file = ".github/workflows/release.yml", steps = ["Read original preparation artifacts", "Publish prepared bytes"], variable = "GH_TOKEN", source = "${{ github.token }}" },
+  { file = ".github/workflows/release.yml", steps = ["Publish prepared bytes"], variable = "CARGO_REGISTRY_TOKEN", source = "${{ steps.registry-auth.outputs.token }}" },
+]
 allowed_run_commands = [
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
-  "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
-  "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite macos-deadline",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job",
+  "./target/ci/release/memcordon-ci ci performance-plan",
+  "./target/ci/release/memcordon-ci release verify-source",
+  "./target/ci/release/memcordon-ci release consumer-cache",
+  "./target/ci/release/memcordon-ci release working-windows-prepare",
+  "./target/ci/release/memcordon-ci release working-windows-consumer --channel native --destination target/ci/windows-installed/native",
+  "./target/ci/release/memcordon-ci release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo",
+  "./target/ci/release/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native",
+  "./target/ci/release/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo",
+  "./target/ci/release/memcordon-ci ci aggregate-stress",
+  "./target/ci/release/memcordon-ci ci aggregate-macos",
+  "./.release/tool/memcordon-ci release public-consumer",
+  "./target/ci/release/memcordon-ci ci prepare --profile miri",
+  "./target/ci/release/memcordon-ci ci prepare --profile fuzz",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose stress --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose stress-packages --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose stress-lifecycle --shard complete",
+  "./target/ci/release/memcordon-ci release select",
+  "./target/ci/release/memcordon-ci release recovery-inputs",
+  "./target/ci/release/memcordon-ci release packages",
+  "./target/ci/release/memcordon-ci release publication-tool",
+  "./target/ci/release/memcordon-ci release build-target",
+  "./target/ci/release/memcordon-ci release installed-consumers",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete",
+  "./target/ci/release/memcordon-ci release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard acceptance",
+  "./.release/tool/memcordon-ci release assemble",
+  "./.release/tool/memcordon-ci release publish",
+  "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool",
+  "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci",
+  "./target/ci/release/memcordon-ci suite macos-deadline",
+  "./target/ci/release/memcordon-ci suite backend-linux-cgroup",
+  "./target/ci/release/memcordon-ci suite backend-linux-private",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose quality --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose msrv --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose supply --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose deadline --shard complete",
+  "./target/ci/release/memcordon-ci suite backend-windows-job",
   "rustup toolchain install 1.97.1 --profile minimal",
+  "rustup run 1.97.1 cargo build --locked --release -p memcordon-ci --bin memcordon-ci",
+  "rustup run 1.97.1 cargo build --locked --release -p memcordon --features test-fixtures --bin memcordon-test-fixture",
   "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
   "rustup toolchain install 1.85.0 --profile minimal",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite policy",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite quality",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite msrv",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite native",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite supply-chain",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite stress",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-sealed-v2",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite package-windows-sealed",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite channel-parity-windows-sealed",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-macos-watchdog",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-native",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-macos",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json",
-  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 2",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 2",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 3",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 3",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 4",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4",
-  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
-  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
+  "./target/ci/release/memcordon-ci suite policy",
+  "./target/ci/release/memcordon-ci suite quality",
+  "./target/ci/release/memcordon-ci suite msrv",
+  "./target/ci/release/memcordon-ci suite native",
+  "./target/ci/release/memcordon-ci suite supply-chain",
+  "./target/ci/release/memcordon-ci suite miri",
+  "./target/ci/release/memcordon-ci suite miri-first",
+  "./target/ci/release/memcordon-ci suite miri-second",
+  "./target/ci/release/memcordon-ci suite fuzz",
+  "./target/ci/release/memcordon-ci suite fuzz-first",
+  "./target/ci/release/memcordon-ci suite fuzz-second",
+  "./target/ci/release/memcordon-ci suite fuzz-quarter-one",
+  "./target/ci/release/memcordon-ci suite fuzz-quarter-two",
+  "./target/ci/release/memcordon-ci suite fuzz-quarter-three",
+  "./target/ci/release/memcordon-ci suite fuzz-quarter-four",
+  "./target/ci/release/memcordon-ci suite stress",
+  "./target/ci/release/memcordon-ci suite stress-packages",
+  "./target/ci/release/memcordon-ci suite stress-lifecycle",
+  "./target/ci/release/memcordon-ci suite release-macos-native",
+  "./target/ci/release/memcordon-ci suite release-macos-acceptance",
+  "./target/ci/release/memcordon-ci suite backend-macos-watchdog",
 ]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/backend-certification.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "GITHUB_TOKEN"
-source = "${{ github.token }}"
-steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_HOME"
-source = "target/ci/cargo-publish-home/slot-1"
-steps = ["Attempt crates.io OIDC publication in slot 1", "Publish new crate with fallback credential in slot 1"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ steps.crates_auth_1.outputs.token }}"
-steps = ["Attempt crates.io OIDC publication in slot 1"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
-steps = ["Publish new crate with fallback credential in slot 1"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_HOME"
-source = "target/ci/cargo-publish-home/slot-2"
-steps = ["Attempt crates.io OIDC publication in slot 2", "Publish new crate with fallback credential in slot 2"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ steps.crates_auth_2.outputs.token }}"
-steps = ["Attempt crates.io OIDC publication in slot 2"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
-steps = ["Publish new crate with fallback credential in slot 2"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_HOME"
-source = "target/ci/cargo-publish-home/slot-3"
-steps = ["Attempt crates.io OIDC publication in slot 3", "Publish new crate with fallback credential in slot 3"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ steps.crates_auth_3.outputs.token }}"
-steps = ["Attempt crates.io OIDC publication in slot 3"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
-steps = ["Publish new crate with fallback credential in slot 3"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_HOME"
-source = "target/ci/cargo-publish-home/slot-4"
-steps = ["Attempt crates.io OIDC publication in slot 4", "Publish new crate with fallback credential in slot 4"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ steps.crates_auth_4.outputs.token }}"
-steps = ["Attempt crates.io OIDC publication in slot 4"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
-steps = ["Publish new crate with fallback credential in slot 4"]
 
 [test]
 fast_short_child_iterations = 128

@@ -1,6 +1,9 @@
 [
   {"name":"retained","prefix":"{\"kind\":\"attempt-retained\"}","public_limit":65536,"launcher_limit":65536},
+  {"name":"retained-v2","prefix":"{\"kind\":\"attempt-retained-v2\"}","public_limit":65536,"launcher_limit":65536},
   {"name":"pending","prefix":"{\"kind\":\"replay-pending\"}","public_limit":65536,"launcher_limit":65536},
+  {"name":"pending-v2","prefix":"{\"kind\":\"replay-pending-v2\"}","public_limit":65536,"launcher_limit":65536},
+  {"name":"retired-v2","prefix":"{\"kind\":\"terminal-retired-v2\"}","public_limit":16777216,"launcher_limit":16777216},
   {"name":"terminal","prefix":"{\"kind\":\"terminal\"}","public_limit":4194304,"launcher_limit":4194304},
   {"name":"reject","prefix":"{\"kind\":\"reject\"}","public_limit":4194304,"launcher_limit":4194304},
   {"name":"qualification-rejected","prefix":"{\"kind\":\"qualification-rejected\"}","public_limit":65536,"launcher_limit":16777216},

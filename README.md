@@ -8,9 +8,12 @@ cleanup and exit-status reporting.
 Sealed providers can additionally enforce an explicitly granted workload
 contract with `--sealed --workload-contract contract.json`. Admission checks the
 authenticated caller, exact grant and policy epoch before releasing the target;
-it does not add network authority to the provider's existing baseline. See the
+the optional Linux private TCP profile creates a separate attempt-owned IPv4
+loopback namespace. See the
 [workload contract specification](docs/spec-workload-contract-v1.md) for registry
-administration, supported profiles, discovery, and qualification requirements.
+administration and baseline profiles, and the [V2 contract](docs/spec-workload-contract-v2.md)
+for private TCP and target identities. Discovery and planning are advisory;
+every launch rechecks its actual local grant and native resources.
 
 ![MemCordon command containment overview](docs/assets/banner.png)
 
@@ -24,6 +27,11 @@ cargo install memcordon
 ```
 
 Installation from source requires Rust 1.85 or newer.
+The default Cargo installation and default native distribution contain only
+`memcordon`. Linux provider companions require `sealed-runtime` (and
+`private-tcp` for private networking); Windows companions require
+`windows-sealed-runtime`. Provider installation remains an explicit administrative
+operation.
 
 ## Run a command
 

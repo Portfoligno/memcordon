@@ -12,10 +12,10 @@ use memcordon_core::{
     BoundaryCapability, BoundaryClass, BoundaryRequirement, CommandSpec, Error, ErrorCategory,
     LaunchEvidence, NativeWindowsCommandV1, Policy, WINDOWS_CONTROL_PIPE, WINDOWS_MAX_FRAME_BYTES,
     WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsEnvironmentEntryV1, WindowsLaunchPolicyV1,
-    WindowsLaunchRequestV1, WindowsLifetimeV1, WindowsProviderRequestV1, WindowsProviderResponseV1,
+    WindowsLaunchRequestV1, WindowsLifetimeV1, WindowsProviderRequestV3, WindowsProviderResponseV3,
     WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
-    WindowsQualificationReceiptV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
-    WindowsStreamRoleV1, WindowsTerminalReplayDecisionV1, validate_windows_stream_manifest,
+    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsStreamRoleV1,
+    WindowsTerminalReplayDecisionV1, validate_windows_stream_manifest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,7 +51,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::backend::{BackendInfo, BoundaryQualification, Execution, SealedAvailability};
+use crate::backend::{BackendInfo, Execution, SealedAvailability};
 
 #[path = "windows_runtime.rs"]
 mod runtime;
@@ -60,8 +60,41 @@ const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 const TOKEN_GROUP_ENABLED: u32 = 0x0000_0004;
 const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
-pub fn workload_discovery()
--> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+fn observed_terminal_delivery(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    authority: &[u8],
+    retired: &[u8],
+) -> Result<memcordon_core::WindowsTerminalDeliveryEvidenceV1, Error> {
+    if authority.is_empty()
+        || authority.len() > memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
+        || retired.is_empty()
+        || retired.len() > memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    {
+        return Err(transport_error(
+            "terminal response exceeds its native frame bound".to_owned(),
+        ));
+    }
+    let delivery = memcordon_core::WindowsTerminalDeliveryEvidenceV1 {
+        schema_version: 1,
+        attempt_id: attempt_id.to_owned(),
+        nonce: nonce.to_owned(),
+        request_sha256: request_sha256.to_owned(),
+        authority_sha256: digest_bytes(authority),
+        retired_sha256: digest_bytes(retired),
+        retired_confirmed: true,
+    };
+    if !delivery.is_consistent() {
+        return Err(transport_error(
+            "terminal delivery binding is invalid".to_owned(),
+        ));
+    }
+    Ok(delivery)
+}
+
+pub fn workload_discovery() -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String>
+{
     prepare_current_process_for_restricted_broker()?;
     let pipe = connect()?;
     authenticate_peer(pipe.raw())?;
@@ -81,12 +114,12 @@ pub fn workload_discovery()
     let challenge = memcordon_core::workload_contract::Nonce128(random);
     write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::WorkloadDiscovery {
+        &WindowsProviderRequestV3::WorkloadDiscovery {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             challenge,
         },
     )?;
-    let WindowsProviderResponseV1::WorkloadDiscovery {
+    let WindowsProviderResponseV3::WorkloadDiscovery {
         schema_version,
         challenge: returned,
         discovery,
@@ -109,10 +142,204 @@ pub fn workload_discovery()
     Ok(discovery)
 }
 
+fn recovery_challenge() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    // SAFETY: the system RNG writes only the fixed output buffer.
+    let status = unsafe {
+        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+            ptr::null_mut(),
+            random.as_mut_ptr(),
+            u32::try_from(random.len()).expect("challenge length fits"),
+            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err("recovery challenge generation failed".to_owned());
+    }
+    Ok(digest_bytes(&random))
+}
+
+/// Request exact same-owner recovery authority through the authenticated public pipe.
+/// A delivery projection exists only after the caller observes a bound V2 retirement.
+pub fn recover_windows_attempt(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+) -> Result<
+    (
+        WindowsProviderResponseV3,
+        Option<memcordon_core::WindowsTerminalDeliveryEvidenceV1>,
+    ),
+    String,
+> {
+    let provider_binding = runtime::installed_binding()?;
+    prepare_current_process_for_restricted_broker()?;
+    let pipe = connect()?;
+    authenticate_peer(pipe.raw())?;
+    let challenge = recovery_challenge()?;
+    write_frame(
+        pipe.raw(),
+        &WindowsProviderRequestV3::RecoverAttempt {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            nonce: nonce.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            challenge: challenge.clone(),
+        },
+    )?;
+    let (response, authority_raw) =
+        read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe.raw())
+            .map_err(|error| error.to_string())?;
+    match &response {
+        WindowsProviderResponseV3::Terminal(receipt)
+            if receipt.attempt_id == attempt_id
+                && receipt.nonce == nonce
+                && receipt.request_sha256 == request_sha256
+                && receipt.retirement_proof.provider_generation
+                    == provider_binding.generation.as_str()
+                && receipt.validate_for_attempt().is_ok() => {}
+        WindowsProviderResponseV3::Reject {
+            schema_version,
+            attempt_id: returned_attempt,
+            nonce: returned_nonce,
+            request_sha256: returned_digest,
+            rejection,
+        } if *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && returned_attempt == attempt_id
+            && returned_nonce == nonce
+            && returned_digest == request_sha256
+            && rejection.is_consistent()
+            && rejection.terminal_receipt().is_some_and(|receipt| {
+                receipt.attempt_id == attempt_id
+                    && receipt.nonce == nonce
+                    && receipt.request_sha256 == request_sha256
+                    && receipt.retirement_proof.provider_generation
+                        == provider_binding.generation.as_str()
+            }) => {}
+        WindowsProviderResponseV3::TerminalRetiredV2(retired)
+            if retired.attempt_id == attempt_id
+                && retired.nonce == nonce
+                && retired.request_sha256 == request_sha256
+                && retired.provider_generation == provider_binding.generation.as_str()
+                && retired.is_consistent_for(
+                    attempt_id,
+                    nonce,
+                    request_sha256,
+                    &retired.terminal_response_sha256,
+                ) =>
+        {
+            return Ok((response, None));
+        }
+        WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+            schema_version,
+            challenge: returned_challenge,
+            attempt_id: returned_attempt,
+            ..
+        } if *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && returned_challenge == &challenge
+            && returned_attempt == attempt_id =>
+        {
+            return Ok((response, None));
+        }
+        _ => return Err("recovery response is not bound to the requested attempt".to_owned()),
+    }
+    let authority_sha256 = digest_bytes(
+        response
+            .terminal_authority_json()
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    );
+    let retired_raw = acknowledge_terminal_retirement(
+        pipe.raw(),
+        attempt_id,
+        nonce,
+        request_sha256,
+        &authority_sha256,
+        &provider_binding,
+    )
+    .map_err(|error| error.to_string())?;
+    let delivery = observed_terminal_delivery(
+        attempt_id,
+        nonce,
+        request_sha256,
+        &authority_raw,
+        &retired_raw,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((response, Some(delivery)))
+}
+
+/// Ask the privileged provider to drive durable recovery to its deadline, then
+/// return its authenticated, caller-filtered authority inventory.
+pub fn converge_windows_recovery(
+    deadline: Duration,
+) -> Result<memcordon_core::WindowsRecoveryInventoryV1, String> {
+    if deadline.is_zero() {
+        return Err("recovery deadline must be positive".to_owned());
+    }
+    let provider_binding = runtime::installed_binding()?;
+    prepare_current_process_for_restricted_broker()?;
+    let pipe = connect()?;
+    authenticate_peer(pipe.raw())?;
+    let challenge = recovery_challenge()?;
+    write_frame(
+        pipe.raw(),
+        &WindowsProviderRequestV3::ConvergeRecovery {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge: challenge.clone(),
+            deadline_millis: u64::try_from(deadline.as_millis())
+                .map_err(|_| "recovery deadline exceeds the wire bound")?,
+        },
+    )?;
+    let WindowsProviderResponseV3::RecoveryInventory(inventory) =
+        read_frame::<WindowsProviderResponseV3>(pipe.raw())?
+    else {
+        return Err("provider did not return a recovery inventory".to_owned());
+    };
+    if !inventory.is_consistent()
+        || inventory.challenge != challenge
+        || inventory.provider_generation != provider_binding.generation.as_str()
+        || inventory.current_boot_identity != runtime::boot_identity()?
+    {
+        return Err("recovery inventory binding differs".to_owned());
+    }
+    Ok(inventory)
+}
+
+/// Query one actually held guardian's native association. The returned data is
+/// diagnostic inventory and cannot authorize a launch or substitute for a grant.
+pub fn observe_windows_guardian_attempt(
+    guardian_identity: memcordon_core::WindowsProcessIdentityV1,
+) -> Result<memcordon_core::WindowsGuardianAttemptObservation, String> {
+    let provider = runtime::installed_binding()?;
+    let pipe = connect()?;
+    authenticate_peer(pipe.raw())?;
+    let challenge = recovery_challenge()?;
+    write_frame(
+        pipe.raw(),
+        &WindowsProviderRequestV3::ObserveGuardianAttempt {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge: challenge.clone(),
+            guardian_identity: guardian_identity.clone(),
+        },
+    )?;
+    let observation: memcordon_core::WindowsGuardianAttemptObservation = read_frame(pipe.raw())?;
+    if !observation.is_consistent()
+        || observation.challenge.as_str() != challenge
+        || observation.guardian_identity != guardian_identity
+        || observation.association.provider != provider
+    {
+        return Err(
+            "live guardian observation differs from independently authenticated invocation".into(),
+        );
+    }
+    Ok(observation)
+}
+
 pub fn workload_plan(
     contract: &memcordon_core::workload_contract::WorkloadContractV1,
-) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
-    use memcordon_core::workload_evidence::WorkloadResolutionReportV1;
+) -> Result<memcordon_core::workload_evidence::RuntimeWorkloadResolution, String> {
+    use memcordon_core::workload_evidence::RuntimeWorkloadResolution;
     contract.validate()?;
     prepare_current_process_for_restricted_broker()?;
     let pipe = connect()?;
@@ -133,13 +360,13 @@ pub fn workload_plan(
     let challenge = memcordon_core::workload_contract::Nonce128(random);
     write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::WorkloadPlan {
+        &WindowsProviderRequestV3::WorkloadPlan {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             challenge,
             contract: contract.clone(),
         },
     )?;
-    let WindowsProviderResponseV1::WorkloadPlan {
+    let WindowsProviderResponseV3::WorkloadPlan {
         schema_version,
         challenge: returned,
         resolution,
@@ -157,26 +384,26 @@ pub fn workload_plan(
         return Err("workload plan binding differs".into());
     }
     match &resolution {
-        WorkloadResolutionReportV1::Planned { binding, .. } => {
+        RuntimeWorkloadResolution::Planned { binding, .. } => {
             runtime::verify_binding(&binding.provider)?;
             if binding.boot_identity.as_str() != runtime::boot_identity()? {
                 return Err("workload plan boot identity differs".into());
             }
         }
-        WorkloadResolutionReportV1::Rejected { .. }
-        | WorkloadResolutionReportV1::Unavailable { .. } => {}
+        RuntimeWorkloadResolution::Rejected { .. }
+        | RuntimeWorkloadResolution::Unavailable { .. } => {}
         _ => return Err("workload plan returned execution authority".into()),
     }
     Ok(resolution)
 }
 
-pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
+pub fn probe() -> Result<memcordon_core::WindowsProviderProbeV1, String> {
     probe_with_binding().map(|(qualification, _)| qualification)
 }
 
 fn probe_with_binding() -> Result<
     (
-        WindowsQualificationReceiptV1,
+        memcordon_core::WindowsProviderProbeV1,
         memcordon_core::PublicProviderBindingV1,
     ),
     String,
@@ -186,66 +413,31 @@ fn probe_with_binding() -> Result<
     authenticate_peer(pipe.raw())?;
     write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::Probe {
+        &WindowsProviderRequestV3::Probe {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
         },
     )?;
-    match read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::Probe {
+    match read_frame::<WindowsProviderResponseV3>(pipe.raw())? {
+        WindowsProviderResponseV3::Probe {
             schema_version,
-            qualification,
-            provider_binding,
+            observation,
         } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-            && provider_binding.is_consistent()
-            && qualification_is_advertisable(&qualification, None)
-            && qualification.provider_identity
+            && observation.validate().is_ok()
+            && observation.provider_identity
                 == format!(
                     "memcordon-sealed-agent-windows-v1:{}",
                     env!("CARGO_PKG_VERSION")
                 ) =>
         {
-            runtime::verify_binding(&provider_binding)?;
-            Ok((qualification, provider_binding))
+            runtime::verify_binding(&observation.provider_binding)?;
+            let provider_binding = observation.provider_binding.clone();
+            Ok((observation, provider_binding))
         }
-        WindowsProviderResponseV1::Reject { rejection, .. } => {
+        WindowsProviderResponseV3::Reject { rejection, .. } => {
             Err(format!("{}: {}", rejection.code, rejection.detail))
         }
-        _ => Err("Windows sealed provider returned an invalid qualification receipt".to_owned()),
+        _ => Err("Windows sealed provider returned an invalid live probe".to_owned()),
     }
-}
-
-fn qualification_is_advertisable(
-    qualification: &WindowsQualificationReceiptV1,
-    mutant: Option<memcordon_core::WindowsSealedMutant>,
-) -> bool {
-    qualification_fields_are_advertisable(
-        qualification.qualified,
-        qualification.is_consistent(),
-        mutant,
-    )
-}
-
-fn qualification_fields_are_advertisable(
-    qualified: bool,
-    consistent: bool,
-    mutant: Option<memcordon_core::WindowsSealedMutant>,
-) -> bool {
-    (qualified || mutant == Some(memcordon_core::WindowsSealedMutant::AdvertiseWithoutCertificate))
-        && consistent
-}
-
-pub(crate) fn certify_qualification_predicate_mutant(
-    mutant: memcordon_core::WindowsSealedMutant,
-) -> Option<memcordon_core::WindowsMutantNativeObservationV1> {
-    // The mapped test supplies the contradictory state that the mutant would
-    // advertise: a schema-consistent receipt cannot substitute for the native
-    // certificate's qualified bit.
-    Some(
-        memcordon_core::WindowsMutantNativeObservationV1::UnqualifiedAdvertisement {
-            ordinary_advertised: qualification_fields_are_advertisable(false, true, None),
-            mutant_advertised: qualification_fields_are_advertisable(false, true, Some(mutant)),
-        },
-    )
 }
 
 fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
@@ -316,17 +508,13 @@ fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
     Ok(result)
 }
 
-pub fn info(qualification: WindowsQualificationReceiptV1) -> BackendInfo {
-    crate::windows_job::info_from_qualification(qualification)
+pub fn info(observation: memcordon_core::WindowsProviderProbeV1) -> BackendInfo {
+    crate::windows_job::info_from_probe(observation)
 }
 
-pub(crate) fn availability(qualification: WindowsQualificationReceiptV1) -> SealedAvailability {
-    let receipt = serde_json::to_vec(&qualification)
-        .expect("qualification receipt always has a bounded serialization");
-    let digest: String = Sha256::digest(receipt)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+pub(crate) fn availability(
+    observation: memcordon_core::WindowsProviderProbeV1,
+) -> SealedAvailability {
     SealedAvailability::Available {
         capability: BoundaryCapability {
             class: BoundaryClass::Sealed,
@@ -343,9 +531,8 @@ pub(crate) fn availability(qualification: WindowsQualificationReceiptV1) -> Seal
                 "AppContainer caller tokens are not supported by Windows sealed v2".to_owned(),
             ],
         },
-        qualification: BoundaryQualification {
-            provider_identity: qualification.provider_identity,
-            receipt_digest: digest,
+        observation: crate::backend::BoundaryReadiness {
+            provider_identity: observation.provider_identity,
             mechanism: "windows-job-object-v2".to_owned(),
         },
     }
@@ -358,6 +545,8 @@ pub fn run(
     console: &crate::windows_job::ConsoleControl,
     context: crate::supervisor::AttemptContext,
 ) -> Result<Execution, Error> {
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-run-entry");
     let (qualification, provider_binding) = probe_with_binding().map_err(|detail| {
         Error::new(
             ErrorCategory::Setup,
@@ -365,8 +554,14 @@ pub fn run(
             missing_provider_message(&detail),
         )
     })?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-probe-end");
     let mut pipe = connect().map_err(transport_error)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-connect-end");
     authenticate_peer(pipe.raw()).map_err(transport_error)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-auth-end");
     let nonce = launch_nonce(command);
     let request = WindowsLaunchRequestV1 {
         restart_attempt: context.restart_attempt,
@@ -379,16 +574,22 @@ pub fn run(
         current_directory: encode_current_directory().map_err(usage_error)?,
         policy: encode_policy(policy, context).map_err(usage_error)?,
     };
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-request-encoded");
     let request_sha256 = Sha256::digest(
         serde_json::to_vec(&request).map_err(|error| transport_error(error.to_string()))?,
     )
     .iter()
     .map(|byte| format!("{byte:02x}"))
     .collect::<String>();
-    write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request)).map_err(transport_error)?;
-    let prepared = read_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(transport_error)?;
+    write_frame(pipe.raw(), &WindowsProviderRequestV3::Launch(request)).map_err(transport_error)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-launch-written");
+    let prepared = read_frame::<WindowsProviderResponseV3>(pipe.raw()).map_err(transport_error)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-prepared-read");
     let (attempt_id, streams, relay_retired_event_handle) = match prepared {
-        WindowsProviderResponseV1::StreamsPrepared {
+        WindowsProviderResponseV3::StreamsPrepared {
             schema_version,
             attempt_id,
             nonce: returned_nonce,
@@ -401,7 +602,7 @@ pub fn run(
         {
             (attempt_id, streams, relay_retired_event_handle)
         }
-        WindowsProviderResponseV1::Reject {
+        WindowsProviderResponseV3::Reject {
             schema_version,
             attempt_id,
             nonce: returned_nonce,
@@ -427,6 +628,8 @@ pub fn run(
         }
     };
     let mut relays = Relays::start(streams, relay_retired_event_handle).map_err(transport_error)?;
+    #[cfg(feature = "test-support")]
+    crate::windows_stack_diagnostics::phase("sealed-relays-started");
     let mut terminal_recovery = WindowsPublicTerminalRecoveryV1::default();
     terminal_recovery
         .bind_attempt()
@@ -434,7 +637,7 @@ pub fn run(
     let mut recovery_transcript = TerminalRecoveryTranscript::default();
     write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::RelaysReady {
+        &WindowsProviderRequestV3::RelaysReady {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.clone(),
             nonce: nonce.clone(),
@@ -469,7 +672,8 @@ pub fn run(
                 }
                 None
             }
-            Ok(true) => match read_frame_detailed::<WindowsProviderResponseV1>(pipe.raw()) {
+            Ok(true) => match read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe.raw())
+            {
                 Ok(response) => Some(response),
                 Err(error) => Some(
                     recover_public_terminal_pipe(
@@ -500,7 +704,7 @@ pub fn run(
                 .map_err(transport_error)?,
             ),
         };
-        if let Some(response) = response {
+        if let Some((response, response_raw)) = response {
             let response_sha256 = digest_bytes(
                 response
                     .terminal_authority_json()
@@ -508,7 +712,7 @@ pub fn run(
                     .as_bytes(),
             );
             match response {
-                WindowsProviderResponseV1::ReplayPending(pending)
+                WindowsProviderResponseV3::ReplayPendingV2(pending)
                     if pending.is_consistent_for(
                         &attempt_id,
                         &nonce,
@@ -573,7 +777,7 @@ pub fn run(
                     }
                     continue;
                 }
-                WindowsProviderResponseV1::TargetAuthorized {
+                WindowsProviderResponseV3::TargetAuthorized {
                     schema_version,
                     attempt_id: returned,
                     nonce: returned_nonce,
@@ -591,7 +795,7 @@ pub fn run(
                         .map_err(|error| transport_error(error.to_owned()))?;
                     target_authorized = true;
                 }
-                WindowsProviderResponseV1::TargetRetired {
+                WindowsProviderResponseV3::TargetRetired {
                     schema_version,
                     attempt_id: returned,
                     nonce: returned_nonce,
@@ -609,7 +813,7 @@ pub fn run(
                     relays.retire().map_err(transport_error)?;
                     write_frame(
                         pipe.raw(),
-                        &WindowsProviderRequestV1::RelaysRetired {
+                        &WindowsProviderRequestV3::RelaysRetired {
                             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
                             attempt_id: attempt_id.clone(),
                             nonce: nonce.clone(),
@@ -622,7 +826,7 @@ pub fn run(
                         .map_err(|error| transport_error(error.to_owned()))?;
                     target_retired = true;
                 }
-                WindowsProviderResponseV1::RelaysAbort {
+                WindowsProviderResponseV3::RelaysAbort {
                     schema_version,
                     attempt_id: returned,
                     nonce: returned_nonce,
@@ -640,7 +844,7 @@ pub fn run(
                     relays.retire().map_err(transport_error)?;
                     write_frame(
                         pipe.raw(),
-                        &WindowsProviderRequestV1::RelaysRetired {
+                        &WindowsProviderRequestV3::RelaysRetired {
                             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
                             attempt_id: attempt_id.clone(),
                             nonce: nonce.clone(),
@@ -653,20 +857,20 @@ pub fn run(
                         .map_err(|error| transport_error(error.to_owned()))?;
                     target_retired = true;
                 }
-                WindowsProviderResponseV1::Terminal(receipt)
+                WindowsProviderResponseV3::Terminal(receipt)
                     if receipt.attempt_id == attempt_id
                         && receipt.nonce == nonce
                         && receipt.request_sha256 == request_sha256
                         && ((target_authorized && target_retired)
                             || terminal_recovery.replay_consumed())
-                        && receipt.process_identity_inventory_is_bounded() =>
+                        && receipt.validate_for_attempt().is_ok() =>
                 {
                     if !terminal_recovery.replay_consumed() {
                         relay_phase
                             .advance(WindowsRelayEventV1::Terminal)
                             .map_err(|error| transport_error(error.to_owned()))?;
                     }
-                    acknowledge_terminal_retirement(
+                    let retired_raw = acknowledge_terminal_retirement(
                         pipe.raw(),
                         &attempt_id,
                         &nonce,
@@ -674,9 +878,16 @@ pub fn run(
                         &response_sha256,
                         &provider_binding,
                     )?;
-                    break receipt;
+                    let delivery = observed_terminal_delivery(
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        &response_raw,
+                        &retired_raw,
+                    )?;
+                    break (receipt, delivery);
                 }
-                WindowsProviderResponseV1::Reject {
+                WindowsProviderResponseV3::Reject {
                     schema_version,
                     attempt_id: returned_attempt,
                     nonce: returned_nonce,
@@ -687,7 +898,7 @@ pub fn run(
                     && returned_nonce == nonce
                     && returned_digest == request_sha256
                     && rejection.is_consistent()
-                    && rejection.terminal_receipt.as_ref().is_none_or(|terminal| {
+                    && rejection.terminal_receipt().is_none_or(|terminal| {
                         terminal.attempt_id == returned_attempt
                             && terminal.nonce == returned_nonce
                             && terminal.request_sha256 == returned_digest
@@ -696,7 +907,7 @@ pub fn run(
                     relay_phase
                         .advance(WindowsRelayEventV1::Reject)
                         .map_err(|error| transport_error(error.to_owned()))?;
-                    let terminal_ack_required = rejection.terminal_ack_required;
+                    let terminal_ack_required = rejection.terminal_ack_required();
                     let mut primary = bound_rejection_error(
                         rejection,
                         policy.workload_contract(),
@@ -705,7 +916,7 @@ pub fn run(
                         &request_sha256,
                     );
                     if terminal_ack_required {
-                        if let Err(acknowledgment) = acknowledge_terminal_retirement(
+                        match acknowledge_terminal_retirement(
                             pipe.raw(),
                             &attempt_id,
                             &nonce,
@@ -713,18 +924,31 @@ pub fn run(
                             &response_sha256,
                             &provider_binding,
                         ) {
-                            if primary.provider_failure.is_none() {
-                                primary.provider_failure = acknowledgment.provider_failure.clone();
+                            Ok(retired_raw) => {
+                                primary.windows_terminal_delivery =
+                                    Some(observed_terminal_delivery(
+                                        &attempt_id,
+                                        &nonce,
+                                        &request_sha256,
+                                        &response_raw,
+                                        &retired_raw,
+                                    )?);
                             }
-                            primary.message = format!(
-                                "{}; secondary terminal acknowledgment failure: {}",
-                                primary.message, acknowledgment
-                            );
+                            Err(acknowledgment) => {
+                                if primary.provider_failure.is_none() {
+                                    primary.provider_failure =
+                                        acknowledgment.provider_failure.clone();
+                                }
+                                primary.message = format!(
+                                    "{}; secondary terminal acknowledgment failure: {}",
+                                    primary.message, acknowledgment
+                                );
+                            }
                         }
                     }
                     return Err(primary);
                 }
-                WindowsProviderResponseV1::AttemptRetained(retained)
+                WindowsProviderResponseV3::AttemptRetainedV2(retained)
                     if retained.is_consistent_for(
                         &attempt_id,
                         &nonce,
@@ -732,7 +956,12 @@ pub fn run(
                         relay_phase,
                     ) =>
                 {
-                    return Err(retained_attempt_error(retained, &provider_binding));
+                    return Err(retained_attempt_error(
+                        retained,
+                        &provider_binding,
+                        &attempt_id,
+                        &request_sha256,
+                    ));
                 }
                 _ => {
                     return Err(transport_error(
@@ -748,7 +977,7 @@ pub fn run(
             {
                 write_frame(
                     pipe.raw(),
-                    &WindowsProviderRequestV1::Cancel {
+                    &WindowsProviderRequestV3::Cancel {
                         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
                         attempt_id: attempt_id.clone(),
                         nonce: nonce.clone(),
@@ -764,7 +993,9 @@ pub fn run(
         }
     };
     relays.retire().map_err(transport_error)?;
-    if !terminal.policy_enforcement.valid_native_terminal(
+    let (terminal, delivery) = terminal;
+    let policy_enforcement = terminal.policy_enforcement.clone().unwrap_or_default();
+    if !policy_enforcement.valid_native_terminal(
         policy.workload_contract(),
         memcordon_core::workload_registry::BaselineProfile::WindowsHostNetworkExternal,
         &attempt_id,
@@ -777,14 +1008,14 @@ pub fn run(
             "terminal workload binding differs from the exact request",
         ));
     }
-    if let memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+    if let memcordon_core::workload_evidence::RuntimePolicyEnforcement::Authorized {
         admission,
         ..
-    } = &terminal.policy_enforcement
+    } = &policy_enforcement
     {
         runtime::verify_binding(&admission.plan.provider).map_err(transport_error)?;
     }
-    if terminal.schema_version != 1
+    if terminal.schema_version != 2
         || !terminal
             .restart_safety
             .is_safe_for(BoundaryRequirement::Sealed)
@@ -808,10 +1039,30 @@ pub fn run(
         inherited_resources_restricted: true,
         frontend_loss_cleanup_authority_verified: true,
     };
+    let memcordon_core::WindowsTerminalPayloadV2::Execution {
+        child_pid,
+        duration_millis,
+        authorization_offset_millis,
+        outcome,
+        boundary_detail,
+    } = terminal.payload
+    else {
+        return Err(Error::new(
+            ErrorCategory::Monitor,
+            "MCSEALED-WINDOWS-RECOVERED-CLOSURE",
+            "recovered closure is not an execution result",
+        ));
+    };
+    let mut boundary_detail = *boundary_detail;
+    if let memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native) =
+        &mut boundary_detail
+    {
+        native.frontend_delivery = Some(delivery);
+    }
     if !memcordon_core::boundary_evidence_is_consistent(
         &launch,
         &terminal.restart_safety,
-        &terminal.boundary_detail,
+        &boundary_detail,
     ) {
         return Err(Error::new(
             ErrorCategory::Monitor,
@@ -820,16 +1071,17 @@ pub fn run(
         ));
     }
     Ok(Execution {
-        policy_enforcement: terminal.policy_enforcement,
-        outcome: terminal.outcome,
+        policy_enforcement,
+        private_execution: None,
+        outcome,
         backend: info(qualification),
-        child_pid: std::num::NonZeroU32::new(terminal.child_pid),
+        child_pid: std::num::NonZeroU32::new(child_pid),
         runtime: None,
-        duration: Duration::from_millis(terminal.duration_millis),
-        authorization_offset: Some(Duration::from_millis(terminal.authorization_offset_millis)),
+        duration: Duration::from_millis(duration_millis),
+        authorization_offset: Some(Duration::from_millis(authorization_offset_millis)),
         launch,
         restart_safety: terminal.restart_safety,
-        boundary_detail: terminal.boundary_detail,
+        boundary_detail,
     })
 }
 
@@ -1492,6 +1744,12 @@ fn read_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
 }
 
 fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, PublicFrameError> {
+    read_frame_with_raw_detailed(handle).map(|(decoded, _)| decoded)
+}
+
+fn read_frame_with_raw_detailed<T: DeserializeOwned>(
+    handle: HANDLE,
+) -> Result<(T, Vec<u8>), PublicFrameError> {
     let mut length = [0_u8; 4];
     read_exact_detailed(handle, &mut length, WindowsPublicFramePhaseV1::Length)?;
     let length = u32::from_le_bytes(length) as usize;
@@ -1533,10 +1791,11 @@ fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, PublicF
             detail,
         }
     })?;
-    serde_json::from_slice(&payload).map_err(|error| PublicFrameError {
+    let decoded = serde_json::from_slice(&payload).map_err(|error| PublicFrameError {
         failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
         detail: error.to_string(),
-    })
+    })?;
+    Ok((decoded, payload))
 }
 
 fn frame_available(handle: HANDLE) -> Result<bool, PublicFrameError> {
@@ -1768,7 +2027,7 @@ fn write_terminal_replay_request(
 ) -> Result<(), String> {
     write_frame(
         pipe,
-        &WindowsProviderRequestV1::ReplayTerminal {
+        &WindowsProviderRequestV3::ReplayTerminal {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
@@ -1815,7 +2074,7 @@ fn recover_public_terminal_pipe(
     transcript: &mut TerminalRecoveryTranscript,
     binding: TerminalReplayBinding<'_>,
     error: PublicFrameError,
-) -> Result<WindowsProviderResponseV1, String> {
+) -> Result<(WindowsProviderResponseV3, Vec<u8>), String> {
     if recovery.observe_failure(error.failure) != WindowsTerminalReplayDecisionV1::ReplayOnce {
         return Err(error.to_string());
     }
@@ -1845,11 +2104,10 @@ fn recover_public_terminal_pipe(
         }
         match frame_available(pipe.raw()) {
             Ok(true) => {
-                return read_frame_detailed::<WindowsProviderResponseV1>(pipe.raw()).map_err(
-                    |secondary| {
+                return read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe.raw())
+                    .map_err(|secondary| {
                         format!("{primary}; secondary exact terminal replay failure: {secondary}")
-                    },
-                );
+                    });
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(10)),
             Err(secondary) => {
@@ -1868,10 +2126,10 @@ fn acknowledge_terminal_retirement(
     request_sha256: &str,
     terminal_response_sha256: &str,
     provider_binding: &memcordon_core::PublicProviderBindingV1,
-) -> Result<(), Error> {
+) -> Result<Vec<u8>, Error> {
     write_frame(
         pipe,
-        &WindowsProviderRequestV1::TerminalAcknowledged {
+        &WindowsProviderRequestV3::TerminalAcknowledged {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
@@ -1880,8 +2138,10 @@ fn acknowledge_terminal_retirement(
         },
     )
     .map_err(transport_error)?;
-    match read_frame::<WindowsProviderResponseV1>(pipe).map_err(transport_error)? {
-        WindowsProviderResponseV1::TerminalRetired(retired)
+    let (response, raw) = read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe)
+        .map_err(|error| transport_error(error.to_string()))?;
+    match response {
+        WindowsProviderResponseV3::TerminalRetiredV2(retired)
             if retired.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -1889,9 +2149,9 @@ fn acknowledge_terminal_retirement(
                 terminal_response_sha256,
             ) =>
         {
-            Ok(())
+            Ok(raw)
         }
-        WindowsProviderResponseV1::AttemptRetained(retained)
+        WindowsProviderResponseV3::AttemptRetainedV2(retained)
             if retained.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -1899,7 +2159,12 @@ fn acknowledge_terminal_retirement(
                 WindowsRelayPhaseV1::Terminal,
             ) =>
         {
-            Err(retained_attempt_error(retained, provider_binding))
+            Err(retained_attempt_error(
+                retained,
+                provider_binding,
+                attempt_id,
+                request_sha256,
+            ))
         }
         _ => Err(transport_error(
             "provider did not confirm exact terminal retirement".to_owned(),
@@ -1908,9 +2173,16 @@ fn acknowledge_terminal_retirement(
 }
 
 fn retained_attempt_error(
-    retained: memcordon_core::WindowsAttemptRetainedV1,
+    retained: memcordon_core::WindowsAttemptRetainedV2,
     provider_binding: &memcordon_core::PublicProviderBindingV1,
+    attempt_id: &str,
+    request_sha256: &str,
 ) -> Error {
+    let association =
+        match provider_attempt_association(provider_binding, attempt_id, request_sha256) {
+            Ok(association) => association,
+            Err(error) => return error,
+        };
     let mut error = transport_error(format!(
         "MCSEALED-WINDOWS-ATTEMPT-RETAINED: relay_phase={:?} cleanup_complete={} terminal_replay_available={} diagnostic_availability={:?} primary={} secondary={}",
         retained.relay_phase,
@@ -1920,6 +2192,7 @@ fn retained_attempt_error(
         retained.primary_detail,
         retained.secondary_failures.join(" | "),
     ));
+    error.provider_association = Some(Box::new(association.clone()));
     if let Some(projection) = retained.provider_failure {
         let validated = serde_json::to_vec(&projection)
             .map_err(|_| "diagnostic projection serialization failed")
@@ -1927,8 +2200,8 @@ fn retained_attempt_error(
                 memcordon_core::ProviderFailureDiagnosticV1::parse_bound(
                     &bytes,
                     provider_binding,
-                    &projection.attempt_id,
-                    &projection.request_sha256,
+                    &association.attempt_id,
+                    &association.request_sha256,
                 )
             });
         match validated {
@@ -1949,13 +2222,34 @@ fn retained_attempt_error(
     error
 }
 
+fn provider_attempt_association(
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<memcordon_core::result_v1::ProviderAttemptAssociationV1, Error> {
+    let digest = |text: &str| {
+        memcordon_core::BoundedText::new(text)
+            .and_then(memcordon_core::DiagnosticSha256::try_from)
+            .map_err(|reason| transport_error(reason.to_owned()))
+    };
+    Ok(memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+        provider: provider.clone(),
+        attempt_id: digest(attempt_id)?,
+        request_sha256: digest(request_sha256)?,
+    })
+}
+
 fn bound_rejection_error(
-    rejection: memcordon_core::ProviderRejectionEvidence,
+    rejection: memcordon_core::WindowsProviderRejectionV2,
     contract: Option<&memcordon_core::workload_contract::WorkloadContractV1>,
     binding: &memcordon_core::PublicProviderBindingV1,
     attempt_id: &str,
     request_sha256: &str,
 ) -> Error {
+    let association = match provider_attempt_association(binding, attempt_id, request_sha256) {
+        Ok(association) => association,
+        Err(error) => return error,
+    };
     if !rejection.is_consistent() {
         return transport_error("provider rejection is inconsistent".to_owned());
     }
@@ -1985,8 +2279,8 @@ fn bound_rejection_error(
             memcordon_core::ProviderFailureDiagnosticV1::parse_bound(
                 &bytes,
                 binding,
-                &projection.attempt_id,
-                &projection.request_sha256,
+                &association.attempt_id,
+                &association.request_sha256,
             )
             .map_err(str::to_owned)
         })
@@ -1998,14 +2292,19 @@ fn bound_rejection_error(
         Ok(Some(projection)) => {
             let summary = projection.projection().safe_summary();
             let mut error = rejection_error(rejection).with_provider_failure(projection);
+            error.provider_association = Some(Box::new(association));
             error.message = format!("{summary}; {}", error.message);
             error
         }
-        Ok(None) => rejection_error(rejection),
+        Ok(None) => {
+            let mut error = rejection_error(rejection);
+            error.provider_association = Some(Box::new(association));
+            error
+        }
     }
 }
 
-fn rejection_error(rejection: memcordon_core::ProviderRejectionEvidence) -> Error {
+fn rejection_error(rejection: memcordon_core::WindowsProviderRejectionV2) -> Error {
     let (category, code, initial_spawn_failure) = match rejection.code.as_str() {
         "MCSPAWN-NOT-FOUND" => (
             ErrorCategory::Spawn,
@@ -2037,7 +2336,7 @@ fn rejection_error(rejection: memcordon_core::ProviderRejectionEvidence) -> Erro
         cleanup_attempted: rejection.cleanup_attempted,
         restart_safety: rejection.restart_safety.clone(),
     })
-    .with_provider_rejection(rejection.clone());
+    .with_windows_provider_rejection_v2(rejection.clone());
     error.os_code = rejection.os_code;
     if category == ErrorCategory::Spawn {
         error.launch_phase = Some("target-spawn-failed");
@@ -2049,6 +2348,22 @@ fn rejection_error(rejection: memcordon_core::ProviderRejectionEvidence) -> Erro
     }
     error.workload_may_be_alive =
         rejection.target_created && rejection.restart_safety.workload_empty != Some(true);
+    if let Some(receipt) = rejection.terminal_receipt()
+        && let memcordon_core::WindowsTerminalPayloadV2::Execution {
+            child_pid,
+            authorization_offset_millis,
+            outcome,
+            ..
+        } = &receipt.payload
+    {
+        // This is the authenticated postauthorization receipt, not a timestamp
+        // inferred from the diagnostic phase or from frontend observation time.
+        error.authorization_offset = Some(Duration::from_millis(*authorization_offset_millis));
+        error.target_pid = Some(*child_pid);
+        error.cleanup = outcome.cleanup().clone();
+        error.policy_enforcement = receipt.policy_enforcement.clone();
+        error.workload_may_be_alive = error.cleanup.workload_empty != Some(true);
+    }
     error
 }
 
@@ -2095,3 +2410,7 @@ fn missing_provider_message(detail: &str) -> String {
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/windows_postauthorization_failure.rs"]
+mod postauthorization_failure_tests;

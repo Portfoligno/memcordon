@@ -6,12 +6,379 @@ use std::process::Command;
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 
 #[test]
+fn unit_export_publishes_only_selected_templates_with_exact_regular_file_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    crate::package::export_unit_files(directory.path()).unwrap();
+    let mut names: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let mut expected = vec![
+        "memcordon-sealed-agent.service",
+        "memcordon-sealed-agent.socket",
+        "memcordon-sealed-launcher.service",
+        "memcordon-sealed-launcher.socket",
+        "memcordon.conf",
+    ];
+    if cfg!(feature = "private-tcp") {
+        expected.extend([
+            "memcordon-sealed-network-launcher.service",
+            "memcordon-sealed-network-launcher.socket",
+        ]);
+    }
+    expected.sort();
+    assert_eq!(names, expected);
+    for name in names {
+        let path = directory.path().join(name);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o7777, 0o644);
+        assert!(!std::fs::read(path).unwrap().is_empty());
+    }
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("memcordon.conf")).unwrap(),
+        "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n"
+    );
+    assert!(crate::package::export_unit_files(directory.path()).is_err());
+}
+
+#[test]
+fn unit_export_rejects_symlink_parents_unprotected_and_nonempty_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("output");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&directory, &alias).unwrap();
+    assert!(crate::package::export_unit_files(&alias).is_err());
+    let nested = directory.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    assert!(crate::package::export_unit_files(&alias.join("nested")).is_err());
+    std::fs::remove_dir(nested).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(crate::package::export_unit_files(&directory).is_err());
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let input = directory.join("existing");
+    std::fs::write(&input, b"preserved input").unwrap();
+    assert!(crate::package::export_unit_files(&directory).is_err());
+    assert_eq!(std::fs::read(input).unwrap(), b"preserved input");
+}
+
+#[cfg(target_env = "gnu")]
+const ARM32_HELPER: &[u8] = b"exact package ARM32 helper";
+
+#[cfg(target_env = "gnu")]
+fn helper_bytes() -> Option<&'static [u8]> {
+    cfg!(target_arch = "aarch64").then_some(ARM32_HELPER)
+}
+
+#[cfg(target_env = "gnu")]
+fn with_helper(
+    mut components: Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord>,
+) -> Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord> {
+    if let Some(bytes) = helper_bytes() {
+        components.push(memcordon_core::runtime_manifest::RuntimeComponentRecord {
+            id: "arm32-abi-helper".into(),
+            path: "memcordon-arm32-abi-helper".into(),
+            role: memcordon_core::runtime_manifest::RuntimeComponentRole::Arm32AbiHelper,
+            size: bytes.len() as u64,
+            mode: 0o755,
+            sha256: String::from(memcordon_core::workload_codec::hash_bytes(bytes)),
+        });
+    }
+    components
+}
+
+#[cfg(target_env = "gnu")]
+fn write_helper(root: &std::path::Path) {
+    if let Some(bytes) = helper_bytes() {
+        let path = root.join("memcordon-arm32-abi-helper");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn install_cannot_replace_a_live_generation_without_upgrade_quiescence() {
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("install"), false).is_ok());
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("install"), true).is_err());
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("upgrade"), true).is_ok());
+}
+
+#[test]
+fn redundant_install_is_rejected_before_epoch_change() {
+    let install = std::ffi::OsStr::new("install");
+    let upgrade = std::ffi::OsStr::new("upgrade");
+    let uninstall = std::ffi::OsStr::new("uninstall");
+    assert!(crate::package::ensure_install_preflight(install, false, false).is_ok());
+    assert!(crate::package::ensure_install_preflight(install, false, true).is_err());
+    assert!(crate::package::ensure_install_preflight(install, true, false).is_err());
+    assert!(crate::package::ensure_install_preflight(install, true, true).is_err());
+    assert!(crate::package::ensure_install_preflight(upgrade, true, true).is_ok());
+    assert!(crate::package::ensure_install_preflight(uninstall, true, true).is_ok());
+}
+
+#[test]
+fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
+    use crate::package::{PackageJournal, PackageJournalEntry, validate_package_journal};
+    use memcordon_core::DiagnosticSha256;
+    let target = std::path::PathBuf::from("/usr/libexec/memcordon-runtime-manifest.json");
+    let entry = PackageJournalEntry {
+        path: target.clone(),
+        backup: Some(std::path::PathBuf::from(
+            "/usr/libexec/.memcordon-backup-example",
+        )),
+        old_sha256: Some(DiagnosticSha256::from_bytes([1; 32])),
+        old_device: Some(1),
+        old_inode: Some(2),
+    };
+    let journal = PackageJournal {
+        schema_version: 1,
+        entries: vec![entry.clone()],
+    };
+    assert!(validate_package_journal(&journal).is_ok());
+    for proof in [
+        "/usr/libexec/memcordon/certification/workload/x64-private-build-v1.json",
+        "/usr/libexec/memcordon/certification/workload/arm64-native-q-grant-v1.json",
+    ] {
+        let mut proof_entry = entry.clone();
+        proof_entry.path = proof.into();
+        proof_entry.backup = None;
+        proof_entry.old_sha256 = None;
+        proof_entry.old_device = None;
+        proof_entry.old_inode = None;
+        assert!(
+            validate_package_journal(&PackageJournal {
+                schema_version: 1,
+                entries: vec![proof_entry],
+            })
+            .is_ok()
+        );
+    }
+    let mut duplicate = journal;
+    duplicate.entries.push(entry.clone());
+    assert!(validate_package_journal(&duplicate).is_err());
+    let mut wrong_target = entry.clone();
+    wrong_target.path = "/etc/passwd".into();
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![wrong_target],
+        })
+        .is_err()
+    );
+    let mut wrong_backup = entry.clone();
+    wrong_backup.backup = Some("/tmp/.memcordon-backup-example".into());
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![wrong_backup],
+        })
+        .is_err()
+    );
+    let mut missing_identity = entry;
+    missing_identity.old_inode = None;
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![missing_identity],
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn package_publication_precedes_activation_and_retains_generation_for_finalization() {
+    let phases = std::cell::RefCell::new(Vec::new());
+    let generation = crate::package::activate_published_package(
+        || {
+            phases.borrow_mut().push("publish");
+            Ok(7_u8)
+        },
+        || {
+            phases.borrow_mut().push("activate");
+            Ok(())
+        },
+        |_| panic!("successful activation must not compensate"),
+    )
+    .unwrap();
+    assert_eq!(generation, 7);
+    assert_eq!(*phases.borrow(), ["publish", "activate"]);
+}
+
+#[test]
+fn package_failed_publication_never_activates_or_compensates() {
+    let error = crate::package::activate_published_package::<()>(
+        || Err("publication was not durable".into()),
+        || panic!("an unpublished generation must not activate"),
+        |_| panic!("publication failure must retain its original recovery path"),
+    )
+    .unwrap_err();
+    assert_eq!(error, "publication was not durable");
+}
+
+#[test]
+fn package_failed_activation_compensates_the_exact_published_generation() {
+    let phases = std::cell::RefCell::new(Vec::new());
+    let error = crate::package::activate_published_package(
+        || {
+            phases.borrow_mut().push("publish");
+            Ok(7_u8)
+        },
+        || {
+            phases.borrow_mut().push("activate");
+            Err("launcher rejected startup".into())
+        },
+        |generation| {
+            assert_eq!(generation, 7);
+            phases.borrow_mut().push("compensate");
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(*phases.borrow(), ["publish", "activate", "compensate"]);
+    assert_eq!(
+        error,
+        "package activation failed: launcher rejected startup; compensation: Ok(())"
+    );
+}
+
+#[test]
+fn package_failed_compensation_never_claims_successful_restoration() {
+    let error = crate::package::activate_published_package(
+        || Ok(7_u8),
+        || Err("launcher rejected startup".into()),
+        |generation| {
+            assert_eq!(generation, 7);
+            Err("postimage identity changed; backups retained".into())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "package activation failed: launcher rejected startup; compensation: Err(\"postimage identity changed; backups retained\")"
+    );
+}
+
+#[test]
+fn installation_epoch_advances_even_for_byte_identical_package_replacement() {
+    let first = crate::package::next_installation_epoch(None, [1; 32]).unwrap();
+    let second = crate::package::next_installation_epoch(Some(&first), [2; 32]).unwrap();
+    assert_eq!(first.counter, 1);
+    assert_eq!(second.counter, 2);
+    assert_ne!(first.nonce_digest, second.nonce_digest);
+    let same_nonce = crate::package::next_installation_epoch(Some(&first), [1; 32]).unwrap();
+    assert_eq!(same_nonce.counter, 2);
+    assert_ne!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&same_nonce).unwrap()
+    );
+    let exhausted = crate::package::PackageInstallationEpochV1 {
+        counter: u64::MAX,
+        ..first
+    };
+    assert!(crate::package::next_installation_epoch(Some(&exhausted), [3; 32]).is_err());
+}
+
+#[test]
+#[cfg(target_env = "gnu")]
+fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
+    use memcordon_core::runtime_manifest::{
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = b"exact provider image";
+    let public = b"exact public image";
+    let source = directory.path().join("memcordon-sealed-agent");
+    let public_path = directory.path().join("memcordon");
+    let manifest_path = directory.path().join("runtime-manifest.json");
+    write_helper(directory.path());
+    for (path, bytes) in [
+        (&source, agent.as_slice()),
+        (&public_path, public.as_slice()),
+    ] {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let component = |id: &str, path: &str, role, bytes: &[u8]| RuntimeComponentRecord {
+        id: id.into(),
+        path: path.into(),
+        role,
+        size: bytes.len() as u64,
+        mode: 0o755,
+        sha256: crate::package::sha256_bytes(bytes),
+    };
+    let manifest = RuntimeManifest::linux_selected(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        crate::linux::runtime_manifest::target().unwrap().into(),
+        with_helper(vec![
+            component(
+                "public-cli",
+                "memcordon",
+                RuntimeComponentRole::PublicCli,
+                public,
+            ),
+            component(
+                "sealed-agent",
+                "memcordon-sealed-agent",
+                RuntimeComponentRole::SealedAgent,
+                agent,
+            ),
+        ]),
+        cfg!(feature = "private-tcp"),
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(&manifest_path, &bytes).unwrap();
+    let snapshot = crate::package::linux_source_snapshot(&source).unwrap();
+    assert_eq!(snapshot.agent_bytes, agent);
+    assert_eq!(snapshot.manifest_bytes, bytes);
+    assert_eq!(snapshot.arm32_helper_bytes.as_deref(), helper_bytes());
+    for (path, original) in [
+        (&source, agent.as_slice()),
+        (&public_path, public.as_slice()),
+    ] {
+        std::fs::write(path, b"changed actual image").unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_err());
+        std::fs::write(path, original).unwrap();
+    }
+    std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(crate::package::linux_source_snapshot(&source).is_err());
+    std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if helper_bytes().is_some() {
+        let helper = directory.path().join("memcordon-arm32-abi-helper");
+        std::fs::write(&helper, b"changed helper").unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_err());
+        write_helper(directory.path());
+    }
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink("missing-manifest", &manifest_path).unwrap();
+    assert!(crate::package::linux_source_snapshot(&source).is_err());
+    std::fs::remove_file(&manifest_path).unwrap();
+    let generated = crate::package::linux_source_snapshot(&source).unwrap();
+    assert_eq!(
+        RuntimeManifest::parse(&generated.manifest_bytes).unwrap(),
+        manifest
+    );
+}
+
+#[test]
 fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
     use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
     };
     let agent = b"exact installed provider image";
-    let manifest = RuntimeManifestV2::linux(
+    let public = b"exact public image";
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("memcordon-sealed-agent");
+    let manifest_path = directory.path().join("runtime-manifest.json");
+    let public_path = directory.path().join("memcordon");
+    std::fs::write(&public_path, public).unwrap();
+    std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manifest = RuntimeManifest::linux_selected(
         env!("CARGO_PKG_VERSION").into(),
         crate::SOURCE_COMMIT.into(),
         crate::linux::runtime_manifest::target().unwrap().into(),
@@ -20,9 +387,9 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
                 id: "public-cli".into(),
                 path: "memcordon".into(),
                 role: RuntimeComponentRole::PublicCli,
-                size: 17,
+                size: public.len() as u64,
                 mode: 0o755,
-                sha256: "ab".repeat(32),
+                sha256: memcordon_core::workload_codec::hash_bytes(public).into(),
             },
             RuntimeComponentRecord {
                 id: "sealed-agent".into(),
@@ -33,12 +400,14 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
                 sha256: memcordon_core::workload_codec::hash_bytes(agent).into(),
             },
         ],
-    );
-    let validate = |manifest: &RuntimeManifestV2, image: &[u8]| {
-        crate::linux::runtime_manifest::validate_installed_source_for_test(
-            &serde_json::to_vec(manifest).unwrap(),
-            image,
-        )
+        cfg!(feature = "private-tcp"),
+    )
+    .unwrap();
+    let validate = |manifest: &RuntimeManifest, image: &[u8]| {
+        std::fs::write(&source, image).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(manifest).unwrap()).unwrap();
+        crate::package::linux_source_snapshot(&source)
     };
     validate(&manifest, agent).unwrap();
     assert!(validate(&manifest, b"different installed image").is_err());
@@ -76,13 +445,12 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
         assert!(!original.is_null(), "missing manifest field {field}");
         assert_ne!(original, replacement);
         wrong_generation[field] = serde_json::Value::String(replacement.into());
-        assert!(
-            crate::linux::runtime_manifest::validate_installed_source_for_test(
-                &serde_json::to_vec(&wrong_generation).unwrap(),
-                agent
-            )
-            .is_err()
-        );
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&wrong_generation).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_err());
         wrong_generation[field] = original;
     }
 }
@@ -317,7 +685,6 @@ fn sealed_package_stable_lease_survives_legacy_inode_replacement() {
     let replacement = crate::linux::service::acquire_legacy_package_lease().unwrap();
 
     assert!(crate::linux::service::acquire_package_lease().is_err());
-    assert!(crate::linux::service::acquire_qualification_lease().is_err());
     assert!(crate::linux::service::acquire_shared_package_lease().is_err());
 
     drop(replacement);
@@ -325,7 +692,6 @@ fn sealed_package_stable_lease_survives_legacy_inode_replacement() {
     drop(stable);
     let shared = crate::linux::service::acquire_shared_package_lease().unwrap();
     assert!(crate::linux::service::acquire_package_lease().is_err());
-    assert!(crate::linux::service::acquire_qualification_lease().is_err());
     drop(shared);
     assert!(crate::linux::service::acquire_package_lease().is_ok());
 }
@@ -385,22 +751,20 @@ fn sealed_package_upgrade_recovers_before_advertising() {
     assert!(launcher_socket.success());
     let qualification = Command::new(AGENT).arg("probe").output().unwrap();
     assert!(qualification.status.success());
-    let typed_receipt: crate::linux::qualification::QualificationReceipt =
-        serde_json::from_slice(&qualification.stdout).expect("strict qualification receipt");
+    let typed_receipt =
+        crate::linux::qualification::ReadinessObservation::parse(&qualification.stdout)
+            .expect("strict live readiness observation");
     assert!(typed_receipt.complete(), "{typed_receipt:#?}");
     let receipt: serde_json::Value = serde_json::from_slice(&qualification.stdout).unwrap();
     assert_eq!(receipt["boundary_retired"], true);
-    assert_eq!(receipt["schema_version"], 3);
+    assert_eq!(receipt["format"], "memcordon.runtime-readiness");
+    assert_eq!(receipt["revision"], 1);
     assert_eq!(receipt["mechanism"], "linux-pid-namespace-cgroup-v2");
     assert_eq!(receipt["provider_identity"], "memcordon-sealed-agent-v2");
-    for field in [
-        "receipt_digest",
-        "setid_transition_certification_digest",
-        "sudo_transition_certification_digest",
-    ] {
+    for field in ["observation_digest"] {
         let digest = receipt[field]
             .as_str()
-            .expect("qualification SHA-256 field");
+            .expect("actual observation SHA-256 field");
         assert_eq!(digest.len(), 64);
         assert!(
             digest
@@ -416,17 +780,9 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .expect("installed provider must resolve");
     let backend_capabilities =
         memcordon_platform::capabilities_for(&backend, memcordon_core::BoundaryRequirement::Sealed);
-    let active_qualification = backend_capabilities
-        .boundary_qualification
-        .as_ref()
-        .expect("installed provider must expose its active qualification");
-    assert_eq!(
-        receipt["provider_identity"],
-        active_qualification.provider_identity
-    );
-    assert_eq!(
-        receipt["receipt_digest"],
-        active_qualification.receipt_digest
+    assert!(
+        backend_capabilities.boundary_qualification.is_none(),
+        "ordinary readiness must not publish legacy qualification authority"
     );
     let execution = memcordon_platform::supervise(memcordon_platform::SupervisorRequest {
         policy,
@@ -517,11 +873,11 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
         String::from_utf8_lossy(&retained.stderr)
     );
     assert!(retained.stderr.is_empty());
-    let typed: crate::inspection_schema::InstalledProviderInspectionV5 =
+    let typed: crate::inspection_schema::InstalledProviderInspection =
         serde_json::from_slice(&retained.stdout).expect("strict current installed inspection");
-    assert_eq!(typed.schema_version, 5);
-    assert_eq!(typed.agent.schema_version, 5);
-    assert_eq!(typed.agent.runtime_manifest_schema, 2);
+    assert_eq!(u32::from(typed.revision), 1);
+    assert_eq!(u32::from(typed.agent.revision), 1);
+    assert_eq!(typed.agent.runtime_manifest_schema, 1);
     assert_eq!(typed.agent.workload_contract_schema, 1);
     assert_eq!(
         typed.agent.profile_catalog_sha256,
@@ -529,10 +885,13 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
     );
     let inspection: serde_json::Value = serde_json::from_slice(&retained.stdout)
         .expect("retained installed-provider inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 5);
+    assert_eq!(
+        inspection["format"],
+        "memcordon.installed-provider-inspection"
+    );
+    assert_eq!(inspection["revision"], 1);
     assert_eq!(inspection["installed_artifacts_valid"], true);
     assert_eq!(inspection["provider_reachable"], true);
-    assert_eq!(inspection["qualification_complete"], true);
     assert_eq!(
         inspection["installed_executable_sha256"],
         inspection["agent"]["executable_sha256"]

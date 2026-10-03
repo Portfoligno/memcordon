@@ -3,56 +3,137 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
-fn compiler_selector_removal_is_confined_to_the_generated_fixture_child() {
-    let fixture = Path::new("tools/memcordon-ci/tests/build_context.rs");
-    let allowed = br#"fn generated_fixture_child(child: &mut std::process::Command) {
-        child.env_remove("RUSTC").env_remove("RUSTDOC");
-    }"#;
-    validate_rust_policy_bytes(fixture, allowed).unwrap();
-    validate_rust_policy_bytes(fixture, include_bytes!("build_context.rs")).unwrap();
-    let rehearsal = Path::new("tools/memcordon-ci/tests/release/rehearsal.rs");
-    validate_rust_policy_bytes(rehearsal, allowed).unwrap();
-    validate_rust_policy_bytes(rehearsal, include_bytes!("release/rehearsal.rs")).unwrap();
-    for path in [
-        "tools/memcordon-ci/tests/other.rs",
-        "crates/example/src/lib.rs",
-    ] {
-        assert!(validate_rust_policy_bytes(Path::new(path), allowed).is_err());
+fn repository_policy_checks_all_lightweight_phases() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    memcordon_ci::policy::run(root).unwrap();
+}
+
+#[test]
+fn repository_rust_sources_satisfy_policy_without_first_error_masking() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(tracked.status.success());
+    let mut files = std::collections::BTreeSet::new();
+    for name in tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let relative = std::path::PathBuf::from(std::str::from_utf8(name).unwrap());
+        if relative
+            .extension()
+            .is_some_and(|extension| extension == "rs")
+        {
+            files.insert(relative);
+        }
     }
-    // Assemble the obsolete credential name only in synthetic negative-test source;
-    // repository policy forbids retaining its literal interface in tracked fixtures.
-    let obsolete_credential = [
-        "fn generated_fixture_child(child: &mut Command) { child.env_remove(\"CARGO_",
-        "REGISTRY_TOKEN\"); }",
-    ]
-    .concat();
-    for denied in [
-        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("GH_TOKEN"); }"#.as_slice(),
-        obsolete_credential.as_bytes(),
-        br#"fn generated_fixture_child(child: &mut Command, key: &str) { child.env_remove(key); }"#,
-        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("RUSTC", "RUSTDOC"); }"#,
-        br#"fn unrelated(child: &mut Command) { child.env_remove("RUSTC"); }"#,
-        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("RUSTC"); fn nested(child: &mut Command) { child.env_remove("RUSTDOC"); } }"#,
+    for base in [
+        "tools/memcordon-ci",
+        "crates/memcordon-testkit",
+        "crates/memcordon-cli/src/bin",
+        "crates/memcordon-cli/tests",
+        "crates/memcordon-platform/src",
     ] {
-        assert!(validate_rust_policy_bytes(fixture, denied).is_err());
-        assert!(validate_rust_policy_bytes(rehearsal, denied).is_err());
+        for entry in walkdir::WalkDir::new(root.join(base)) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+            {
+                files.insert(entry.path().strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
     }
-    let credential = br#"fn remove(child: &mut Command) { child.env_remove("GH_TOKEN"); }"#;
-    for path in [
-        "tools/memcordon-ci/src/command.rs",
-        "tools/memcordon-ci/src/release.rs",
-    ] {
-        validate_rust_policy_bytes(Path::new(path), credential).unwrap();
+    let failures: Vec<_> = files
+        .iter()
+        .filter_map(|relative| {
+            let bytes = match std::fs::read(root.join(relative)) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("read tracked Rust source {relative:?}: {error}"),
+            };
+            validate_rust_policy_bytes(relative, &bytes)
+                .err()
+                .map(|error| error.to_string())
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn neutral_execution_identity_does_not_exempt_pre_exec() {
+    let path = Path::new(
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/execution_identity.rs",
+    );
+    let native = b"fn run(command: &mut std::process::Command, uid: u32, gid: u32) { command.gid(gid).uid(uid); }";
+    validate_rust_policy_bytes(path, native).unwrap();
+    let hook =
+        b"fn run(command: &mut std::process::Command) { unsafe { command.pre_exec(|| Ok(())); } }";
+    assert!(validate_rust_policy_bytes(path, hook).is_err());
+    validate_rust_policy_bytes(
+        path,
+        include_bytes!("../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/execution_identity.rs"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn process_test_boundary_has_one_shared_native_setup_hook() {
+    struct Hooks(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Hooks {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "pre_exec" {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let source = include_bytes!("../../../crates/memcordon-platform/src/test_support.rs");
+    validate_rust_policy_bytes(
+        Path::new("crates/memcordon-platform/src/test_support.rs"),
+        source,
+    )
+    .unwrap();
+    let file = syn::parse_file(std::str::from_utf8(source).unwrap()).unwrap();
+    let mut hooks = Hooks(0);
+    syn::visit::Visit::visit_file(&mut hooks, &file);
+    assert_eq!(hooks.0, 1);
+}
+
+#[test]
+fn private_sealed_forks_have_exact_reviewed_source_boundaries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux");
+    let fork = b"fn run() { unsafe { libc::fork(); } }";
+    for name in ["private_guardian.rs", "private_namespace_init.rs"] {
+        let relative = directory.join(name);
+        validate_rust_policy_bytes(&relative, fork).unwrap();
+        let bytes = std::fs::read(root.join(&relative)).unwrap();
+        validate_rust_policy_bytes(&relative, &bytes)
+            .unwrap_or_else(|error| panic!("reviewed source {relative:?}: {error}"));
+    }
+    for name in ["private_unreviewed.rs", "private_guardian_copy.rs"] {
+        assert!(validate_rust_policy_bytes(&directory.join(name), fork).is_err());
     }
 }
 
 #[test]
 fn deadline_helpers_preserve_typed_spawning_and_environment_boundaries() {
     for (path, source) in [
-        (
-            "tools/ci-native-fingerprint.rs",
-            include_str!("../../ci-native-fingerprint.rs"),
-        ),
         (
             "tools/memcordon-deadline-oracle/src/native.rs",
             include_str!("../../memcordon-deadline-oracle/src/native.rs"),
@@ -69,29 +150,6 @@ fn deadline_helpers_preserve_typed_spawning_and_environment_boundaries() {
         validate_rust_policy_bytes(Path::new(path), source.as_bytes())
             .expect("native helper policy");
     }
-}
-
-#[test]
-fn closed_compilation_environment_is_confined_to_reviewed_context_builders() {
-    let source = b"fn run(command: &mut std::process::Command) { command.env_clear().env(\"RUSTC\", \"/pinned/rustc\"); }";
-    for path in [
-        "tools/ci-native-fingerprint.rs",
-        "tools/memcordon-ci/src/build_context.rs",
-    ] {
-        validate_rust_policy_bytes(Path::new(path), source).unwrap();
-    }
-    for path in [
-        "tools/memcordon-ci/src/suites.rs",
-        "crates/example/src/lib.rs",
-        "tools/other.rs",
-    ] {
-        assert!(validate_rust_policy_bytes(Path::new(path), source).is_err());
-    }
-    validate_rust_policy_bytes(
-        Path::new("tools/memcordon-ci/src/build_context.rs"),
-        include_bytes!("../src/build_context.rs"),
-    )
-    .unwrap();
 }
 
 #[test]
@@ -239,4 +297,26 @@ fn sealed_identity_transition_obeys_the_semantic_subprocess_policy() {
         include_bytes!("../src/sealed_identity.rs"),
     )
     .expect("the native setpriv argv builder must remain shell- and environment-free");
+}
+
+#[test]
+fn retired_context_and_source_proof_paths_have_no_environment_exemption() {
+    let source = br#"fn run(command: &mut std::process::Command) { command.env("RUSTC", "/pinned/rustc"); }"#;
+    let removed = br#"fn generated_fixture_child(command: &mut std::process::Command) { command.env_remove("RUSTC"); }"#;
+    for path in [
+        "tools/ci-native-fingerprint.rs",
+        "tools/memcordon-ci/src/build_context.rs",
+        "tools/memcordon-ci/src/release_source.rs",
+        "tools/memcordon-ci/tests/build_context.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(path), source).is_err());
+        assert!(validate_rust_policy_bytes(Path::new(path), removed).is_err());
+    }
+    let credential =
+        br#"fn remove(command: &mut std::process::Command) { command.env_remove("GH_TOKEN"); }"#;
+    validate_rust_policy_bytes(Path::new("tools/memcordon-ci/src/command.rs"), credential).unwrap();
+    assert!(
+        validate_rust_policy_bytes(Path::new("tools/memcordon-ci/src/release.rs"), credential)
+            .is_err()
+    );
 }

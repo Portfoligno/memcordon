@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 const STANDARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
-const RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
+const BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeTestCommand {
@@ -18,20 +18,21 @@ pub fn commands(release_mode: bool) -> Vec<NativeTestCommand> {
         "--all-features",
         "--locked",
     ];
-    if !release_mode {
-        return vec![NativeTestCommand {
-            arguments,
-            deadline: STANDARD_DEADLINE,
-        }];
+    if release_mode {
+        arguments.push("--release");
     }
 
-    arguments.push("--release");
     let mut build_arguments = arguments.clone();
     build_arguments.push("--no-run");
+    // Bound cold compilation separately from execution on every native lane.
+    // Both phases select the same targets, features, profile, and lockfile.
+    // Execute every selected test binary after a failure, but retain Cargo's
+    // nonzero final status and the existing whole-execution deadline.
+    arguments.push("--no-fail-fast");
     vec![
         NativeTestCommand {
             arguments: build_arguments,
-            deadline: RELEASE_BUILD_DEADLINE,
+            deadline: BUILD_DEADLINE,
         },
         NativeTestCommand {
             arguments,

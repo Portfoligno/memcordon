@@ -28,29 +28,28 @@ The attempt cgroup is the nested cgroup-namespace root. No writable ancestor cgr
 
 Unrelated privileged host brokers remain outside the process-lineage threat model. Sealed supervision is not a filesystem, network, syscall, secret, package-manager, or general host isolation boundary; elevated target code may modify host resources its intentionally acquired credentials can reach.
 
-## Qualification, evidence, and certification
+## Readiness, runtime facts and native tests
 
-Runtime qualification schema 2 proves split-service installation/authentication, launcher NNP disabled, caller mount/NNP/CapBnd reproduction, initial provider capabilities absent, cgroup and namespace containment, exact descriptors, recursive-provider rejection, front-end-loss cleanup, recursive emptiness, helper reaping, boundary retirement, and recovery. The receipt binds the release certification scenario inventory and required set-ID/`sudo` digests.
-
-The receipt also carries the exact MemCordon package version. The public client
-rejects a provider whose version differs from its own before target
-authorization; an operator must explicitly install the matching package and
-run the package upgrade command.
+Current readiness is a named factual observation of the actual installation,
+authenticated services, native baseline setup and cleanup. It does not bind
+set-ID/sudo hashes or issue a saved permission token. Every launch independently
+checks the actual caller and installed components; workload admission also resolves
+the current protected local grant and epoch. The client rejects a provider whose
+package version differs before target authorization; an operator must explicitly
+install or upgrade the matching package.
 
 Execution report schema 10 carries `LinuxSealedEvidenceV2` and `preserve-caller-envelope`. Consistency requires caller envelope reproduction and boundary independence from credentials; it does not require permanently empty target capabilities or `NoNewPrivs: 1`. Plan and doctor schemas are 9 and 6. The native launch wire and generic provider contract are version 3; exact-grant admission is specified in [workload contract v1](../docs/spec-workload-contract-v1.md). V1 provider/mechanism/evidence is never accepted under the new schemas.
 
-Linux x86-64 release certification builds temporary Rust fixtures, a root-owned mode-`04755` set-ID fixture, a minimal file-capability fixture, and an ephemeral test user. It verifies set-ID, `sudo -n -u`, file-capability, caller NNP 0 and 1, reduced CapBnd, caller-specific mount context, post-transition cgroup/PID membership, elevated escape denial, recursive-provider rejection, front-end/provider/launcher/guardian loss, `cgroup.kill`, `populated 0`, complete reaping, package upgrade/recovery, and absence of leaked users/processes/records/cgroups/fixtures/units. All subprocesses use native argv from Rust; no shell or workflow environment protocol is involved.
+Ordinary native regressions preserve actual caller NNP/CapBnd, credential
+transition, mount context, cgroup/PID membership, escape denial, recursive-provider
+rejection, owner loss, cgroup.kill, populated0, reaping and package recovery
+behavior. Test-owned users, processes, records, cgroups, fixtures and units must
+retire. Missing or unavailable prerequisites are recorded truthfully rather than
+passing skipped cases. Passing regressions does not replace the runtime's live
+checks. All subprocesses use native structured argv.
 
-Certification uploads newline-terminated structured reports:
-
-- `provider-package-verification.json`;
-- `provider-qualification-v2.json`;
-- `setid-transition.json`;
-- `sudo-transition.json`;
-- `file-capability-transition.json`;
-- `caller-envelope.json`;
-- `mount-context.json`;
-- `fault-injection.json`; and
-- `cleanup-leak-check.json`.
-
-Every required scenario must be present and passed; Linux x86-64 cannot advertise v2 when a set-ID, `sudo`, or file-capability prerequisite is unavailable. Missing, skipped, false, stale, contradictory, or v1 evidence fails the release.
+The private TCP feature has a distinct target identity and seccomp contract,
+authorization-started attempt timer and real ptrace exec-stop handshake. Its named
+gated and post-exec facts are described in the
+[V2 workload contract](../docs/spec-workload-contract-v2.md). They cannot be emitted
+under this historical numeric evidence domain.

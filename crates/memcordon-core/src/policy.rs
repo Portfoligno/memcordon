@@ -204,6 +204,7 @@ impl CommandSpec {
 #[derive(Clone, Debug)]
 pub struct Policy {
     workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
+    private_workload_contract: Option<crate::workload_contract::WorkloadContractV2>,
     pub memory: Option<ByteSize>,
     pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
@@ -226,6 +227,7 @@ impl Policy {
     pub fn new(memory: ByteSize) -> Self {
         Self {
             workload_contract: None,
+            private_workload_contract: None,
             memory: Some(memory),
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -243,6 +245,7 @@ impl Policy {
     pub fn unbounded() -> Self {
         Self {
             workload_contract: None,
+            private_workload_contract: None,
             memory: None,
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -266,7 +269,28 @@ impl Policy {
         request: crate::workload_contract::WorkloadContractV1,
     ) -> Result<Self, String> {
         request.validate()?;
+        if self.private_workload_contract.is_some() {
+            return Err("mixed workload request versions".into());
+        }
         self.workload_contract = Some(request);
+        Ok(self)
+    }
+
+    pub fn private_workload_contract(
+        &self,
+    ) -> Option<&crate::workload_contract::WorkloadContractV2> {
+        self.private_workload_contract.as_ref()
+    }
+
+    pub fn with_private_workload_contract(
+        mut self,
+        request: crate::workload_contract::WorkloadContractV2,
+    ) -> Result<Self, String> {
+        request.validate()?;
+        if self.workload_contract.is_some() {
+            return Err("mixed workload request versions".into());
+        }
+        self.private_workload_contract = Some(request);
         Ok(self)
     }
 

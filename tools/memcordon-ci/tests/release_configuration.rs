@@ -73,6 +73,23 @@ fn canonical_release() -> Release {
 }
 
 #[test]
+fn linux_assets_cover_both_native_release_targets() {
+    let release = canonical_release();
+    let mut linux_targets: Vec<&str> = release
+        .assets
+        .target
+        .iter()
+        .filter(|asset| asset.rust_target.ends_with("-unknown-linux-gnu"))
+        .map(|asset| asset.rust_target.as_str())
+        .collect();
+    linux_targets.sort_unstable();
+    assert_eq!(
+        linux_targets,
+        ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+    );
+}
+
+#[test]
 fn canonical_fallback_configuration_derives_the_release_bound_dynamically() {
     let release = canonical_release();
     let development = workspace_version();

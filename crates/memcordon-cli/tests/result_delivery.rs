@@ -70,8 +70,11 @@ fn failed_report_sink_has_separate_evidence_and_full_evidence_pipe_never_blocks(
         let text = evidence.finish();
         if !full {
             let record: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(record["stage"], "writer_exit");
-            assert_eq!(record["writer_exit_code"], 125);
+            assert_eq!(record["stage"], "destination");
+            assert!(
+                record["writer_exit_code"].is_null(),
+                "missing parent must reject before native writer creation"
+            );
         }
     }
 }
