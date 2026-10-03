@@ -1,7 +1,9 @@
 use memcordon_ci::release::{
     artifacts,
     distribution::TargetDistribution,
-    installed_consumer::{binary_path, create_fresh_destination, measured_manifest},
+    installed_consumer::{
+        binary_path, cli_case_command, create_fresh_destination, measured_manifest,
+    },
     source::{BuildSourceIdentity, SelectedSource},
     target::unit_export_directory,
 };
@@ -13,6 +15,73 @@ fn directory() -> tempfile::TempDir {
     } else {
         tempfile::tempdir().unwrap()
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_cli_paths_reach_actual_fixture_and_report_after_child_changes_directory() {
+    use memcordon_ci::{command::CommandSpec, config};
+    use std::{path::PathBuf, time::Duration};
+
+    let owner = directory();
+    let payload = owner.path().join("payload");
+    let reports = owner.path().join("cases");
+    std::fs::create_dir(&payload).unwrap();
+    std::fs::create_dir(&reports).unwrap();
+    let fixture = owner.path().join("selected-fixture-input");
+    let bytes = b"selected fixture bytes, distinct from the child directory";
+    std::fs::write(&fixture, bytes).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let compiler = CommandSpec::toolchain_program(
+        "rustup",
+        owner.path(),
+        &config::toolchains(root).unwrap().stable,
+        "rustc",
+        Duration::from_secs(30),
+    )
+    .arg(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/support/installed_path_child.rs"),
+    )
+    .args(["--edition", "2024", "-o"])
+    .arg(payload.join("memcordon"))
+    .output_quiet()
+    .unwrap();
+    assert!(compiler.status.success(), "{compiler:?}");
+
+    // Supply driver-relative paths without changing this multithreaded test's cwd.
+    let current = std::env::current_dir().unwrap();
+    let common = current
+        .ancestors()
+        .find(|ancestor| owner.path().starts_with(ancestor))
+        .unwrap();
+    let mut relative = PathBuf::new();
+    for _ in current.strip_prefix(common).unwrap().components() {
+        relative.push("..");
+    }
+    relative.push(owner.path().strip_prefix(common).unwrap());
+    let (command, report) = cli_case_command(
+        &relative.join("payload"),
+        "native-test",
+        &relative.join("selected-fixture-input"),
+        &relative.join("cases"),
+        "path-observation",
+        &[],
+        &[],
+    )
+    .unwrap();
+    let output = command.output_quiet().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(report).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(reports.join("path-observation.json")).unwrap(),
+        bytes
+    );
+    assert!(!payload.join("cases/path-observation.json").exists());
 }
 
 #[cfg(unix)]

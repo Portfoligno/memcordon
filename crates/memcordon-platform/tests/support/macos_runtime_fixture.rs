@@ -1,7 +1,9 @@
 //! Native test support; ownership uses the production tickets and child API.
 #![cfg(all(target_os = "macos", feature = "test-support"))]
 
-use super::{Child, ChildOwner, LocalChild, ProcessGroupLease, UnreapedChild, runtime};
+use super::{
+    Child, ChildOwner, LocalChild, NativeSpawnFailure, ProcessGroupLease, UnreapedChild, runtime,
+};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
@@ -12,7 +14,32 @@ use std::time::{Duration, Instant};
 pub struct NativeChildProbe {
     child: Child,
 }
+pub struct NativeCreationObservation {
+    observation: runtime::RetirementObservation,
+}
+impl NativeCreationObservation {
+    pub fn settled_until(&self, deadline: Instant) -> bool {
+        self.observation.settled_until(deadline)
+    }
+    fn from_ticket(ticket: &runtime::Ticket) -> Self {
+        let failure = NativeSpawnFailure::pending(
+            io::Error::new(io::ErrorKind::TimedOut, "delayed test creation"),
+            ticket.observer(),
+        );
+        Self {
+            observation: failure
+                .pending
+                .expect("pending creation retains exact observer"),
+        }
+    }
+}
 impl NativeChildProbe {
+    pub fn creation_observation(&self) -> NativeCreationObservation {
+        let ChildOwner::Local(local) = &self.child.owner else {
+            unreachable!()
+        };
+        NativeCreationObservation::from_ticket(&local.retirement)
+    }
     pub fn pid(&self) -> i32 {
         self.child.pid
     }
@@ -103,7 +130,20 @@ impl runtime::LaunchRuntime {
         entered: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
     ) -> io::Result<mpsc::Receiver<io::Result<NativeChildProbe>>> {
+        self.test_observed_delayed_native_creation(entered, release)
+            .map(|(receiver, _)| receiver)
+    }
+    #[doc(hidden)]
+    pub fn test_observed_delayed_native_creation(
+        &self,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    ) -> io::Result<(
+        mpsc::Receiver<io::Result<NativeChildProbe>>,
+        NativeCreationObservation,
+    )> {
         let ticket = self.reserve()?;
+        let observation = NativeCreationObservation::from_ticket(&ticket);
         let (sender, receiver) = mpsc::sync_channel(1);
         self.enqueue(Box::new(move || {
             let child = create(ticket, true);
@@ -115,6 +155,14 @@ impl runtime::LaunchRuntime {
             // already-reserved retirement slot; no replacement thread exists.
             let _ = sender.try_send(child);
         }))?;
-        Ok(receiver)
+        Ok((receiver, observation))
+    }
+    #[doc(hidden)]
+    pub fn test_observed_no_child_completion(&self) -> io::Result<NativeCreationObservation> {
+        let ticket = self.reserve()?;
+        let observation = NativeCreationObservation::from_ticket(&ticket);
+        ticket.begin()?;
+        drop(ticket); // Exclusive creation returned without a native child.
+        Ok(observation)
     }
 }

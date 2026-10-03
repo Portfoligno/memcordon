@@ -214,3 +214,55 @@ fn shutdown_during_delayed_creation_is_nonblocking_and_late_child_is_not_discard
             .success()
     );
 }
+
+#[test]
+fn pending_creation_observation_requires_exact_retirement_with_fixed_expiry() {
+    let runtime = MacosLaunchRuntime::new(1).unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let (response, observation) = runtime
+        .test_observed_delayed_native_creation(entered.clone(), release.clone())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !entered.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            release.store(true, Ordering::Release);
+            panic!("owned child creation did not reach the publication gate");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(response); // Force late publication into the owned native reaper.
+    let expired = Instant::now();
+    let pending_at_expiry = !observation.settled_until(expired);
+    release.store(true, Ordering::Release);
+    assert!(pending_at_expiry);
+    assert!(observation.settled_until(deadline));
+    let mut next = runtime.test_native_child(true).unwrap();
+    assert!(
+        observation.settled_until(expired),
+        "later generation is independent"
+    );
+    next.terminate().unwrap();
+    next.reaped_within(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn no_child_completion_and_ownership_loss_have_distinct_cleanup_proof() {
+    let runtime = MacosLaunchRuntime::new(1).unwrap();
+    let no_child = runtime.test_observed_no_child_completion().unwrap();
+    let mut child = runtime.test_native_child(false).unwrap();
+    let owned = child.creation_observation();
+    assert!(no_child.settled_until(Instant::now()));
+    child.consume_by_external_waiter().unwrap();
+    assert!(child.try_wait().is_err());
+    drop(child);
+    let deadline = Instant::now() + Duration::from_millis(10);
+    assert!(
+        !owned.settled_until(deadline),
+        "OwnershipLost is never clean"
+    );
+    assert!(
+        !owned.settled_until(deadline),
+        "expired bound is not renewed"
+    );
+}

@@ -142,7 +142,7 @@ pub fn materialize_native(
     let (bundle, archive) = TargetBundle::load(target_directory)?;
     let owner = tempfile::Builder::new()
         .prefix("native-consumer-")
-        .tempdir_in(temporary_parent)?;
+        .tempdir_in(std::path::absolute(temporary_parent)?)?;
     let directory = owner.path().join("payload");
     artifacts::extract_members(
         &target::decode_archive(&archive, &bundle.distribution.target)?,
@@ -188,7 +188,7 @@ pub fn materialize_cargo(
     consumer.install_cli(root, cache, &bundle.distribution)?;
     let owner = tempfile::Builder::new()
         .prefix("cargo-consumer-")
-        .tempdir_in(temporary_parent)?;
+        .tempdir_in(std::path::absolute(temporary_parent)?)?;
     let directory = owner.path().join("payload");
     fs::create_dir(&directory)?;
     for binary in &bundle.distribution.binaries {
@@ -247,22 +247,24 @@ pub fn materialize_cargo(
     })
 }
 
-pub fn run_cli_case(
-    payload: &MaterializedPayload,
+/// Bind driver-relative paths before changing the selected child's directory.
+/// Absolute paths retain symlink spelling and do not replace custody checks.
+pub fn cli_case_command(
+    directory: &Path,
+    target: &str,
+    fixture: &Path,
     output_directory: &Path,
     name: &str,
     wrapper_arguments: &[OsString],
     fixture_arguments: &[&str],
-) -> Result<ResultV1> {
+) -> Result<(CommandSpec, PathBuf)> {
     artifacts::safe_basename(name)?;
-    let report_path = output_directory.join(name).with_extension("json");
-    let mut command = CommandSpec::new(
-        binary_path(
-            &payload.directory,
-            "memcordon",
-            &payload.distribution.target,
-        ),
-        &payload.directory,
+    let directory = std::path::absolute(directory)?;
+    let fixture = std::path::absolute(fixture)?;
+    let report_path = std::path::absolute(output_directory.join(name).with_extension("json"))?;
+    let command = CommandSpec::new(
+        binary_path(&directory, "memcordon", target),
+        &directory,
         Duration::from_secs(60),
     )
     .args(wrapper_arguments)
@@ -272,10 +274,29 @@ pub fn run_cli_case(
         OsString::from("--report"),
         report_path.as_os_str().to_os_string(),
         OsString::from("--"),
-        payload.fixture.path.as_os_str().to_os_string(),
+        fixture.as_os_str().to_os_string(),
     ])
-    .args(fixture_arguments)
-    .materialize()?;
+    .args(fixture_arguments);
+    Ok((command, report_path))
+}
+
+pub fn run_cli_case(
+    payload: &MaterializedPayload,
+    output_directory: &Path,
+    name: &str,
+    wrapper_arguments: &[OsString],
+    fixture_arguments: &[&str],
+) -> Result<ResultV1> {
+    let (command, report_path) = cli_case_command(
+        &payload.directory,
+        &payload.distribution.target,
+        &payload.fixture.path,
+        output_directory,
+        name,
+        wrapper_arguments,
+        fixture_arguments,
+    )?;
+    let mut command = command.materialize()?;
     let output = memcordon_testkit::run_with_deadline_output_limit(
         &mut command,
         Duration::from_secs(60),

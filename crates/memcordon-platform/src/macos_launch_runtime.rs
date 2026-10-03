@@ -349,6 +349,18 @@ impl RetirementObservation {
             .load(Ordering::Acquire);
         value >> STATE_BITS == self.key.generation && state(value) != State::Vacant as u64
     }
+    pub(crate) fn settled_until(&self, deadline: std::time::Instant) -> bool {
+        loop {
+            if !self.pending() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+        }
+    }
 }
 
 fn reap(inner: Arc<Inner>, events: mpsc::Receiver<()>) {

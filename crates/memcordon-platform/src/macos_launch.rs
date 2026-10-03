@@ -1039,21 +1039,21 @@ fn native_spawn(
 
 struct NativeSpawnFailure {
     error: io::Error,
-    pending: bool,
+    pending: Option<runtime::RetirementObservation>,
 }
 impl From<io::Error> for NativeSpawnFailure {
     fn from(error: io::Error) -> Self {
         Self {
             error,
-            pending: false,
+            pending: None,
         }
     }
 }
 impl NativeSpawnFailure {
-    fn pending(error: io::Error) -> Self {
+    fn pending(error: io::Error, observation: runtime::RetirementObservation) -> Self {
         Self {
             error,
-            pending: true,
+            pending: Some(observation),
         }
     }
 }
@@ -1083,6 +1083,7 @@ fn native_spawn_context(
         admission.check()?;
     }
     let ticket = runtime.reserve()?;
+    let observation = ticket.observer();
     let expires = crate::macos_deadline::add(
         crate::macos_deadline::continuous_nanos()?,
         deadline.saturating_duration_since(Instant::now()),
@@ -1128,23 +1129,31 @@ fn native_spawn_context(
     }))?;
     loop {
         if let Some(admission) = admission {
-            admission.check().map_err(NativeSpawnFailure::pending)?;
+            if let Err(error) = admission.check() {
+                return Err(NativeSpawnFailure::pending(error, observation));
+            }
         }
-        if crate::macos_deadline::continuous_nanos().map_err(NativeSpawnFailure::pending)?
-            >= expires
-        {
-            return Err(NativeSpawnFailure::pending(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "native creation remains owned in flight",
-            )));
+        let now = match crate::macos_deadline::continuous_nanos() {
+            Ok(now) => now,
+            Err(error) => return Err(NativeSpawnFailure::pending(error, observation)),
+        };
+        if now >= expires {
+            return Err(NativeSpawnFailure::pending(
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native creation remains owned in flight",
+                ),
+                observation,
+            ));
         }
         match receive.recv_timeout(Duration::from_millis(2)) {
             Ok(result) => return result.map_err(NativeSpawnFailure::from),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(NativeSpawnFailure::pending(io::Error::other(
-                    "native creation owner unavailable",
-                )));
+                return Err(NativeSpawnFailure::pending(
+                    io::Error::other("native creation owner unavailable"),
+                    observation,
+                ));
             }
         }
     }
@@ -1790,7 +1799,7 @@ fn launch_configured(
         },
     };
     let mut guardian_owner = None;
-    let mut pending_capture_or_creation = false;
+    let mut pending_creation = None;
     let mut configured = false;
     let mut release = memcordon_core::ReleaseEvidence::NotIssued;
     let mut phase = "helper-spawn";
@@ -1823,13 +1832,12 @@ fn launch_configured(
             Some(signal) => signal.snapshot.clone(),
             None => crate::signal::CallerSignalSnapshot::capture()?,
         };
-        pending_capture_or_creation = true;
+        // Capture owns descriptors only; native creation has not been enqueued.
         let envelope = crate::macos_envelope::Envelope::capture_bounded(
             deadline,
             snapshot,
             signal.map(|signal| &signal.admission),
         )?;
-        pending_capture_or_creation = false;
         let (envelope_send, envelope_receive) = std::os::unix::net::UnixDatagram::pair()?;
         envelope.send(&envelope_send, run)?;
         let auxiliary = (
@@ -1848,7 +1856,6 @@ fn launch_configured(
             command.program().to_owned(),
         ];
         args.extend(command.arguments().iter().cloned());
-        pending_capture_or_creation = true;
         let child = native_spawn_context(
             image,
             &args,
@@ -1863,11 +1870,10 @@ fn launch_configured(
             },
         )
         .map_err(|failure| {
-            pending_capture_or_creation = failure.pending;
+            pending_creation = failure.pending;
             failure.error
         })?;
         diagnostic.guardian_pid = Some(child.id());
-        pending_capture_or_creation = false;
         drop(endpoint);
         guardian_owner = Some(Guardian {
             channel: Some(channel.clone()),
@@ -2181,7 +2187,12 @@ fn launch_configured(
                         detail: error.to_string(),
                     }),
                 }
-            } else if !pending_capture_or_creation && error.kind() != io::ErrorKind::TimedOut {
+            } else if pending_creation
+                .as_ref()
+                .is_none_or(|observation| observation.settled_until(cleanup_deadline))
+            {
+                // No native operation was enqueued, or this exact creation's
+                // ticket proves no-child completion or actual native retirement.
                 diagnostic.cleanup.state = CleanupState::Complete;
             }
             if !diagnostic.cleanup.errors.is_empty() {

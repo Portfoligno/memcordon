@@ -378,23 +378,7 @@ impl PackageConsumer {
             bundle,
         };
         let toolchain = crate::config::toolchains(root)?.stable;
-        rustup_cargo(
-            root,
-            &toolchain,
-            [
-                std::ffi::OsStr::new("generate-lockfile"),
-                std::ffi::OsStr::new("--manifest-path"),
-                value.manifest.as_os_str(),
-                std::ffi::OsStr::new("--config"),
-                value.config.as_os_str(),
-            ],
-            Duration::from_secs(300),
-        )
-        .run()?;
-        verify_external_lock(
-            &root.join("Cargo.lock"),
-            &value.manifest.with_file_name("Cargo.lock"),
-        )?;
+        prepare_consumer_lock(root, &toolchain, &value.manifest, &value.config)?;
         let output = rustup_cargo(
             root,
             &toolchain,
@@ -506,7 +490,34 @@ impl PackageConsumer {
     }
 }
 
-fn verify_external_lock(selected: &Path, consumer: &Path) -> Result<()> {
+/// Reconcile the generated local workspace while retaining selected external pins.
+pub fn prepare_consumer_lock(
+    root: &Path,
+    toolchain: &str,
+    manifest: &Path,
+    config: &Path,
+) -> Result<()> {
+    let selected = root.join("Cargo.lock");
+    let consumer = manifest.with_file_name("Cargo.lock");
+    fs::copy(&selected, &consumer)?;
+    rustup_cargo(
+        root,
+        toolchain,
+        [
+            std::ffi::OsStr::new("update"),
+            std::ffi::OsStr::new("--workspace"),
+            std::ffi::OsStr::new("--manifest-path"),
+            manifest.as_os_str(),
+            std::ffi::OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+        Duration::from_secs(300),
+    )
+    .run()?;
+    verify_external_lock(&selected, &consumer)
+}
+
+pub fn verify_external_lock(selected: &Path, consumer: &Path) -> Result<()> {
     let parse = |path: &Path| -> Result<BTreeMap<(String, String, String), Option<String>>> {
         let text = fs::read_to_string(path)?;
         let lock: toml::Value = toml::from_str(&text)?;
