@@ -1,3 +1,6 @@
+#![cfg(target_os = "linux")]
+
+#[allow(dead_code)] // This test exercises the path guard without probing installed provider paths.
 #[path = "../src/bin/memcordon-sealed-agent/linux/retired_state.rs"]
 mod retired_state;
 

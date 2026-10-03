@@ -37,7 +37,7 @@ fn windows_product_package_command(arguments: &[OsString]) -> bool {
     };
     match arguments.len() {
         2 => fixed(1, "inspect") || fixed(1, "verify") || product_operation(1),
-        3 => (fixed(2, "--json") && (fixed(1, "inspect") || fixed(1, "verify"))),
+        3 => fixed(2, "--json") && (fixed(1, "inspect") || fixed(1, "verify")),
         4 => fixed(1, "policy") && fixed(2, "inspect") && fixed(3, "--json"),
         5 => fixed(1, "policy") && fixed(2, "apply") && fixed(3, "--file"),
         _ => false,

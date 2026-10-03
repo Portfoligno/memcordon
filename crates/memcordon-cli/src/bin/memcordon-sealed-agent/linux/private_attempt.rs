@@ -118,7 +118,7 @@ pub struct PrivateAttemptRecordV4 {
     pub network_namespace_inode: Option<u64>,
     pub checkpoint: Option<PrivateTcpCheckpointV2>,
     pub checkpoint_digest: Option<DiagnosticSha256>,
-    pub gated_facts: Option<OperationalGatedFacts>,
+    pub(super) gated_facts: Option<OperationalGatedFacts>,
     pub cleanup_error: Option<BoundedText<4096>>,
 }
 

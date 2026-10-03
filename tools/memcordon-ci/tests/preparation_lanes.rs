@@ -1,7 +1,8 @@
 use memcordon_ci::{
     CiError,
+    command::CommandSpec,
     performance_plan::Layout,
-    preparation::{complete_lanes, remaining},
+    preparation::{complete_lanes, observed, remaining},
 };
 use std::{
     sync::{Arc, Mutex},
@@ -53,4 +54,52 @@ fn original_group_deadline_caps_each_command_without_renewal() {
     let end = Instant::now() + Duration::from_secs(2);
     assert!(remaining(end, Duration::from_secs(30)).unwrap() <= Duration::from_secs(2));
     assert!(remaining(Instant::now(), Duration::from_secs(30)).is_err());
+}
+
+#[test]
+fn failed_operation_exposes_child_diagnostics_even_when_collection_fails() {
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("memcordon-operation-fixture-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let root = tempfile::Builder::new()
+        .prefix("memcordon-operation-fixture-")
+        .tempdir()
+        .unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for directory in [root.path().to_path_buf(), root.path().join("absent")] {
+        let command = CommandSpec::new(&executable, root.path(), Duration::from_secs(20)).args([
+            "--ignored",
+            "--exact",
+            "failing_operation_child",
+            "--nocapture",
+        ]);
+        let error = observed(command, &directory, "diagnostic-fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("operation diagnostic-fixture failed"));
+        assert!(error.contains("captured stdout diagnostic"));
+        assert!(error.contains("captured stderr diagnostic"));
+        if directory == root.path() {
+            let stdout =
+                std::fs::read_to_string(directory.join("diagnostic-fixture.stdout.bin")).unwrap();
+            let stderr =
+                std::fs::read_to_string(directory.join("diagnostic-fixture.stderr.bin")).unwrap();
+            assert!(stdout.contains("captured stdout diagnostic"));
+            assert!(stderr.contains("captured stderr diagnostic"));
+        } else {
+            assert!(error.contains("stdout collection=Err"));
+            assert!(error.contains("stderr collection=Err"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit subprocess fixture for failure diagnostics"]
+fn failing_operation_child() {
+    println!("captured stdout diagnostic");
+    eprintln!("captured stderr diagnostic");
+    panic!("deliberate child failure");
 }

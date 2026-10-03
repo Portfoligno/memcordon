@@ -57,18 +57,31 @@ fn companion_version_and_help_are_administrative_and_exact() {
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).expect("help should be UTF-8");
     for command in [
-        "package inspect [--json]",
-        "package verify [--json]",
-        "package install [--ephemeral-ci [--archive-path A --archive-certificate CERT]]",
-        "package upgrade [--ephemeral-ci [--archive-path A --archive-certificate CERT]]",
-        "package uninstall [--ephemeral-ci]",
+        "memcordon-sealed-agent serve",
+        "memcordon-sealed-agent launch-broker",
+        "memcordon-sealed-agent probe",
+        "package <install|upgrade|inspect|verify|uninstall> [--json]",
     ] {
         assert!(help.contains(command), "agent help omits {command}");
     }
-    assert!(!help.contains("launch-broker"));
-    assert!(!help.contains("\n  memcordon-sealed-agent serve"));
+    assert!(!help.contains("--ephemeral-ci"));
+    assert!(!help.contains("--archive-certificate"));
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[test]
+fn package_inspection_is_unavailable_without_a_native_provider_package() {
+    let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
+    let output = agent(&["package", "inspect", "--json"]);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "retired release command is unavailable"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[test]
 fn package_inspection_is_credential_free_and_machine_readable() {
     let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
@@ -80,7 +93,8 @@ fn package_inspection_is_credential_free_and_machine_readable() {
     );
     let inspection: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 5);
+    assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
+    assert_eq!(inspection["revision"], 1);
     assert_eq!(inspection["version"], env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "windows")]
     {
@@ -164,7 +178,8 @@ fn bare_inspection_does_not_infer_package_custody_from_a_hard_linked_build() {
         String::from_utf8_lossy(&output.stderr)
     );
     let inspection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(inspection["schema_version"], 5);
+    assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
+    assert_eq!(inspection["revision"], 1);
     assert_eq!(inspection["compiled_metadata_valid"], true);
 
     let manifest = directory.path().join("runtime-manifest.json");

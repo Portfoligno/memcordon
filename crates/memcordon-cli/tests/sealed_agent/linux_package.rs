@@ -8,6 +8,7 @@ const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 #[test]
 fn unit_export_publishes_only_selected_templates_with_exact_regular_file_modes() {
     let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     crate::package::export_unit_files(directory.path()).unwrap();
     let mut names: Vec<_> = std::fs::read_dir(directory.path())
         .unwrap()
@@ -154,7 +155,7 @@ fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
                 schema_version: 1,
                 entries: vec![proof_entry],
             })
-            .is_ok()
+            .is_err()
         );
     }
     let mut duplicate = journal;
@@ -761,17 +762,15 @@ fn sealed_package_upgrade_recovers_before_advertising() {
     assert_eq!(receipt["revision"], 1);
     assert_eq!(receipt["mechanism"], "linux-pid-namespace-cgroup-v2");
     assert_eq!(receipt["provider_identity"], "memcordon-sealed-agent-v2");
-    for field in ["observation_digest"] {
-        let digest = receipt[field]
-            .as_str()
-            .expect("actual observation SHA-256 field");
-        assert_eq!(digest.len(), 64);
-        assert!(
-            digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        );
-    }
+    let digest = receipt["observation_digest"]
+        .as_str()
+        .expect("actual observation SHA-256 field");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
 
     let policy = memcordon_core::Policy::unbounded().sealed();
     let backend = memcordon_platform::probe()

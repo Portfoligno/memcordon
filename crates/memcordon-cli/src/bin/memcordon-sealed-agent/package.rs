@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -2084,9 +2085,11 @@ fn live_attempt_exists() -> Result<bool, String> {
     if !state_root.exists() {
         return Ok(false);
     }
-    for entry in std::fs::read_dir(state_root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let _entry = entry;
+    if let Some(entry) = std::fs::read_dir(state_root)
+        .map_err(|error| error.to_string())?
+        .next()
+    {
+        entry.map_err(|error| error.to_string())?;
         return Ok(true);
     }
     Ok(false)

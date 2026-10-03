@@ -319,7 +319,7 @@ fn bounded_helper_path(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn helper_path() -> Result<Option<std::path::PathBuf>, Box<Error>> {
     std::env::current_exe().map(Some).map_err(|error| {
         Box::new(
@@ -1309,7 +1309,9 @@ pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
     };
     if args.json {
         if args.operational_format {
-            let mut operational = memcordon_core::result_v1::PlanV1::from(&plan);
+            let operational = memcordon_core::result_v1::PlanV1::from(&plan);
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            let mut operational = operational;
             #[cfg(all(target_os = "linux", feature = "private-tcp"))]
             if let Some(contract) = args.policy.private_workload_contract() {
                 match memcordon_platform::private_plan(contract) {
@@ -1547,7 +1549,9 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     }
     if args.json {
         let code = if args.operational_format {
-            let mut capabilities = memcordon_core::result_v1::CapabilitiesV1::from(&report);
+            let capabilities = memcordon_core::result_v1::CapabilitiesV1::from(&report);
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            let mut capabilities = capabilities;
             #[cfg(all(target_os = "linux", feature = "private-tcp"))]
             {
                 match private_discovery {

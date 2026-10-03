@@ -2348,21 +2348,22 @@ fn rejection_error(rejection: memcordon_core::WindowsProviderRejectionV2) -> Err
     }
     error.workload_may_be_alive =
         rejection.target_created && rejection.restart_safety.workload_empty != Some(true);
-    if let Some(receipt) = rejection.terminal_receipt()
-        && let memcordon_core::WindowsTerminalPayloadV2::Execution {
+    if let Some(receipt) = rejection.terminal_receipt() {
+        if let memcordon_core::WindowsTerminalPayloadV2::Execution {
             child_pid,
             authorization_offset_millis,
             outcome,
             ..
         } = &receipt.payload
-    {
-        // This is the authenticated postauthorization receipt, not a timestamp
-        // inferred from the diagnostic phase or from frontend observation time.
-        error.authorization_offset = Some(Duration::from_millis(*authorization_offset_millis));
-        error.target_pid = Some(*child_pid);
-        error.cleanup = outcome.cleanup().clone();
-        error.policy_enforcement = receipt.policy_enforcement.clone();
-        error.workload_may_be_alive = error.cleanup.workload_empty != Some(true);
+        {
+            // This is the authenticated postauthorization receipt, not a timestamp
+            // inferred from the diagnostic phase or from frontend observation time.
+            error.authorization_offset = Some(Duration::from_millis(*authorization_offset_millis));
+            error.target_pid = Some(*child_pid);
+            error.cleanup = outcome.cleanup().clone();
+            error.policy_enforcement = receipt.policy_enforcement.clone();
+            error.workload_may_be_alive = error.cleanup.workload_empty != Some(true);
+        }
     }
     error
 }

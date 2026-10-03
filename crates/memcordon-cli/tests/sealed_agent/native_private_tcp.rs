@@ -191,16 +191,19 @@ fn private_prelaunch_rejects_ungranted_program_before_target_allocation() {
 }
 
 #[test]
-fn private_prelaunch_does_not_infer_elf_authority_from_preserved_caller() {
+fn private_preserved_prelaunch_requires_an_exact_native_program_path() {
     let root = std::fs::File::open("/").unwrap();
     let request = private_request(
         ExecutionIdentityRequestV2::PreserveCaller,
-        b"/opt/memcordon/candidate-elf",
+        b"/opt/memcordon/../candidate-elf",
     );
     let rejection =
         pin_private_prelaunch_authority(&request, None, &eligible_caller(), root.as_fd(), 0, 0)
             .unwrap_err();
-    assert!(rejection.contains("entrypoint authority unavailable"));
+    assert!(
+        rejection.contains("preserved program must be an exact absolute native path"),
+        "{rejection}"
+    );
 }
 
 #[test]

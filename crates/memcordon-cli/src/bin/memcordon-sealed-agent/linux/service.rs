@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};

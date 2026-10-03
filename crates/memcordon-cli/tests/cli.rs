@@ -22,7 +22,7 @@ fn execution(values: &[&str]) -> memcordon::invocation::ExecutionArgs {
 }
 
 #[test]
-fn qualification_frame_capture_requires_both_scoped_capabilities() {
+fn retired_qualification_frame_options_are_rejected() {
     for args in [
         vec![
             "--sealed",
@@ -51,9 +51,8 @@ fn qualification_frame_capture_requires_both_scoped_capabilities() {
             "program",
         ],
     ] {
-        let error =
-            route(&native(&args)).expect_err("incomplete qualification capability must fail");
-        assert_eq!(error.code, "MCUSAGE-WINDOWS-QUALIFICATION-CAPTURE");
+        let error = route(&native(&args)).expect_err("retired qualification options must fail");
+        assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION");
     }
 }
 

@@ -3,15 +3,12 @@
 //! terminal evidence; dropping the owner starts best-effort containment.
 
 use std::fs::File;
-use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_evidence_v2::{
-    EntryResourceObservationV2, NamespaceObservationV2, PrivatePortPolicyV1,
-    PrivateTcpCheckpointV2, PrivateTcpRetiredV2, QualifiedNativeAbiV2, TargetIdentityKindV2,
-    TargetIdentityObservationV2, VerifiedTrue,
+    PrivateTcpCheckpointV2, PrivateTcpRetiredV2, VerifiedTrue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

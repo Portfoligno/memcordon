@@ -259,10 +259,7 @@ fn recover_account_reservation(
             Err(_)
                 if !Path::new("/proc")
                     .join(reservation.owner_pid.to_string())
-                    .exists() =>
-            {
-                ()
-            }
+                    .exists() => {}
             Err(_) => return Ok(false),
         }
     }

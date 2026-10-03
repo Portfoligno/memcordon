@@ -74,8 +74,10 @@ pub fn observed(command: CommandSpec, directory: &Path, name: &str) -> Result<()
     );
     if !result.status.success() {
         return Err(CiError::Message(format!(
-            "operation {name} failed with {:?}; stdout collection={stdout:?}; stderr collection={stderr:?}",
-            result.status
+            "operation {name} failed with {:?}; stdout collection={stdout:?}; stderr collection={stderr:?}\nstdout:\n{}\nstderr:\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
         )));
     }
     stdout?;

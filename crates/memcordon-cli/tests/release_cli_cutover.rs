@@ -12,6 +12,15 @@ fn denied(platform: ReleasePlatform, arguments: &[&str]) -> bool {
 
 #[test]
 fn retired_release_entrypoints_close_without_blocking_operational_packages() {
+    let expected_platform = if cfg!(target_os = "linux") {
+        ReleasePlatform::Linux
+    } else if cfg!(target_os = "windows") {
+        ReleasePlatform::Windows
+    } else {
+        ReleasePlatform::Other
+    };
+    assert_eq!(ReleasePlatform::current(), expected_platform);
+    assert!(denied(ReleasePlatform::Other, &["package", "inspect"]));
     for command in [
         "release-case-reuse-source",
         "release-hosted-facility-controls",

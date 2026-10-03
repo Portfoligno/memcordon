@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
-mod native_acceptance_catalogue;
 mod suites;
 
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use memcordon_ci::{CiError, Result, command, config, policy};
+use memcordon_ci::{CiError, Result, command, config, native_acceptance_catalogue, policy};
 pub use memcordon_ci::{bootstrap_profile, performance_plan, preparation};
 
 #[derive(Parser)]
