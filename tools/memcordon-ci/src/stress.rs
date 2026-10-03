@@ -37,6 +37,10 @@ fn evidence(root: &Path, phase: &str, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stress evidence records each independent phase, counter, timing and disposition fact"
+)]
 fn state(
     root: &Path,
     target: &Path,
@@ -136,6 +140,10 @@ pub fn packages(root: &Path, stable: &str, target: &Path) -> Result<()> {
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stress completion preserves the original observed result and all independent progress counters"
+)]
 fn finish<T>(
     root: &Path,
     target: &Path,

@@ -231,7 +231,7 @@ fn sudo(cwd: &Path, arguments: &[OsString]) -> Result<Vec<u8>> {
 }
 
 fn identifier(value: &str) -> Result<LogicalId> {
-    LogicalId::new(value.into()).map_err(|error| CiError::Message(error.into()))
+    LogicalId::new(value.into()).map_err(CiError::Message)
 }
 
 fn bounded<T, const N: usize>(values: impl IntoIterator<Item = T>) -> Result<BoundedVec<T, N>> {
@@ -306,6 +306,10 @@ fn registry(payload: &MaterializedPayload) -> Result<RuntimePrivatePolicyRegistr
     Ok(value)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native cases keep selected inputs and expected outcome facts explicit"
+)]
 fn execute(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -335,6 +339,10 @@ fn execute(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native cases keep selected inputs and independent outcome assertions explicit"
+)]
 fn execute_observed(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -362,6 +370,10 @@ fn execute_observed(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native cases retain exact argv separately from expected outcome facts"
+)]
 fn execute_options(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -391,6 +403,10 @@ fn execute_options(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "owned native execution joins exact inputs, interruption and independently expected terminal facts"
+)]
 fn execute_controlled(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -813,7 +829,7 @@ fn descendant_and_restart_cases(
             || execution.terminal.outcome != OutcomeKindV1::Deadline
             || execution.terminal.admission_metadata.request != *contract
             || !execution.terminal.exec_observed
-            || !identities.insert(execution.terminal.attempt_id.clone())
+            || !identities.insert(execution.terminal.attempt_id)
         {
             return Err(CiError::Message(
                 "restart did not independently grant, execute and retire both attempts".into(),
@@ -918,6 +934,10 @@ fn wait_ready(path: &Path, until: std::time::Instant) -> Result<()> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "native lifetime cases bind installed paths, identity, contract and grant disposition independently"
+)]
 fn grant_lifetime(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -1304,6 +1324,10 @@ fn reject_launch(
     reject_launch_state(payload, cwd, output, group, name, caller, contract, false)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rejection cases retain caller inputs and expected reservation ownership independently"
+)]
 fn reject_launch_state(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -1327,6 +1351,10 @@ fn reject_launch_state(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rejection cases retain exact hostile environment and independently expected native reservation state"
+)]
 fn reject_launch_environment(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -1545,6 +1573,10 @@ fn strict_request_cases(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "advisory cases bind actual installed contract and independent positive or rejection expectation"
+)]
 fn advisory_case(
     payload: &MaterializedPayload,
     cwd: &Path,
@@ -2605,12 +2637,12 @@ fn compile_native_cases(root: &Path, output: &Path) -> Result<std::path::PathBuf
     }
     let mut executables = Vec::new();
     for message in Message::parse_stream(compiled.stdout.as_slice()) {
-        if let Message::CompilerArtifact(artifact) = message.map_err(CiError::Io)? {
-            if artifact.target.name == "sealed_agent" && artifact.profile.test {
-                if let Some(executable) = artifact.executable {
-                    executables.push(executable.into_std_path_buf());
-                }
-            }
+        if let Message::CompilerArtifact(artifact) = message.map_err(CiError::Io)?
+            && artifact.target.name == "sealed_agent"
+            && artifact.profile.test
+            && let Some(executable) = artifact.executable
+        {
+            executables.push(executable.into_std_path_buf());
         }
     }
     if executables.len() != 1 {

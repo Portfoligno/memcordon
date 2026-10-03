@@ -15,7 +15,7 @@ fn exact_listener_anchor_retains_port_and_does_not_substitute_prelaunch_denial()
         bytes
     };
     validate_tcp_anchor(&encode(&[ready.clone(), completed.clone()]), false).unwrap();
-    assert!(validate_tcp_anchor(&encode(&[completed.clone()]), false).is_err());
+    assert!(validate_tcp_anchor(&encode(std::slice::from_ref(&completed)), false).is_err());
     let mut changed = completed.clone();
     changed["bound_port"] = 40001.into();
     assert!(validate_tcp_anchor(&encode(&[ready.clone(), changed]), false).is_err());

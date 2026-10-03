@@ -10,13 +10,13 @@ fuzz_target!(|data: &[u8]| {
     {
         return;
     }
-    let Ok(receipt) = serde_json::from_slice::<AttemptPolicyEnforcementV1>(data) else {
+    let Ok(receipt) = serde_json::from_slice::<RuntimePolicyEnforcement>(data) else {
         return;
     };
     if !receipt.terminal_success() {
         return;
     }
-    let AttemptPolicyEnforcementV1::Authorized {
+    let RuntimePolicyEnforcement::Authorized {
         admission,
         before_authorization,
         ..
@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     // Every terminal fact remains required; successful admission never supplies it.
     for (preserved, closed) in [(false, false), (false, true), (true, false)] {
         assert!(
-            AttemptPolicyEnforcementV1::retired(
+            RuntimePolicyEnforcement::retired(
                 admission.as_ref().clone(),
                 before_authorization.clone(),
                 preserved,
@@ -42,16 +42,16 @@ fuzz_target!(|data: &[u8]| {
     restarted.admission_nonce = Nonce128(nonce);
     assert!(!before_authorization.matches_binding(&restarted));
     assert!(
-        AttemptPolicyEnforcementV1::retired(*restarted, before_authorization, true, true).is_err()
+        RuntimePolicyEnforcement::retired(*restarted, before_authorization, true, true).is_err()
     );
-    let uncertain = AttemptPolicyEnforcementV1::AuthorizationUncertain {
+    let uncertain = RuntimePolicyEnforcement::AuthorizationUncertain {
         request: Some(admission.plan.request),
         failure: AdmissionAvailabilityFailure::TransportLost,
     };
     assert!(!uncertain.terminal_success());
     assert!(matches!(
         uncertain.resolution(),
-        Some(WorkloadResolutionReportV1::Unavailable {
+        Some(RuntimeWorkloadResolution::Unavailable {
             authorization: AuthorizationKnowledge::Unknown,
             ..
         })

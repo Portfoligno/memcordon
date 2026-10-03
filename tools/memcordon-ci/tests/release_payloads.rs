@@ -132,8 +132,10 @@ fn target_archives_reject_traversal_truncation_and_wrong_architecture() {
     let truncated = &archive[..archive.len() / 2];
     assert!(target::decode_archive(truncated, "x86_64-unknown-linux-gnu").is_err());
 }
+type TransportCall = (String, Vec<(String, String)>, Instant);
+
 struct RedirectFixture {
-    calls: Mutex<Vec<(String, Vec<(String, String)>, Instant)>>,
+    calls: Mutex<Vec<TransportCall>>,
 }
 impl Transport for RedirectFixture {
     fn request(

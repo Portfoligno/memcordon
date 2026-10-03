@@ -3,6 +3,36 @@ use std::collections::BTreeSet;
 use memcordon_ci::fuzz_targets::{FuzzShard, targets};
 
 #[test]
+fn retained_probe_and_distribution_seeds_reach_valid_models_and_reject_substitution() {
+    let probe_bytes = include_bytes!("../../../fuzz/corpus/windows-provider-probe/observed.json");
+    memcordon_core::canonical_json::reject_duplicate_json_keys(probe_bytes).unwrap();
+    let probe: memcordon_core::WindowsProviderProbeV1 =
+        serde_json::from_slice(probe_bytes).unwrap();
+    probe.validate().unwrap();
+    let mut foreign = probe.clone();
+    foreign.format = "memcordon.retired-qualification".into();
+    assert!(foreign.validate().is_err());
+    let mut unauthenticated = probe;
+    unauthenticated.launcher_authenticated = false;
+    assert!(unauthenticated.validate().is_err());
+
+    let distribution_bytes =
+        include_bytes!("../../../fuzz/corpus/target-distribution/cli-only.json");
+    memcordon_core::canonical_json::reject_duplicate_json_keys(distribution_bytes).unwrap();
+    let mut distribution: memcordon_ci::release::distribution::TargetDistribution =
+        serde_json::from_slice(distribution_bytes).unwrap();
+    distribution.validate().unwrap();
+    distribution.units.push("unexpected.service".into());
+    assert!(distribution.validate().is_err());
+    assert!(
+        memcordon_core::canonical_json::reject_duplicate_json_keys(
+            br#"{"revision":1,"revision":1}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn shards_cover_current_and_future_manifest_targets_exactly_once() {
     let manifest = include_str!("../../../fuzz/Cargo.toml");
     for manifest in [

@@ -189,17 +189,16 @@ fn bare_inspection_does_not_infer_package_custody_from_a_hard_linked_build() {
         .args(["package", "inspect", "--json"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap().trim(),
-        "package source is not an exact regular artifact"
-    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let with_manifest: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(with_manifest, inspection);
+    assert!(with_manifest.get("installed_artifacts_valid").is_none());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn package_inspection_preserves_source_mode_and_manifest_nofollow_checks() {
+fn bare_inspection_does_not_claim_source_custody_from_modes_or_sibling_links() {
     let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -220,26 +219,18 @@ fn package_inspection_preserves_source_mode_and_manifest_nofollow_checks() {
             .args(["package", "inspect", "--json"])
             .output()
             .unwrap();
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        let diagnostic = String::from_utf8(output.stderr).unwrap();
-        if unsafe_executable_mode {
-            assert_eq!(
-                diagnostic.trim(),
-                "package source is not an exact regular artifact"
-            );
-        } else {
-            assert!(
-                diagnostic.starts_with("package source open "),
-                "{diagnostic}"
-            );
-        }
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let inspection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
+        assert_eq!(inspection["compiled_metadata_valid"], true);
+        assert!(inspection.get("installed_artifacts_valid").is_none());
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn package_inspection_never_falls_back_from_a_present_invalid_manifest() {
+fn bare_inspection_does_not_consume_a_sibling_invalid_manifest() {
     let _lifecycle = EXECUTABLE_LIFECYCLE.lock().unwrap();
     use std::os::unix::fs::PermissionsExt;
 
@@ -254,13 +245,10 @@ fn package_inspection_never_falls_back_from_a_present_invalid_manifest() {
         .args(["package", "inspect", "--json"])
         .output()
         .unwrap();
-    assert!(
-        !output.status.success(),
-        "invalid package manifest was ignored"
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "invalid package emitted inspection authority"
-    );
-    assert!(!output.stderr.is_empty());
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let inspection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inspection["format"], "memcordon.agent-package-inspection");
+    assert_eq!(inspection["compiled_metadata_valid"], true);
+    assert!(inspection.get("installed_artifacts_valid").is_none());
 }

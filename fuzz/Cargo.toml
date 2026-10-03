@@ -195,8 +195,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "service-unit-policy"
-path = "fuzz_targets/service_unit_policy.rs"
+name = "target-distribution"
+path = "fuzz_targets/target_distribution.rs"
 test = false
 doc = false
 bench = false
@@ -307,8 +307,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "windows-qualification"
-path = "fuzz_targets/windows_qualification.rs"
+name = "windows-provider-probe"
+path = "fuzz_targets/windows_provider_probe.rs"
 test = false
 doc = false
 bench = false

@@ -246,14 +246,13 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 if !ids.insert(id(value)?) {
                     return Err(CiError::Message("duplicate release object ID".into()));
                 }
-                if field(value, "tag_name")? == tag {
-                    if value.get("draft").and_then(Value::as_bool).is_none()
-                        || selected.replace(value.clone()).is_some()
-                    {
-                        return Err(CiError::Message(
-                            "duplicate release tag or unknown state".into(),
-                        ));
-                    }
+                if field(value, "tag_name")? == tag
+                    && (value.get("draft").and_then(Value::as_bool).is_none()
+                        || selected.replace(value.clone()).is_some())
+                {
+                    return Err(CiError::Message(
+                        "duplicate release tag or unknown state".into(),
+                    ));
                 }
             }
             if values.len() < 100
@@ -333,16 +332,16 @@ impl<'a, T: Transport> Publisher<'a, T> {
                     detail: "asset name/size/state differs".into(),
                 });
             }
-            if let Some(digest) = asset.get("digest").and_then(Value::as_str) {
-                if let Some(digest) = digest.strip_prefix("sha256:") {
-                    return Ok(if digest == record.sha256 {
-                        RemoteState::Matching
-                    } else {
-                        RemoteState::Conflicting {
-                            detail: "asset digest differs".into(),
-                        }
-                    });
-                }
+            if let Some(digest) = asset.get("digest").and_then(Value::as_str)
+                && let Some(digest) = digest.strip_prefix("sha256:")
+            {
+                return Ok(if digest == record.sha256 {
+                    RemoteState::Matching
+                } else {
+                    RemoteState::Conflicting {
+                        detail: "asset digest differs".into(),
+                    }
+                });
             }
             let url = self.api(&["releases", "assets", &id(asset)?.to_string()])?;
             let headers = if public {
@@ -410,10 +409,10 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 if field(&value, "name")? != package {
                     return Err(CiError::Message("registry index package differs".into()));
                 }
-                if field(&value, "vers")? == self.bundle.metadata.source.version.to_string() {
-                    if row.replace(value).is_some() {
-                        return Err(CiError::Message("duplicate registry version row".into()));
-                    }
+                if field(&value, "vers")? == self.bundle.metadata.source.version.to_string()
+                    && row.replace(value).is_some()
+                {
+                    return Err(CiError::Message("duplicate registry version row".into()));
                 }
             }
             let Some(row) = row else {
@@ -526,7 +525,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 let _reply =
                     self.write("POST", &self.api(&["releases"])?, &body, "application/json");
                 let Some(release) = self.release()? else {
-                    return Ok(self.inspect()?);
+                    return self.inspect();
                 };
                 release
             }

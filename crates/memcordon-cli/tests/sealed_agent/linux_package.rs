@@ -338,6 +338,19 @@ fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
     assert_eq!(snapshot.agent_bytes, agent);
     assert_eq!(snapshot.manifest_bytes, bytes);
     assert_eq!(snapshot.arm32_helper_bytes.as_deref(), helper_bytes());
+    for path in [&source, &public_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            crate::package::linux_source_snapshot(&source).is_err(),
+            "unsafe source mode was accepted: {path:?}"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = path.with_extension("linked");
+        std::fs::hard_link(path, &link).unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_err());
+        std::fs::remove_file(link).unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_ok());
+    }
     for (path, original) in [
         (&source, agent.as_slice()),
         (&public_path, public.as_slice()),
@@ -355,6 +368,12 @@ fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
         assert!(crate::package::linux_source_snapshot(&source).is_err());
         write_helper(directory.path());
     }
+    for invalid_manifest in [b"{}\n".as_slice(), b"not JSON\n".as_slice()] {
+        std::fs::write(&manifest_path, invalid_manifest).unwrap();
+        assert!(crate::package::linux_source_snapshot(&source).is_err());
+    }
+    std::fs::write(&manifest_path, &bytes).unwrap();
+    assert!(crate::package::linux_source_snapshot(&source).is_ok());
     std::fs::remove_file(&manifest_path).unwrap();
     std::os::unix::fs::symlink("missing-manifest", &manifest_path).unwrap();
     assert!(crate::package::linux_source_snapshot(&source).is_err());

@@ -980,11 +980,11 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
     let mut compiled_saves = 0;
     for (ordinal, value) in steps.iter().enumerate() {
         let step = mapping(value, "deep shard step")?;
-        if let Some(run) = scalar(step, "run") {
-            if run.split_whitespace().any(|part| part == "suite") {
-                ordinary_driver_before_suite(steps, ordinal)?;
-                invocations.push((run, scalar(step, "if")));
-            }
+        if let Some(run) = scalar(step, "run")
+            && run.split_whitespace().any(|part| part == "suite")
+        {
+            ordinary_driver_before_suite(steps, ordinal)?;
+            invocations.push((run, scalar(step, "if")));
         }
         if let Some(uses) = scalar(step, "uses") {
             if uses.starts_with("actions/cache/") {
@@ -1606,13 +1606,12 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
         if scalar(step, "run").is_some_and(|value| value.ends_with("suite macos-deadline")) {
             execution = true;
         }
-        if let Some(with) = step.get(key("with")).and_then(Value::as_mapping) {
-            if scalar(step, "uses") == Some(UPLOAD_ARTIFACT_ACTION)
-                && scalar(with, "path") == Some("target/ci/deadline-evidence")
-                && scalar(step, "if") == Some("always()")
-            {
-                failure_artifact = true;
-            }
+        if let Some(with) = step.get(key("with")).and_then(Value::as_mapping)
+            && scalar(step, "uses") == Some(UPLOAD_ARTIFACT_ACTION)
+            && scalar(with, "path") == Some("target/ci/deadline-evidence")
+            && scalar(step, "if") == Some("always()")
+        {
+            failure_artifact = true;
         }
     }
     if !execution || !failure_artifact {
@@ -1913,14 +1912,13 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 ));
             }
         }
-        if let Some(uses) = step.get(key("uses")).and_then(Value::as_str) {
-            if !uses.starts_with("actions/download-artifact@")
-                && !uses.starts_with("rust-lang/crates-io-auth-action@")
-            {
-                return Err(failure(
-                    "publisher cannot checkout/restore cache or run another action",
-                ));
-            }
+        if let Some(uses) = step.get(key("uses")).and_then(Value::as_str)
+            && !uses.starts_with("actions/download-artifact@")
+            && !uses.starts_with("rust-lang/crates-io-auth-action@")
+        {
+            return Err(failure(
+                "publisher cannot checkout/restore cache or run another action",
+            ));
         }
     }
     if writes != 1 {
@@ -2525,7 +2523,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
             && !native_path_fixture
-            && !reviewed_git_environment(&relative)
+            && !reviewed_git_environment(relative)
         {
             visitor
                 .violations
@@ -2544,7 +2542,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         }
         if relative.starts_with(Path::new("crates/memcordon-platform/src"))
             && (visitor.names_proc_self_exe
-                || (visitor.calls_current_exe && !reviewed_macos_writer_image(&relative)))
+                || (visitor.calls_current_exe && !reviewed_macos_writer_image(relative)))
         {
             visitor
                 .violations

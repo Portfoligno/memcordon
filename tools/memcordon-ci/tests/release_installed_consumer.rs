@@ -1,7 +1,7 @@
 use memcordon_ci::release::{
     artifacts,
     distribution::TargetDistribution,
-    installed_consumer::{binary_path, measured_manifest},
+    installed_consumer::{binary_path, create_fresh_destination, measured_manifest},
     source::{BuildSourceIdentity, SelectedSource},
 };
 use memcordon_core::runtime_manifest::SealedRuntime;
@@ -25,6 +25,18 @@ fn source() -> BuildSourceIdentity {
             version: "1.2.3".parse().unwrap(),
         },
     }
+}
+
+#[test]
+fn fresh_consumer_destination_provisions_missing_parent_but_preserves_existing_evidence() {
+    let root = directory();
+    let destination = root.path().join("windows-installed/cargo");
+    create_fresh_destination(&destination).unwrap();
+    let evidence = destination.join("failure.json");
+    std::fs::write(&evidence, b"original diagnostics").unwrap();
+    assert!(create_fresh_destination(&destination).is_err());
+    assert_eq!(std::fs::read(&evidence).unwrap(), b"original diagnostics");
+    create_fresh_destination(&root.path().join("windows-installed/native")).unwrap();
 }
 
 // Architecture-header fixtures test inventory and byte correlation only. They

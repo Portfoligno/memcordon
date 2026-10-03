@@ -113,25 +113,20 @@ impl CommandSpec {
     }
 
     pub fn materialize(&self) -> Result<Command> {
-        let mut command = match &self.toolchain {
-            invocation => {
-                let mut command = Command::new(&self.program);
-                match invocation {
-                    Some(ToolchainInvocation::Cargo { toolchain }) => {
-                        command.args(["run", toolchain, "cargo"]);
-                    }
-                    Some(ToolchainInvocation::Program {
-                        toolchain,
-                        executable,
-                    }) => {
-                        command.args(["run", toolchain]).arg(executable);
-                    }
-                    None => {}
-                }
-                command.args(&self.arguments).current_dir(&self.current_dir);
-                command
+        let mut command = Command::new(&self.program);
+        match &self.toolchain {
+            Some(ToolchainInvocation::Cargo { toolchain }) => {
+                command.args(["run", toolchain, "cargo"]);
             }
-        };
+            Some(ToolchainInvocation::Program {
+                toolchain,
+                executable,
+            }) => {
+                command.args(["run", toolchain]).arg(executable);
+            }
+            None => {}
+        }
+        command.args(&self.arguments).current_dir(&self.current_dir);
         self.apply_environment(&mut command);
         Ok(command)
     }

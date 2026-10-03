@@ -33,6 +33,10 @@ pub struct InstalledWindowsPayload {
 impl InstalledWindowsPayload {
     /// Bind the installed case inputs to the measured channel payload, independently
     /// of any report produced by the workload. This is inventory, not permission.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "materialization joins independently selected source, channel, binary graph and installation paths"
+    )]
     pub fn from_materialized(
         channel: InstalledChannel,
         source: &crate::release::source::BuildSourceIdentity,

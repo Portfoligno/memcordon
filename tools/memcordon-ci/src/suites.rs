@@ -251,9 +251,32 @@ fn miri(
             OsString::from("--locked"),
         ];
         arguments.extend(target.arguments().into_iter().map(OsString::from));
-        // Each original harness remains intact, including its inter-test races.
-        // The normal 900-second command deadline applies independently to it.
-        cargo(root, nightly, "miri", arguments)?;
+        if target == memcordon_ci::miri_targets::MiriTarget::Integration("report".into()) {
+            let mut list = arguments.clone();
+            list.extend(["--", "--list", "--format", "terse"].map(OsString::from));
+            let all = cargo(root, nightly, "miri", &list)?;
+            list.push(OsString::from("--ignored"));
+            let ignored = cargo(root, nightly, "miri", &list)?;
+            let batches = memcordon_ci::miri_targets::report_batches(&all, &ignored)?;
+            write_plan(
+                root,
+                "miri",
+                "report-batches.json",
+                &serde_json::json!({
+                    "planner_version": 1, "target": "report", "command_deadline_seconds": CARGO_DEADLINE.as_secs(), "batches": batches
+                }),
+            )?;
+            for batch in batches {
+                let mut command = arguments.clone();
+                command.push(OsString::from("--"));
+                command.extend(batch.arguments().into_iter().map(OsString::from));
+                cargo(root, nightly, "miri", command)?;
+            }
+        } else {
+            // Concurrency-sensitive harnesses remain intact, including their
+            // inter-test races. The original 900s command deadline applies.
+            cargo(root, nightly, "miri", arguments)?;
+        }
     }
     Ok(())
 }

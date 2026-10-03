@@ -42,9 +42,11 @@ fn json_response(value: Value) -> Response {
     response(200, serde_json::to_vec(&value).unwrap())
 }
 
+type TransportCall = (String, Vec<(String, String)>, Instant, u64);
+
 struct Script {
     responses: Mutex<std::collections::VecDeque<Response>>,
-    calls: Mutex<Vec<(String, Vec<(String, String)>, Instant, u64)>>,
+    calls: Mutex<Vec<TransportCall>>,
 }
 impl Script {
     fn new(responses: Vec<Response>) -> Self {
@@ -500,7 +502,6 @@ fn prepared_zip() -> Vec<u8> {
         None,
         serde_json::to_vec(&compatibility).unwrap(),
     );
-    drop(append);
     let public = PublicManifest {
         schema: 1,
         version: selected.version.clone(),

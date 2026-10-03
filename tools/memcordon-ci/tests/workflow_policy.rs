@@ -82,7 +82,8 @@ fn macos_deadline_rejects_missing_failure_evidence() {
         &repository_policy,
     )
     .expect("complete independent deadline lane");
-    for missing in ["target/ci/deadline-evidence"] {
+    {
+        let missing = "target/ci/deadline-evidence";
         let invalid = fixture.replace(missing, "missing-deadline-proof");
         assert!(
             policy::validate_workflow_bytes(

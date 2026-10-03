@@ -402,6 +402,19 @@ pub fn run_materialized_channel(
     Ok(())
 }
 
+/// Provision container directories while reserving a fresh operation leaf.
+/// An existing leaf remains an error; prior diagnostics are never reused.
+pub fn create_fresh_destination(destination: &Path) -> Result<()> {
+    if let Some(parent) = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(destination)?;
+    Ok(())
+}
+
 pub fn run(
     root: &Path,
     target_directory: &Path,
@@ -420,7 +433,7 @@ pub fn run_with_external(
     destination: &Path,
     external_input: Option<&Path>,
 ) -> Result<()> {
-    fs::create_dir(destination)?;
+    create_fresh_destination(destination)?;
     run_channel_with_external(
         root,
         target_directory,
@@ -473,7 +486,7 @@ pub fn run_channel_with_external(
             "installed consumer requires the actual selected native host".into(),
         ));
     }
-    fs::create_dir(destination)?;
+    create_fresh_destination(destination)?;
     let payload = match channel {
         InstalledChannel::NativeBundle => materialize_native(target_directory, destination)?,
         InstalledChannel::CargoPackage => {
