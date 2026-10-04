@@ -6,22 +6,22 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Added
 
-- Linux policy administrators can apply and inspect named local-policy activation
-  documents with exact grant, epoch and execution-identity references.
-- `--workload-contract` recognizes schema-2 Linux contracts. `plan` and `doctor`
-  report availability for the requested profile and execution identity. Registry
-  entries and successful parsing do not authorize a command to start. The optional
-  private TCP provider supports attempt-owned IPv4 loopback namespaces with either
-  preserved caller identity or an explicit administrator-defined target identity.
-- Named `result-v1`, `plan-v1` and `capabilities-v1` output formats retain actual
-  runtime, native termination and cleanup observations. Planning and capabilities
-  are explicitly advisory.
+- `--workload-contract` accepts schema-2 Linux contracts. The optional
+  `private-tcp` provider gives each attempt a private IPv4 loopback network and
+  runs commands as the caller or an administrator-defined target identity on GNU
+  Linux x64 and ARM64.
+- Linux administrators can install approved executables for target identities
+  with `memcordon-sealed-agent package policy entrypoint install`.
+- `--report-format result-v1` includes workload-contract details, command
+  termination and cleanup results. `plan --plan-format plan-v1` and
+  `doctor --capability-format capabilities-v1` report availability and conflicts
+  for the requested profile and identity; these checks remain advisory.
 
 ### Fixed
 
-- Linux sealed-provider installation and upgrades no longer reject the newly
-  installed package during service startup because its transaction is still
-  marked unfinished. Failed activation retains validated rollback support.
+- Linux sealed-provider installation and upgrades no longer fail service startup
+  by rejecting the package being installed. Failed activation can roll back to
+  the previous validated installation.
 - Linux workload discovery and planning allow up to 60 seconds for fresh
   provider verification, avoiding false connection timeouts when checking the
   installed binary takes longer than five seconds.
@@ -30,19 +30,22 @@ All notable user-visible changes to MemCordon are documented here.
   Windows error code.
 - Workload contracts reject non-loopback addresses declared as host-shared
   loopback peers and ambiguous IPv4-mapped IPv6 exact peers.
-- Source builds generate identical embedded policy bytes from LF and CRLF
-  checkouts, preserving the reviewed policy digest and strict validation.
+- Source builds from CRLF checkouts no longer fail embedded-policy validation
+  solely because of line endings.
 
 ### Compatibility
 
-- Default Cargo installations and default native archives contain only the public
-  CLI. Linux and Windows provider companions require explicit platform features.
-- New local admission and private execution facts require the named output
-  formats; incompatible numeric-format selections reject before native allocation.
-  Supported historical execution, plan and doctor schemas remain readable.
-- Old qualification-bearing policy activation records are rejected. Administrators
-  must explicitly apply the new local-policy envelopes; saved self-test output or
-  release certificates cannot authorize installed workloads.
+- Default Cargo installations and native archives include only the public CLI
+  executable. To build provider companions, select `--features sealed-runtime`
+  on Linux, `--features private-tcp` for Linux private TCP, or
+  `--features windows-sealed-runtime` on Windows, then install the provider.
+- Workload-contract V2 requires the named output formats above. Incompatible
+  numeric-format selections fail before a command starts. Supported historical
+  execution, plan and doctor schemas remain readable.
+- Linux administrators must migrate old numeric policy activation documents to
+  the named local-policy formats and apply them with
+  `memcordon-sealed-agent package policy apply --file activation.json`.
+  Old documents are rejected.
 
 ## [0.5.6-rc.33] - 2026-09-24
 
