@@ -350,8 +350,17 @@ fn large_poll_interval_cannot_postpone_a_short_deadline() {
         .args(["hold", "--duration", "30s"]);
     let started = Instant::now();
     let output = run_with_deadline(&mut command, Duration::from_secs(3)).unwrap();
-    assert_eq!(output.status.code(), Some(123));
-    assert!(started.elapsed() < Duration::from_secs(2));
+    let elapsed = started.elapsed();
+    let diagnostic = format!(
+        "status={:?}; elapsed={elapsed:?}; stdout({} bytes)={:?}; stderr({} bytes)={:?}",
+        output.status,
+        output.stdout.len(),
+        String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(16 * 1024)]),
+        output.stderr.len(),
+        String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(16 * 1024)]),
+    );
+    assert_eq!(output.status.code(), Some(123), "{diagnostic}");
+    assert!(elapsed < Duration::from_secs(2), "{diagnostic}");
 }
 
 #[test]
@@ -495,9 +504,31 @@ fn requested_deadline_expires_during_unacknowledged_startup() {
 }
 
 #[test]
+fn stalled_inspector_startup_error_retains_native_cause_and_phase() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let missing_image = directory.path().join("missing-inspector-image");
+    let native_error = std::fs::metadata(&missing_image).unwrap_err();
+    assert_eq!(native_error.raw_os_error(), Some(libc::ENOENT));
+    let error =
+        memcordon_platform::test_support::macos_inspector_stall(&missing_image).unwrap_err();
+    assert!(
+        error.starts_with("stalled inspector normal lane startup: "),
+        "{error}"
+    );
+    assert!(error.contains(&native_error.to_string()), "{error}");
+}
+
+#[test]
 fn stalled_inspector_is_bounded_and_guardian_retirement_progresses() {
     let _runtime = native_runtime();
     memcordon_platform::test_support::macos_inspector_stall(image()).unwrap();
+}
+
+#[test]
+fn inspector_natural_exit_cancellation_preserves_actual_owned_reap() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_inspector_cancel_after_exit(image()).unwrap();
 }
 
 fn read_identity(path: &Path) -> memcordon_platform::test_support::ProcessIdentity {

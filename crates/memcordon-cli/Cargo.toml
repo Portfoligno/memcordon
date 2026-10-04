@@ -13,6 +13,9 @@ publish = ["crates-io"]
 autobins = false
 
 [features]
+sealed-runtime = []
+private-tcp = ["sealed-runtime"]
+windows-sealed-runtime = ["sealed-runtime"]
 test-fixtures = ["memcordon-platform/test-support", "memcordon-core/test-support"]
 test-support = ["memcordon-platform/test-support", "test-fixtures"]
 
@@ -23,16 +26,19 @@ path = "src/main.rs"
 [[bin]]
 name = "memcordon-sealed-agent"
 path = "src/bin/memcordon-sealed-agent/main.rs"
+required-features = ["sealed-runtime"]
 doc = false
 
 [[bin]]
 name = "memcordon-target-desktop-bootstrap"
 path = "src/bin/memcordon-target-desktop-bootstrap.rs"
+required-features = ["windows-sealed-runtime"]
 doc = false
 
 [[bin]]
 name = "memcordon-session-broker"
 path = "src/bin/memcordon-session-broker.rs"
+required-features = ["windows-sealed-runtime"]
 doc = false
 
 [[bin]]
@@ -62,6 +68,11 @@ memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", ver
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+flate2.workspace = true
+tar.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -94,10 +105,10 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 memcordon-testkit = { path = "../memcordon-testkit" }
-tempfile.workspace = true
 toml.workspace = true
 
 [build-dependencies]
+serde.workspace = true
 serde_json.workspace = true
 static_vcruntime.workspace = true
 

@@ -1,10 +1,10 @@
 //! Provider-owned atomic policy activation and launch serialization.
-#[cfg(target_os = "linux")]
 use memcordon_core::BoundedVec;
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_contract::Nonce128;
-use memcordon_core::workload_contract::{ContractVersionOne, PolicyEpoch};
-use memcordon_core::workload_registry::PolicyRegistryV1;
+use memcordon_core::workload_contract::PolicyEpoch;
+use memcordon_core::workload_registry::RuntimePolicyRegistry;
+use memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
@@ -14,8 +14,9 @@ use std::{io::Write, num::NonZeroU64};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Activation {
-    pub schema_version: ContractVersionOne,
-    pub registry: PolicyRegistryV1,
+    pub format: String,
+    pub revision: u32,
+    pub registry: RuntimePolicyRegistry,
     pub registry_digest: DiagnosticSha256,
     pub epoch: PolicyEpoch,
     pub revoked_admissions: memcordon_core::diagnostics::BoundedVec<Nonce128, 256>,
@@ -52,7 +53,7 @@ impl Activation {
         disposition: memcordon_core::workload_registry::GrantChangeDisposition,
         live: &[(
             String,
-            memcordon_core::workload_registry::ProviderAdmissionSnapshotV1,
+            memcordon_core::workload_registry::RuntimeAdmissionSnapshot,
         )],
     ) -> Result<memcordon_core::diagnostics::BoundedVec<Nonce128, 256>, String> {
         let mut revoked = memcordon_core::diagnostics::BoundedVec::default();
@@ -73,6 +74,9 @@ impl Activation {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.format != "memcordon.local-activation" || self.revision != 1 {
+            return Err("local activation format differs".into());
+        }
         if self.registry.canonical_digest()? != self.registry_digest {
             return Err("policy activation digest differs".into());
         }
@@ -80,7 +84,173 @@ impl Activation {
     }
 }
 
-pub fn read_configuration(path: &Path) -> Result<PolicyRegistryV1, String> {
+/// Linux V2 authority is stored as its own exact activation shape. Existing
+/// V1 callers receive only its explicit preserve-caller baseline projection;
+/// private/delegated grants cannot be laundered into V1 authorization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationV2 {
+    pub format: String,
+    pub revision: u32,
+    pub registry: RuntimePrivatePolicyRegistry,
+    pub registry_digest: DiagnosticSha256,
+    pub epoch: PolicyEpoch,
+    pub revoked_admissions: BoundedVec<Nonce128, 256>,
+}
+
+#[derive(Clone)]
+pub(crate) enum VersionedLiveBinding {
+    V1(Box<memcordon_core::workload_registry::RuntimeAdmissionSnapshot>),
+    Private(Box<memcordon_core::workload_admission_v2::RuntimePrivateAdmissionSnapshot>),
+}
+
+impl VersionedLiveBinding {
+    fn registry_digest(&self) -> &DiagnosticSha256 {
+        match self {
+            Self::V1(value) => &value.registry_digest,
+            Self::Private(value) => &value.registry_digest,
+        }
+    }
+
+    fn admission_nonce(&self) -> Nonce128 {
+        match self {
+            Self::V1(value) => value.admission_nonce,
+            Self::Private(value) => value.admission_nonce,
+        }
+    }
+}
+
+pub(crate) fn next_revocations_versioned(
+    previous: Option<&Activation>,
+    disposition: memcordon_core::workload_registry::GrantChangeDisposition,
+    live: &[(String, VersionedLiveBinding)],
+) -> Result<BoundedVec<Nonce128, 256>, String> {
+    let mut revoked = BoundedVec::default();
+    for (_, binding) in live {
+        let nonce = binding.admission_nonce();
+        if (disposition == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive
+            || previous.is_some_and(|value| value.revoked_admissions.as_slice().contains(&nonce)))
+            && !revoked.as_slice().contains(&nonce)
+        {
+            revoked
+                .try_push(nonce)
+                .map_err(|_| "revocation reference bound exceeded")?;
+        }
+    }
+    Ok(revoked)
+}
+
+impl ActivationV2 {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.format != "memcordon.local-private-activation" || self.revision != 1 {
+            return Err("local private activation format differs".into());
+        }
+        if self.registry.canonical_digest()? != self.registry_digest {
+            return Err("V2 policy activation digest differs".into());
+        }
+        for (index, nonce) in self.revoked_admissions.as_slice().iter().enumerate() {
+            if self.revoked_admissions.as_slice()[..index].contains(nonce) {
+                return Err("duplicate V2 revoked admission".into());
+            }
+        }
+        self.registry.baseline_v1_projection()?;
+        Ok(())
+    }
+
+    pub(crate) fn baseline_projection(&self) -> Result<Activation, String> {
+        let registry = self.registry.baseline_v1_projection()?;
+        Ok(Activation {
+            format: "memcordon.local-activation".into(),
+            revision: 1,
+            registry_digest: registry.canonical_digest()?,
+            registry,
+            epoch: self.epoch.clone(),
+            revoked_admissions: self.revoked_admissions.clone(),
+        })
+    }
+}
+
+pub enum VersionedActivation {
+    V1(Activation),
+    V2(ActivationV2),
+}
+
+impl VersionedActivation {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len()
+            > memcordon_core::workload_limits::REGISTRY_BYTES
+                + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+        {
+            return Err("policy activation exceeds bound".into());
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
+        let version = document_kind(
+            bytes,
+            "memcordon.local-activation",
+            "memcordon.local-private-activation",
+        )?;
+        match version {
+            1 => {
+                let value: Activation =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                value.validate()?;
+                Ok(Self::V1(value))
+            }
+            2 => {
+                let value: ActivationV2 =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                value.validate()?;
+                Ok(Self::V2(value))
+            }
+            _ => Err("unsupported policy activation schema version".into()),
+        }
+    }
+}
+
+pub(crate) enum RegistryConfiguration {
+    V1(RuntimePolicyRegistry),
+    V2(RuntimePrivatePolicyRegistry),
+}
+
+impl RegistryConfiguration {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
+        match document_kind(
+            bytes,
+            "memcordon.local-policy",
+            "memcordon.local-private-policy",
+        )? {
+            1 => RuntimePolicyRegistry::parse(bytes).map(Self::V1),
+            2 => RuntimePrivatePolicyRegistry::parse(bytes).map(Self::V2),
+            _ => Err("unsupported policy registry schema version".into()),
+        }
+    }
+}
+
+fn document_kind(bytes: &[u8], baseline: &str, private: &str) -> Result<u64, String> {
+    if bytes.len()
+        > memcordon_core::workload_limits::REGISTRY_BYTES
+            + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+    {
+        return Err("local policy document exceeds bound".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if value.get("revision").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported local policy revision".into());
+    }
+    match value.get("format").and_then(serde_json::Value::as_str) {
+        Some(format) if format == baseline => Ok(1),
+        Some(format) if format == private => Ok(2),
+        _ => Err("unsupported local policy format".into()),
+    }
+}
+
+pub fn read_configuration(path: &Path) -> Result<RuntimePolicyRegistry, String> {
+    RuntimePolicyRegistry::parse(&read_configuration_bytes(path)?)
+}
+
+fn read_configuration_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     if !file
         .metadata()
@@ -93,17 +263,29 @@ pub fn read_configuration(path: &Path) -> Result<PolicyRegistryV1, String> {
     file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    PolicyRegistryV1::parse(&bytes)
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn read_configuration_any(path: &Path) -> Result<RegistryConfiguration, String> {
+    let bytes = read_configuration_bytes(path)?;
+    RegistryConfiguration::parse(&bytes)
 }
 
 #[cfg(target_os = "linux")]
 pub fn inspect() -> Result<(), String> {
     let lease = native::Lease::acquire()?;
-    let activation = lease.read()?;
-    println!(
-        "{}",
-        serde_json::to_string(&activation).map_err(|error| error.to_string())?
-    );
+    match lease.read_any()? {
+        None => println!("null"),
+        Some(VersionedActivation::V1(activation)) => println!(
+            "{}",
+            serde_json::to_string(&activation).map_err(|error| error.to_string())?
+        ),
+        Some(VersionedActivation::V2(activation)) => println!(
+            "{}",
+            serde_json::to_string(&activation).map_err(|error| error.to_string())?
+        ),
+    }
     Ok(())
 }
 
@@ -111,18 +293,28 @@ pub fn inspect() -> Result<(), String> {
 pub fn apply(path: &Path) -> Result<(), String> {
     // Exclude package replacement while allowing policy changes during live launches.
     let _package = crate::linux::service::acquire_shared_package_lease()?;
-    let registry = read_configuration(path)?;
+    let registry = read_configuration_any(path)?;
     let lease = native::Lease::acquire()?;
-    let revoke = registry.active_attempt_disposition
-        == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
-    let active = lease.live_bindings()?;
-    let activation = lease.activate(registry, None)?;
+    let revoke = match &registry {
+        RegistryConfiguration::V1(registry) => registry.active_attempt_disposition,
+        RegistryConfiguration::V2(registry) => registry.active_attempt_disposition,
+    } == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
+    let active = lease.versioned_live_bindings()?;
+    let activation = match registry {
+        RegistryConfiguration::V1(registry) => {
+            serde_json::to_value(lease.activate(registry, None)?)
+        }
+        RegistryConfiguration::V2(registry) => {
+            serde_json::to_value(lease.activate_v2(registry, None)?)
+        }
+    }
+    .map_err(|error| error.to_string())?;
     drop(lease);
     if revoke {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let lease = native::Lease::acquire()?;
-            let remaining = lease.live_bindings()?;
+            let remaining = lease.versioned_live_bindings()?;
             if active
                 .iter()
                 .all(|(identity, _)| !remaining.iter().any(|(other, _)| other == identity))
@@ -159,13 +351,39 @@ pub mod native {
         lock: File,
     }
     impl Lease {
-        pub fn retain_snapshot(&self, registry: &PolicyRegistryV1) -> Result<(), String> {
+        pub fn retain_snapshot(&self, registry: &RuntimePolicyRegistry) -> Result<(), String> {
             let digest = registry.canonical_digest()?;
-            self.check_capacity(&digest)?;
+            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
+            self.retain_snapshot_encoded(&digest, &bytes, 1)
+        }
+
+        pub(crate) fn retain_snapshot_v2(
+            &self,
+            registry: &RuntimePrivatePolicyRegistry,
+        ) -> Result<(), String> {
+            let digest = registry.canonical_digest()?;
+            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
+            self.retain_snapshot_encoded(&digest, &bytes, 2)
+        }
+
+        fn retain_snapshot_encoded(
+            &self,
+            digest: &DiagnosticSha256,
+            bytes: &[u8],
+            version: u32,
+        ) -> Result<(), String> {
+            self.check_capacity(digest)?;
             let mut retained = std::collections::BTreeSet::new();
             retained.insert(String::from(digest.clone()));
-            for (_, binding) in self.live_bindings()? {
-                retained.insert(String::from(binding.registry_digest));
+            for (_, binding) in self.versioned_live_bindings()? {
+                retained.insert(String::from(binding.registry_digest().clone()));
+            }
+            if let Some(active) = self.read_any()? {
+                let active_digest = match active {
+                    VersionedActivation::V1(active) => active.registry_digest,
+                    VersionedActivation::V2(active) => active.registry_digest,
+                };
+                retained.insert(String::from(active_digest));
             }
             for entry in
                 std::fs::read_dir("/var/lib/memcordon/policy").map_err(|error| error.to_string())?
@@ -188,11 +406,11 @@ pub mod native {
                     }
                 }
             }
-            let path = std::path::PathBuf::from(String::from(digest)).with_extension("snapshot");
+            let path =
+                std::path::PathBuf::from(String::from(digest.clone())).with_extension("snapshot");
             use std::os::unix::ffi::OsStrExt;
             let name = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|error| error.to_string())?;
-            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
             if bytes.len() > memcordon_core::workload_limits::REGISTRY_BYTES {
                 return Err("encoded registry exceeds limit".into());
             }
@@ -202,7 +420,7 @@ pub mod native {
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             ) {
                 Ok(mut file) => {
-                    file.write_all(&bytes)
+                    file.write_all(bytes)
                         .and_then(|()| file.sync_all())
                         .map_err(|error| error.to_string())?;
                 }
@@ -213,9 +431,12 @@ pub mod native {
                     file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
                         .read_to_end(&mut existing)
                         .map_err(|error| error.to_string())?;
-                    if PolicyRegistryV1::parse(&existing)?.canonical_digest()?
-                        != registry.canonical_digest()?
-                    {
+                    let existing_digest = match version {
+                        1 => RuntimePolicyRegistry::parse(&existing)?.canonical_digest()?,
+                        2 => RuntimePrivatePolicyRegistry::parse(&existing)?.canonical_digest()?,
+                        _ => return Err("unsupported policy snapshot version".into()),
+                    };
+                    if existing_digest != *digest {
                         return Err("immutable policy snapshot differs".into());
                     }
                 }
@@ -253,12 +474,69 @@ pub mod native {
             Ok(references)
         }
 
+        pub(crate) fn versioned_live_bindings(
+            &self,
+        ) -> Result<Vec<(String, VersionedLiveBinding)>, String> {
+            let mut references = Vec::new();
+            for entry in
+                std::fs::read_dir(crate::linux::STATE_ROOT).map_err(|error| error.to_string())?
+            {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let Some(identity) = name
+                    .to_str()
+                    .filter(|value| crate::linux::cgroup::valid_attempt_identity(value))
+                else {
+                    continue;
+                };
+                let record = match crate::linux::recovery::read_record_no_follow(&entry.path()) {
+                    Ok(record) => record,
+                    Err(_) if !entry.path().exists() => continue,
+                    Err(error) => return Err(error),
+                };
+                let binding = if record.starts_with("format=memcordon.private-native-journal\n") {
+                    let record = crate::linux::private_attempt::PrivateAttemptRecordV4::parse(
+                        record.as_bytes(),
+                    )?;
+                    if record.attempt_id.as_str() != identity {
+                        return Err("native journal live reference filename differs".into());
+                    }
+                    // These facts preserve local grant lifetime/revocation only;
+                    // journal parsing cannot reconstruct OperationalAdmission.
+                    record
+                        .admission_metadata
+                        .map(|metadata| VersionedLiveBinding::Private(Box::new(metadata)))
+                } else if record.starts_with("version=4\n") {
+                    return Err(
+                        "retired qualification journal requires administrative recovery".into(),
+                    );
+                } else {
+                    crate::linux::attempt::parse_durable_policy(&record)?
+                        .map(|admission| VersionedLiveBinding::V1(Box::new(admission)))
+                };
+                if let Some(binding) = binding {
+                    if references.len() == memcordon_core::workload_limits::LIVE_BINDINGS {
+                        return Err("policy live reference capacity exceeded".into());
+                    }
+                    references.push((identity.into(), binding));
+                }
+            }
+            Ok(references)
+        }
+
         pub fn check_capacity(&self, candidate: &DiagnosticSha256) -> Result<(), String> {
-            let references = self.live_bindings()?;
+            let references = self.versioned_live_bindings()?;
             let mut snapshots = std::collections::BTreeSet::new();
             snapshots.insert(*candidate.bytes());
             for (_, binding) in references {
-                snapshots.insert(*binding.registry_digest.bytes());
+                snapshots.insert(*binding.registry_digest().bytes());
+            }
+            if let Some(active) = self.read_any()? {
+                let active_digest = match active {
+                    VersionedActivation::V1(active) => active.registry_digest,
+                    VersionedActivation::V2(active) => active.registry_digest,
+                };
+                snapshots.insert(*active_digest.bytes());
             }
             if snapshots.len() > memcordon_core::workload_limits::SNAPSHOTS {
                 return Err("policy snapshot capacity exhausted".into());
@@ -309,6 +587,21 @@ pub mod native {
             Ok(Self { directory, lock })
         }
         pub fn read(&self) -> Result<Option<Activation>, String> {
+            match self.read_any()? {
+                None => Ok(None),
+                Some(VersionedActivation::V1(value)) => Ok(Some(value)),
+                Some(VersionedActivation::V2(value)) => value.baseline_projection().map(Some),
+            }
+        }
+
+        pub fn read_v2(&self) -> Result<Option<ActivationV2>, String> {
+            match self.read_any()? {
+                Some(VersionedActivation::V2(value)) => Ok(Some(value)),
+                _ => Ok(None),
+            }
+        }
+
+        pub fn read_any(&self) -> Result<Option<VersionedActivation>, String> {
             let file = match open_at(&self.directory, c"policy-activation.json", libc::O_RDONLY) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -323,24 +616,21 @@ pub mod native {
             if bytes.len() > limit {
                 return Err("policy activation exceeds bound".into());
             }
-            let value: Activation =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            value.validate()?;
-            Ok(Some(value))
+            VersionedActivation::parse(&bytes).map(Some)
         }
         pub fn activate(
             &self,
-            registry: PolicyRegistryV1,
+            registry: RuntimePolicyRegistry,
             instance: Option<Nonce128>,
         ) -> Result<Activation, String> {
             registry.validate()?;
             self.check_capacity(&registry.canonical_digest()?)?;
             self.retain_snapshot(&registry)?;
             let previous = self.read()?;
-            let revoked_admissions = Activation::next_revocations(
+            let revoked_admissions = next_revocations_versioned(
                 previous.as_ref(),
                 registry.active_attempt_disposition,
-                &self.live_bindings()?,
+                &self.versioned_live_bindings()?,
             )?;
             let epoch = match (instance, previous) {
                 (Some(service_instance), _) => PolicyEpoch {
@@ -365,12 +655,67 @@ pub mod native {
                 },
             };
             let value = Activation {
-                schema_version: ContractVersionOne::default(),
+                format: "memcordon.local-activation".into(),
+                revision: 1,
                 registry_digest: registry.canonical_digest()?,
                 registry,
                 epoch,
                 revoked_admissions,
             };
+            self.write_activation(&value)?;
+            Ok(value)
+        }
+
+        pub fn activate_v2(
+            &self,
+            registry: RuntimePrivatePolicyRegistry,
+            instance: Option<Nonce128>,
+        ) -> Result<ActivationV2, String> {
+            registry.validate()?;
+            self.check_capacity(&registry.canonical_digest()?)?;
+            self.retain_snapshot_v2(&registry)?;
+            let previous = self.read()?;
+            let revoked_admissions = next_revocations_versioned(
+                previous.as_ref(),
+                registry.active_attempt_disposition,
+                &self.versioned_live_bindings()?,
+            )?;
+            let epoch = match (instance, previous) {
+                (Some(service_instance), _) => PolicyEpoch {
+                    service_instance,
+                    revision: NonZeroU64::MIN,
+                },
+                (None, Some(previous)) => PolicyEpoch {
+                    service_instance: previous.epoch.service_instance,
+                    revision: NonZeroU64::new(
+                        previous
+                            .epoch
+                            .revision
+                            .get()
+                            .checked_add(1)
+                            .ok_or("policy revision exhausted")?,
+                    )
+                    .ok_or("zero policy revision")?,
+                },
+                (None, None) => PolicyEpoch {
+                    service_instance: random_nonce()?,
+                    revision: NonZeroU64::MIN,
+                },
+            };
+            let value = ActivationV2 {
+                format: "memcordon.local-private-activation".into(),
+                revision: 1,
+                registry_digest: registry.canonical_digest()?,
+                registry,
+                epoch,
+                revoked_admissions,
+            };
+            value.validate()?;
+            self.write_activation(&value)?;
+            Ok(value)
+        }
+
+        fn write_activation<T: Serialize>(&self, value: &T) -> Result<(), String> {
             let mut bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
             if bytes.len()
                 > memcordon_core::workload_limits::REGISTRY_BYTES
@@ -407,7 +752,7 @@ pub mod native {
             self.directory
                 .sync_all()
                 .map_err(|error| error.to_string())?;
-            Ok(value)
+            Ok(())
         }
     }
     impl Drop for Lease {
@@ -468,16 +813,25 @@ pub mod native {
 #[cfg(target_os = "linux")]
 pub fn start_service_instance() -> Result<(), String> {
     let lease = native::Lease::acquire()?;
-    let registry = match lease.read()? {
-        Some(previous) => previous.registry,
-        None => PolicyRegistryV1 {
-            schema_version: ContractVersionOne::default(),
-            profiles: BoundedVec::default(),
-            grants: BoundedVec::default(),
-            active_attempt_disposition:
-                memcordon_core::workload_registry::GrantChangeDisposition::DrainExisting,
-        },
-    };
-    lease.activate(registry, Some(native::random_nonce()?))?;
+    let instance = native::random_nonce()?;
+    match lease.read_any()? {
+        Some(VersionedActivation::V2(previous)) => {
+            lease.activate_v2(previous.registry, Some(instance))?;
+        }
+        previous => {
+            let registry = match previous {
+                Some(VersionedActivation::V1(previous)) => previous.registry,
+                _ => RuntimePolicyRegistry {
+                    format: "memcordon.local-policy".into(),
+                    revision: 1,
+                    profiles: BoundedVec::default(),
+                    grants: BoundedVec::default(),
+                    active_attempt_disposition:
+                        memcordon_core::workload_registry::GrantChangeDisposition::DrainExisting,
+                },
+            };
+            lease.activate(registry, Some(instance))?;
+        }
+    }
     Ok(())
 }

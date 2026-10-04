@@ -1,0 +1,186 @@
+//! Product-native CI scenario catalogue.
+
+pub const LINUX_SEALED_TESTS: &[&str] = &[
+    "native_exact_grant_epoch_and_terminal_checkpoint_are_enforced",
+    "native_tcp_requirement_preserves_baseline_authority",
+    "qualification_fails_closed_without_root_provider",
+    "qualification_receipt_requires_complete_retirement",
+    "sealed_direct_exit_retires_fresh_boundary",
+    "sealed_staged_fixture_is_isolated_and_removed_after_retirement",
+    "sealed_future_deadline_authorizes_and_retires",
+    "sealed_expired_deadline_never_authorizes_and_retires",
+    "sealed_child_outlives_direct_target_until_cleanup",
+    "sealed_double_fork_remains_in_pid_namespace_and_cgroup",
+    "sealed_setsid_daemon_remains_contained",
+    "sealed_setid_transition_preserves_boundary",
+    "sealed_sudo_transition_preserves_boundary",
+    "sealed_file_capability_transition_preserves_boundary",
+    "sealed_caller_no_new_privs_is_reproduced",
+    "sealed_caller_capability_bounding_set_is_reproduced",
+    "sealed_caller_mount_context_is_reproduced",
+    "sealed_recursive_provider_request_is_rejected",
+    "sealed_retained_streams_do_not_finish_before_retirement",
+    "sealed_fork_storm_is_empty_before_result",
+    "sealed_fork_during_cleanup_cannot_survive",
+    "sealed_target_cannot_move_to_parent_or_sibling_cgroup",
+    "sealed_target_cannot_setns_into_host_namespace",
+    "sealed_target_cannot_mount_writable_cgroup_view",
+    "sealed_target_inherits_only_verified_descriptors",
+    "sealed_target_cannot_disable_namespace_init",
+    "sealed_frontend_loss_before_authorization_never_runs_target",
+    "sealed_frontend_loss_after_authorization_triggers_guardian",
+    "sealed_provider_worker_loss_triggers_guardian",
+    "sealed_guardian_loss_before_authorization_fails_closed",
+    "sealed_guardian_loss_after_authorization_cannot_report_success",
+    "sealed_native_nonzero_exit_preserves_provenance",
+    "sealed_native_exit_126_and_127_are_not_exec_failures",
+    "sealed_missing_target_preserves_enoent_exec_provenance",
+    "sealed_non_executable_target_preserves_eacces_exec_provenance",
+    "sealed_restart_uses_fresh_retired_boundary",
+    "sealed_simultaneous_attempts_have_disjoint_boundaries",
+    "sealed_recovery_removes_authenticated_stale_record_without_cgroup",
+    "sealed_recovery_quarantines_cgroup_without_authenticated_record",
+    "sealed_recovery_blocks_capability_while_live_state_is_ambiguous",
+    "sealed_faults_before_authorization_never_create_marker",
+    "sealed_namespace_init_failure_is_typed_prompt_and_retired",
+    "sealed_cgroup_kill_failure_never_reports_retirement",
+    "sealed_persistent_populated_state_blocks_restart",
+    "sealed_namespace_init_reap_delay_blocks_result",
+    "sealed_guardian_reap_failure_blocks_result",
+    "sealed_package_identity_rejects_tampered_provider",
+    "sealed_package_stable_lease_survives_legacy_inode_replacement",
+    "sealed_package_upgrade_recovers_before_advertising",
+    "sealed_package_uninstall_refuses_live_authenticated_attempt",
+];
+pub const MACOS_LIFECYCLE_SCENARIOS: &[&str] = &[
+    "hard_unavailability_refuses_before_target_execution",
+    "confirmed_limit_has_dedicated_status",
+    "macos_system_success_and_failure_smoke_tests_are_bounded",
+    "virtual_metric_is_explicitly_supported",
+    "wrapper_interrupt_is_forwarded_cleaned_and_mapped",
+    "guardian_kills_workload_after_wrapper_crash",
+    "default_command_lifetime_kills_background_descendant_before_return",
+    "immediate_success_failure_and_status_are_reaped_and_preserved",
+    "command_exit_grace_allows_remaining_workload_to_drain_naturally",
+    "command_exit_grace_force_cleans_survivors_after_expiry",
+    "deadline_remains_authoritative_during_command_exit_grace",
+    "workload_lifetime_waits_for_background_descendant_to_finish_naturally",
+    "natural_workload_completion_starts_retirement_reserve_at_completion",
+    "workload_lifetime_deadline_cleans_background_descendant",
+];
+
+pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[
+    "public_frontend_preserves_sigint_exec_policy",
+    "public_frontend_preserves_sigterm_exec_policy",
+    "public_frontend_preserves_sighup_exec_policy",
+    "running_guardian_loss_is_prompt_and_never_clean_retirement",
+    "repeated_stop_events_preserve_first_grace_and_retirement_deadline",
+    "submillisecond_remaining_admission_never_renews_budget",
+    "mutation_disabled_guardian_timer_is_detected",
+    "continuous_clock_jump_expires_original_guardian_deadline",
+    "valid_control_flood_cannot_starve_guardian_deadline",
+    "mutation_release_after_cancel_is_detected",
+    "isolated_accounting_reports_memory_limits_and_complete_retirement",
+    "native_accounting_backend_preserves_consistent_retirement",
+    "caller_envelope_owns_descriptor_and_cwd_snapshots_and_rejects_bad_manifests",
+    "caller_envelope_preserves_native_bytes_signals_limits_umask_and_exact_descriptors",
+    "held_native_spawn_publication_is_cancelled_after_startup_expiry",
+    "guardian_and_launcher_loss_never_execute_target_marker",
+    "missing_helper_and_unacknowledged_readiness_have_bounded_typed_failures",
+    "disarm_timeout_has_nonblocking_drop_and_eventual_owned_reap",
+    "private_protocol_rejects_truncation_duplicates_and_wrong_binding",
+    "installed_layout_probe_works_with_spaces_minimal_path_and_closed_stdio",
+    "large_poll_interval_cannot_postpone_a_short_deadline",
+    "target_exec_failure_is_distinct_from_reserved_child_exit",
+    "requested_deadline_expires_during_unacknowledged_startup",
+    "stalled_inspector_is_bounded_and_guardian_retirement_progresses",
+    "stopped_guardian_cleans_observed_descendant_after_root_and_frontend_exit",
+    "guardian_inspector_stalls_preserve_custody_after_frontend_death",
+    "bounded_child_slots_and_descriptors_recover_after_repeated_launches",
+];
+
+pub const MACOS_MUTATION_SCENARIOS: &[(&str, &str, &str)] = &[
+    (
+        "memcordon",
+        "macos_remediation",
+        "mutation_disabled_guardian_timer_is_detected",
+    ),
+    (
+        "memcordon-platform",
+        "macos_deadline",
+        "mutation_expired_work_cleanup_clamp_is_detected",
+    ),
+    (
+        "memcordon-platform",
+        "macos_inventory",
+        "mutation_unknown_member_dropping_is_detected",
+    ),
+    (
+        "memcordon",
+        "macos_remediation",
+        "mutation_release_after_cancel_is_detected",
+    ),
+    (
+        "memcordon",
+        "result_delivery",
+        "mutation_synchronous_final_stderr_is_detected",
+    ),
+    (
+        "memcordon-core",
+        "report",
+        "mutation_successful_backend_result_counted_as_authorization_is_rejected",
+    ),
+];
+
+pub const MACOS_ADMISSION_SCENARIOS: &[(&str, &str, &str)] = &[
+    (
+        "memcordon-platform",
+        "test-support",
+        "cancelled_supervision_with_no_helper_is_a_reportable_interruption",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "host_cancellation_handle_cannot_own_two_contexts",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "cancellation_before_commit_remains_sticky_across_attempts",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "commit_and_cancellation_share_one_ordered_state",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "committed_admission_is_not_a_second_release_permission",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "host_managed_pre_cancelled_run_never_resolves_or_creates_a_helper",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "owned_signal_actions_restore_in_isolated_process",
+    ),
+    (
+        "memcordon",
+        "test-fixtures",
+        "cancellation_at_native_release_boundaries_never_reopens_admission",
+    ),
+];
+
+pub fn macos_scenarios() -> Vec<&'static str> {
+    MACOS_LIFECYCLE_SCENARIOS
+        .iter()
+        .chain(MACOS_REMEDIATION_SCENARIOS)
+        .copied()
+        .chain(["installed_package_execution_probe_and_deadline"])
+        .chain(["installed_package_typed_external_consumer"])
+        .collect()
+}

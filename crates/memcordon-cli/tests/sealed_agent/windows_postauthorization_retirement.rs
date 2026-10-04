@@ -1,9 +1,118 @@
 use memcordon_core::{
     BoundaryMechanismEvidence, BoundarySetupPhase, ChildTermination, CleanupSummary,
     ProviderRejectionEvidence, RestartSafetyProof, RunOutcome, WINDOWS_PRIVATE_PROTOCOL_VERSION,
-    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsSealedEvidenceV2,
-    WindowsTerminalReceiptV1,
+    WindowsLauncherResponseV1, WindowsLauncherResponseV3, WindowsProcessIdentityV1,
+    WindowsSealedEvidenceV2, WindowsTerminalReceiptV1,
 };
+
+#[test]
+fn terminal_seed_freezes_before_proof_and_rejects_replacement() {
+    use memcordon_core::{ProcessObservationUnavailableReasonV1, WindowsProcessObservationV2};
+
+    let digest = "c7".repeat(32);
+    let target = WindowsProcessIdentityV1 {
+        process_id: 417,
+        creation_time_100ns: 991_342,
+    };
+    let mut record = crate::windows::record::WindowsAttemptRecordV1::new(
+        digest.clone(),
+        digest.clone(),
+        target.clone(),
+        digest.clone(),
+        digest,
+    )
+    .unwrap();
+    record.nonce = "seed-before-final-close".to_owned();
+    record.target_identity = Some(target.clone());
+    record.guardian_identity = Some(target.clone());
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &target);
+    record.authorization_unix_millis = Some(1);
+    record.state = crate::windows::record::WindowsAttemptStateV1::Terminating;
+    let mut observation = WindowsProcessObservationV2::unavailable(
+        ProcessObservationUnavailableReasonV1::WorkerLostBeforeFreeze,
+    );
+    observation.root_identity = Some(target);
+    let mut stores = 0;
+    record
+        .freeze_terminal_seed_for_test(observation.clone(), None, |_| {
+            stores += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(stores, 1);
+    assert_eq!(
+        record.terminal_seed.as_ref().unwrap().process_observation,
+        observation
+    );
+    assert!(record.retirement_proof.is_none());
+    assert!(
+        record
+            .freeze_terminal_seed_for_test(observation, None, |_| panic!("duplicate seed store"))
+            .is_err()
+    );
+}
+
+#[test]
+fn frozen_seed_accepts_only_matching_later_retirement_proof() {
+    let digest = "c8".repeat(32);
+    let target = WindowsProcessIdentityV1 {
+        process_id: 418,
+        creation_time_100ns: 991_343,
+    };
+    let mut record = crate::windows::record::WindowsAttemptRecordV1::new(
+        digest.clone(),
+        digest.clone(),
+        target.clone(),
+        digest.clone(),
+        digest,
+    )
+    .unwrap();
+    record.nonce = "frozen-seed-proof".to_owned();
+    record.target_identity = Some(target.clone());
+    record.guardian_identity = Some(target.clone());
+    record.authorization_unix_millis = Some(1);
+    let rejection = super::windows_v3_fixture::postauthorization_failure(
+        &mut record,
+        target,
+        false,
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+        BoundarySetupPhase::Authorization,
+    );
+    let failure = rejection.provider_failure.unwrap();
+    let memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+        rejection.disposition
+    else {
+        panic!("fixture must contain a receipt")
+    };
+    record.state = crate::windows::record::WindowsAttemptStateV1::Empty;
+    record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
+    record.retirement_proof = None;
+    let mut mismatched = (*receipt).clone();
+    mismatched
+        .process_observation
+        .root_identity
+        .as_mut()
+        .expect("fixture has a root identity")
+        .creation_time_100ns += 1;
+    assert!(
+        record
+            .stage_terminal_proof_for_test(&mismatched, Some(failure.clone()), |_| {
+                panic!("conflicting seed must not be stored")
+            })
+            .is_err()
+    );
+    record
+        .stage_terminal_proof_for_test(&receipt, Some(failure), |_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        record.lifecycle,
+        memcordon_core::WindowsTerminalLifecycleV1::ProofReady
+    );
+    assert_eq!(
+        record.retirement_proof.as_ref(),
+        Some(&receipt.retirement_proof)
+    );
+}
 
 #[test]
 fn revocation_remains_the_original_diagnostic_after_cleanup_failure() {
@@ -91,7 +200,7 @@ fn policy_revocation_keeps_observed_status_in_a_bound_terminal_outbox() {
                 sealed_boundary_retired: true,
                 errors: Vec::new(),
             },
-            boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(
+            boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
                 WindowsSealedEvidenceV2 {
                     target_released: true,
                     terminate_job_invoked: true,
@@ -102,7 +211,7 @@ fn policy_revocation_keeps_observed_status_in_a_bound_terminal_outbox() {
                     final_job_handles_closed: true,
                     ..WindowsSealedEvidenceV2::default()
                 },
-            ),
+            )),
         };
         let response = WindowsLauncherResponseV1::Terminal(terminal.clone());
         let disposition = Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
@@ -145,6 +254,8 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
     .unwrap();
     record.guardian_identity = Some(identity.clone());
     record.target_identity = Some(identity.clone());
+    record.nonce = nonce.to_owned();
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &identity);
     record.state = crate::windows::record::WindowsAttemptStateV1::Authorized;
     record.authorization_unix_millis = Some(1);
     record.validate_for_store_for_test().unwrap();
@@ -167,71 +278,22 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
     record.cleanup_state.active_processes_zero = true;
     record.cleanup_state.guardian_reaped = true;
     record.complete_rejection_cleanup_for_test().unwrap();
-    let restart_safety = RestartSafetyProof {
-        direct_child_reaped: true,
-        workload_empty: Some(true),
-        helpers_reaped: true,
-        containment_removed: true,
-        containment_incapable_of_live_members: true,
-        sealed_boundary_retired: true,
-        errors: Vec::new(),
-    };
-    let terminal = WindowsTerminalReceiptV1 {
-        policy_enforcement: Default::default(),
-        schema_version: 1,
-        attempt_id: record.attempt_id.clone(),
-        nonce: nonce.to_owned(),
-        request_sha256: record.request_sha256.clone(),
-        child_pid: identity.process_id,
-        duration_millis: 2,
-        authorization_offset_millis: 1,
-        job_total_processes: 1,
-        job_process_identities: vec![identity],
-        cleanup_process_creation: None,
-        outcome: RunOutcome::MonitorFailed {
-            error: "Resume certification fault cancelled the suspended target".to_owned(),
-            child_after_termination: Some(ChildTermination::ExitCode { code: 1 }),
-            cleanup: CleanupSummary {
-                force_attempted: true,
-                direct_child_reaped: true,
-                workload_empty: Some(true),
-                ..CleanupSummary::default()
-            },
-        },
-        restart_safety: restart_safety.clone(),
-        boundary_detail: BoundaryMechanismEvidence::WindowsJobObjectV2(WindowsSealedEvidenceV2 {
-            target_released: false,
-            terminate_job_invoked: true,
-            active_processes_zero: true,
-            direct_target_reaped: true,
-            relays_retired: true,
-            guardian_reaped: true,
-            final_job_handles_closed: true,
-            ..WindowsSealedEvidenceV2::default()
-        }),
-    };
-    let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-CERTIFICATION-FAULT".to_owned(),
-        phase: BoundarySetupPhase::Authorization,
-        detail: "Resume certification fault".to_owned(),
-        os_code: None,
-        loader_qualification: None,
-        target_created: true,
-        target_released: false,
-        cleanup_attempted: true,
-        restart_safety,
-        terminal_ack_required: true,
-        terminal_receipt: Some(Box::new(terminal)),
-    };
+    let rejection = super::windows_v3_fixture::postauthorization_failure(
+        &mut record,
+        identity,
+        false,
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+        BoundarySetupPhase::Authorization,
+    );
     assert!(rejection.is_consistent());
+    let mut diagnostic_expired = rejection.clone();
+    diagnostic_expired.provider_failure = None;
+    assert!(diagnostic_expired.is_consistent());
     let mut release_mismatch = rejection.clone();
     release_mismatch.target_released = true;
     assert!(!release_mismatch.is_consistent());
 
-    let response = WindowsLauncherResponseV1::Reject {
+    let response = WindowsLauncherResponseV3::Reject {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
@@ -239,13 +301,16 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
-    let replayed: WindowsLauncherResponseV1 =
+    let replayed: WindowsLauncherResponseV3 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(replayed).unwrap(),
-        serde_json::to_value(response).unwrap()
+        serde_json::from_str::<serde_json::Value>(&response.terminal_authority_json().unwrap())
+            .unwrap()
     );
     let retired = record.terminal_retired_receipt(nonce).unwrap();
+    assert!(record.terminal_retired_receipt("wrong-nonce").is_err());
+    assert!(record.terminal_response_json.is_some());
     assert_eq!(retired.attempt_id, record.attempt_id);
     assert_eq!(retired.request_sha256, record.request_sha256);
     assert_eq!(
@@ -286,7 +351,9 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
     record.causal_diagnostics.observe(original).unwrap();
     let retained_original = record.causal_diagnostics.original.clone();
     record.guardian_identity = Some(identity.clone());
-    record.target_identity = Some(identity);
+    record.target_identity = Some(identity.clone());
+    record.nonce = nonce.to_owned();
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &identity);
     record.state = crate::windows::record::WindowsAttemptStateV1::Authorized;
     record.authorization_unix_millis = Some(1);
     record.validate_for_store_for_test().unwrap();
@@ -297,32 +364,14 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
     record.cleanup_state.guardian_reaped = true;
     record.complete_rejection_cleanup_for_test().unwrap();
 
-    let rejection = ProviderRejectionEvidence {
-        workload_admission: None,
-        provider_failure: None,
-        schema_version: 1,
-        code: "MCSEALED-WINDOWS-CERTIFICATION-FAULT".to_owned(),
-        phase: BoundarySetupPhase::Retirement,
-        detail: "receipt-less posttarget certification fault".to_owned(),
-        os_code: None,
-        loader_qualification: None,
-        target_created: true,
-        target_released: false,
-        cleanup_attempted: true,
-        restart_safety: RestartSafetyProof {
-            direct_child_reaped: true,
-            workload_empty: Some(true),
-            helpers_reaped: true,
-            containment_removed: true,
-            containment_incapable_of_live_members: true,
-            sealed_boundary_retired: true,
-            errors: Vec::new(),
-        },
-        terminal_ack_required: true,
-        terminal_receipt: None,
-    };
+    let rejection = super::windows_v3_fixture::preauthorization_rejection(
+        &record,
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+        BoundarySetupPhase::Retirement,
+        true,
+    );
     assert!(rejection.is_consistent());
-    let response = WindowsLauncherResponseV1::Reject {
+    let response = WindowsLauncherResponseV3::Reject {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),

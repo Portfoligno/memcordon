@@ -170,8 +170,9 @@ pub struct InstalledProviderInspectionV4 {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AgentPackageInspectionV5 {
-    pub schema_version: u32,
+pub struct AgentPackageInspection {
+    pub format: AgentInspectionFormat,
+    pub revision: InspectionRevision,
     pub version: String,
     pub source_commit: String,
     pub executable_sha256: String,
@@ -191,18 +192,49 @@ pub struct AgentPackageInspectionV5 {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct InstalledProviderInspectionV5 {
-    pub schema_version: u32,
-    pub agent: AgentPackageInspectionV5,
+pub struct InstalledProviderInspection {
+    pub format: InstalledInspectionFormat,
+    pub revision: InspectionRevision,
+    pub agent: AgentPackageInspection,
     pub installed_executable_sha256: String,
     pub installed_artifacts_valid: bool,
     pub provider_identity: Option<String>,
     pub provider_reachable: bool,
-    pub qualification_complete: bool,
     pub policy: memcordon_core::runtime_manifest::InstalledPolicyObservationV1,
-    pub profile_qualification: memcordon_core::runtime_manifest::QualificationArtifactReferenceV1,
-    pub diagnostic_qualification:
-        Option<memcordon_core::runtime_manifest::QualificationArtifactReferenceV1>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum AgentInspectionFormat {
+    #[serde(rename = "memcordon.agent-package-inspection")]
+    Ordinary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum InstalledInspectionFormat {
+    #[serde(rename = "memcordon.installed-provider-inspection")]
+    Ordinary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct InspectionRevision;
+
+impl TryFrom<u32> for InspectionRevision {
+    type Error = &'static str;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value == 1 {
+            Ok(Self)
+        } else {
+            Err("unsupported inspection revision")
+        }
+    }
+}
+
+impl From<InspectionRevision> for u32 {
+    fn from(_: InspectionRevision) -> Self {
+        1
+    }
 }
 
 // Serde's strict outer derive cannot distinguish flattened enum fields from
@@ -266,8 +298,9 @@ deserialize_inspection!(AgentPackageInspectionV4, ProviderPackageMetadataV4, {
     execution_report_schema: u32, plan_report_schema: u32,
     doctor_report_schema: u32, compiled_metadata_valid: bool,
 });
-deserialize_inspection!(AgentPackageInspectionV5, ProviderPackageMetadataV4, {
-    schema_version: u32, version: String, source_commit: String,
+deserialize_inspection!(AgentPackageInspection, ProviderPackageMetadataV4, {
+    format: AgentInspectionFormat, revision: InspectionRevision,
+    version: String, source_commit: String,
     executable_sha256: String, provider_protocol: u32,
     native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols,
     runtime_manifest_schema: u32, workload_contract_schema: u32,

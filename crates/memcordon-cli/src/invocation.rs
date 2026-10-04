@@ -1,3 +1,4 @@
+use sha2::Digest;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,8 +49,11 @@ Usage:
     memcordon +1GiB +10m ./workload
 
 Budgets and common options:
-  --sealed                       Require certified sealed supervision; off
+  --sealed                       Require sealed supervision; off
   --workload-contract PATH        Require exact workload admission; needs --sealed
+  --expected-private-plan PATH    Require the saved private plan at launch
+  --frozen-private-contract PATH  Test one-port tamper after an accepted private plan
+  --reuse-private-two-attempts    Test two real private launches under one plan and actor
   +MEMORY                        Memory ceiling; bytes, KB..EB, or KiB..EiB
   +TIME                          Elapsed-time deadline; decimal ms, s, m, or h
   --wait-for command|workload    Terminate remaining members after command exit
@@ -99,7 +103,7 @@ pub const HELP_TOPIC_USAGE: &[(&str, &str)] = &[
     (
         "containment",
         with_reference!(
-            r#"Require a certified process-supervision boundary.
+            r#"Require a process-supervision boundary with independent cleanup ownership.
 
 Usage:
   memcordon --sealed [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
@@ -107,7 +111,7 @@ Usage:
   memcordon doctor --require sealed
 
 --sealed fails before target authorization when the host cannot establish and
-verify a certified boundary with independent cleanup authority and terminal
+verify a boundary with independent cleanup authority and terminal
 workload-empty proof. It never falls back to standard supervision. It is not a
 filesystem, network, syscall, or secret sandbox.
 
@@ -292,7 +296,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-10 JSON to PATH; unset
+  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -401,7 +405,7 @@ Options:
   applicable.
 
 Containment:
-  --sealed                              Require certified sealed supervision; off
+  --sealed                              Require sealed supervision; off
   --workload-contract PATH               Strict workload declaration; requires --sealed
 
   Sealed mode fails before target authorization when the complete contract is
@@ -471,7 +475,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-10 JSON report; unset
+  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -545,7 +549,7 @@ Budgets:
 
 Policy options (value; default):
   --workload-contract PATH               Strict workload declaration; requires --sealed
-  --sealed                              Require certified sealed supervision; off
+  --sealed                              Require sealed supervision; off
   --enforcement auto|hard|watchdog       Backend requirement; auto
   --wait-for command|workload            Clean on direct-command exit or wait for workload empty; command
   --command-exit-grace DURATION          Natural-drain grace after direct-command exit; 0s
@@ -740,7 +744,7 @@ impl LimitToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
     pub boundary: BoundaryRequirement,
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
@@ -813,6 +817,28 @@ impl Default for PolicyArgs {
 }
 
 impl PolicyArgs {
+    pub fn baseline_workload_contract(
+        &self,
+    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV1> {
+        match self.workload_contract.as_ref() {
+            Some(memcordon_core::workload_contract::WorkloadContract::V1(contract)) => {
+                Some(contract)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn private_workload_contract(
+        &self,
+    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV2> {
+        match self.workload_contract.as_ref() {
+            Some(memcordon_core::workload_contract::WorkloadContract::V2(contract)) => {
+                Some(contract)
+            }
+            _ => None,
+        }
+    }
+
     pub fn policy(&self, budgets: &BudgetSet) -> Policy {
         let mut policy = Policy::unbounded();
         policy.memory = budgets.memory;
@@ -829,7 +855,7 @@ impl PolicyArgs {
         policy.command_exit_grace = self.command_exit_grace;
         policy.limit_grace = self.limit_grace;
         policy.swap = self.swap;
-        if let Some(request) = &self.workload_contract {
+        if let Some(request) = self.baseline_workload_contract() {
             policy = policy
                 .with_workload_contract(request.clone())
                 .expect("validated CLI workload contract remains valid");
@@ -840,6 +866,7 @@ impl PolicyArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputRequest {
+    pub report_format: memcordon_core::ReportFormat,
     pub report_path: Option<PathBuf>,
     pub summary: bool,
     pub quiet: bool,
@@ -851,6 +878,8 @@ pub struct ExecutionArgs {
     pub policy: PolicyArgs,
     pub command: Vec<OsString>,
     pub output: OutputRequest,
+    #[cfg(all(windows, feature = "test-support"))]
+    pub windows_stack_phases: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -862,14 +891,16 @@ pub enum Requirement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorArgs {
+    pub operational_format: bool,
     pub json: bool,
     pub probe_execution: bool,
     pub requirement: Option<Requirement>,
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanArgs {
+    pub operational_format: bool,
     pub json: bool,
     pub budgets: BudgetSet,
     pub policy: PolicyArgs,
@@ -892,11 +923,24 @@ pub enum HelpKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invocation {
     Execute(ExecutionArgs),
+    WindowsRecovery(WindowsRecoveryArgs),
     Doctor(DoctorArgs),
     Plan(PlanArgs),
     Clean(CleanArgs),
     Help(HelpKind),
     Version,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowsRecoveryArgs {
+    Attempt {
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+    },
+    Converge {
+        deadline_millis: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -943,6 +987,9 @@ pub fn route(argv: &[OsString]) -> Result<Invocation, CliError> {
     if first == "clean" {
         return parse_clean(&argv[1..]);
     }
+    if first == "windows-recover" {
+        return parse_windows_recovery(&argv[1..]).map(Invocation::WindowsRecovery);
+    }
     if let Some((code, replacement)) = legacy(first) {
         return Err(CliError::new(
             code,
@@ -953,6 +1000,71 @@ pub fn route(argv: &[OsString]) -> Result<Invocation, CliError> {
         ));
     }
     parse_execution(argv).map(Invocation::Execute)
+}
+
+fn parse_windows_recovery(argv: &[OsString]) -> Result<WindowsRecoveryArgs, CliError> {
+    if !cfg!(windows) {
+        return Err(CliError::new(
+            "MCCLI-WINDOWS-RECOVERY-PLATFORM",
+            "Windows recovery is available only on Windows",
+        ));
+    }
+    let token = |index: usize, label: &str| {
+        argv.get(index)
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                CliError::new(
+                    "MCCLI-WINDOWS-RECOVERY-ARGUMENT",
+                    format!("{label} is required as UTF-8"),
+                )
+            })
+    };
+    match argv.first().and_then(|value| value.to_str()) {
+        Some("attempt") if argv.len() == 4 => {
+            let attempt_id = token(1, "attempt id")?;
+            let nonce = token(2, "nonce")?;
+            let request_sha256 = token(3, "request SHA-256")?;
+            let hex_digest = |value: &str| {
+                value.len() == sha2::Sha256::output_size() * 2
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            if !hex_digest(&attempt_id) || !hex_digest(&request_sha256) {
+                return Err(CliError::new(
+                    "MCCLI-WINDOWS-RECOVERY-BINDING",
+                    "attempt id and request SHA-256 must be hex digests",
+                ));
+            }
+            Ok(WindowsRecoveryArgs::Attempt {
+                attempt_id,
+                nonce,
+                request_sha256,
+            })
+        }
+        Some("converge") if argv.len() == 2 => {
+            let deadline_millis =
+                token(1, "deadline milliseconds")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        CliError::new(
+                            "MCCLI-WINDOWS-RECOVERY-DEADLINE",
+                            "deadline must be a positive millisecond count",
+                        )
+                    })?;
+            if !(1..=600_000).contains(&deadline_millis) {
+                return Err(CliError::new(
+                    "MCCLI-WINDOWS-RECOVERY-DEADLINE",
+                    "deadline must be within 1..=600000 milliseconds",
+                ));
+            }
+            Ok(WindowsRecoveryArgs::Converge { deadline_millis })
+        }
+        _ => Err(CliError::new(
+            "MCCLI-WINDOWS-RECOVERY-USAGE",
+            "use: memcordon windows-recover attempt ATTEMPT_ID NONCE REQUEST_SHA256 | converge DEADLINE_MILLIS",
+        )),
+    }
 }
 
 fn parse_help(argv: &[OsString]) -> Result<Invocation, CliError> {
@@ -1023,8 +1135,11 @@ fn legacy(first: &OsStr) -> Option<(&'static str, &'static str)> {
 fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
     let mut policy = PolicyArgs::default();
     let mut report_path = None;
+    let mut report_format = memcordon_core::ReportFormat::Legacy;
     let mut summary = false;
     let mut quiet = false;
+    #[cfg(all(windows, feature = "test-support"))]
+    let mut windows_stack_phases = false;
     let mut index = 0;
     let mut budgets = BudgetSet::default();
     while index < argv.len() {
@@ -1055,6 +1170,14 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         match name {
             "--summary" if inline_value.is_none() => summary = true,
             "--quiet" if inline_value.is_none() => quiet = true,
+            "--report-format" => {
+                let value = option_value(argv, &mut index, inline_value, name)?;
+                report_format = match value.to_str() {
+                    Some("legacy") => memcordon_core::ReportFormat::Legacy,
+                    Some("result-v1") => memcordon_core::ReportFormat::ResultV1,
+                    _ => return Err(invalid_value(name, &value.to_string_lossy())),
+                };
+            }
             "--report" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
                 if value == OsStr::new("-") {
@@ -1064,6 +1187,16 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
                     ));
                 }
                 report_path = Some(PathBuf::from(value));
+            }
+            #[cfg(all(windows, feature = "test-support"))]
+            "--windows-stack-phases" if inline_value.is_none() => {
+                if windows_stack_phases {
+                    return Err(CliError::new(
+                        "MCUSAGE-WINDOWS-STACK-PHASES",
+                        "--windows-stack-phases may be supplied once",
+                    ));
+                }
+                windows_stack_phases = true;
             }
             _ => parse_policy_option(name, inline_value, argv, &mut index, &mut policy)?,
         }
@@ -1082,19 +1215,44 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         ));
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
+    #[cfg(all(windows, feature = "test-support"))]
+    if windows_stack_phases
+        && (policy.boundary != BoundaryRequirement::Sealed
+            || policy.baseline_workload_contract().is_none()
+            || report_path.is_none())
+    {
+        return Err(CliError::new(
+            "MCUSAGE-WINDOWS-STACK-PHASES",
+            "--windows-stack-phases requires --sealed, --workload-contract, and --report",
+        ));
+    }
+    if (policy.private_workload_contract().is_some()
+        || policy.baseline_workload_contract().is_some())
+        && report_path.is_some()
+        && report_format != memcordon_core::ReportFormat::ResultV1
+    {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
+            "local runtime admission facts require --report-format result-v1 before launch",
+        ));
+    }
     Ok(ExecutionArgs {
         budgets,
         policy,
         command: argv[index..].to_vec(),
         output: OutputRequest {
+            report_format,
             report_path,
             summary,
             quiet,
         },
+        #[cfg(all(windows, feature = "test-support"))]
+        windows_stack_phases,
     })
 }
 
 fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
+    let mut operational_format = false;
     let mut json = false;
     let mut probe_execution = false;
     let mut requirement = None;
@@ -1108,6 +1266,15 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
         let (name, inline_value) = split_option(text);
         match name {
             "--json" if inline_value.is_none() => json = true,
+            "--capability-format" => {
+                let value = option_value(argv, &mut index, inline_value, name)?;
+                operational_format = match value.to_str() {
+                    Some("legacy") => false,
+                    Some("capabilities-v1") => true,
+                    _ => return Err(invalid_value(name, &value.to_string_lossy())),
+                };
+                json = true;
+            }
             "--probe-execution" if inline_value.is_none() => probe_execution = true,
             "--workload-contract" => {
                 parse_policy_option(name, inline_value, argv, &mut index, &mut workload_policy)?
@@ -1136,7 +1303,14 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
             "--workload-contract requires --require sealed",
         ));
     }
+    if workload_policy.workload_contract.is_some() && json && !operational_format {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
+            "local runtime admission facts require --capability-format capabilities-v1",
+        ));
+    }
     Ok(Invocation::Doctor(DoctorArgs {
+        operational_format,
         json,
         probe_execution,
         requirement,
@@ -1145,6 +1319,7 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
 }
 
 fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
+    let mut operational_format = false;
     let mut policy = PolicyArgs::default();
     let mut json = false;
     let mut index = 0;
@@ -1168,13 +1343,28 @@ fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
         let (name, inline_value) = split_option(text);
         if name == "--json" && inline_value.is_none() {
             json = true;
+        } else if name == "--plan-format" {
+            let value = option_value(argv, &mut index, inline_value, name)?;
+            operational_format = match value.to_str() {
+                Some("legacy") => false,
+                Some("plan-v1") => true,
+                _ => return Err(invalid_value(name, &value.to_string_lossy())),
+            };
+            json = true;
         } else {
             parse_policy_option(name, inline_value, argv, &mut index, &mut policy)?;
         }
         index += 1;
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
+    if policy.workload_contract.is_some() && json && !operational_format {
+        return Err(CliError::new(
+            "MCUSAGE-WORKLOAD-REPORT-FORMAT",
+            "local runtime admission facts require --plan-format plan-v1",
+        ));
+    }
     Ok(Invocation::Plan(PlanArgs {
+        operational_format,
         json,
         budgets,
         policy,
@@ -1349,7 +1539,7 @@ fn parse_policy_option(
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| error.to_string())?;
-            memcordon_core::workload_contract::WorkloadContractV1::parse(&bytes)
+            memcordon_core::workload_contract::WorkloadContract::parse(&bytes)
         };
         policy.workload_contract =
             Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))?);

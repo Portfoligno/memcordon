@@ -1,0 +1,25 @@
+format = "memcordon.performance-selection"
+revision = 1
+
+[macos_release]
+selected = "serial"
+[preparation]
+selected = "serial"
+[quality]
+selected = "serial"
+
+[[stress]]
+platform = "linux-x64"
+selected = "serial"
+[[stress]]
+platform = "macos-arm64"
+selected = "serial"
+[[stress]]
+platform = "macos-x64"
+selected = "serial"
+[[stress]]
+platform = "windows-x64"
+selected = "serial"
+[[stress]]
+platform = "windows-arm64"
+selected = "serial"

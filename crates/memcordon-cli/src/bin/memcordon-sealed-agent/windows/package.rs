@@ -14,9 +14,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::inspection_schema::{
-    AgentPackageInspectionV5 as AgentPackageInspectionV4,
-    InstalledProviderInspectionV5 as InstalledProviderInspectionV4, ProviderPackageMetadataV4,
-    TargetDesktopBootstrapRuntimeV4,
+    AgentPackageInspection, InspectionRevision, InstalledInspectionFormat,
+    InstalledProviderInspection, ProviderPackageMetadataV4, TargetDesktopBootstrapRuntimeV4,
 };
 
 use super::security::{
@@ -40,9 +39,7 @@ const IMAGE_DELETE_DEADLINE: Duration = Duration::from_secs(5);
 const IMAGE_DELETE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PACKAGE_CLEANUP_DEADLINE: Duration = Duration::from_secs(30);
 const PACKAGE_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const QUALIFICATION_ROLLBACK_FAULT: &str = "qualification-rollback-fault";
 const SCM_CONNECT_ACE_MARKER: &str = "scm-launcher-connect-ace-owned";
-const EPHEMERAL_CI_MARKER_CONTENTS: &[u8] = b"enabled\n";
 
 pub fn install_root() -> PathBuf {
     std::env::var_os("ProgramFiles")
@@ -76,7 +73,7 @@ pub(crate) fn installed_public_provider_binding()
     let path = install_root().join("runtime-manifest.json");
     SecurityDescriptor::from_sddl(INSTALL_SDDL)?.verify_path(&install_root())?;
     let bytes = read_regular_no_follow_bounded(&path, "runtime-manifest", 128 * 1024)?;
-    let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(&bytes)?;
+    let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&bytes)?;
     if manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.source_commit != crate::SOURCE_COMMIT
     {
@@ -92,7 +89,7 @@ pub(crate) fn installed_public_provider_binding()
 }
 
 fn validate_runtime_components(
-    manifest: &memcordon_core::runtime_manifest::RuntimeManifestV2,
+    manifest: &memcordon_core::runtime_manifest::RuntimeManifest,
     agent: &Path,
     bootstrap: &Path,
     broker: &Path,
@@ -102,18 +99,18 @@ fn validate_runtime_components(
 }
 
 fn validate_runtime_snapshot(
-    manifest: &memcordon_core::runtime_manifest::RuntimeManifestV2,
+    manifest: &memcordon_core::runtime_manifest::RuntimeManifest,
     artifacts: &CapturedPackageArtifacts,
 ) -> Result<(), String> {
-    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifestV2};
+    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
     if manifest.components.len() != 4
         || *manifest
-            != RuntimeManifestV2::windows(
+            != RuntimeManifest::windows(
                 manifest.version.clone(),
                 manifest.source_commit.clone(),
                 native_runtime_target().into(),
                 manifest.components.clone(),
-            )
+            )?
     {
         return Err(
             "installed runtime manifest schema, platform, profile or protocol differs".into(),
@@ -186,7 +183,7 @@ fn source_runtime_manifest(
     broker: &Path,
 ) -> Result<Vec<u8>, String> {
     use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
     };
     let directory = agent.parent().ok_or("provider source has no parent")?;
     let manifest_path = directory.join("runtime-manifest.json");
@@ -231,17 +228,17 @@ fn source_runtime_manifest(
                 sha256: crate::package::sha256_bytes(&content),
             });
         }
-        let manifest = RuntimeManifestV2::windows(
+        let manifest = RuntimeManifest::windows(
             env!("CARGO_PKG_VERSION").into(),
             crate::SOURCE_COMMIT.into(),
             native_runtime_target().into(),
             components,
-        );
+        )?;
         let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
         bytes
     };
-    let manifest = RuntimeManifestV2::parse(&bytes)?;
+    let manifest = RuntimeManifest::parse(&bytes)?;
     validate_runtime_components(&manifest, agent, bootstrap, broker)?;
     if manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.source_commit != crate::SOURCE_COMMIT
@@ -714,108 +711,23 @@ fn service_config_record(
     fields.join("\0")
 }
 
-pub fn mutate(
-    operation: &OsStr,
-    ephemeral_ci: bool,
-    qualification_artifact_directory: Option<&Path>,
-) -> Result<(), String> {
-    if qualification_artifact_directory.is_some() && (!ephemeral_ci || operation != "install") {
-        return Err("external qualification artifacts require an ephemeral CI install".to_owned());
-    }
-    if let Some(destination) = qualification_artifact_directory {
-        validate_qualification_artifact_directory(destination)?;
-    }
-    if operation == "install-rollback-certification" {
-        if !ephemeral_ci {
-            return Err(
-                "Windows rollback certification requires ephemeral CI installation".to_owned(),
-            );
-        }
+pub fn mutate(operation: &OsStr) -> Result<(), String> {
+    if operation == "install" {
         let lease = PackageLease::acquire()?;
-        let transition = install(true)?;
-        let marker = state_root()
-            .join("package")
-            .join(QUALIFICATION_ROLLBACK_FAULT);
-        if let Err(error) = std::fs::write(&marker, b"inject qualification failure\n") {
-            let install_error = format!(
-                "MCSEALED-WINDOWS-INSTALL-STATE: cannot write rollback certification fault {}: {error}",
-                marker.display()
-            );
-            let _lease = lease;
-            return match rollback_fresh_install(FreshRollback::Transition(transition)) {
-                Ok(()) => Err(install_error),
-                Err(rollback_error) => Err(format!(
-                    "MCSEALED-WINDOWS-INSTALL-ROLLBACK-FAILED: install={install_error}; rollback={rollback_error}"
-                )),
-            };
-        }
-        qualify_outside_package_lease(lease, QualificationRollback::Fresh(transition), None)
-    } else if let Some(fault) = session_broker_certification_fault(operation) {
-        let intent = InstallIntent::ephemeral_certification(ephemeral_ci, fault)?;
-        let _lease = PackageLease::acquire()?;
-        match install_with_intent(intent) {
-            Ok(_) => Err(
-                "MCSEALED-WINDOWS-CERTIFICATION-FAULT-SURVIVED: session-broker install fault did not interrupt installation"
-                    .to_owned(),
-            ),
-            Err(error) => Err(error),
-        }
-    } else if operation == "seed-retired-certification-workspace" {
-        if !ephemeral_ci || !certification_faults_enabled() {
-            return Err(
-                "Windows retired-workspace certification requires an ephemeral CI installation"
-                    .to_owned(),
-            );
-        }
-        let _lease = PackageLease::acquire()?;
-        seed_retired_certification_workspace()
-    } else if operation == "install" {
-        let lease = PackageLease::acquire()?;
-        let transition = install(ephemeral_ci)?;
-        qualify_outside_package_lease(
-            lease,
-            QualificationRollback::Fresh(transition),
-            qualification_artifact_directory,
-        )
+        let transition = install()?;
+        verify_ready_package(lease, ActivationRollback::Fresh(transition))
     } else if operation == "upgrade" {
         let lease = PackageLease::acquire()?;
         reconcile_services_from_installed()?;
-        let installation = upgrade(ephemeral_ci)?;
-        qualify_outside_package_lease(lease, QualificationRollback::Upgrade(installation), None)
+        let installation = upgrade()?;
+        verify_ready_package(lease, ActivationRollback::Upgrade(installation))
     } else if operation == "uninstall" {
         let _lease = PackageLease::acquire()?;
         reconcile_services_from_installed()?;
-        uninstall(ephemeral_ci)
+        uninstall()
     } else {
         Err("unknown package operation".to_owned())
     }
-}
-
-fn session_broker_certification_fault(operation: &OsStr) -> Option<InstallSessionBrokerFault> {
-    Some(match operation.to_str()? {
-        "install-broker-registration-rollback-certification" => {
-            InstallSessionBrokerFault::AfterRegistration
-        }
-        "install-broker-privileges-rollback-certification" => {
-            InstallSessionBrokerFault::Configuration(
-                SessionBrokerConfigurationFault::AfterRequiredPrivileges,
-            )
-        }
-        "install-broker-sid-rollback-certification" => {
-            InstallSessionBrokerFault::Configuration(SessionBrokerConfigurationFault::AfterSidType)
-        }
-        "install-broker-failure-actions-rollback-certification" => {
-            InstallSessionBrokerFault::Configuration(
-                SessionBrokerConfigurationFault::AfterFailureActions,
-            )
-        }
-        "install-broker-security-rollback-certification" => {
-            InstallSessionBrokerFault::Configuration(
-                SessionBrokerConfigurationFault::AfterSecurityApply,
-            )
-        }
-        _ => return None,
-    })
 }
 
 pub(super) struct PackageLease {
@@ -842,8 +754,8 @@ impl PackageLease {
     }
 }
 
-fn install(ephemeral_ci: bool) -> Result<InstallTransition, String> {
-    install_with_intent(InstallIntent::from_ephemeral_ci(ephemeral_ci))
+fn install() -> Result<InstallTransition, String> {
+    install_with_intent(InstallIntent::Normal)
 }
 
 fn install_with_intent(intent: InstallIntent) -> Result<InstallTransition, String> {
@@ -880,8 +792,8 @@ fn install_with_intent(intent: InstallIntent) -> Result<InstallTransition, Strin
     if !ownership.complete() {
         panic!("successful fresh installation does not own every configured service");
     }
-    if transition.phase != InstallPhase::ReadyForQualification {
-        panic!("successful fresh installation did not reach qualification-ready phase");
+    if transition.phase != InstallPhase::ReadyForActivation {
+        panic!("successful fresh installation did not reach activation-ready phase");
     }
     Ok(transition)
 }
@@ -996,73 +908,18 @@ pub(crate) enum InstallSessionBrokerFault {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstallIntent {
     Normal,
-    Ephemeral,
-    EphemeralCertification(InstallSessionBrokerFault),
+    #[cfg(any(test, feature = "test-support"))]
+    NativeFault(InstallSessionBrokerFault),
 }
 
 impl InstallIntent {
-    pub(crate) fn from_ephemeral_ci(ephemeral_ci: bool) -> Self {
-        if ephemeral_ci {
-            Self::Ephemeral
-        } else {
-            Self::Normal
-        }
-    }
-
-    pub(crate) fn ephemeral_certification(
-        ephemeral_ci: bool,
-        fault: InstallSessionBrokerFault,
-    ) -> Result<Self, String> {
-        if !ephemeral_ci {
-            return Err(
-                "MCSEALED-WINDOWS-CERTIFICATION-ADMISSION: session-broker rollback certification requires --ephemeral-ci"
-                    .to_owned(),
-            );
-        }
-        Ok(Self::EphemeralCertification(fault))
-    }
-
-    pub(crate) fn is_ephemeral(self) -> bool {
-        !matches!(self, Self::Normal)
-    }
-
-    pub(crate) fn authorized_session_broker_fault(
-        self,
-        marker_verified: bool,
-    ) -> Result<Option<InstallSessionBrokerFault>, String> {
+    pub(crate) fn session_broker_fault(self) -> Option<InstallSessionBrokerFault> {
         match self {
-            Self::EphemeralCertification(fault) if marker_verified => Ok(Some(fault)),
-            Self::EphemeralCertification(_) => Err(
-                "MCSEALED-WINDOWS-CERTIFICATION-AUTHORIZATION: protected ephemeral marker verification failed before session-broker fault injection"
-                    .to_owned(),
-            ),
-            Self::Normal | Self::Ephemeral => Ok(None),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::NativeFault(fault) => Some(fault),
+            Self::Normal => None,
         }
     }
-}
-
-pub(crate) fn establish_ephemeral_marker<Create, Verify>(
-    intent: InstallIntent,
-    create_marker: Create,
-    verify_marker: Verify,
-) -> Result<(), String>
-where
-    Create: FnOnce() -> Result<(), String>,
-    Verify: FnOnce() -> bool,
-{
-    if !intent.is_ephemeral() {
-        return Ok(());
-    }
-    create_marker()?;
-    if verify_marker() {
-        return Ok(());
-    }
-    let detail = if matches!(intent, InstallIntent::EphemeralCertification(_)) {
-        "MCSEALED-WINDOWS-CERTIFICATION-AUTHORIZATION: protected ephemeral marker verification failed before service configuration"
-    } else {
-        "MCSEALED-WINDOWS-INSTALL-STATE: protected ephemeral marker verification failed after creation"
-    };
-    Err(detail.to_owned())
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -1071,14 +928,14 @@ enum InstallPhase {
     Building,
     RuntimeSealed,
     ServiceCleanupAvailable,
-    ReadyForQualification,
+    ReadyForActivation,
 }
 
 impl InstallPhase {
     fn service_cleanup_required(self) -> bool {
         matches!(
             self,
-            Self::ServiceCleanupAvailable | Self::ReadyForQualification
+            Self::ServiceCleanupAvailable | Self::ReadyForActivation
         )
     }
 }
@@ -1275,8 +1132,6 @@ struct UpgradeRollback {
     target_desktop_bootstrap: PathBuf,
     session_broker: PathBuf,
     artifact_digests: PackageArtifactDigests,
-    qualification: Option<PathBuf>,
-    ephemeral_ci: bool,
     scm_connect_ace_owned: bool,
 }
 
@@ -1310,12 +1165,12 @@ impl ProviderRemovalContext {
     }
 }
 
-fn upgrade(ephemeral_ci: bool) -> Result<UpgradeInstallation, String> {
+fn upgrade() -> Result<UpgradeInstallation, String> {
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
-    upgrade_from(ephemeral_ci, &source)
+    upgrade_from(&source)
 }
 
-fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation, String> {
+fn upgrade_from(source: &Path) -> Result<UpgradeInstallation, String> {
     let scm_connect_ace_owned = scm_ownership_marker_present()?;
     let installed = installed_binary();
     let captured = validate_existing_installed_artifacts()?;
@@ -1342,24 +1197,12 @@ fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation
         &broker_backup,
         Some(&captured.digests),
     )?;
-    let qualification = state_root().join("package").join("qualification.json");
-    let qualification_backup = install_root().join("qualification.json.rollback");
-    let qualification_backup = if qualification.is_file() {
-        std::fs::copy(&qualification, &qualification_backup).map_err(|error| {
-            format!("cannot preserve the working Windows qualification for rollback: {error}")
-        })?;
-        Some(qualification_backup)
-    } else {
-        None
-    };
     let rollback = UpgradeRollback {
         runtime_manifest,
         binary: backup,
         target_desktop_bootstrap: bootstrap_backup,
         session_broker: broker_backup,
         artifact_digests: captured.digests,
-        qualification: qualification_backup,
-        ephemeral_ci,
         scm_connect_ace_owned,
     };
     let source_broker = packaged_session_broker(&source)?;
@@ -1386,7 +1229,7 @@ fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation
             owned: rollback.scm_connect_ace_owned,
         },
     }) {
-        let rollback_result = restore_upgrade(&rollback, ephemeral_ci, None);
+        let rollback_result = restore_upgrade(&rollback, None);
         return match rollback_result {
             Ok(()) => {
                 cleanup_upgrade_rollback(&rollback);
@@ -1399,7 +1242,7 @@ fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation
             )),
         };
     }
-    let mut transition = InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
+    let mut transition = InstallTransition::new(InstallIntent::Normal);
     let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
     match install_transaction(
         &source,
@@ -1422,7 +1265,7 @@ fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation
             })
         }
         Err(upgrade_error) => {
-            let rollback_result = restore_upgrade(&rollback, ephemeral_ci, Some(transition));
+            let rollback_result = restore_upgrade(&rollback, Some(transition));
             match rollback_result {
                 Ok(()) => {
                     cleanup_upgrade_rollback(&rollback);
@@ -1438,66 +1281,46 @@ fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation
     }
 }
 
-enum QualificationRollback {
+enum ActivationRollback {
     Fresh(InstallTransition),
     Upgrade(UpgradeInstallation),
 }
 
-fn qualify_outside_package_lease(
+fn verify_ready_package(lease: PackageLease, rollback: ActivationRollback) -> Result<(), String> {
+    verify_ready_package_with_observation(lease, rollback, || {
+        super::qualification::probe().and_then(|probe| {
+            if probe.attempts_empty {
+                Ok(())
+            } else {
+                Err("installed provider is not idle".into())
+            }
+        })
+    })
+}
+
+fn verify_ready_package_with_observation(
     lease: PackageLease,
-    rollback: QualificationRollback,
-    qualification_artifact_directory: Option<&Path>,
+    rollback: ActivationRollback,
+    observe: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let qualification_fault = state_root()
-        .join("package")
-        .join(QUALIFICATION_ROLLBACK_FAULT);
-    let (qualification, _lease) = if qualification_fault.is_file() {
-        (
-            Err(super::qualification::QualificationFailure::from(
-                "MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected fresh qualification rollback"
-                    .to_owned(),
-            )),
-            lease,
-        )
-    } else {
-        super::qualification::qualify_and_store_for_scope("package", lease)?
-    };
-    let artifact_export = match qualification_artifact_directory {
-        Some(destination) => export_production_qualification_artifacts(destination, &qualification),
-        None => Ok(()),
-    };
-    match (qualification, artifact_export, rollback) {
-        (Ok(_), Ok(()), QualificationRollback::Upgrade(installation)) => {
+    // Live readiness creates no target or admission lease. Keep package custody
+    // held through observation and any compensation of this exact generation.
+    let _lease = lease;
+    let ready = observe();
+    match (ready, rollback) {
+        (Ok(()), ActivationRollback::Upgrade(installation)) => {
             drop(installation.transition);
             cleanup_upgrade_rollback(&installation.rollback);
             Ok(())
         }
-        (Ok(_), Ok(()), QualificationRollback::Fresh(transition)) => {
+        (Ok(()), ActivationRollback::Fresh(transition)) => {
             drop(transition);
             Ok(())
         }
-        (Ok(_), Err(export_error), QualificationRollback::Upgrade(installation)) => {
-            drop(installation.transition);
-            cleanup_upgrade_rollback(&installation.rollback);
-            Err(format!(
-                "Windows qualification succeeded but external artifact export failed: {export_error}"
-            ))
-        }
-        (Ok(_), Err(export_error), QualificationRollback::Fresh(transition)) => {
-            drop(transition);
-            Err(format!(
-                "Windows qualification succeeded but external artifact export failed: {export_error}"
-            ))
-        }
-        (Err(failure), artifact_export, QualificationRollback::Upgrade(installation)) => {
-            let error = qualification_error_with_artifact_export(failure.detail, artifact_export);
+        (Err(error), ActivationRollback::Upgrade(installation)) => {
             let rollback = installation.rollback;
-            let rollback_result = restore_upgrade(
-                &rollback,
-                rollback.ephemeral_ci,
-                Some(installation.transition),
-            );
-            match rollback_result {
+            let restored = restore_upgrade(&rollback, Some(installation.transition));
+            match restored {
                 Ok(()) => {
                     cleanup_upgrade_rollback(&rollback);
                     Err(format!("MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK: {error}"))
@@ -1507,182 +1330,21 @@ fn qualify_outside_package_lease(
                 )),
             }
         }
-        (Err(failure), artifact_export, QualificationRollback::Fresh(transition)) => {
-            let error = qualification_error_with_artifact_export(failure.detail, artifact_export);
+        (Err(error), ActivationRollback::Fresh(transition)) => {
             match rollback_fresh_install(FreshRollback::Transition(transition)) {
                 Ok(()) => Err(format!(
-                    "MCSEALED-WINDOWS-PACKAGE: operation=install stage=qualification rollback=complete detail={error}"
+                    "MCSEALED-WINDOWS-PACKAGE: operation=install stage=readiness rollback=complete detail={error}"
                 )),
                 Err(rollback_error) => Err(format!(
-                    "MCSEALED-WINDOWS-INSTALL-ROLLBACK-FAILED: qualification={error}; rollback={rollback_error}"
+                    "MCSEALED-WINDOWS-INSTALL-ROLLBACK-FAILED: readiness={error}; rollback={rollback_error}"
                 )),
             }
         }
     }
-}
-
-fn qualification_error_with_artifact_export(
-    error: String,
-    artifact_export: Result<(), String>,
-) -> String {
-    match artifact_export {
-        Ok(()) => error,
-        Err(export_error) => {
-            let export_error = bounded_external_export_diagnostic(&export_error);
-            format!(
-                "{error}; secondary external qualification artifact export failure: {export_error}"
-            )
-        }
-    }
-}
-
-fn bounded_external_export_diagnostic(value: &str) -> String {
-    let limit = memcordon_windows_launch_core::MAX_FAILURE_DETAIL_BYTES;
-    if value.len() <= limit {
-        return value.to_owned();
-    }
-    let end = value
-        .char_indices()
-        .map(|(offset, character)| offset + character.len_utf8())
-        .take_while(|end| *end <= limit)
-        .last()
-        .unwrap_or_default();
-    value[..end].to_owned()
-}
-
-#[cfg(test)]
-pub(crate) fn qualification_error_with_artifact_export_for_test(
-    primary: String,
-    export_error: String,
-) -> String {
-    qualification_error_with_artifact_export(primary, Err(export_error))
-}
-
-fn validate_qualification_artifact_directory(destination: &Path) -> Result<(), String> {
-    reject_reparse_components(destination)?;
-    let metadata = std::fs::symlink_metadata(destination).map_err(|error| {
-        format!(
-            "external qualification artifact directory is unavailable at {}: {error}",
-            destination.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(format!(
-            "external qualification artifact destination is not a directory: {}",
-            destination.display()
-        ));
-    }
-    Ok(())
-}
-
-fn export_production_qualification_artifacts(
-    destination: &Path,
-    qualification: &Result<
-        memcordon_core::WindowsQualificationReceiptV1,
-        super::qualification::QualificationFailure,
-    >,
-) -> Result<(), String> {
-    let (outcome, receipt) = match qualification {
-        Ok(receipt) => (&receipt.loader_qualification, Some(receipt)),
-        Err(failure) => (
-            failure.loader_qualification.as_ref().ok_or_else(|| {
-                "typed production loader qualification outcome is absent".to_owned()
-            })?,
-            None,
-        ),
-    };
-    export_typed_production_qualification_artifacts(destination, outcome, receipt)
-}
-
-fn export_typed_production_qualification_artifacts(
-    destination: &Path,
-    outcome: &memcordon_core::WindowsLoaderQualificationOutcomeV2,
-    receipt: Option<&memcordon_core::WindowsQualificationReceiptV1>,
-) -> Result<(), String> {
-    validate_qualification_artifact_directory(destination)?;
-    if !outcome.is_consistent() {
-        return Err("typed production loader qualification outcome is inconsistent".to_owned());
-    }
-    let expected_plan_digest = match outcome {
-        memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
-            Some(ready.launch_plan_sha256.as_str())
-        }
-        memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure) => {
-            failure.launch_plan_sha256.as_deref()
-        }
-    };
-    let plan = match (expected_plan_digest, outcome.launch_plan_json()) {
-        (Some(expected), Some(json)) => {
-            let plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
-                serde_json::from_str(json)
-                    .map_err(|error| format!("typed production loader plan is invalid: {error}"))?;
-            if plan.launch_plan_sha256() != expected {
-                return Err(
-                    "typed production loader plan digest differs from its outcome".to_owned(),
-                );
-            }
-            Some(plan)
-        }
-        (Some(_), None) => {
-            return Err(
-                "typed production loader plan is absent for a post-plan outcome".to_owned(),
-            );
-        }
-        (None, Some(_)) => {
-            return Err(
-                "typed production loader plan is present for a pre-plan outcome".to_owned(),
-            );
-        }
-        (None, None) => None,
-    };
-    if let Some(receipt) = receipt {
-        if !receipt.qualified
-            || !receipt.is_consistent()
-            || receipt.loader_qualification != *outcome
-        {
-            return Err("typed Windows qualification receipt is inconsistent".to_owned());
-        }
-    }
-    let mut exported_outcome = outcome.clone();
-    exported_outcome.clear_launch_plan_json();
-
-    // Publish dependencies before the outcome commit point so a reader can
-    // never observe an outcome whose required plan or receipt is absent.
-    if let Some(plan) = &plan {
-        write_external_qualification_json(destination, "production-loader-plan-v1.json", plan)?;
-    }
-    if let Some(receipt) = receipt {
-        write_external_qualification_json(destination, "qualification.json", receipt)?;
-    }
-    write_external_qualification_json(
-        destination,
-        "production-loader-result-v2.json",
-        &exported_outcome,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn export_typed_production_qualification_artifacts_for_test(
-    destination: &Path,
-    outcome: &memcordon_core::WindowsLoaderQualificationOutcomeV2,
-    receipt: Option<&memcordon_core::WindowsQualificationReceiptV1>,
-) -> Result<(), String> {
-    export_typed_production_qualification_artifacts(destination, outcome, receipt)
-}
-
-fn write_external_qualification_json<T: serde::Serialize>(
-    destination: &Path,
-    name: &str,
-    value: &T,
-) -> Result<(), String> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    copy_atomically_bytes(&bytes, &destination.join(name))
 }
 
 fn restore_upgrade(
     rollback: &UpgradeRollback,
-    ephemeral_ci: bool,
     transition: Option<InstallTransition>,
 ) -> Result<(), String> {
     validate_artifact_pair(
@@ -1732,8 +1394,7 @@ fn restore_upgrade(
             owned: rollback.scm_connect_ace_owned,
         },
     })?;
-    let mut restored_transition =
-        InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
+    let mut restored_transition = InstallTransition::new(InstallIntent::Normal);
     install_transaction(
         &rollback.binary,
         &rollback.target_desktop_bootstrap,
@@ -1748,12 +1409,6 @@ fn restore_upgrade(
         )
         .map_err(|error| error.to_string())?;
     }
-    if let Some(qualification_backup) = &rollback.qualification {
-        let destination = state_root().join("package").join("qualification.json");
-        let staged = destination.with_extension("json.new");
-        std::fs::copy(qualification_backup, &staged).map_err(|error| error.to_string())?;
-        super::record::replace_atomically(&staged, &destination)?;
-    }
     drop(restored_transition);
     match bootstrap_error {
         Some(error) => Err(format!(
@@ -1767,7 +1422,6 @@ fn cleanup_upgrade_rollback(rollback: &UpgradeRollback) {
     for path in std::iter::once(&rollback.binary)
         .chain(std::iter::once(&rollback.target_desktop_bootstrap))
         .chain(std::iter::once(&rollback.session_broker))
-        .chain(rollback.qualification.iter())
     {
         if path_absent_no_follow(path, "cleanup-upgrade-rollback") == Ok(false) {
             let _ = std::fs::remove_file(path);
@@ -1794,7 +1448,7 @@ fn captured_installed_manifest(
         "capture-installed-runtime-manifest",
         memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
     )?;
-    let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(&bytes)?;
+    let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&bytes)?;
     validate_runtime_snapshot(&manifest, artifacts)?;
     Ok(Some(bytes))
 }
@@ -1824,7 +1478,7 @@ fn install_captured_transaction(
     transition: &mut InstallTransition,
 ) -> Result<(), String> {
     if let Some(bytes) = manifest_bytes {
-        let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(bytes)?;
+        let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(bytes)?;
         validate_runtime_snapshot(&manifest, source_artifacts)?;
     }
     let install_root = install_root();
@@ -1917,19 +1571,6 @@ fn install_captured_transaction(
         DirectorySecurityTransition::DaclAndMandatoryLabel,
     )?;
 
-    let marker = package_path.join("ephemeral-ci");
-    establish_ephemeral_marker(
-        transition.intent,
-        || {
-            std::fs::write(&marker, EPHEMERAL_CI_MARKER_CONTENTS).map_err(|error| {
-                format!(
-                    "MCSEALED-WINDOWS-INSTALL-STATE: cannot write ephemeral package marker: {error}"
-                )
-            })
-        },
-        ephemeral_ci_enabled,
-    )?;
-
     validate_installed_artifacts(&source_artifacts.digests)?;
     let services = configure_services(&destination, ServiceConfiguration::Fresh(transition))?;
     harden_runtime_state_security(transition)?;
@@ -1937,7 +1578,7 @@ fn install_captured_transaction(
     start_services(&services)?;
     transition.phase = InstallPhase::ServiceCleanupAvailable;
     verify_live_installed_state()?;
-    transition.phase = InstallPhase::ReadyForQualification;
+    transition.phase = InstallPhase::ReadyForActivation;
     Ok(())
 }
 
@@ -2057,9 +1698,7 @@ fn configure_services(
             service_manager::reconcile_session_broker(&manager, &session_broker_config)?
         }
         ServiceConfiguration::Fresh(transition) => {
-            let fault = transition
-                .intent
-                .authorized_session_broker_fault(certification_faults_enabled())?;
+            let fault = transition.intent.session_broker_fault();
             let broker = service_manager::create_session_broker_registration(
                 &manager,
                 &session_broker_config,
@@ -2221,27 +1860,6 @@ fn apply_final_directory_security(
                 path.display()
             )
         })
-}
-
-pub fn certification_faults_enabled() -> bool {
-    ephemeral_ci_enabled()
-}
-
-pub fn ephemeral_ci_enabled() -> bool {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let marker = state_root().join("package").join("ephemeral-ci");
-    let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return false;
-    }
-    if u64::try_from(EPHEMERAL_CI_MARKER_CONTENTS.len()).ok() != Some(metadata.len()) {
-        return false;
-    }
-    std::fs::read(marker).is_ok_and(|contents| contents == EPHEMERAL_CI_MARKER_CONTENTS)
 }
 
 pub(crate) fn copy_atomically_bytes(bytes: &[u8], destination: &Path) -> Result<(), String> {
@@ -2500,28 +2118,17 @@ pub(crate) fn reconcile_certification_marker_security(path: &Path) -> Result<(),
     expected.verify_path(path)
 }
 
-fn uninstall(ephemeral_ci: bool) -> Result<(), String> {
-    uninstall_with_removal(ephemeral_ci, remove_provider_files)
+fn uninstall() -> Result<(), String> {
+    uninstall_with_removal(remove_provider_files)
 }
 
 fn uninstall_with_removal(
-    ephemeral_ci: bool,
     remove: impl FnOnce(ProviderRemovalContext) -> Result<(), String>,
 ) -> Result<(), String> {
     service_owned_cleanup_barrier()?;
     let captured = validate_existing_installed_artifacts()?;
     let runtime_manifest = captured_installed_manifest(&captured)?;
     let policy_snapshot = super::policy_registry::capture_retired()?;
-    let qualification_path = state_root().join("package").join("qualification.json");
-    let qualification = if qualification_path.is_file() {
-        Some(read_regular_no_follow_bounded(
-            &qualification_path,
-            "uninstall-qualification-snapshot",
-            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
-        )?)
-    } else {
-        None
-    };
     if let Err(remove_error) = uninstall_services() {
         let reconcile = reconcile_services_from_installed();
         return match reconcile {
@@ -2541,7 +2148,7 @@ fn uninstall_with_removal(
         ScmAceDisposition::NotOwned
     };
     if let Err(remove_error) = remove(ProviderRemovalContext { scm_ace }) {
-        let mut transition = InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
+        let mut transition = InstallTransition::new(InstallIntent::Normal);
         let rollback = (|| {
             // A partial removal can leave hardened directories that cannot be
             // reopened with bootstrap authority. Retire that remaining state
@@ -2560,16 +2167,7 @@ fn uninstall_with_removal(
                 super::policy_registry::restore_retired(snapshot)?;
             }
             install_captured_transaction(&captured, runtime_manifest.as_deref(), &mut transition)
-        })()
-        .and_then(|()| {
-            if let Some(qualification) = qualification {
-                let destination = state_root().join("package").join("qualification.json");
-                let staged = destination.with_extension("json.new");
-                std::fs::write(&staged, qualification).map_err(|error| error.to_string())?;
-                super::record::replace_atomically(&staged, &destination)?;
-            }
-            Ok(())
-        });
+        })();
         return match rollback {
             Ok(()) => Err(format!(
                 "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: filesystem removal failed and the installed pair was restored: {remove_error}"
@@ -2724,9 +2322,7 @@ pub(crate) fn remove_installed_binary_with_convergence(
 
 #[derive(Clone, Copy, Debug)]
 enum PackageArtifact {
-    QualificationReceipt,
     EphemeralCi,
-    QualificationRollbackFault,
     ScmLauncherConnectOwnership,
     PreauthorizationFaultMatrix,
     RetirementFaultMatrix,
@@ -2738,9 +2334,7 @@ enum PackageArtifact {
 impl PackageArtifact {
     fn name(self) -> &'static str {
         match self {
-            Self::QualificationReceipt => "qualification.json",
             Self::EphemeralCi => "ephemeral-ci",
-            Self::QualificationRollbackFault => QUALIFICATION_ROLLBACK_FAULT,
             Self::ScmLauncherConnectOwnership => SCM_CONNECT_ACE_MARKER,
             Self::PreauthorizationFaultMatrix => "preauthorization-fault-matrix.json",
             Self::RetirementFaultMatrix => "retirement-fault-matrix.json",
@@ -2752,9 +2346,7 @@ impl PackageArtifact {
 
     fn phase(self) -> &'static str {
         match self {
-            Self::QualificationReceipt => "remove qualification receipt",
             Self::EphemeralCi => "remove ephemeral package marker",
-            Self::QualificationRollbackFault => "remove qualification rollback fault",
             Self::ScmLauncherConnectOwnership => "remove SCM launcher connect ownership marker",
             Self::PreauthorizationFaultMatrix => "remove preauthorization fault matrix",
             Self::RetirementFaultMatrix => "remove retirement fault matrix",
@@ -2813,9 +2405,7 @@ fn remove_provider_state(context: ProviderRemovalContext) -> Result<(), String> 
     if state_present {
         let package = state.join("package");
         for artifact in [
-            PackageArtifact::QualificationReceipt,
             PackageArtifact::EphemeralCi,
-            PackageArtifact::QualificationRollbackFault,
             PackageArtifact::ScmLauncherConnectOwnership,
             PackageArtifact::PreauthorizationFaultMatrix,
             PackageArtifact::RetirementFaultMatrix,
@@ -3233,10 +2823,7 @@ fn bounded_residual_inventory(
 fn classify_residual(directory: StateDirectory, name: &str) -> (&'static str, &'static str) {
     match directory {
         StateDirectory::Package => match name {
-            "qualification.json" => ("QualificationReceipt", "file"),
-            "qualification.json.new" => ("QualificationReceiptStaged", "absent"),
             "ephemeral-ci" => ("EphemeralCi", "file"),
-            QUALIFICATION_ROLLBACK_FAULT => ("QualificationRollbackFault", "file"),
             SCM_CONNECT_ACE_MARKER => ("ScmLauncherConnectOwnership", "file"),
             "preauthorization-fault-matrix.json" => ("PreauthorizationFaultMatrix", "file"),
             "retirement-fault-matrix.json" => ("RetirementFaultMatrix", "file"),
@@ -3579,38 +3166,26 @@ fn verify_service_process_protection(manager: &service_manager::ScHandle) -> Res
 }
 
 pub fn installed_inspection(
-    agent: AgentPackageInspectionV4,
-) -> Result<InstalledProviderInspectionV4, String> {
+    agent: AgentPackageInspection,
+) -> Result<InstalledProviderInspection, String> {
     verify_installed()?;
     let installed_executable_sha256 =
         crate::package::sha256_regular_no_follow(&installed_binary())?;
     let qualification = super::qualification::probe().ok();
-    let qualification_complete = qualification
-        .as_ref()
-        .is_some_and(|receipt| receipt.qualified && receipt.is_consistent());
+    let provider_reachable = qualification.is_some();
     let policy = match super::policy_registry::Lease::acquire().and_then(|lease| lease.read()) {
         Ok(Some(activation)) => activation.inspection()?,
         Ok(None) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unconfigured,
         Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
     };
-    let target = match std::env::consts::ARCH {
-        "aarch64" => "aarch64-pc-windows-msvc",
-        "x86_64" => "x86_64-pc-windows-msvc",
-        _ => return Err("unsupported installed inspection architecture".into()),
-    };
-    Ok(InstalledProviderInspectionV4 {
-        schema_version: 5,
+    Ok(InstalledProviderInspection {
+        format: InstalledInspectionFormat::Ordinary,
+        revision: InspectionRevision,
         agent,
         installed_executable_sha256,
         installed_artifacts_valid: true,
         provider_identity: qualification.map(|receipt| receipt.provider_identity),
-        provider_reachable: qualification_complete,
-        qualification_complete,
+        provider_reachable,
         policy,
-        profile_qualification: memcordon_core::runtime_manifest::profile_qualification_reference(
-            target,
-        ),
-        diagnostic_qualification:
-            memcordon_core::runtime_manifest::diagnostic_qualification_reference(target),
     })
 }

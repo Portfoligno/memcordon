@@ -1,31 +1,32 @@
-use sha2::{Digest, Sha256};
-
-pub use super::qualification_schema::QualificationReceipt;
-
-fn certification_digest(scenario: &str, expected: &[&str]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"linux-pid-namespace-cgroup-v2\0");
-    digest.update(scenario.as_bytes());
-    for property in expected {
-        digest.update(b"\0");
-        digest.update(property.as_bytes());
-    }
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
+pub use memcordon_core::runtime_readiness::ReadinessObservation;
 
 /// Executed as a sacrificial native target under the inherited, package-verified
 /// systemd address-family filter. It deliberately makes no stronger claim about
 /// alternate kernel networking interfaces or inherited descriptors.
 pub fn workload_profile_probe() -> Result<(), String> {
+    unix_socket_probe()?;
+    for family in [libc::AF_INET, libc::AF_INET6] {
+        // SAFETY: socket has no pointer arguments. Capture errno before cleanup.
+        let descriptor = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        if descriptor >= 0 {
+            // SAFETY: unexpected successful descriptor is still owned by the probe.
+            unsafe { libc::close(descriptor) };
+            return Err("baseline INET denial was bypassed".into());
+        }
+        if error != Some(libc::EAFNOSUPPORT) {
+            return Err("baseline INET denial errno changed".into());
+        }
+    }
+    Ok(())
+}
+
+fn unix_socket_probe() -> Result<(), String> {
     for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
         // SAFETY: socket has only scalar arguments; a successful descriptor is closed below.
         let descriptor = unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC, 0) };
         if descriptor < 0 {
-            return Err("qualified UNIX socket creation failed".into());
+            return Err("baseline UNIX socket creation failed".into());
         }
         // SAFETY: descriptor belongs exclusively to this probe.
         unsafe { libc::close(descriptor) };
@@ -40,40 +41,65 @@ pub fn workload_profile_probe() -> Result<(), String> {
             )
         } != 0
         {
-            return Err("qualified UNIX socketpair failed".into());
+            return Err("baseline UNIX socketpair failed".into());
         }
         for descriptor in pair {
             // SAFETY: successful socketpair transfers both descriptors to this probe.
             unsafe { libc::close(descriptor) };
         }
     }
-    for family in [libc::AF_INET, libc::AF_INET6] {
-        // SAFETY: socket has no pointer arguments. Capture errno before cleanup.
-        let descriptor = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        let error = std::io::Error::last_os_error().raw_os_error();
-        if descriptor >= 0 {
-            // SAFETY: unexpected successful descriptor is still owned by the probe.
+    Ok(())
+}
+
+#[cfg(feature = "private-tcp")]
+pub fn network_workload_profile_probe() -> Result<(), String> {
+    use crate::network_readiness::{Family, validate_creation};
+    unix_socket_probe()?;
+    validate_creation(Family::Unix, Ok(()), libc::EAFNOSUPPORT)?;
+    for (family, domain, kind, protocol) in [
+        (Family::Ipv4, libc::AF_INET, libc::SOCK_STREAM, 0),
+        (
+            Family::RouteNetlink,
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_ROUTE,
+        ),
+        (Family::Ipv6, libc::AF_INET6, libc::SOCK_STREAM, 0),
+    ] {
+        // SAFETY: scalar native socket operation under the inherited unit filter.
+        let descriptor = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
+        let outcome = if descriptor < 0 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .expect("failed socket has errno"))
+        } else {
+            // SAFETY: this probe exclusively owns the successful socket.
             unsafe { libc::close(descriptor) };
-            return Err("qualified INET denial was bypassed".into());
-        }
-        if error != Some(libc::EAFNOSUPPORT) {
-            return Err("qualified INET denial errno changed".into());
-        }
+            Ok(())
+        };
+        validate_creation(family, outcome, libc::EAFNOSUPPORT)?;
     }
     Ok(())
 }
 
-pub fn qualify() -> Result<QualificationReceipt, String> {
+pub fn observe_readiness() -> Result<ReadinessObservation, String> {
     verify_provider_identity()?;
     crate::package::verify()?;
-    qualify_after_package_verification()
+    observe_after_package_verification()
+}
+
+#[cfg(feature = "private-tcp")]
+pub fn observe_network_readiness() -> Result<ReadinessObservation, String> {
+    verify_provider_identity()?;
+    crate::package::verify()?;
+    observe_selected_after_package_verification(true)
 }
 
 #[cfg(feature = "test-support")]
-pub(crate) fn qualify_after_package_verification_for_test() -> Result<QualificationReceipt, String>
+pub(crate) fn observe_after_package_verification_for_test() -> Result<ReadinessObservation, String>
 {
     verify_provider_identity()?;
-    qualify_after_package_verification()
+    observe_after_package_verification()
 }
 
 fn verify_provider_identity() -> Result<(), String> {
@@ -85,7 +111,13 @@ fn verify_provider_identity() -> Result<(), String> {
     Ok(())
 }
 
-fn qualify_after_package_verification() -> Result<QualificationReceipt, String> {
+fn observe_after_package_verification() -> Result<ReadinessObservation, String> {
+    observe_selected_after_package_verification(false)
+}
+
+fn observe_selected_after_package_verification(
+    network: bool,
+) -> Result<ReadinessObservation, String> {
     // SAFETY: PR_GET_NO_NEW_PRIVS has no pointer arguments.
     let launcher_no_new_privs_disabled =
         unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 0;
@@ -110,7 +142,11 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let profile_probe = sacrificial_attempt_with_arguments(
         executable.as_os_str().as_bytes(),
-        vec![b"workload-profile-probe".to_vec()],
+        vec![if network {
+            b"network-workload-profile-probe".to_vec()
+        } else {
+            b"workload-profile-probe".to_vec()
+        }],
     );
     let profile_verified = profile_probe.as_ref().is_ok_and(|facts| {
         facts.child_status == Some(0)
@@ -169,84 +205,83 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
             && facts.guardian_reaped
             && facts.boundary_retired
     });
-    let qualified = success_verified
-        && spawn_error_verified
-        && launcher_no_new_privs_disabled
-        && profile_verified;
-    let setid_transition_certification_digest = certification_digest(
-        "sealed_setid_transition_preserves_boundary",
-        &[
-            "effective-uid-changed",
-            "attempt-cgroup-preserved",
-            "nested-pid-namespace-preserved",
-            "terminal-cleanup-verified",
-        ],
-    );
-    let sudo_transition_certification_digest = certification_digest(
-        "sealed_sudo_transition_preserves_boundary",
-        &[
-            "sudo-noninteractive-transition-succeeded",
-            "attempt-cgroup-preserved",
-            "nested-pid-namespace-preserved",
-            "terminal-cleanup-verified",
-        ],
-    );
-    let mut digest = Sha256::new();
-    digest.update(b"memcordon-sealed-agent-v2\0");
-    digest.update(env!("CARGO_PKG_VERSION").as_bytes());
-    digest.update(b"\0");
-    digest.update(setid_transition_certification_digest.as_bytes());
-    digest.update(sudo_transition_certification_digest.as_bytes());
-    digest.update([u8::from(qualified), u8::from(recovery_complete)]);
-    if let Ok(facts) = sacrificial.as_ref() {
-        digest.update(
-            facts
-                .child_status
-                .expect("qualification observed child status")
-                .to_be_bytes(),
-        );
-        digest.update(facts.caller_envelope_digest.as_bytes());
-    }
-    if let Ok(facts) = missing_sacrificial.as_ref() {
-        digest.update(
-            facts
-                .child_status
-                .expect("qualification observed child status")
-                .to_be_bytes(),
-        );
-        digest.update(facts.caller_envelope_digest.as_bytes());
-    }
-    let receipt = QualificationReceipt {
-        schema_version: 3,
-        workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
-            .reference(),
+    let mut observation = ReadinessObservation {
+        format: if network {
+            "memcordon.network-launcher-readiness"
+        } else {
+            "memcordon.runtime-readiness"
+        }
+        .into(),
+        revision: 1,
+        workload_profile: if network {
+            crate::network_readiness::profile()
+        } else {
+            memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
+        },
         workload_profile_probe_verified: profile_verified,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         provider_identity: "memcordon-sealed-agent-v2".to_owned(),
         control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
-        launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
-        receipt_digest: digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
+        launcher_service_identity: if network {
+            "memcordon-sealed-network-launcher.service:v2"
+        } else {
+            "memcordon-sealed-launcher.service:v2"
+        }
+        .to_owned(),
+        observation_digest: String::new(),
+        success_child_status: sacrificial
+            .as_ref()
+            .ok()
+            .and_then(|facts| facts.child_status),
+        missing_target_child_status: missing_sacrificial
+            .as_ref()
+            .ok()
+            .and_then(|facts| facts.child_status),
+        profile_child_status: profile_probe
+            .as_ref()
+            .ok()
+            .and_then(|facts| facts.child_status),
+        caller_envelope_digest: sacrificial
+            .as_ref()
+            .ok()
+            .map(|facts| facts.caller_envelope_digest.clone()),
         unified_cgroup_v2: true,
         private_cgroup_subtree: true,
         clone3,
-        clone3_into_cgroup: qualified,
-        pid_namespace: qualified,
-        mount_namespace: qualified,
-        cgroup_namespace: qualified,
+        clone3_into_cgroup: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.assignment_verified),
+        pid_namespace: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.namespaces_verified),
+        mount_namespace: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.namespaces_verified),
+        cgroup_namespace: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.namespaces_verified),
         pidfd: pidfd_available,
         close_range,
-        guardian_outside_boundary: qualified,
-        target_gated: qualified,
-        assignment_verified: qualified,
-        inherited_descriptors_verified: qualified,
+        guardian_outside_boundary: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.guardian_ready_before_authorization),
+        target_gated: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.guardian_ready_before_authorization),
+        assignment_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.assignment_verified),
+        inherited_descriptors_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.descriptors_verified),
         spawn_error_reporting_verified: spawn_error_verified,
-        frontend_loss_authority_verified: qualified,
-        cgroup_kill: qualified,
+        frontend_loss_authority_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.frontend_loss_authority_verified),
+        cgroup_kill: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.cgroup_kill_invoked),
         workload_empty: sacrificial.as_ref().is_ok_and(|facts| facts.cgroup_empty),
         helpers_reaped: sacrificial
             .as_ref()
@@ -270,15 +305,15 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
             .as_ref()
             .is_ok_and(|facts| facts.initial_provider_capabilities_absent),
         credential_transition_disposition: "preserve-caller-envelope".to_owned(),
-        setid_transition_certification_digest,
-        sudo_transition_certification_digest,
-        post_transition_cgroup_membership_verified: qualified,
-        post_transition_pid_namespace_verified: qualified,
-        post_transition_cleanup_verified: qualified,
-        recursive_provider_request_rejected: qualified,
     };
-    if receipt.complete() {
-        Ok(receipt)
+    observation.observation_digest = observation.digest_facts()?;
+    let complete = if network {
+        crate::network_readiness::complete(&observation)
+    } else {
+        observation.complete()
+    };
+    if success_verified && complete {
+        Ok(observation)
     } else {
         let mut causes = Vec::new();
         if let Some(error) = sacrificial_error {
@@ -286,12 +321,12 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
         }
         if causes.is_empty() {
             causes.push(
-                "qualification predicates were incomplete without a native phase error".to_owned(),
+                "readiness observations were incomplete without a native phase error".to_owned(),
             );
         }
         Err(format!(
-            "MCSEALED-PROVIDER-UNAVAILABLE: receipt={}; {}",
-            receipt.render(),
+            "MCSEALED-PROVIDER-UNAVAILABLE: observation={}; {}",
+            observation.render(),
             causes.join("; "),
         ))
     }

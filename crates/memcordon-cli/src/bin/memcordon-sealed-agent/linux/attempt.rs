@@ -219,7 +219,7 @@ impl AttemptRecord {
 
     pub fn bind_policy_checkpoint(
         &mut self,
-        binding: &memcordon_core::workload_evidence::AttemptBindingV1,
+        binding: &memcordon_core::workload_evidence::RuntimeAttemptBinding,
         checkpoint: &memcordon_core::workload_evidence::VerifiedCheckpointV1,
     ) -> Result<(), String> {
         let snapshot: crate::admission::FrozenAdmission = serde_json::from_str(
@@ -290,14 +290,12 @@ impl AttemptRecord {
         #[cfg(feature = "test-support")] fault: Option<TransitionFault>,
         #[cfg(not(feature = "test-support"))] _fault: Option<()>,
     ) -> Result<(), String> {
-        let mut temporary =
-            TransitionTemporary::create(self.path.with_extension("new"), &self.state_root)?;
-        let version = if self.policy_binding.is_some() {
-            3
+        let header = if self.policy_binding.is_some() {
+            "format=memcordon.linux-workload-journal\nrevision=1\n"
         } else if self.caller_envelope_digest.is_some() {
-            2
+            "version=2\n"
         } else {
-            1
+            "version=1\n"
         };
         let envelope = self
             .caller_envelope_digest
@@ -322,13 +320,13 @@ impl AttemptRecord {
                 format!("authenticated-uid={uid}\nprivate-invocation-digest={digest}\n")
             })
             .unwrap_or_default();
-        write_record(
-            &mut temporary.file,
-            &format!(
-                "version={version}\ncgroup={}\n{envelope}{private_invocation}{policy}{checkpoint}state={state}\n",
-                self.identity
-            ),
-        )?;
+        let body = format!(
+            "{header}cgroup={}\n{envelope}{private_invocation}{policy}{checkpoint}state={state}\n",
+            self.identity
+        );
+        let mut temporary =
+            TransitionTemporary::create(self.path.with_extension("new"), &self.state_root)?;
+        write_record(&mut temporary.file, &body)?;
         temporary
             .file
             .sync_all()
@@ -399,7 +397,13 @@ pub(crate) fn parse_durable_policy(
             return Err("duplicate durable record field".into());
         }
     }
-    let version = fields.remove("version").ok_or("durable version absent")?;
+    let version = match fields.remove("format") {
+        Some("memcordon.linux-workload-journal") if fields.remove("revision") == Some("1") => {
+            "local-policy"
+        }
+        Some(_) => return Err("unsupported durable record format or revision".into()),
+        None => fields.remove("version").ok_or("durable version absent")?,
+    };
     let identity = fields
         .remove("cgroup")
         .ok_or("durable attempt identity absent")?;
@@ -414,7 +418,7 @@ pub(crate) fn parse_durable_policy(
         None if state != "allocated" => {}
         _ => return Err("durable frontend identity differs from allocated state".into()),
     }
-    if matches!(version, "2" | "3") {
+    if matches!(version, "2" | "local-policy") {
         let digest = fields
             .remove("caller-envelope-digest")
             .ok_or("durable caller envelope absent")?;
@@ -425,7 +429,7 @@ pub(crate) fn parse_durable_policy(
     }
     let admission = match version {
         "1" | "2" => None,
-        "3" => {
+        "local-policy" => {
             let bytes = fields
                 .remove("policy-binding")
                 .ok_or("durable policy admission absent")?
@@ -460,7 +464,7 @@ pub(crate) fn parse_durable_policy(
                 }
                 memcordon_core::workload_contract::reject_duplicate_json_keys(bytes.as_bytes())?;
                 let (binding, checkpoint): (
-                    memcordon_core::workload_evidence::AttemptBindingV1,
+                    memcordon_core::workload_evidence::RuntimeAttemptBinding,
                     memcordon_core::workload_evidence::VerifiedCheckpointV1,
                 ) = serde_json::from_str(bytes).map_err(|error| error.to_string())?;
                 if binding.attempt_id.as_str() != identity

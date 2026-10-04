@@ -7,6 +7,8 @@ fuzz_target!(|count: u16| {
         history
             .append(
                 memcordon_core::AttemptRecord {
+                    operational_failure: None,
+                    private_execution: None,
                     runtime: None,
                     number,
                     kind: if number == 1 {
@@ -38,7 +40,7 @@ fuzz_target!(|count: u16| {
                     }),
                     restart_decision: memcordon_core::RestartDecisionRecord::default(),
                     launch: memcordon_core::LaunchEvidence::default(),
-                    policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+                    policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
                     restart_safety: memcordon_core::RestartSafetyProof::default(),
                     boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
                         backend: "fuzz-fixture".to_owned(),

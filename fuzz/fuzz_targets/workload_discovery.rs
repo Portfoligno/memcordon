@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
         ] {
             if discovery.validate(profile) {
                 let json = serde_json::to_vec(&discovery).unwrap();
-                let decoded: memcordon_core::workload_discovery::WorkloadDiscoveryV1 =
+                let decoded: memcordon_core::workload_discovery::WorkloadDiscovery =
                     serde_json::from_slice(&json).unwrap();
                 assert!(decoded.validate(profile));
                 let mut substituted = decoded;

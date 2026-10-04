@@ -1,4 +1,5 @@
 /target
+/.release
 /fuzz/target
 /tools/memcordon-ci/target
 /fuzz/corpus

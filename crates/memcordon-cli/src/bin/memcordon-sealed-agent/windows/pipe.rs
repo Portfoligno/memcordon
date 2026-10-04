@@ -272,6 +272,26 @@ impl OwnedHandle {
     pub const fn raw(&self) -> HANDLE {
         self.0
     }
+
+    /// Explicitly closes an authority-bearing handle. A destructor remains
+    /// the emergency fallback, but only this checked operation is positive
+    /// evidence that native handle closure succeeded.
+    pub fn close_checked(&mut self) -> Result<(), String> {
+        let handle = self.0;
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err("retirement handle is not live".to_owned());
+        }
+        // SAFETY: this instance uniquely owns the live kernel handle.
+        if unsafe { CloseHandle(handle) } == 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        self.0 = std::ptr::null_mut();
+        Ok(())
+    }
+
+    pub fn close_for_retirement(mut self) -> Result<(), String> {
+        self.close_checked()
+    }
 }
 
 impl Drop for OwnedHandle {

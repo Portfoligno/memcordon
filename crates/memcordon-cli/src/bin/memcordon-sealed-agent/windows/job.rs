@@ -3,7 +3,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -66,12 +66,32 @@ impl std::fmt::Display for JobObservationError {
 }
 impl From<JobObservationError> for String {
     fn from(error: JobObservationError) -> Self {
-        super::diagnostics::capture_native(
+        super::diagnostics::capture(super::job_diagnostics::event(
             error.operation,
             error.source.raw_os_error(),
-            memcordon_core::FailureCodeV1::JobQuery,
-        );
+        ));
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn wrong_object_accounting_error() -> JobObservationError {
+    // Valid event handles deliberately have the wrong native object type. Their
+    // owners remain live until the accounting call has captured its Win32 error.
+    let event = || {
+        // SAFETY: anonymous event has no optional security or name pointers.
+        OwnedHandle::new(unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(ptr::null(), 0, 0, ptr::null())
+        })
+        .expect("test event")
+    };
+    let job = Job {
+        handle: event(),
+        completion_port: event(),
+    };
+    match job.accounting_observed() {
+        Ok(_) => panic!("event handle unexpectedly accepted as a Job"),
+        Err(error) => error,
     }
 }
 
@@ -92,6 +112,18 @@ enum JobObjectSecurity {
 }
 
 impl Job {
+    pub fn close_checked(&mut self) -> Result<(), String> {
+        let port_result = self.completion_port.close_checked();
+        let job_result = self.handle.close_checked();
+        port_result?;
+        job_result
+    }
+
+    pub fn close_for_retirement(self) -> Result<(), String> {
+        let mut job = self;
+        job.close_checked()
+    }
+
     pub fn process_is_in_any_job(process: HANDLE) -> Result<bool, String> {
         let mut inside = 0_i32;
         // SAFETY: process is live; a null Job asks whether it belongs to any Job.
@@ -448,7 +480,13 @@ impl Job {
             let header = storage.as_ptr().cast::<u32>();
             let assigned = unsafe { *header } as usize;
             let listed = unsafe { *header.add(1) } as usize;
-            if success == 0 && assigned > capacity {
+            if success == 0
+                && native_failure
+                    .as_ref()
+                    .and_then(|failure| failure.source.raw_os_error())
+                    == i32::try_from(ERROR_MORE_DATA).ok()
+                && assigned > capacity
+            {
                 capacity = assigned.saturating_add(16);
                 continue;
             }
@@ -473,6 +511,87 @@ impl Job {
                 })
                 .collect();
         }
+    }
+
+    pub(super) fn process_ids_observed_bounded(
+        &self,
+        max_bytes: usize,
+        max_queries: u32,
+    ) -> Result<BoundedProcessSnapshot, JobObservationError> {
+        use memcordon_core::FailureOperationV1::QueryJobProcessIds;
+        if max_queries == 0 {
+            return Ok(BoundedProcessSnapshot::RetryBudget);
+        }
+        let mut capacity = usize::try_from(self.accounting_observed()?.ActiveProcesses)
+            .map_err(|_| {
+                JobObservationError::semantic(
+                    QueryJobProcessIds,
+                    "Job process count exceeds address width",
+                )
+            })?
+            .saturating_add(16);
+        for _ in 0..max_queries {
+            let slots = capacity.checked_add(1).ok_or_else(|| {
+                JobObservationError::semantic(QueryJobProcessIds, "Job process-list size overflow")
+            })?;
+            let bytes = slots.checked_mul(size_of::<usize>()).ok_or_else(|| {
+                JobObservationError::semantic(QueryJobProcessIds, "Job process-list byte overflow")
+            })?;
+            if bytes > max_bytes || u32::try_from(bytes).is_err() {
+                return Ok(BoundedProcessSnapshot::ByteBudget);
+            }
+            let mut storage = Vec::<usize>::new();
+            if storage.try_reserve_exact(slots).is_err() {
+                return Ok(BoundedProcessSnapshot::AllocationUnavailable);
+            }
+            storage.resize(slots, 0);
+            let mut returned = 0_u32;
+            // SAFETY: storage is native-aligned, initialized, and bytes is its
+            // complete writable allocation.
+            let success = unsafe {
+                QueryInformationJobObject(
+                    self.handle(),
+                    JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                    storage.as_mut_ptr().cast(),
+                    u32::try_from(bytes).expect("bounded native byte count"),
+                    &raw mut returned,
+                )
+            };
+            let native_failure =
+                (success == 0).then(|| JobObservationError::last(QueryJobProcessIds));
+            // SAFETY: the initialized first pointer-sized slot contains the
+            // two u32 header words on both supported Windows targets.
+            let header = storage.as_ptr().cast::<u32>();
+            let assigned = unsafe { *header } as usize;
+            let listed = unsafe { *header.add(1) } as usize;
+            if success == 0 && assigned > capacity {
+                capacity = assigned.saturating_add(16);
+                continue;
+            }
+            if success == 0 {
+                return Err(native_failure.expect("failed native query captured immediately"));
+            }
+            if listed > capacity || listed > assigned {
+                return Err(JobObservationError::semantic(
+                    QueryJobProcessIds,
+                    "Job process-list readback is inconsistent",
+                ));
+            }
+            let mut process_ids = Vec::new();
+            if process_ids.try_reserve_exact(listed).is_err() {
+                return Ok(BoundedProcessSnapshot::AllocationUnavailable);
+            }
+            for value in &storage[1..1 + listed] {
+                process_ids.push(u32::try_from(*value).map_err(|_| {
+                    JobObservationError::semantic(
+                        QueryJobProcessIds,
+                        "Job process id exceeds the Windows PID width",
+                    )
+                })?);
+            }
+            return Ok(BoundedProcessSnapshot::Complete(process_ids));
+        }
+        Ok(BoundedProcessSnapshot::RetryBudget)
     }
 
     fn accounting(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, String> {
@@ -606,6 +725,13 @@ impl Job {
         }
         Ok(self.accounting_observed()?.ActiveProcesses == 0)
     }
+}
+
+pub(super) enum BoundedProcessSnapshot {
+    Complete(Vec<u32>),
+    ByteBudget,
+    RetryBudget,
+    AllocationUnavailable,
 }
 
 fn reject_fault(

@@ -281,9 +281,8 @@ pub(crate) fn sealed_info(receipt: crate::sealed::client::ProbeReceipt) -> Backe
                     workload_empty_proof: true,
                     limitations: vec!["requires installed root MemCordon provider".to_owned()],
                 },
-                qualification: crate::backend::BoundaryQualification {
+                observation: crate::backend::BoundaryReadiness {
                     provider_identity: receipt.provider_identity,
-                    receipt_digest: receipt.receipt_digest,
                     mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
                 },
             },
@@ -888,6 +887,7 @@ pub fn run_attempt(
     let (launch, restart_safety, boundary_detail) =
         crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
+        private_execution: None,
         policy_enforcement: Default::default(),
         outcome,
         backend,

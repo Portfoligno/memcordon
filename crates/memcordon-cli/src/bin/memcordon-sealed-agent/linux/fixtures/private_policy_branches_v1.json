@@ -1,0 +1,1 @@
+{"schema_version":1,"selector":"private_tcp::wrong_grant_profile_and_port_rejected","positive_control_selector":"private_tcp::native_tcp_bind_listen_connect","branch_order":["wrong-grant","wrong-profile","unapproved-changed-port-plan","committed-port-tamper"],"require_frozen_port_binding":true}

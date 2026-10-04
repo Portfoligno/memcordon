@@ -102,7 +102,7 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
         exec_status = exec_status,
         os_code = os_code,
         policy_enforcement = serde_json::to_string(
-            &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+            &memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
         )
         .unwrap(),
         caller_envelope_digest = CALLER_ENVELOPE_DIGEST,
@@ -110,6 +110,207 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
         caller_mount_namespace_digest = CALLER_MOUNT_NAMESPACE_DIGEST,
     )
     .into_bytes()
+}
+
+#[test]
+fn private_preallocation_rejection_needs_exact_live_invocation_binding() {
+    use memcordon_core::private_runtime::PrivateRuntimeRejection;
+    use memcordon_core::workload_contract::WorkloadContractV2;
+    use memcordon_core::{BoundedText, DiagnosticSha256, PublicProviderBindingV1};
+
+    let contract = WorkloadContractV2::parse(include_bytes!(
+        "../../../fuzz/corpus/workload-request/baseline-v2.json"
+    ))
+    .unwrap();
+    let expected = PrivateRuntimeRejection {
+        format: "memcordon.private-runtime-rejection".into(),
+        revision: 1,
+        provider: PublicProviderBindingV1 {
+            generation: BoundedText::new("1.2.3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            runtime_manifest_sha256: DiagnosticSha256::from_bytes([7; 32]),
+        },
+        attempt_id: [0x12; 16],
+        request_sha256: DiagnosticSha256::from_bytes([0x34; 32]),
+        invocation_sha256: DiagnosticSha256::from_bytes([0x56; 32]),
+        contract,
+        boundary_allocated: false,
+        reservation_may_remain: true,
+        detail: BoundedText::new("live grant rejected before boundary allocation").unwrap(),
+    };
+    let parse = |bytes: &[u8]| {
+        PrivateRuntimeRejection::parse_bound(
+            bytes,
+            &expected.provider,
+            expected.attempt_id,
+            &expected.request_sha256,
+            &expected.contract,
+            &expected.invocation_sha256,
+        )
+    };
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    assert_eq!(parse(&bytes).unwrap(), expected);
+    for field in ["attempt_id", "request_sha256", "invocation_sha256"] {
+        let mut swapped = serde_json::to_value(&expected).unwrap();
+        swapped[field] = if field == "attempt_id" {
+            serde_json::to_value([0x34; 16]).unwrap()
+        } else {
+            serde_json::to_value(DiagnosticSha256::from_bytes([0x78; 32])).unwrap()
+        };
+        assert!(
+            parse(&serde_json::to_vec(&swapped).unwrap()).is_err(),
+            "{field}"
+        );
+    }
+    let indeterminate = serde_json::json!({
+        "schema_version": 11,
+        "attempt_id": "12121212121212121212121212121212",
+        "release_knowledge": "possibly-released",
+        "retirement_knowledge": "unverified",
+        "replay_disposition": "do-not-replay",
+        "reason_code": "MCSEALED-PRIVATE-TERMINAL-UNVERIFIED"
+    });
+    assert!(parse(&serde_json::to_vec(&indeterminate).unwrap()).is_err());
+
+    let rejection = br#"{
+        "schema_version":1,
+        "code":"MCSEALED-PRIVATE-QUALIFICATION",
+        "phase":"request-validation",
+        "detail":"no installed qualification",
+        "os_code":null,
+        "target_created":false,
+        "target_released":false,
+        "cleanup":{"attempted":false,"direct_child_reaped":false,
+            "workload_empty":null,"helpers_reaped":false,
+            "containment_removed":false,"sealed_boundary_retired":false,"errors":[]}
+    }"#;
+    assert!(parse(rejection).is_err());
+}
+
+#[test]
+fn historical_private_report_preserves_exact_binding_and_retirement_checks() {
+    use std::num::NonZeroU64;
+
+    use memcordon_core::report_v11::{
+        PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivateTerminalOutcomeV11,
+        TrustedPrivateExecutionV11,
+    };
+    use memcordon_core::workload_admission_v2::AttemptBindingV2;
+    use memcordon_core::workload_contract::{LogicalId, Nonce128, ProfileRef};
+    use memcordon_core::workload_evidence_v2::{
+        EntryResourceObservationV2, NamespaceObservationV2, PrivatePortPolicyV1,
+        PrivateTcpCheckpointV2, PrivateTcpRetiredV2, QualifiedNativeAbiV2, TargetIdentityKindV2,
+        TargetIdentityObservationV2, VerifiedTrue,
+    };
+    use memcordon_core::{BoundedText, DiagnosticSha256};
+
+    fn digest(byte: u8) -> DiagnosticSha256 {
+        DiagnosticSha256::from_bytes([byte; 32])
+    }
+    fn yes() -> VerifiedTrue {
+        VerifiedTrue::observed(true).unwrap()
+    }
+    let attempt = AttemptBindingV2 {
+        attempt_id: BoundedText::new("12121212121212121212121212121212").unwrap(),
+        admission_digest: digest(7),
+        caller_envelope_digest: digest(8),
+        native_invocation_digest: digest(9),
+    };
+    let checkpoint = PrivateTcpCheckpointV2 {
+        attempt_binding: attempt.canonical_digest().unwrap(),
+        profile: ProfileRef {
+            id: LogicalId::new("linux-tcp4-private-v1".into()).unwrap(),
+            semantic_digest: digest(2),
+        },
+        identity: TargetIdentityObservationV2 {
+            kind: TargetIdentityKindV2::PreserveCaller,
+            entrypoint_digest: digest(3),
+            exact_credentials_verified: yes(),
+            no_new_privileges_verified: yes(),
+            capability_sets_empty: yes(),
+            bounding_set_empty: yes(),
+        },
+        caller_envelope_reference: Nonce128([4; 16]),
+        target_network_namespace: NamespaceObservationV2::observed(
+            NonZeroU64::new(11).unwrap(),
+            NonZeroU64::new(22).unwrap(),
+            true,
+            true,
+        )
+        .unwrap(),
+        topology_digest: digest(5),
+        filter_digest: digest(6),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        port_policy: PrivatePortPolicyV1::observed(0, 32768, 60999, true).unwrap(),
+        resources: EntryResourceObservationV2::observed(5, 3, true, true, true, true, true)
+            .unwrap(),
+        guardian_verified: yes(),
+        epoch_revalidated: yes(),
+        checkpoint_durable: yes(),
+    };
+    let retirement =
+        PrivateTcpRetiredV2::observed(&checkpoint, true, true, true, true, true, true).unwrap();
+    let report = PrivateExecutionReportV11 {
+        schema_version: PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+        source_commit: "a".repeat(40),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        runtime_manifest_sha256: digest(10),
+        installed_qualification_sha256: digest(11),
+        attempt,
+        checkpoint,
+        retirement,
+        terminal_receipt_sha256: digest(12),
+        outcome: PrivateTerminalOutcomeV11::Exited { code: 0 },
+    };
+    let bytes = serde_json::to_vec(&report).unwrap();
+    let checkpoint_sha256 = report.checkpoint.canonical_digest().unwrap();
+    let retirement_sha256 = report.retirement.canonical_digest().unwrap();
+    let expected = TrustedPrivateExecutionV11 {
+        source_commit: &report.source_commit,
+        native_abi: report.native_abi,
+        runtime_manifest_sha256: &report.runtime_manifest_sha256,
+        installed_qualification_sha256: &report.installed_qualification_sha256,
+        attempt: &report.attempt,
+        checkpoint_sha256: &checkpoint_sha256,
+        retirement_sha256: &retirement_sha256,
+        terminal_receipt_sha256: &report.terminal_receipt_sha256,
+        outcome: &report.outcome,
+    };
+    assert_eq!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &bytes,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &expected,
+        )
+        .unwrap(),
+        report
+    );
+
+    let wrong_manifest = digest(99);
+    let swapped_expected = TrustedPrivateExecutionV11 {
+        runtime_manifest_sha256: &wrong_manifest,
+        ..expected
+    };
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &bytes,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &swapped_expected,
+        )
+        .is_err()
+    );
+
+    let mut unretired = serde_json::to_value(&report).unwrap();
+    unretired["retirement"]["provider_network_references_closed"] = serde_json::json!(false);
+    let unretired = serde_json::to_vec(&unretired).unwrap();
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &unretired,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &expected,
+        )
+        .is_err()
+    );
 }
 
 fn revoked_terminal() -> Vec<u8> {
@@ -137,11 +338,12 @@ fn revoked_terminal() -> Vec<u8> {
             revision: NonZeroU64::MIN,
         },
     };
-    let snapshot = ProviderAdmissionSnapshotV1 {
+    let snapshot = RuntimeAdmissionSnapshot {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
         request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
         request,
         registry_digest: digest.clone(),
-        qualification_digest: digest.clone(),
         admission_nonce: Nonce128([4; 16]),
         caller_invocation_reference: Nonce128([5; 16]),
         private_invocation_digest: digest.clone(),
@@ -149,7 +351,7 @@ fn revoked_terminal() -> Vec<u8> {
         native_profile: profile,
     };
     let source = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let binding = AttemptBindingV1::from_snapshot(
+    let binding = RuntimeAttemptBinding::from_snapshot(
         &snapshot,
         memcordon_core::PublicProviderBindingV1 {
             generation: BoundedText::new(&format!("0.5.3-dev:{source}")).unwrap(),
@@ -172,7 +374,7 @@ fn revoked_terminal() -> Vec<u8> {
         true,
     )
     .unwrap();
-    let enforcement = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    let enforcement = RuntimePolicyEnforcement::retired(binding, checkpoint, true, true).unwrap();
     let ordinary = String::from_utf8(terminal(0, "success", "none")).unwrap();
     let mut payload = String::new();
     for line in ordinary.lines() {
@@ -249,7 +451,7 @@ fn policy_revocation_preserves_authorized_attempt_and_verified_retirement() {
         );
     }
     let legacy = serde_json::to_string(
-        &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+        &memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
     )
     .unwrap();
     let mut unbound = String::new();

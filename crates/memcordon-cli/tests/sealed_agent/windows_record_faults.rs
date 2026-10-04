@@ -274,6 +274,46 @@ fn observed_record() -> WindowsAttemptRecordV1 {
 }
 
 #[test]
+fn service_and_core_v4_records_use_identical_optional_disposition_bytes() {
+    for disposition in [
+        None,
+        Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort),
+    ] {
+        let record = WindowsAttemptRecordV1 {
+            terminal_disposition: disposition,
+            ..observed_record()
+        };
+        let service = serde_json::to_vec(&record).unwrap();
+        let core = serde_json::to_vec(&decoded_v4(&record)).unwrap();
+        assert_eq!(service, core);
+    }
+    let mut preterminal = observed_record();
+    preterminal.validate_for_store_for_test().unwrap();
+    authenticate(&preterminal, &preterminal.attempt_id).unwrap();
+}
+
+#[test]
+fn worker_thread_identity_is_in_authenticated_durable_record() {
+    let mut record = observed_record();
+    record.worker_identity = Some(WindowsProcessIdentityV1 {
+        process_id: 42,
+        creation_time_100ns: 7,
+    });
+    record.worker_thread_identity = Some(memcordon_core::WindowsWorkerThreadIdentityV1 {
+        thread_id: 43,
+        creation_time_100ns: 8,
+    });
+    record.validate_for_store_for_test().unwrap();
+    authenticate(&record, &record.attempt_id).unwrap();
+    let decoded: memcordon_core::WindowsDurableAttemptRecordV4 =
+        serde_json::from_slice(&canonical_record_bytes(&record).unwrap()).unwrap();
+    assert_eq!(
+        decoded.worker_thread_identity,
+        record.worker_thread_identity
+    );
+}
+
+#[test]
 fn native_publication_fault_matrix_preserves_original_and_honest_commit_boundary() {
     for phase in [
         PublicationPhase::ReadPrevious,

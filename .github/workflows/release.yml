@@ -2,1337 +2,750 @@ name: Release
 
 on:
   push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+*"
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing protected SemVer tag to publish or reconcile
+        description: Existing unprefixed release tag
         required: true
+        type: string
+      recovery-mode:
+        description: Rebuild or reuse the original prepared bytes
+        required: true
+        default: reprepare
+        type: choice
+        options: [reprepare, publication-only]
+      original-run-id:
+        description: Original preparation run for publication-only
+        type: string
+      prepared-artifact-id:
+        description: Original immutable prepared artifact id
+        type: string
+      tool-artifact-id:
+        description: Original immutable publication tool artifact id
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: memcordon-release
+  group: memcordon-release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  linux-standard-certification:
-    name: Release / Linux standard certification / x64
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        id: source-push
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        id: source-dispatch
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: standard-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: standard-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: managed-v2-cargo-target-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: release-certification-standard-linux-x64
-          path: target/ci/reports/standard/linux-x64/backend-linux-cgroup-v2.json
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: diagnostics-standard-linux-x64
-          path: target/ci/standard-diagnostics/linux-x64
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: ${{ steps.standard-target.outputs.cache-primary-key }}
-      - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.standard-deps.outputs.cache-primary-key }}
-
-  windows-standard-certification:
-    name: Release / Windows standard certification / x64
-    needs: preflight
-    runs-on: windows-2025
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        id: source-push
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        id: source-dispatch
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: standard-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: standard-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: managed-v2-cargo-target-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: release-certification-standard-windows-x64
-          path: target/ci/reports/standard/windows-x64/backend-windows-job-object.json
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: diagnostics-standard-windows-x64
-          path: target/ci/standard-diagnostics/windows-x64
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/standard-backend
-          key: ${{ steps.standard-target.outputs.cache-primary-key }}
-      - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.standard-deps.outputs.cache-primary-key }}
-
-  preflight:
-    name: Release / preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: preflight-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
-      - run: rustup toolchain install 1.85.0 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: preflight-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci
-            !target/ci/control-bootstrap
-            !target/ci/source-home
-            !target/ci/native-inputs.bin
-            !target/ci/native-inputs.admission.json
-            !target/ci/reports
-            !target/ci/*evidence*
-            !target/ci/*diagnostic*
-            !target/ci/release-bundle
-            !target/ci/release-inputs
-          key: managed-v2-cargo-target-release-v3-preflight-1.97.1-msrv-1.85.0-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.preflight-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.preflight-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci
-            !target/ci/control-bootstrap
-            !target/ci/source-home
-            !target/ci/native-inputs.bin
-            !target/ci/native-inputs.admission.json
-            !target/ci/reports
-            !target/ci/*evidence*
-            !target/ci/*diagnostic*
-            !target/ci/release-bundle
-            !target/ci/release-inputs
-          key: ${{ steps.preflight-target.outputs.cache-primary-key }}
-      - if: always() && steps.preflight-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.preflight-deps.outputs.cache-primary-key }}
-
-  native:
-    name: Release / native / ${{ matrix.id }}
-    needs: preflight
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: linux-x64
-            runner: ubuntu-24.04
-          - id: linux-arm64
-            runner: ubuntu-24.04-arm
-          - id: macos-arm64
-            runner: macos-15
-          - id: macos-x64
-            runner: macos-15-intel
-          - id: windows-x64
-            runner: windows-2025
-          - id: windows-arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: native-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: native-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci/release-native
-          key: managed-v2-cargo-target-release-v1-native-${{ matrix.id }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-native
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: release-native-${{ matrix.id }}
-          path: target/ci/release-output
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.native-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.native-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci/release-native
-          key: ${{ steps.native-target.outputs.cache-primary-key }}
-      - if: always() && steps.native-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.native-deps.outputs.cache-primary-key }}
-
-  miri:
-    name: Release / Miri
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: miri-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci/miri
-          key: managed-v2-cargo-target-release-v1-miri-nightly-2026-07-31-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'crates/**', 'tools/**', 'ci/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.miri-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.miri-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci/miri
-          key: ${{ steps.miri-target.outputs.cache-primary-key }}
-
-  fuzz:
-    name: Release / fuzz
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: fuzz-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: fuzz/target
-          key: managed-v2-cargo-target-release-v2-fuzz-nightly-2026-07-31-${{ hashFiles('target/ci/native-inputs.bin', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/tools.toml', 'ci/toolchains.toml') }}
-      - id: fuzz-tools
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-tools
-          key: managed-v2-cargo-tools-release-v1-fuzz-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'ci/tools.toml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.fuzz-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.fuzz-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: fuzz/target
-          key: ${{ steps.fuzz-target.outputs.cache-primary-key }}
-      - if: always() && steps.fuzz-tools.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.fuzz-tools.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-tools
-          key: ${{ steps.fuzz-tools.outputs.cache-primary-key }}
-
-  linux-certification:
-    name: Release / Linux sealed certification
-    needs: preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: certification-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: certification-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/sealed-agent
-          key: managed-v2-cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-certification-linux
-          path: target/ci/reports/linux-sealed-v2
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-          include-hidden-files: true
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/sealed-agent
-          key: ${{ steps.certification-target.outputs.cache-primary-key }}
-      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
-
-  windows-loader-production:
-    name: Release / Windows loader production / ${{ matrix.id }}
-    needs: native
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-native-windows-${{ matrix.id }}
-          path: target/ci/release-input
-      - id: production-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-windows-loader-production-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: production-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: managed-v2-cargo-target-release-windows-loader-production-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.production-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.production-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: ${{ steps.production-target.outputs.cache-primary-key }}
-      - if: always() && steps.production-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.production-deps.outputs.cache-primary-key }}
-
-  windows-provider-lifecycle:
-    name: Release / Windows provider lifecycle / ${{ matrix.id }}
-    needs: windows-loader-production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-native-windows-${{ matrix.id }}
-          path: target/ci/release-input
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-      - id: lifecycle-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: lifecycle-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: managed-v2-cargo-target-release-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/provider-lifecycle
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/backend
-            target/ci/windows-sealed
-          key: ${{ steps.lifecycle-target.outputs.cache-primary-key }}
-      - if: always() && steps.lifecycle-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.lifecycle-deps.outputs.cache-primary-key }}
-
-  windows-package-channel:
-    name: Release / Windows package channel / ${{ matrix.id }}
-    needs: windows-provider-lifecycle
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-native-windows-${{ matrix.id }}
-          path: target/ci/release-input
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/provider-lifecycle
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-windows-loader-production-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/loader-production
-      - id: package-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: package-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: managed-v2-cargo-target-release-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - name: Certify packaged Cargo channel
-        env:
-          CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-windows-package-channel-${{ matrix.id }}
-          path: target/ci/windows-sealed-cargo
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: ${{ steps.package-target.outputs.cache-primary-key }}
-      - if: always() && steps.package-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.package-deps.outputs.cache-primary-key }}
-
-  macos-acceptance:
-    name: Release / macOS ${{ matrix.id }} acceptance
-    needs: preflight
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: arm64
-            runner: macos-15
-          - id: x64
-            runner: macos-15-intel
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    steps:
-      - name: Check out pushed tag
-        id: source-push
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        id: source-dispatch
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - id: macos-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-macos-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: macos-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/native
-            target/ci/backend-macos
-            target/ci/deadline-build
-            target/ci/deadline-oracle-build
-          key: managed-v2-cargo-target-release-macos-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'MAINTAINERS.md', 'rust-toolchain.toml', '.cargo/**', '.github/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-macos
-      - if: matrix.id == 'arm64'
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-acceptance-macos-arm64
-          path: target/ci/reports/backend-macos-watchdog.json
-          if-no-files-found: error
-          retention-days: 14
-      - if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-deadline-macos-${{ matrix.id }}
-          path: target/ci/deadline-evidence
-          if-no-files-found: error
-          retention-days: 14
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.macos-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.macos-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/bootstrap
-            target/ci/native
-            target/ci/backend-macos
-            target/ci/deadline-build
-            target/ci/deadline-oracle-build
-          key: ${{ steps.macos-target.outputs.cache-primary-key }}
-      - if: always() && steps.macos-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.macos-deps.outputs.cache-primary-key }}
-
-  assemble:
-    name: Release / assemble
-    needs:
-      - native
-      - miri
-      - fuzz
-      - linux-certification
-      - windows-package-channel
-      - macos-acceptance
-      - linux-standard-certification
-      - windows-standard-certification
+  select:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      selected-commit: ${{ steps.source.outputs.selected-commit }}
+      public-consumer: ${{ steps.source.outputs.public-consumer }}
+      recovery-mode: ${{ steps.source.outputs.recovery-mode }}
+      tool-artifact-id: ${{ steps.tool.outputs.artifact-id || steps.recovery.outputs.tool-artifact-id }}
+      prepared-artifact-id: ${{ steps.recovery.outputs.prepared-artifact-id }}
+      original-run-id: ${{ steps.recovery.outputs.original-run-id }}
     steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
+      - if: github.event_name == 'push'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
+      - if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: deps
         with:
-          pattern: release-*
-          path: target/ci/release-inputs
-          merge-multiple: false
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: source
+        run: ./target/ci/release/memcordon-ci release select
+      - id: recovery
+        name: Read original preparation artifacts
+        if: steps.source.outputs.recovery-mode == 'publication-only'
+        run: ./target/ci/release/memcordon-ci release recovery-inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: steps.source.outputs.recovery-mode == 'reprepare'
+        run: ./target/ci/release/memcordon-ci release publication-tool
+      - if: steps.source.outputs.recovery-mode == 'reprepare'
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          name: selected-source-${{ github.run_id }}
+          path: .release/source.json
+          if-no-files-found: error
+      - id: tool
+        if: steps.source.outputs.recovery-mode == 'reprepare'
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: publication-tool-${{ github.run_id }}
+          path: .release/tool
+          if-no-files-found: error
+      - if: always() && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
           path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  packages:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: &release-check-source-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci release verify-source
+      - id: packages
+        run: ./target/ci/release/memcordon-ci release packages
       - uses: ./.github/actions/upload-artifact
         with:
-          name: release-bundle
-          path: target/ci/release-bundle
+          name: packages-${{ github.run_id }}
+          path: .release/packages
           if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
+      - if: always() && steps.packages.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: ${{ steps.deps.outputs.cache-primary-key }}
 
-  rehearse-public:
-    name: Release / rehearse public state / ${{ matrix.id }}
-    needs: assemble
+  source-checks:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci suite policy
+      - id: quality-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose quality --shard complete
+      - id: quality-products
+        if: steps.quality-context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/quality
+          key: ${{ steps.quality-context.outputs.product-key }}
+      - id: quality
+        run: ./target/ci/release/memcordon-ci suite quality
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - id: msrv-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose msrv --shard complete
+      - id: msrv-products
+        if: steps.msrv-context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/msrv
+          key: ${{ steps.msrv-context.outputs.product-key }}
+      - id: msrv
+        run: ./target/ci/release/memcordon-ci suite msrv
+      - id: supply-context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose supply --shard complete
+      - id: supply-products
+        if: steps.supply-context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: &release-check-tool-paths |
+            target/ci-tools/bin
+            target/ci-tools-build
+          key: ${{ steps.supply-context.outputs.product-key }}
+      - id: supply
+        run: ./target/ci/release/memcordon-ci suite supply-chain
+      - if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality.outputs.cache-quiescent == 'true' && steps.quality-products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/quality
+          key: ${{ steps.quality-products.outputs.cache-primary-key }}
+      - if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.msrv-products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/msrv
+          key: ${{ steps.msrv-products.outputs.cache-primary-key }}
+      - if: always() && steps.supply-context.outputs.compiled-cache-usable == 'true' && steps.supply.outputs.cache-quiescent == 'true' && steps.supply-products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-tool-paths
+          key: ${{ steps.supply-products.outputs.cache-primary-key }}
+      - if: always() && steps.quality.outputs.cache-quiescent == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.supply.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  miri:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [first, second]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci ci prepare --profile miri
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard complete
+      - id: products
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/miri-*
+          key: ${{ steps.context.outputs.product-key }}-${{ matrix.shard }}
+      - id: first
+        if: matrix.shard == 'first'
+        run: ./target/ci/release/memcordon-ci suite miri-first
+      - id: second
+        if: matrix.shard == 'second'
+        run: ./target/ci/release/memcordon-ci suite miri-second
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/miri-*
+          key: ${{ steps.products.outputs.cache-primary-key }}
+      - if: always() && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  fuzz:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [first, second]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci release verify-source
+      - id: prepare
+        run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz
+      - id: context
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard complete
+      - id: products
+        if: steps.context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: &release-fuzz-product-paths |
+            fuzz/target
+            target/ci-tools/bin
+            target/ci-tools-build
+          key: ${{ steps.context.outputs.product-key }}-${{ matrix.shard }}
+      - id: first
+        if: matrix.shard == 'first'
+        run: ./target/ci/release/memcordon-ci suite fuzz-first
+      - id: second
+        if: matrix.shard == 'second'
+        run: ./target/ci/release/memcordon-ci suite fuzz-second
+      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-fuzz-product-paths
+          key: ${{ steps.products.outputs.cache-primary-key }}
+      - if: always() && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: *release-check-source-paths
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  native-linux-x64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: linux-x64
+          - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-          - id: windows-x64
-            runner: windows-2025
-          - id: windows-arm64
-            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    permissions:
-      contents: read
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    steps: &native-target-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: release-bundle
-          path: target/ci/release-bundle
-      - id: rehearse-public-deps
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-rehearse-public-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
-        uses: ./.github/actions/upload-artifact
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: cache
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete
+      - id: products
+        if: steps.cache.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json
+            target/ci-build
+            target/ci/native
+          key: ${{ steps.cache.outputs.product-key }}
+      - id: build
+        run: ./target/ci/release/memcordon-ci release build-target
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: native-${{ matrix.target }}-${{ github.run_id }}
+          path: .release/target
+          if-no-files-found: error
+      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci-build
+            target/ci/native
+          key: ${{ steps.products.outputs.cache-primary-key }}
+      - if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  native-linux-arm64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *native-target-steps
+
+  native-macos-x64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-apple-darwin, runner: macos-15-intel}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *native-target-steps
+
+  native-macos-arm64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-apple-darwin, runner: macos-15}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *native-target-steps
+
+  native-windows-x64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *native-target-steps
+
+  native-windows-arm64:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *native-target-steps
+
+  installed-linux-x64:
+    needs: [select, packages, native-linux-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, channel: both}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: &installed-target-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: native-${{ matrix.target }}-${{ github.run_id }}
+          path: .release/target
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: packages-${{ github.run_id }}
+          path: .release/packages
+          digest-mismatch: error
+      - id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-installed-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: cache
+        run: ./target/ci/release/memcordon-ci release consumer-cache
+      - id: consumers
+        if: steps.cache.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci-consumers
+            target/ci-build/private-native-tests
+          key: ${{ steps.cache.outputs.consumer-key }}
+      - id: native
+        if: matrix.channel != 'cargo'
+        run: ./target/ci/release/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native
+      - id: cargo
+        if: matrix.channel != 'native'
+        run: ./target/ci/release/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: release-public-rehearsal-${{ matrix.id }}
-          path: target/ci/public-rehearsal/report.json
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.rehearse-public-deps.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.rehearse-public-deps.outputs.cache-primary-key != ''
+          name: installed-results-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}
+          path: .release/installed-results
+          if-no-files-found: warn
+      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.consumers.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}
+            target/ci-consumers
+            target/ci-build/private-native-tests
+          key: ${{ steps.consumers.outputs.cache-primary-key }}
+      - if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
 
-  publish:
-    name: Release / publish
-    needs:
-      - assemble
-      - rehearse-public
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    permissions:
-      actions: read
-      contents: write
-      id-token: write
-    steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-bundle
-          path: target/ci/release-bundle
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - name: Stage GitHub draft and assets
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github
-      - name: Acquire crates.io token for publication slot 1
-        id: crates_auth_1
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 1
-        id: publish_oidc_1
-        continue-on-error: true
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-1
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1
-      - name: Authorize new-crate token fallback in slot 1
-        id: authorize_fallback_1
-        if: steps.publish_oidc_1.outcome == 'failure'
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1
-      - name: Publish new crate with fallback credential in slot 1
-        if: steps.authorize_fallback_1.outcome == 'success' && steps.authorize_fallback_1.outputs.authorized == 'true'
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-1
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1
-      - name: Acquire crates.io token for publication slot 2
-        id: crates_auth_2
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 2
-        id: publish_oidc_2
-        continue-on-error: true
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-2
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2
-      - name: Authorize new-crate token fallback in slot 2
-        id: authorize_fallback_2
-        if: steps.publish_oidc_2.outcome == 'failure'
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 2
-      - name: Publish new crate with fallback credential in slot 2
-        if: steps.authorize_fallback_2.outcome == 'success' && steps.authorize_fallback_2.outputs.authorized == 'true'
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-2
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 2
-      - name: Acquire crates.io token for publication slot 3
-        id: crates_auth_3
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 3
-        id: publish_oidc_3
-        continue-on-error: true
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-3
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3
-      - name: Authorize new-crate token fallback in slot 3
-        id: authorize_fallback_3
-        if: steps.publish_oidc_3.outcome == 'failure'
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 3
-      - name: Publish new crate with fallback credential in slot 3
-        if: steps.authorize_fallback_3.outcome == 'success' && steps.authorize_fallback_3.outputs.authorized == 'true'
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-3
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 3
-      - name: Acquire crates.io token for publication slot 4
-        id: crates_auth_4
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Attempt crates.io OIDC publication in slot 4
-        id: publish_oidc_4
-        continue-on-error: true
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-4
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_4.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4
-      - name: Authorize new-crate token fallback in slot 4
-        id: authorize_fallback_4
-        if: steps.publish_oidc_4.outcome == 'failure'
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 4
-      - name: Publish new crate with fallback credential in slot 4
-        if: steps.authorize_fallback_4.outcome == 'success' && steps.authorize_fallback_4.outputs.authorized == 'true'
-        env:
-          CARGO_HOME: target/ci/cargo-publish-home/slot-4
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4
-      - name: Upload publication evidence
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: release-publication-evidence
-          path: target/ci/publication-evidence/publication-evidence.json
-          if-no-files-found: warn
-          retention-days: 30
-          compression-level: 0
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates
-      - name: Finalize GitHub release
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github
-      - uses: ./.github/actions/upload-artifact
-        with:
-          name: release-publication-report
-          path: target/ci/release-bundle/publication-report.json
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-
-  verify-public:
-    name: Release / verify public state / ${{ matrix.id }}
-    needs: publish
+  installed-linux-arm64:
+    needs: [select, packages, native-linux-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - id: linux-x64
-            runner: ubuntu-24.04
-          - id: windows-x64
-            runner: windows-2025
-          - id: windows-arm64
-            runner: windows-11-arm
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, channel: both}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    permissions:
-      contents: read
+    steps: *installed-target-steps
+
+  installed-macos-x64:
+    needs: [select, packages, native-macos-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, channel: both}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-macos-arm64:
+    needs: [select, packages, native-macos-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-apple-darwin, runner: macos-15, channel: both}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-windows-x64-native:
+    needs: [select, packages, native-windows-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, channel: native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-windows-x64-cargo:
+    needs: [select, packages, native-windows-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, channel: cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-windows-arm64-native:
+    needs: [select, packages, native-windows-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-windows-arm64-cargo:
+    needs: [select, packages, native-windows-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  assemble:
+    needs: [select, packages, source-checks, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, installed-linux-x64, installed-linux-arm64, installed-macos-x64, installed-macos-arm64, installed-windows-x64-native, installed-windows-x64-cargo, installed-windows-arm64-native, installed-windows-arm64-cargo]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      prepared-artifact-id: ${{ steps.prepared.outputs.artifact-id }}
     steps:
-      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: release-bundle
-          path: target/ci/release-bundle
+          name: publication-tool-${{ github.run_id }}
+          path: .release/tool
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: release-publication-report
-          path: target/ci/release-bundle
-      - id: verify-public-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+          name: selected-source-${{ github.run_id }}
+          path: .release
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-release-verify-public-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - id: inventory-observation
-        if: always()
+          name: packages-${{ github.run_id }}
+          path: .release/packages
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: native-*-${{ github.run_id }}
+          path: .release/targets
+          digest-mismatch: error
+      - run: ./.release/tool/memcordon-ci release assemble
+      - id: prepared
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/inventory-observation/v1/**/run-start.json
-            target/ci/reports/inventory-observation/v1/**/phase-*.json
-            target/ci/reports/inventory-observation/v1/**/inventory-*.json
-          if-no-files-found: warn
-          retention-days: 14
-          compression-level: 0
-      - id: verify-public-target
-        if: steps.build-context-prepare.outcome == 'success'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+          name: prepared-${{ github.run_id }}
+          path: .release/prepared
+          if-no-files-found: error
+
+  publish:
+    needs: [select, assemble]
+    if: always() && needs.select.result == 'success' && (needs.assemble.result == 'success' || needs.select.outputs.recovery-mode == 'publication-only')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: memcordon-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    steps:
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: target/ci/verify-bootstrap
-          key: managed-v2-cargo-target-release-verify-public-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public
-      - id: build-context-audit
-        if: always() && steps.build-context-prepare.outcome == 'success'
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.verify-public-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.verify-public-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: target/ci/verify-bootstrap
-          key: ${{ steps.verify-public-target.outputs.cache-primary-key }}
-      - if: always() && steps.verify-public-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+          artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.verify-public-deps.outputs.cache-primary-key }}
+          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          run-id: ${{ needs.select.outputs.original-run-id }}
+          github-token: ${{ github.token }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.select.outputs.original-run-id }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - id: registry-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Publish prepared bytes
+        run: ./.release/tool/memcordon-ci release publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
+
+  published-consumer:
+    needs: [select, assemble, publish]
+    if: always() && needs.publish.result == 'success' && needs.select.outputs.public-consumer == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          run-id: ${{ needs.select.outputs.original-run-id }}
+          github-token: ${{ github.token }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.select.outputs.original-run-id }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: ./.release/tool/memcordon-ci release public-consumer
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: public-consumer-${{ github.run_id }}
+          path: .release/prepared/public-consumer-results
+          if-no-files-found: error
+          include-hidden-files: true

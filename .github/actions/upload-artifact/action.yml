@@ -21,6 +21,14 @@ inputs:
     description: Whether hidden files are included.
     default: "false"
 
+outputs:
+  artifact-id:
+    description: Immutable artifact id from the successful upload attempt.
+    value: ${{ steps.retry-two.outputs.artifact-id || steps.retry-one.outputs.artifact-id || steps.initial.outputs.artifact-id }}
+  artifact-digest:
+    description: SHA256 of the exact uploaded artifact ZIP.
+    value: ${{ steps.retry-two.outputs.artifact-digest || steps.retry-one.outputs.artifact-digest || steps.initial.outputs.artifact-digest }}
+
 runs:
   using: composite
   steps:

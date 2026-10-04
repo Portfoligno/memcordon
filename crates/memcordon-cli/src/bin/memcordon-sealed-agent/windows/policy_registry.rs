@@ -2,8 +2,8 @@
 use super::pipe::OwnedHandle;
 use super::security::SecurityDescriptor;
 use crate::policy_registry::Activation;
-use memcordon_core::workload_contract::{ContractVersionOne, Nonce128, PolicyEpoch};
-use memcordon_core::workload_registry::PolicyRegistryV1;
+use memcordon_core::workload_contract::{Nonce128, PolicyEpoch};
+use memcordon_core::workload_registry::RuntimePolicyRegistry;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -135,7 +135,7 @@ impl Lease {
     ) -> Result<
         Vec<(
             String,
-            memcordon_core::workload_registry::ProviderAdmissionSnapshotV1,
+            memcordon_core::workload_registry::RuntimeAdmissionSnapshot,
         )>,
         String,
     > {
@@ -161,14 +161,14 @@ impl Lease {
             if bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
                 return Err("policy reference exceeds limit".into());
             }
-            let snapshot: memcordon_core::workload_registry::ProviderAdmissionSnapshotV1 =
+            let snapshot: memcordon_core::workload_registry::RuntimeAdmissionSnapshot =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             snapshot.validate()?;
             references.push((identity.into(), snapshot));
         }
         Ok(references)
     }
-    pub fn retain_snapshot(&self, registry: &PolicyRegistryV1) -> Result<(), String> {
+    pub fn retain_snapshot(&self, registry: &RuntimePolicyRegistry) -> Result<(), String> {
         let digest = registry.canonical_digest()?;
         let mut retained = std::collections::BTreeSet::new();
         retained.insert(String::from(digest.clone()));
@@ -214,7 +214,7 @@ impl Lease {
                 file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
                     .read_to_end(&mut existing)
                     .map_err(|error| error.to_string())?;
-                if PolicyRegistryV1::parse(&existing)?.canonical_digest()?
+                if RuntimePolicyRegistry::parse(&existing)?.canonical_digest()?
                     != registry.canonical_digest()?
                 {
                     return Err("immutable registry snapshot differs".into());
@@ -227,7 +227,7 @@ impl Lease {
     pub fn register_reference(
         &self,
         attempt_id: &str,
-        snapshot: &memcordon_core::workload_registry::ProviderAdmissionSnapshotV1,
+        snapshot: &memcordon_core::workload_registry::RuntimeAdmissionSnapshot,
     ) -> Result<(), String> {
         super::record::validate_attempt_id(attempt_id)?;
         snapshot.validate()?;
@@ -301,7 +301,7 @@ impl Lease {
     }
     pub fn activate(
         &self,
-        registry: PolicyRegistryV1,
+        registry: RuntimePolicyRegistry,
         instance: Option<Nonce128>,
     ) -> Result<Activation, String> {
         registry.validate()?;
@@ -338,7 +338,8 @@ impl Lease {
             },
         };
         let activation = Activation {
-            schema_version: ContractVersionOne::default(),
+            format: "memcordon.local-activation".into(),
+            revision: 1,
             registry_digest: registry.canonical_digest()?,
             registry,
             epoch,
@@ -439,8 +440,9 @@ pub fn start_service_instance() -> Result<(), String> {
         .map_err(|error| format!("policy startup read: {error}"))?
     {
         Some(previous) => previous.registry,
-        None => PolicyRegistryV1 {
-            schema_version: ContractVersionOne::default(),
+        None => RuntimePolicyRegistry {
+            format: "memcordon.local-policy".into(),
+            revision: 1,
             profiles: memcordon_core::BoundedVec::default(),
             grants: memcordon_core::BoundedVec::default(),
             active_attempt_disposition:

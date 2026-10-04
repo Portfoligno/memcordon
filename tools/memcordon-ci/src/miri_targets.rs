@@ -5,7 +5,41 @@ use serde::Deserialize;
 
 use crate::{CiError, Result};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiriShard {
+    First,
+    Second,
+}
+
+impl MiriShard {
+    pub fn spec(self) -> crate::target_shard::ShardSpec {
+        crate::target_shard::ShardSpec::new(
+            usize::from(self == Self::Second),
+            std::num::NonZeroUsize::new(2).expect("nonzero partition"),
+        )
+        .expect("valid two-way partition")
+    }
+}
+
+pub fn plan_shard(
+    metadata: &[u8],
+    package_name: &str,
+    shard: MiriShard,
+) -> Result<Vec<MiriTarget>> {
+    let targets: Vec<_> = plan(metadata, package_name)?
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ordinal, target)| shard.spec().selects(ordinal).then_some(target))
+        .collect();
+    if targets.is_empty() {
+        return Err(CiError::Message(
+            "Miri shard selected no test targets".into(),
+        ));
+    }
+    Ok(targets)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
 pub enum MiriTarget {
     Library,
     Binary(String),
@@ -51,7 +85,8 @@ struct Target {
 }
 
 /// Plan the same package/default-feature coverage as an unfiltered Cargo test.
-/// Each target retains its entire harness; individual tests are never partitioned.
+/// Targets retain their entire harness except the independently reviewed report
+/// integration harness, whose cases are discovered and batched at execution.
 pub fn plan(metadata: &[u8], package_name: &str) -> Result<Vec<MiriTarget>> {
     let metadata: Metadata = serde_json::from_slice(metadata)?;
     let mut packages = metadata
@@ -145,4 +180,77 @@ pub fn plan(metadata: &[u8], package_name: &str) -> Result<Vec<MiriTarget>> {
         return Err(CiError::Message("Miri selected no test targets".to_owned()));
     }
     Ok(selected.into_iter().collect())
+}
+
+/// One exact subset of the report harness. Ignored cases stay selected and
+/// libtest retains their original ignored status; no include-ignored flag is used.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ReportBatch {
+    pub selected: Vec<String>,
+    pub ignored: Vec<String>,
+    pub excluded: Vec<String>,
+}
+
+impl ReportBatch {
+    pub fn arguments(&self) -> Vec<String> {
+        let mut arguments = vec!["--exact".to_owned()];
+        for name in &self.excluded {
+            arguments.push("--skip".to_owned());
+            arguments.push(name.clone());
+        }
+        arguments
+    }
+}
+
+/// Strict terse libtest listing, bounded independently of candidate input.
+fn listing(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    if bytes.len() > 64 * 1024 {
+        return Err(CiError::Message("Miri report listing exceeds bound".into()));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CiError::Message("Miri report listing is not UTF-8".into()))?;
+    let mut names = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let name = line
+            .strip_suffix(": test")
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+            })
+            .ok_or_else(|| CiError::Message("Miri report listing has an unknown row".into()))?;
+        if !names.insert(name.to_owned()) || names.len() > 512 {
+            return Err(CiError::Message(
+                "Miri report listing is duplicate or oversized".into(),
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// Partition only the report integration target. Two actual listings provide
+/// the complete inventory and its ignored subset; all other targets stay whole.
+/// Eight cases per batch retain a finite 900s command budget while avoiding the
+/// observed 49-case invocation timeout. The workflow's original 60m limit stays.
+pub fn report_batches(all: &[u8], ignored: &[u8]) -> Result<Vec<ReportBatch>> {
+    let all = listing(all)?;
+    let ignored = listing(ignored)?;
+    if all.is_empty() || !ignored.is_subset(&all) || all == ignored {
+        return Err(CiError::Message(
+            "Miri report inventory has no runnable cases or foreign ignored rows".into(),
+        ));
+    }
+    let names: Vec<_> = all.iter().cloned().collect();
+    Ok(names
+        .chunks(8)
+        .map(|chunk| {
+            let selected: BTreeSet<_> = chunk.iter().cloned().collect();
+            ReportBatch {
+                ignored: selected.intersection(&ignored).cloned().collect(),
+                excluded: all.difference(&selected).cloned().collect(),
+                selected: chunk.to_vec(),
+            }
+        })
+        .collect())
 }

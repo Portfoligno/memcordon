@@ -1,8 +1,10 @@
 # Windows causal diagnostics acceptance after 0.5.5-rc.1
 
 This acceptance map supplements [the V1 contract](windows-causal-diagnostics-v1.md).
-Execution reports remain schema 10, diagnostic projections remain V1, and the
-Windows public/private protocols remain 2/2. A diagnostic never supplies a
+Live Windows execution uses `memcordon.result` revision 1, public/private
+protocol 3/3, terminal receipt V2, and durable attempt record V4. Numeric execution
+report schema 11 remains a compatibility format. Diagnostic projections remain
+V1. A diagnostic never supplies a
 missing terminal receipt, acknowledgment, retirement proof or restart authority.
 
 ## Executable regression map
@@ -23,26 +25,42 @@ executable assertions, not an assertion that this document ran them.
 | Storage faults preserve original and truthful durability | `windows_record_faults::native_publication_fault_matrix_preserves_original_and_honest_commit_boundary` | Native write/flush/rename/readback fault injection |
 | Stalled storage cannot own Job cleanup | `windows_record_faults::frozen_native_publication_does_not_own_workload_job_cleanup` | Native writer and guardian ownership |
 | Bound retained response survives record reread failure | `windows_replay_retention::bound_launch_retention_survives_record_reread_failure` | Native retained-failure response |
+| Accounting conversion retains its native code and monitor classification | `windows::launcher_service::job_conversion_tests::job_accounting_conversion_preserves_monitor_classification` | Native wrapper through launch conversion and journal |
+| Every emitted Job/target/guardian operation has one typed mapping | `windows::launcher_service::job_conversion_tests::job_observation_mapping_covers_emitted_operations` | Native conversion inventory and semantic errors |
+| String-returning wrappers cannot replace the typed original | `windows::launcher_service::job_conversion_tests::job_string_conversion_preserves_semantics` | Native legacy conversion |
+| Later observation reconstruction retains the original operation | `windows::launcher_service::job_conversion_tests::job_diagnostic_reconstruction_preserves_operation` | Native cleanup conversion |
 
-These source-file names are navigation labels. The authoritative fully qualified
-test names live in `tools/memcordon-ci/src/workload_qualification.rs` and the
-sealed-agent test module declarations. The certification driver requires exactly
-one successful named test for each selected native case; zero matches cannot
-produce a qualified result. x64 and ARM64 certificates remain separate, tied to
-their source and component provenance. Portable success does not certify Windows.
+These source-file names are navigation labels. Fully qualified test names follow
+the sealed-agent test module declarations. Native CI executes the selected Cargo
+test binaries on their matching hosts. Portable success does not establish native
+Windows behavior.
 
 ## Installed-provider acceptance
 
-An installed-package test must observe the original monitor event through the
-supported authenticated failure channel and schema-10 frontend report after a
-later receiptless terminal-binding refusal. Compare the original typed operation,
-native domain/value and ordering, preserve later secondary events, and require
-the operation to remain failed. Observed cleanup must not manufacture a receipt,
-ACK, policy retirement, restart or success. Record exact package/component
-identity and retain public evidence before supported package recovery.
+The installed consumer in `tools/memcordon-ci/src/windows_installed_cases.rs`
+uses the selected native archive or exact packaged crates on each matching MSVC
+architecture. Its two cases are `sampling-population` and
+`guardian-loss-after-release`. The population fixture holds the root and 256
+children while the driver independently retains their PID/birth identities. It
+requires a deadline result with complete retirement. The guardian-loss case
+terminates an authenticated, held guardian after release and requires the
+original monitor failure, a provider-failure result and complete retirement.
+A bounded sample with explicit omissions is valid; a fabricated complete history
+is not. Preflight requires 4 GiB available memory; insufficient capacity is a
+failed requirement.
 
-The source regression map is not a claim that this installed-provider sequence
-or the unchanged downstream Windows Nightly workload passed. Those need fresh
+The consumer verifies the named result's provider association, native exit status,
+authorization and cleanup. It retains bounded report/stdout/stderr hashes and
+keeps behavior, collection, workload cleanup and package cleanup outcomes
+separate. Public smoke runs before and after the cases; retained-state recovery,
+package upgrade and uninstall must also complete. Assessments are written to
+`windows-assessment.json` and `installed-assessment.json`. The release workflow
+runs native-bundle and Cargo-package channels on separate fresh hosts and waits
+for successful installed jobs before assembly. These checks do not grant a local
+launch permission or substitute for the provider's live native checks.
+
+The source regression map does not establish successful installed-consumer
+execution or downstream workload validation. Those need fresh
 native evidence. Keep private-state ACLs unchanged: no ownership takeover,
 privilege escalation, raw-state reader or alternate diagnostic endpoint is part
 of this acceptance path. Explicit unavailable/loss evidence remains a failure
@@ -50,10 +68,8 @@ observation; a secondary event never becomes an unavailable original.
 
 ## Downstream closure
 
-Source candidate regression, isolated installed-package qualification and the
-approved bare-PATH downstream verifier are distinct evidence classes. This patch
-does not upgrade an installation, select a release artifact or authorize a grant.
-Closing the installer incident requires a fresh ordered suite in the original
+Source regression, selected installed-consumer execution and downstream workload
+verification exercise distinct inputs. Downstream validation requires the original
 execution context: exact installed identity/version, active probe, smoke,
 installer compilation, direct executable installer invocation and the project's
 remaining required gates. Preserve the reviewed workload and its budgets; a
@@ -61,5 +77,6 @@ source build or a tool-version check alone cannot replace the functional gate.
 
 The Linux baseline continues to reject genuine TCP requirements before release.
 Required TCP tests remain blocked in that context, never counted as passing
-negative application tests. A private TCP profile or coverage partition requires
-its own explicit approval and native qualification.
+negative application tests. The optional private TCP provider uses its own local
+grants and native checks as described in the
+[V2 workload contract](../docs/spec-workload-contract-v2.md).

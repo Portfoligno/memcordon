@@ -6,7 +6,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
-use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifestV2};
+use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -107,7 +107,7 @@ pub(super) fn verify_binding(
     file.take(128 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    let manifest = RuntimeManifestV2::parse(&bytes)?;
+    let manifest = RuntimeManifest::parse(&bytes)?;
     let target = match std::env::consts::ARCH {
         "x86_64" => "x86_64-pc-windows-msvc",
         "aarch64" => "aarch64-pc-windows-msvc",
@@ -116,12 +116,12 @@ pub(super) fn verify_binding(
     if manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.components.len() != 4
         || manifest
-            != RuntimeManifestV2::windows(
+            != RuntimeManifest::windows(
                 manifest.version.clone(),
                 manifest.source_commit.clone(),
                 target.into(),
                 manifest.components.clone(),
-            )
+            )?
         || manifest.public_binding(&bytes)? != *expected
     {
         return Err("installed runtime binding differs from provider".into());
@@ -183,6 +183,22 @@ pub(super) fn verify_binding(
         return Err("public runtime inventory differs".into());
     }
     Ok(())
+}
+
+/// Recovery reads the actual installed binding independently of live readiness.
+pub(super) fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, String> {
+    let root = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+        .join("MemCordon");
+    let file = open_protected(&root.join("runtime-manifest.json"))?;
+    let mut bytes = Vec::new();
+    file.take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let binding = RuntimeManifest::parse(&bytes)?.public_binding(&bytes)?;
+    verify_binding(&binding)?;
+    Ok(binding)
 }
 pub(super) fn boot_identity() -> Result<String, String> {
     #[repr(C)]

@@ -1,4 +1,5 @@
 [workspace]
+default-members = ["crates/memcordon-cli"]
 members = [
     "crates/memcordon-core",
     "crates/memcordon-windows-launch-core",
@@ -24,6 +25,7 @@ anstream = "1.0.0"
 anstyle = "1.0.14"
 anstyle-query = "1.1.5"
 base64 = "0.23.1"
+zeroize = "1.9.0"
 clap = { version = "4.5.53", features = ["derive"] }
 libc = "0.2.178"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
@@ -42,6 +44,7 @@ tar = "0.4.44"
 tempfile = "3.20.0"
 toml = "1.1.4"
 ureq = { version = "3.3.0", default-features = false, features = ["gzip", "json", "rustls"] }
+url = "2.5.8"
 walkdir = "2.5.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 

@@ -145,3 +145,181 @@ fn broker_request_rejects_digest_tampering_and_noncanonical_descriptor_inventory
     invalid.descriptor_manifest.swap(0, 1);
     assert!(encode_launch_broker_request(&invalid).is_err());
 }
+
+#[test]
+fn private_forwarding_keeps_native_broker_and_public_envelope_digests_distinct() {
+    use memcordon_core::private_runtime::PrivateRuntimeRequest;
+    use memcordon_core::workload_contract::WorkloadContractV2;
+    let launch = request();
+    let public = PrivateRuntimeRequest {
+        format: "memcordon.private-runtime-request".into(),
+        revision: 1,
+        contract: WorkloadContractV2::parse(include_bytes!(
+            "../../../../fuzz/corpus/workload-request/baseline-v2.json"
+        ))
+        .unwrap(),
+        native_launch: encode_launch_request(&launch).unwrap(),
+        attempt_deadline_millis: None,
+    };
+    let payload = public.encode().unwrap();
+    let expected_native: [u8; 32] = Sha256::digest(&public.native_launch).into();
+    let expected_public: [u8; 32] = Sha256::digest(&payload).into();
+    assert_ne!(expected_native, expected_public);
+    // The old forwarding call used the outer digest; the retained native
+    // broker validator must continue rejecting that byte-domain substitution.
+    assert_eq!(
+        LaunchBrokerRequestV2::authenticated(
+            [0x5a; 16],
+            expected_public,
+            73,
+            99,
+            launch.clone(),
+            caller_envelope(),
+            broker_manifest(),
+        ),
+        Err(RequestCodecError::InvalidValue)
+    );
+    let (broker, outer) = LaunchBrokerRequestV2::authenticated_private(
+        [0x5a; 16],
+        &payload,
+        73,
+        99,
+        launch,
+        caller_envelope(),
+        broker_manifest(),
+    )
+    .unwrap();
+    let decoded =
+        decode_launch_broker_request(&encode_launch_broker_request(&broker).unwrap()).unwrap();
+    assert_eq!(decoded, broker);
+    assert_eq!(decoded.request_digest, expected_native);
+    assert_eq!(
+        outer,
+        memcordon_core::DiagnosticSha256::from_bytes(expected_public)
+    );
+}
+
+#[test]
+fn private_reply_binding_rejects_native_digest_in_place_of_public_envelope_digest() {
+    use memcordon_core::private_runtime::{
+        PrivateRuntimeRejection, PrivateRuntimeRequest, PrivateRuntimeTerminal,
+    };
+    use memcordon_core::result_v1::{CleanupStateV1, LaunchStateV1, OutcomeKindV1};
+    use memcordon_core::workload_admission_v2::RuntimePrivateAdmissionSnapshot;
+    use memcordon_core::workload_contract::{Nonce128, WorkloadContractV2};
+    use memcordon_core::workload_registry::CallerSelector;
+    use memcordon_core::workload_registry_v2::ProfileKindV2;
+    use memcordon_core::{BoundedText, DiagnosticSha256, PublicProviderBindingV1};
+    let launch = request();
+    let mut contract = WorkloadContractV2::parse(include_bytes!(
+        "../../../../fuzz/corpus/workload-request/baseline-v2.json"
+    ))
+    .unwrap();
+    contract.authorized_profile = ProfileKindV2::LinuxTcp4PrivateV1.reference();
+    contract.ceiling = ProfileKindV2::LinuxTcp4PrivateV1.ceiling();
+    contract.requirements = Default::default();
+    let public = PrivateRuntimeRequest {
+        format: "memcordon.private-runtime-request".into(),
+        revision: 1,
+        contract: contract.clone(),
+        native_launch: encode_launch_request(&launch).unwrap(),
+        attempt_deadline_millis: None,
+    };
+    let payload = public.encode().unwrap();
+    let expected_public = DiagnosticSha256::from_bytes(Sha256::digest(&payload).into());
+    let expected_native =
+        DiagnosticSha256::from_bytes(Sha256::digest(&public.native_launch).into());
+    let (broker, public_digest) = LaunchBrokerRequestV2::authenticated_private(
+        [0x5a; 16],
+        &payload,
+        73,
+        99,
+        launch,
+        caller_envelope(),
+        broker_manifest(),
+    )
+    .unwrap();
+    assert_eq!(public_digest, expected_public);
+    assert_eq!(
+        DiagnosticSha256::from_bytes(broker.request_digest),
+        expected_native
+    );
+    let provider = PublicProviderBindingV1 {
+        generation: BoundedText::new("1.2.3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        runtime_manifest_sha256: DiagnosticSha256::from_bytes([7; 32]),
+    };
+    let rejection = PrivateRuntimeRejection {
+        format: "memcordon.private-runtime-rejection".into(),
+        revision: 1,
+        provider: provider.clone(),
+        attempt_id: broker.attempt_id,
+        request_sha256: public_digest.clone(),
+        invocation_sha256: expected_native.clone(),
+        contract: contract.clone(),
+        boundary_allocated: false,
+        reservation_may_remain: false,
+        detail: BoundedText::new("native grant denied before allocation").unwrap(),
+    };
+    let terminal = PrivateRuntimeTerminal {
+        format: "memcordon.private-runtime-terminal".into(),
+        revision: 1,
+        provider: provider.clone(),
+        native_abi: "aarch64-unknown-linux-gnu".into(),
+        attempt_id: broker.attempt_id,
+        request_sha256: public_digest,
+        admission_metadata: RuntimePrivateAdmissionSnapshot {
+            format: "memcordon.private-admission-metadata".into(),
+            revision: 1,
+            request_sha256: memcordon_core::workload_codec::contract_digest_v2(&contract).unwrap(),
+            invocation_sha256: expected_native.clone(),
+            caller: CallerSelector::Linux { uid: 1000 },
+            registry_digest: DiagnosticSha256::from_bytes([8; 32]),
+            epoch: contract.expected_epoch.clone(),
+            admission_nonce: Nonce128([9; 16]),
+            profile_id: contract.authorized_profile.clone(),
+            request: contract.clone(),
+        },
+        launch: LaunchStateV1::NotCreated,
+        authorization_offset_millis: None,
+        authorization_monotonic_millis: None,
+        target_pid: None,
+        network_namespace: None,
+        exec_observed: false,
+        post_exec_descriptor_count: None,
+        outcome: OutcomeKindV1::LaunchFailure,
+        native_termination: None,
+        cleanup: CleanupStateV1::Complete,
+        account_reservation_retired: true,
+        namespace_references_closed: true,
+        error: Some(BoundedText::new("actual gated setup rejected").unwrap()),
+    };
+    let parse_rejection = |value: &PrivateRuntimeRejection| {
+        PrivateRuntimeRejection::parse_bound(
+            &serde_json::to_vec(value).unwrap(),
+            &provider,
+            broker.attempt_id,
+            &expected_public,
+            &contract,
+            &expected_native,
+        )
+    };
+    let parse_terminal = |value: &PrivateRuntimeTerminal| {
+        PrivateRuntimeTerminal::parse_bound(
+            &serde_json::to_vec(value).unwrap(),
+            &provider,
+            broker.attempt_id,
+            &expected_public,
+            &contract,
+            &expected_native,
+        )
+    };
+    parse_rejection(&rejection).unwrap();
+    parse_terminal(&terminal).unwrap();
+    let mut wrong_rejection = rejection;
+    wrong_rejection.request_sha256 = expected_native.clone();
+    assert!(parse_rejection(&wrong_rejection).is_err());
+    let mut wrong_terminal = terminal;
+    wrong_terminal.request_sha256 = expected_native.clone();
+    assert!(parse_terminal(&wrong_terminal).is_err());
+}

@@ -1,6 +1,114 @@
 use memcordon_ci::miri_targets::{MiriTarget, plan};
 use serde_json::{Value, json};
 
+#[test]
+fn report_case_batches_are_deterministic_exhaustive_and_preserve_ignored_cases() {
+    use memcordon_ci::miri_targets::report_batches;
+    let names: Vec<_> = (0..19).map(|index| format!("case_{index:02}")).collect();
+    let listing = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| format!("{name}: test\n"))
+            .collect::<String>()
+    };
+    let all = listing(&names);
+    let ignored_names = vec![names[2].clone(), names[17].clone()];
+    let ignored = listing(&ignored_names);
+    let batches = report_batches(all.as_bytes(), ignored.as_bytes()).unwrap();
+    assert_eq!(batches.len(), 3);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.selected.len())
+            .collect::<Vec<_>>(),
+        [8, 8, 3]
+    );
+    assert_eq!(
+        batches
+            .iter()
+            .flat_map(|batch| batch.selected.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+    assert_eq!(
+        batches
+            .iter()
+            .flat_map(|batch| batch.ignored.clone())
+            .collect::<Vec<_>>(),
+        ignored_names
+    );
+    for batch in &batches {
+        let arguments = batch.arguments();
+        assert_eq!(arguments.first().unwrap(), "--exact");
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "--include-ignored" | "--ignored"))
+        );
+        for name in &names {
+            assert_ne!(batch.selected.contains(name), batch.excluded.contains(name));
+        }
+        assert_eq!(
+            arguments[1..]
+                .chunks_exact(2)
+                .map(|pair| {
+                    assert_eq!(pair[0], "--skip");
+                    pair[1].clone()
+                })
+                .collect::<Vec<_>>(),
+            batch.excluded
+        );
+    }
+    let mut reversed = names;
+    reversed.reverse();
+    assert_eq!(
+        report_batches(listing(&reversed).as_bytes(), ignored.as_bytes()).unwrap(),
+        batches
+    );
+}
+
+#[test]
+fn malformed_case_inventory_cannot_silently_drop_miri_coverage() {
+    use memcordon_ci::miri_targets::report_batches;
+    for all in [
+        "",
+        "a: test\na: test\n",
+        "a: bench\n",
+        "bad name: test\n",
+        "a: test\nunknown row\n",
+    ] {
+        assert!(report_batches(all.as_bytes(), b"").is_err());
+    }
+    assert!(report_batches(b"a: test\n", b"foreign: test\n").is_err());
+    assert!(report_batches(b"a: test\n", b"a: test\n").is_err());
+    assert!(report_batches(&[b'x'; 64 * 1024 + 1], b"").is_err());
+    assert!(report_batches(b"\xff: test\n", b"").is_err());
+}
+
+#[test]
+fn complete_harness_shards_are_disjoint_and_preserve_authoritative_plan() {
+    use memcordon_ci::miri_targets::{MiriShard, plan_shard};
+    let data = metadata(
+        json!({}),
+        vec![
+            target("core", "lib", true, true, &[]),
+            target("integration", "test", true, false, &[]),
+            target("example", "example", true, false, &[]),
+            target("bench", "bench", true, false, &[]),
+            target("binary", "bin", true, false, &[]),
+        ],
+    );
+    let first = plan_shard(&data, "core", MiriShard::First).unwrap();
+    let second = plan_shard(&data, "core", MiriShard::Second).unwrap();
+    assert!(first.iter().all(|target| !second.contains(target)));
+    let mut joined = first;
+    joined.extend(second);
+    joined.sort();
+    assert_eq!(joined, plan(&data, "core").unwrap());
+    let single = metadata(json!({}), vec![target("core", "lib", true, false, &[])]);
+    assert!(plan_shard(&single, "core", MiriShard::Second).is_err());
+}
+
 fn target(name: &str, kind: &str, test: bool, doctest: bool, required: &[&str]) -> Value {
     json!({"name":name,"kind":[kind],"test":test,"doctest":doctest,"required-features":required})
 }

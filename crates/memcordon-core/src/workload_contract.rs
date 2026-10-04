@@ -1,4 +1,5 @@
 //! Exact workload functionality and independent administrator authority.
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU64};
 
 use crate::workload_limits as limits;
@@ -273,6 +274,39 @@ impl<'de> Deserialize<'de> for ContractVersionOne {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ContractVersionTwo(u16);
+impl Default for ContractVersionTwo {
+    fn default() -> Self {
+        Self(2)
+    }
+}
+impl<'de> Deserialize<'de> for ContractVersionTwo {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        if u16::deserialize(decoder)? != 2 {
+            return Err(serde::de::Error::custom(
+                "unsupported workload contract version",
+            ));
+        }
+        Ok(Self::default())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionIdentityRefV2 {
+    pub id: LogicalId,
+    pub semantic_digest: DiagnosticSha256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ExecutionIdentityRequestV2 {
+    PreserveCaller,
+    AdministratorProfile { reference: ExecutionIdentityRefV2 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadContractV1 {
@@ -284,6 +318,88 @@ pub struct WorkloadContractV1 {
     pub requirements: BoundedVec<RequirementV1, { limits::REQUIREMENTS }>,
     pub endpoints: BoundedVec<EndpointDeclarationV1, { limits::ENDPOINTS }>,
     pub expected_epoch: PolicyEpoch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadContractV2 {
+    pub schema_version: ContractVersionTwo,
+    pub workload_plan_digest: DiagnosticSha256,
+    pub authorized_profile: ProfileRef,
+    pub authorization: AuthorizationRef,
+    pub ceiling: NetworkCeilingV1,
+    pub requirements: BoundedVec<RequirementV1, { limits::REQUIREMENTS }>,
+    pub endpoints: BoundedVec<EndpointDeclarationV1, { limits::ENDPOINTS }>,
+    pub expected_epoch: PolicyEpoch,
+    pub execution_identity: ExecutionIdentityRequestV2,
+}
+
+/// Dispatches only on the explicit version; a V2 identity can never disappear into V1.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkloadContract {
+    V1(WorkloadContractV1),
+    V2(WorkloadContractV2),
+}
+
+impl WorkloadContract {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > limits::CONTRACT_BYTES {
+            return Err("workload contract exceeds byte limit".into());
+        }
+        reject_duplicate_json_keys(bytes)?;
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            schema_version: u16,
+        }
+        let version: VersionProbe =
+            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        match version.schema_version {
+            1 => {
+                let request: WorkloadContractV1 =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                request.validate()?;
+                Ok(Self::V1(request))
+            }
+            2 => {
+                let request: WorkloadContractV2 =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                request.validate()?;
+                Ok(Self::V2(request))
+            }
+            _ => Err("unsupported workload contract version".into()),
+        }
+    }
+}
+
+impl WorkloadContractV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        match WorkloadContract::parse(bytes)? {
+            WorkloadContract::V2(request) => Ok(request),
+            WorkloadContract::V1(_) => Err("expected workload contract version two".into()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        WorkloadContractV1 {
+            schema_version: ContractVersionOne::default(),
+            workload_plan_digest: self.workload_plan_digest.clone(),
+            authorized_profile: self.authorized_profile.clone(),
+            authorization: self.authorization.clone(),
+            ceiling: self.ceiling.clone(),
+            requirements: self.requirements.clone(),
+            endpoints: self.endpoints.clone(),
+            expected_epoch: self.expected_epoch.clone(),
+        }
+        .validate()?;
+        if self.authorized_profile.id.as_str() == "linux-tcp4-private-v1"
+            && (self.ceiling.direct_socket_authority
+                != DirectSocketCeiling::AttemptPrivateIpv4StackAllPorts
+                || self.ceiling.credential_gains != CredentialGainCeiling::NoGain)
+        {
+            return Err("private TCP profile requires private socket and no-gain ceilings".into());
+        }
+        Ok(())
+    }
 }
 
 impl WorkloadContractV1 {
@@ -321,6 +437,7 @@ impl WorkloadContractV1 {
             }
             if let RequirementV1::Tcp {
                 family,
+                scope,
                 peer: TcpPeerRequirement::ExactAddress { endpoint },
                 ..
             } = requirement
@@ -331,6 +448,7 @@ impl WorkloadContractV1 {
                 ) {
                     return Err("TCP family differs from exact peer family".into());
                 }
+                validate_exact_peer_scope(*scope, endpoint)?;
             }
             let referenced = match requirement {
                 RequirementV1::Tcp {
@@ -415,6 +533,23 @@ impl WorkloadContractV1 {
         }
         Ok(())
     }
+}
+
+fn validate_exact_peer_scope(scope: TcpScope, endpoint: &TcpEndpoint) -> Result<(), String> {
+    let loopback = match endpoint {
+        TcpEndpoint::V4 { address, .. } => Ipv4Addr::from(*address).is_loopback(),
+        TcpEndpoint::V6 { address, .. } => {
+            let address = Ipv6Addr::from(*address);
+            if address.to_ipv4_mapped().is_some() {
+                return Err("IPv4-mapped IPv6 exact peer is ambiguous".into());
+            }
+            address.is_loopback()
+        }
+    };
+    if scope == TcpScope::HostSharedLoopback && !loopback {
+        return Err("host-shared-loopback exact peer is not loopback".into());
+    }
+    Ok(())
 }
 
 /// A bounded first pass rejects duplicates even inside internally tagged enums,

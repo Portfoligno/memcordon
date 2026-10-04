@@ -4,6 +4,7 @@ mod diagnostics;
 pub mod guardian;
 pub mod guardian_service;
 pub mod job;
+mod job_diagnostics;
 pub mod launcher_service;
 pub(crate) mod loader_access;
 pub mod package;

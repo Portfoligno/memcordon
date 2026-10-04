@@ -1,12 +1,8 @@
 use super::*;
 
 #[test]
-#[ignore = "requires an installed ephemeral Windows provider and administrative package access"]
-fn legacy_manifest_absence_survives_failed_upgrade_qualification() {
-    assert!(
-        certification_faults_enabled(),
-        "protected ephemeral marker is mandatory"
-    );
+#[ignore = "requires an installed Windows provider and administrative package access"]
+fn legacy_manifest_absence_survives_failed_upgrade_readiness() {
     let lease = PackageLease::acquire().unwrap();
     let before = validate_existing_installed_artifacts().unwrap();
     let bytes = captured_installed_manifest(&before)
@@ -23,24 +19,17 @@ fn legacy_manifest_absence_survives_failed_upgrade_qualification() {
         .unwrap()
         .registry;
     std::fs::remove_file(&restore.path).unwrap();
-    let installation = upgrade_from(
-        true,
-        Path::new(
-            option_env!("CARGO_BIN_EXE_memcordon-sealed-agent")
-                .expect("run native package qualification through --test sealed_agent"),
-        ),
-    )
+    let installation = upgrade_from(Path::new(
+        option_env!("CARGO_BIN_EXE_memcordon-sealed-agent")
+            .expect("run native package qualification through --test sealed_agent"),
+    ))
     .unwrap();
-    std::fs::write(
-        state_root()
-            .join("package")
-            .join(QUALIFICATION_ROLLBACK_FAULT),
-        b"fixture\n",
+    let error = verify_ready_package_with_observation(
+        lease,
+        ActivationRollback::Upgrade(installation),
+        || Err("injected actual readiness failure after byte publication".into()),
     )
-    .unwrap();
-    let error =
-        qualify_outside_package_lease(lease, QualificationRollback::Upgrade(installation), None)
-            .unwrap_err();
+    .unwrap_err();
     assert!(
         error.contains("MCSEALED-WINDOWS-UPGRADE-ROLLED-BACK"),
         "{error}"
@@ -87,12 +76,8 @@ impl Drop for RestoreManifest {
 }
 
 #[test]
-#[ignore = "requires an installed ephemeral Windows provider and administrative package access"]
+#[ignore = "requires an installed Windows provider and administrative package access"]
 fn mixed_runtime_component_is_rejected_before_execution() {
-    assert!(
-        certification_faults_enabled(),
-        "protected ephemeral marker is mandatory"
-    );
     let _package = PackageLease::acquire().unwrap();
     let captured = validate_existing_installed_artifacts().unwrap();
     let bytes = captured_installed_manifest(&captured)
@@ -102,7 +87,7 @@ fn mixed_runtime_component_is_rejected_before_execution() {
         path: install_root().join("runtime-manifest.json"),
         bytes,
     };
-    let mut manifest: memcordon_core::runtime_manifest::RuntimeManifestV2 =
+    let mut manifest: memcordon_core::runtime_manifest::RuntimeManifest =
         serde_json::from_slice(&restore.bytes).unwrap();
     let bootstrap = manifest
         .components
@@ -112,7 +97,7 @@ fn mixed_runtime_component_is_rejected_before_execution() {
                 == memcordon_core::runtime_manifest::RuntimeComponentRole::DesktopBootstrap
         })
         .unwrap();
-    bootstrap.sha256 = "00".repeat(32);
+    bootstrap.sha256 = "bb".repeat(32);
     copy_atomically_bytes(&serde_json::to_vec(&manifest).unwrap(), &restore.path).unwrap();
     assert!(installed_public_provider_binding().is_err());
     let directory = tempfile::TempDir::new().unwrap();
@@ -136,12 +121,8 @@ fn mixed_runtime_component_is_rejected_before_execution() {
 }
 
 #[test]
-#[ignore = "requires an installed ephemeral Windows provider and administrative package access"]
+#[ignore = "requires an installed Windows provider and administrative package access"]
 fn partial_uninstall_restores_captured_images_manifest_and_policy() {
-    assert!(
-        certification_faults_enabled(),
-        "protected ephemeral marker is mandatory"
-    );
     let _package = PackageLease::acquire().unwrap();
     let before = validate_existing_installed_artifacts().unwrap();
     let manifest_path = install_root().join("runtime-manifest.json");
@@ -161,7 +142,7 @@ fn partial_uninstall_restores_captured_images_manifest_and_policy() {
         if legacy_absence {
             std::fs::remove_file(&manifest_path).unwrap();
         }
-        let failure = uninstall_with_removal(true, |_context| {
+        let failure = uninstall_with_removal(|_context| {
             if manifest_path.exists() {
                 std::fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
             }

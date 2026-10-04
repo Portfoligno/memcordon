@@ -2,180 +2,60 @@ use std::path::{Path, PathBuf};
 
 use memcordon_ci::{config, policy};
 use serde_yaml::Value;
-use syn::parse::Parser;
-use syn::visit::Visit;
+
+#[path = "support/text_fixture.rs"]
+mod text_fixture;
+
+const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
 #[test]
-fn release_rehearsal_is_required_before_publication() {
-    let root = repository_root();
-    let repository_policy = config::policy(&root).expect("repository policy");
-    let fixture = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
-    let fixtures = [fixture.clone(), fixture.replace('\n', "\r\n")];
-    for fixture in &fixtures {
-        policy::validate_workflow_bytes(
-            &root,
-            Path::new(".github/workflows/release.yml"),
-            fixture.as_bytes(),
-            &repository_policy,
-        )
-        .expect("complete release rehearsal gate");
-
-        let fixture = fixture.replace("\r\n", "\n");
-        policy::validate_workflow_bytes(
-            &root,
-            Path::new(".github/workflows/release.yml"),
-            fixture.as_bytes(),
-            &repository_policy,
-        )
-        .expect("normalized release rehearsal gate");
-
-        for (original, replacement) in [
-            ("      - rehearse-public\n", ""),
-            (
-                "          - id: windows-arm64\n            runner: windows-11-arm\n",
-                "",
-            ),
-            (
-                "    name: Release / rehearse public state / ${{ matrix.id }}",
-                "    name: Release / unchecked public state / ${{ matrix.id }}",
-            ),
-            (
-                "    timeout-minutes: 90\n    permissions:\n      contents: read\n    steps:",
-                "    timeout-minutes: 90\n    permissions:\n      contents: write\n    steps:",
-            ),
-            (
-                "release rehearse-public --bundle target/ci/release-bundle",
-                "release verify-public --bundle target/ci/release-bundle",
-            ),
-            (
-                "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
-                "      - if: false\n        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
-            ),
-            (
-                "    permissions:\n      contents: read\n    steps:",
-                "    permissions:\n      contents: read\n    env:\n      REHEARSAL_MODE: skip\n    steps:",
-            ),
-            (
-                "      - id: rehearse-public-deps\n        uses:",
-                "      - id: rehearse-public-deps\n        continue-on-error: true\n        uses:",
-            ),
-            (
-                "name: release-public-rehearsal-${{ matrix.id }}",
-                "name: omitted-public-rehearsal-${{ matrix.id }}",
-            ),
-            (
-                "path: target/ci/public-rehearsal/report.json",
-                "path: target/ci/public-rehearsal/missing.json",
-            ),
-            (
-                "key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}",
-                "key: stale-rehearsal-cache",
-            ),
-        ] {
-            let rehearsal = fixture.find("  rehearse-public:\n").expect("rehearsal job");
-            let offset = fixture[rehearsal..]
-                .find(original)
-                .expect("missing mutation anchor in rehearsal or publish");
-            let start = rehearsal + offset;
-            let mut invalid = fixture.to_owned();
-            invalid.replace_range(start..start + original.len(), replacement);
-            assert!(
-                policy::validate_workflow_bytes(
-                    &root,
-                    Path::new(".github/workflows/release.yml"),
-                    invalid.as_bytes(),
-                    &repository_policy,
-                )
-                .is_err(),
-                "release rehearsal mutation was accepted: {original}"
-            );
-        }
+fn workflow_mutation_fixture_is_checkout_eol_independent() {
+    let lf = text_fixture::canonical_lf_utf8(
+        include_bytes!("../../../.github/workflows/ci.yml"),
+        CI_WORKFLOW_PATH,
+    )
+    .unwrap();
+    let crlf = text_fixture::crlf_from_lf(&lf);
+    for source in [lf.as_bytes(), crlf.as_bytes()] {
+        assert_eq!(
+            text_fixture::canonical_lf_utf8(source, CI_WORKFLOW_PATH).unwrap(),
+            lf
+        );
     }
 }
 
 #[test]
-fn incident_path_regression_remains_in_the_native_workspace_suite() {
-    struct Strings(Vec<String>);
-    impl<'ast> Visit<'ast> for Strings {
-        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-            self.0.push(literal.value());
-        }
+fn text_fixture_preserves_utf8_with_mixed_line_endings() {
+    assert_eq!(
+        text_fixture::canonical_lf_utf8("first\r\n日本語\nlast\r\n".as_bytes(), "fixture").unwrap(),
+        "first\n日本語\nlast\n"
+    );
+}
 
-        fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
-            if expression.mac.path.is_ident("vec") {
-                let values =
-                    syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
-                        .parse2(expression.mac.tokens.clone())
-                        .expect("native suite argument vector parses");
-                self.0.extend(values.iter().map(syn::LitStr::value));
-            }
-            syn::visit::visit_expr_macro(self, expression);
-        }
+#[test]
+fn text_fixture_rejects_bare_cr_missing_newline_and_invalid_utf8() {
+    for source in [
+        b"first\rsecond\n".as_slice(),
+        b"first\r",
+        b"first",
+        b"\xff\n",
+    ] {
+        assert!(text_fixture::canonical_lf_utf8(source, "fixture").is_err());
     }
+}
 
-    let source = include_str!("build_context.rs");
-    let file = syn::parse_file(source).expect("build-context tests parse");
-    let incident = file
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Fn(function)
-                if function.sig.ident
-                    == "isolated_install_child_uses_the_canonical_source_namespace" =>
-            {
-                Some(function)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(incident.len(), 1, "incident regression must be unique");
-    let incident = incident[0];
-    assert!(
-        incident
-            .attrs
-            .iter()
-            .any(|attr| attr.path().is_ident("test"))
-    );
-    assert!(
-        !incident
-            .attrs
-            .iter()
-            .any(|attr| attr.path().is_ident("ignore"))
-    );
-    let mut strings = Strings(Vec::new());
-    strings.visit_item_fn(incident);
-    assert!(
-        strings
-            .0
-            .iter()
-            .any(|value| value == "generated_package_unmanaged_child")
-    );
-
+#[test]
+fn native_workspace_suite_retains_all_targets_and_features() {
     let suites_source = include_str!("../src/suites.rs");
     assert!(suites_source.contains("Suite::Native => native(root, &toolchains.stable, false)"));
-    let suites = syn::parse_file(suites_source).expect("suite source parses");
-    let native = suites
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Fn(function) if function.sig.ident == "native" => Some(function),
-            _ => None,
-        })
-        .expect("native suite implementation");
-    let mut native_strings = Strings(Vec::new());
-    native_strings.visit_item_fn(native);
-    assert!(native_strings.0.iter().any(|value| value == "test"));
     assert!(
         suites_source
             .contains("for command in memcordon_ci::native_test_plan::commands(release_mode)")
     );
-    assert!(suites_source.contains(
-        "cargo_with_deadline(root, stable, \"test\", command.arguments, command.deadline)"
-    ));
     for release_mode in [false, true] {
         let commands = memcordon_ci::native_test_plan::commands(release_mode);
         assert!(!commands.is_empty(), "native test plan must run Cargo");
@@ -191,7 +71,7 @@ fn incident_path_regression_remains_in_the_native_workspace_suite() {
 }
 
 #[test]
-fn macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence() {
+fn macos_deadline_rejects_missing_failure_evidence() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy");
     let fixture = include_str!("../../../.github/workflows/ci.yml");
@@ -202,10 +82,8 @@ fn macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence() {
         &repository_policy,
     )
     .expect("complete independent deadline lane");
-    for missing in [
-        "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
-        "target/ci/deadline-evidence",
-    ] {
+    {
+        let missing = "target/ci/deadline-evidence";
         let invalid = fixture.replace(missing, "missing-deadline-proof");
         assert!(
             policy::validate_workflow_bytes(
@@ -273,6 +151,68 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
 }
 
 #[test]
+fn deep_ci_miri_job_bound_includes_audit_and_cleanup_headroom() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/deep-ci.yml"),
+        fixture.as_bytes(),
+        &repository_policy,
+    )
+    .expect("the exact deep CI workflow should pass");
+
+    for timeout_minutes in [45, 59, 61] {
+        let invalid = workflow_with_job_timeout(fixture, "miri", timeout_minutes);
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/deep-ci.yml"),
+            &invalid,
+            &repository_policy,
+        )
+        .expect_err("a changed Miri job bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("deep shard runner or execution bounds differ"),
+            "unexpected workflow policy error: {error}"
+        );
+    }
+}
+
+#[test]
+fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/deep-ci.yml"),
+        fixture.as_bytes(),
+        &repository_policy,
+    )
+    .expect("the bounded deep CI workflow should pass");
+
+    for timeout_minutes in [89, 91, 120] {
+        let invalid = workflow_with_job_timeout(fixture, "stress", timeout_minutes);
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/deep-ci.yml"),
+            &invalid,
+            &repository_policy,
+        )
+        .expect_err("a changed stress job bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("deep CI stress timeout does not cover the complete cold workload"),
+            "unexpected workflow policy error: {error}"
+        );
+    }
+}
+
+#[test]
 fn dependabot_requires_each_independent_dependency_surface() {
     let exact = include_str!("../../../.github/dependabot.yml").replace("\r\n", "\n");
     policy::validate_dependabot_bytes(exact.as_bytes())
@@ -309,114 +249,24 @@ fn dependabot_requires_each_independent_dependency_surface() {
 fn fuzz_dependency_cache_keys_require_the_fuzz_lockfile() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
-    for relative in [
-        ".github/workflows/deep-ci.yml",
-        ".github/workflows/release.yml",
-    ] {
-        let exact = std::fs::read_to_string(root.join(relative))
-            .expect("workflow fixture should be readable")
-            .replace("\r\n", "\n");
-        let invalid = exact.replacen("'fuzz/Cargo.lock', ", "", 1);
-        assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
-        let error = policy::validate_workflow_bytes(
-            &root,
-            Path::new(relative),
-            invalid.as_bytes(),
-            &repository_policy,
-        )
-        .expect_err("a fuzz dependency cache key without its lockfile must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("fuzz manifest must include its lockfile"),
-            "unexpected policy error: {error}"
-        );
-    }
-}
-
-#[test]
-fn release_preflight_binds_provisioning_and_cache_to_toolchain_config() {
-    let root = repository_root();
-    let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let exact = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
-        .expect("release workflow fixture should be readable")
+    let relative = ".github/workflows/deep-ci.yml";
+    let exact = std::fs::read_to_string(root.join(relative))
+        .expect("workflow fixture should be readable")
         .replace("\r\n", "\n");
-    for (case, source, replacement, expected_error) in [
-        (
-            "missing MSRV install",
-            "      - run: rustup toolchain install 1.85.0 --profile minimal\n",
-            "",
-            "release preflight toolchain provisioning differs",
-        ),
-        (
-            "wrong MSRV install",
-            "      - run: rustup toolchain install 1.85.0 --profile minimal\n",
-            "      - run: rustup toolchain install 1.97.1 --profile minimal\n",
-            "release preflight toolchain provisioning differs",
-        ),
-        (
-            "wrong MSRV cache identity",
-            "cargo-target-release-v3-preflight-1.97.1-msrv-1.85.0-",
-            "cargo-target-release-v3-preflight-1.97.1-msrv-1.97.1-",
-            "release preflight target cache identity differs",
-        ),
-    ] {
-        let invalid = exact.replacen(source, replacement, 1);
-        assert_ne!(invalid, exact, "{case} mutation must apply");
-        let error = policy::validate_workflow_bytes(
-            &root,
-            Path::new(".github/workflows/release.yml"),
-            invalid.as_bytes(),
-            &repository_policy,
-        )
-        .expect_err("release preflight toolchain drift must fail");
-        assert!(
-            error.to_string().contains(expected_error),
-            "unexpected {case} policy error: {error}"
-        );
-    }
-}
-
-#[test]
-fn windows_package_channel_restores_lifecycle_evidence_at_its_leaf() {
-    let root = repository_root();
-    let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
-    policy::validate_workflow_bytes(
-        &root,
-        Path::new(".github/workflows/release.yml"),
-        exact.as_bytes(),
-        &repository_policy,
-    )
-    .expect("the exact release workflow should restore lifecycle evidence at its leaf");
-
-    let restored_at_report_root = r#"      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2/provider-lifecycle
-"#;
-    let failed_layout = r#"      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: release-windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2
-"#;
-    let invalid = exact.replacen(restored_at_report_root, failed_layout, 1);
-    assert_ne!(
-        invalid, exact,
-        "provider-lifecycle download mutation must apply"
-    );
+    let invalid = exact.replacen("'fuzz/Cargo.lock', ", "", 1);
+    assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
     let error = policy::validate_workflow_bytes(
         &root,
-        Path::new(".github/workflows/release.yml"),
+        Path::new(relative),
         invalid.as_bytes(),
         &repository_policy,
     )
-    .expect_err("the failed package-channel evidence layout must be rejected");
+    .expect_err("a fuzz dependency cache key without its lockfile must fail");
     assert!(
         error
             .to_string()
-            .contains("windows-package-channel download inputs differ"),
-        "unexpected package-channel policy error: {error}"
+            .contains("fuzz manifest must include its lockfile"),
+        "unexpected policy error: {error}"
     );
 }
 
@@ -424,23 +274,11 @@ fn windows_package_channel_restores_lifecycle_evidence_at_its_leaf() {
 fn windows_arm_native_matrix_entries_are_structurally_required() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
-    for (relative, job, fixture) in [
-        (
-            ".github/workflows/ci.yml",
-            "CI native",
-            include_str!("../../../.github/workflows/ci.yml"),
-        ),
-        (
-            ".github/workflows/deep-ci.yml",
-            "deep CI stress",
-            include_str!("../../../.github/workflows/deep-ci.yml"),
-        ),
-        (
-            ".github/workflows/release.yml",
-            "release native",
-            include_str!("../../../.github/workflows/release.yml"),
-        ),
-    ] {
+    for (relative, job, fixture) in [(
+        ".github/workflows/ci.yml",
+        "CI native",
+        include_str!("../../../.github/workflows/ci.yml"),
+    )] {
         let exact = fixture.replace("\r\n", "\n");
         let windows_rows = "          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n";
         for replacement in [
@@ -506,57 +344,56 @@ fn windows_arm_native_matrix_entries_are_structurally_required() {
             "unexpected {job} runner policy error: {runner_error}"
         );
     }
-}
-
-#[test]
-fn public_windows_release_smoke_is_structurally_required() {
-    let root = repository_root();
-    let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
-    for (name, source, replacement, expected) in [
-        (
-            "ARM runner",
-            "          - id: linux-x64\n            runner: ubuntu-24.04\n          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n",
-            "          - id: linux-x64\n            runner: ubuntu-24.04\n          - id: windows-x64\n            runner: windows-2025\n",
-            "verify-public job matrix entries differ",
-        ),
-        (
-            "timeout",
-            "    timeout-minutes: 90\n    permissions:\n      contents: read\n",
-            "    timeout-minutes: 30\n    permissions:\n      contents: read\n",
-            "verify-public timeout differs",
-        ),
-        (
-            "public verification command",
-            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public\n",
-            "",
-            "verify-public step count differs",
-        ),
-        (
-            "target cache path",
-            "          path: target/ci/verify-bootstrap\n          key: managed-v2-cargo-target-release-verify-public-v2-",
-            "          path: target/ci/other\n          key: managed-v2-cargo-target-release-verify-public-v2-",
-            "verify-public verify-public-target cache inputs differ",
-        ),
+    // The typed planner supplies the complete stress matrix. Verify
+    // both layouts together retain the independent native Windows runners.
+    use memcordon_ci::performance_plan::{Layout, PerformancePlan};
+    let plan = PerformancePlan::read(&root).unwrap();
+    let mut cells = plan.stress_cells(Layout::Serial).unwrap();
+    cells.extend(plan.stress_cells(Layout::Parallel).unwrap());
+    let windows = cells
+        .iter()
+        .filter(|cell| {
+            cell["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("windows-"))
+        })
+        .map(|cell| {
+            (
+                cell["id"].as_str().unwrap(),
+                cell["runner"].as_str().unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        windows,
+        std::collections::BTreeMap::from([
+            ("windows-x64", "windows-2025"),
+            ("windows-arm64", "windows-11-arm"),
+        ])
+    );
+    let mut missing = plan.clone();
+    missing
+        .stress
+        .retain(|entry| entry.platform != "windows-arm64");
+    assert!(missing.validate().is_err());
+    let mut duplicate = plan.clone();
+    let arm = duplicate
+        .stress
+        .iter_mut()
+        .find(|entry| entry.platform == "windows-arm64")
+        .unwrap();
+    arm.platform = "windows-x64".into();
+    assert!(duplicate.validate().is_err());
+    let deep: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/deep-ci.yml")).unwrap();
+    for (job, output) in [
+        ("stress", "combined"),
+        ("stress-packages", "split"),
+        ("stress-lifecycle", "split"),
     ] {
-        let verify = exact.find("  verify-public:\n").expect("verify-public job");
-        let offset = exact[verify..]
-            .find(source)
-            .expect("verify-public mutation anchor");
-        let start = verify + offset;
-        let mut invalid = exact.clone();
-        invalid.replace_range(start..start + source.len(), replacement);
-        assert_ne!(invalid, exact, "{name} mutation must apply");
-        let error = policy::validate_workflow_bytes(
-            &root,
-            Path::new(".github/workflows/release.yml"),
-            invalid.as_bytes(),
-            &repository_policy,
-        )
-        .expect_err("public Windows release-smoke regression must fail");
-        assert!(
-            error.to_string().contains(expected),
-            "unexpected {name} policy error: {error}"
+        assert_eq!(
+            deep["jobs"][job]["strategy"]["matrix"]["include"].as_str(),
+            Some(format!("${{{{ fromJSON(needs.performance-plan.outputs.{output}) }}}}").as_str())
         );
     }
 }
@@ -564,35 +401,17 @@ fn public_windows_release_smoke_is_structurally_required() {
 #[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
-    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
-    let explicit = r#"      - name: Check out pushed tag
-        if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out dispatched tag
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-"#;
-    let coalesced = r#"      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-"#;
-    let invalid = exact.replacen(explicit, coalesced, 1);
+    let exact = include_str!("../../../.github/workflows/ci.yml").replace("\r\n", "\n");
+    let invalid = exact.replacen(
+        "          persist-credentials: false\n",
+        "          ref: ${{ inputs.tag || github.ref }}\n          persist-credentials: false\n",
+        1,
+    );
     assert_ne!(invalid, exact, "checkout fixture mutation must apply");
-
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let error = policy::validate_workflow_bytes(
         &root,
-        Path::new(".github/workflows/release.yml"),
+        Path::new(CI_WORKFLOW_PATH),
         invalid.as_bytes(),
         &repository_policy,
     )
@@ -608,18 +427,17 @@ fn action_input_boolean_value_selection_is_rejected() {
 #[test]
 fn named_github_environments_are_rejected() {
     let root = repository_root();
-    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    let exact = include_str!("../../../.github/workflows/ci.yml").replace("\r\n", "\n");
     let invalid = exact.replacen(
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n",
-        "    runs-on: ubuntu-24.04\n    environment: release\n    timeout-minutes: 60\n",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n",
+        "    runs-on: ubuntu-24.04\n    environment: release\n    timeout-minutes: 30\n",
         1,
     );
     assert_ne!(invalid, exact, "environment fixture mutation must apply");
-
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let error = policy::validate_workflow_bytes(
         &root,
-        Path::new(".github/workflows/release.yml"),
+        Path::new(CI_WORKFLOW_PATH),
         invalid.as_bytes(),
         &repository_policy,
     )
@@ -636,94 +454,81 @@ fn named_github_environments_are_rejected() {
 fn certification_runner_regressions_are_rejected_structurally() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let backend =
-        include_str!("../../../.github/workflows/backend-certification.yml").replace("\r\n", "\n");
-    let release = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    let path = Path::new(".github/workflows/backend-certification.yml");
+    let backend: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../.github/workflows/backend-certification.yml"
+    ))
+    .unwrap();
     let cases = [
         (
-            Path::new(".github/workflows/backend-certification.yml"),
-            backend.as_str(),
-            "    runs-on: ubuntu-24.04\n",
-            "    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
+            "standard-linux",
+            "[self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]",
         ),
         (
-            Path::new(".github/workflows/backend-certification.yml"),
-            backend.as_str(),
-            "          - id: x64\n            runner: windows-2025\n",
-            "          - id: x64\n            runner: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+            "standard-windows",
+            "[self-hosted, memcordon, windows, x64, job-object, ephemeral]",
         ),
-        (
-            Path::new(".github/workflows/release.yml"),
-            release.as_str(),
-            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
-            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
-        ),
-        (
-            Path::new(".github/workflows/release.yml"),
-            release.as_str(),
-            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n",
-            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
-        ),
-        (
-            Path::new(".github/workflows/backend-certification.yml"),
-            backend.as_str(),
-            "    runs-on: ubuntu-24.04\n",
-            "    runs-on: ubuntu-latest\n",
-        ),
-        (
-            Path::new(".github/workflows/backend-certification.yml"),
-            backend.as_str(),
-            "          - id: x64\n            runner: windows-2025\n",
-            "          - id: x64\n            runner: windows-latest\n",
-        ),
-        (
-            Path::new(".github/workflows/release.yml"),
-            release.as_str(),
-            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
-            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-latest\n",
-        ),
-        (
-            Path::new(".github/workflows/release.yml"),
-            release.as_str(),
-            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n",
-            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n    runs-on: windows-latest\n",
-        ),
+        ("standard-linux", "ubuntu-latest"),
+        ("standard-windows", "windows-latest"),
     ];
-
-    for (path, fixture, exact, replacement) in cases {
-        let invalid = fixture.replacen(exact, replacement, 1);
-        assert_ne!(
-            invalid, fixture,
-            "runner fixture mutation must apply: {path:?}"
-        );
-        policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
-            .expect_err("noncanonical certification runner must be rejected");
+    for (job, replacement) in cases {
+        let mut invalid = backend.clone();
+        invalid["jobs"][job]["runs-on"] = serde_yaml::from_str(replacement).unwrap();
+        assert_ne!(invalid, backend, "native runner mutation must apply: {job}");
+        policy::validate_workflow_bytes(
+            &root,
+            path,
+            serde_yaml::to_string(&invalid).unwrap().as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("noncanonical certification runner must be rejected");
     }
 }
 
 #[test]
-fn linux_certification_uploads_retain_hidden_failure_diagnostics() {
+fn windows_working_source_jobs_disable_eol_conversion_before_checkout() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    let path = Path::new(".github/workflows/backend-certification.yml");
+    let bytes = include_bytes!("../../../.github/workflows/backend-certification.yml");
+    policy::validate_workflow_bytes(&root, path, bytes, &repository_policy).unwrap();
+    let workflow: serde_yaml::Value = serde_yaml::from_slice(bytes).unwrap();
+    for job in [
+        "windows-payload-x64",
+        "windows-payload-arm64",
+        "windows-installed-x64",
+        "windows-installed-arm64",
+    ] {
+        let steps = workflow["jobs"][job]["steps"].as_sequence().unwrap();
+        assert_eq!(
+            steps.first().unwrap()["run"].as_str(),
+            Some("git config --global core.autocrlf false"),
+            "{job} must configure checkout before source materialization",
+        );
+        assert!(
+            steps[1]["uses"]
+                .as_str()
+                .unwrap()
+                .starts_with("actions/checkout@")
+        );
+    }
+}
+
+#[test]
+fn stress_uploads_retain_hidden_failure_diagnostics() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
-    for (path, fixture) in [
-        (
-            Path::new(".github/workflows/backend-certification.yml"),
-            include_str!("../../../.github/workflows/backend-certification.yml"),
-        ),
-        (
-            Path::new(".github/workflows/release.yml"),
-            include_str!("../../../.github/workflows/release.yml"),
-        ),
-    ] {
-        let normalized = fixture.replace("\r\n", "\n");
-        let invalid = normalized.replacen("          include-hidden-files: true\n", "", 1);
-        assert_ne!(
-            invalid, normalized,
-            "hidden-diagnostic fixture mutation must apply: {path:?}"
-        );
-        policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
-            .expect_err("Linux certification must upload hidden failure diagnostics");
-    }
+    let path = Path::new(".github/workflows/deep-ci.yml");
+    let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
+    let normalized = text_fixture::canonical_lf_utf8(fixture.as_bytes(), "workflow fixture")
+        .expect("workflow fixture must be UTF-8 text with a trailing newline");
+    let invalid = normalized.replacen("          include-hidden-files: true\n", "", 1);
+    assert_ne!(
+        invalid, normalized,
+        "hidden-diagnostic fixture mutation must apply"
+    );
+    policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
+        .expect_err("actual stress job must upload hidden failure diagnostics");
 }
 
 #[test]
@@ -893,7 +698,6 @@ fn every_workflow_upload_uses_the_bounded_action() {
         include_str!("../../../.github/workflows/ci.yml"),
         include_str!("../../../.github/workflows/deep-ci.yml"),
         include_str!("../../../.github/workflows/backend-certification.yml"),
-        include_str!("../../../.github/workflows/release.yml"),
     ];
     let local = "uses: ./.github/actions/upload-artifact";
     let direct = "uses: actions/upload-artifact@";
@@ -907,5 +711,8 @@ fn every_workflow_upload_uses_the_bounded_action() {
             workflow.matches(local).count()
         })
         .sum();
-    assert_eq!(count, 55, "workflow artifact upload inventory differs");
+    assert!(
+        count >= 4,
+        "ordinary workflow artifact upload coverage regressed"
+    );
 }

@@ -29,8 +29,11 @@ window (without `sudo`):
 %USERPROFILE%\.cargo\bin\memcordon.exe doctor --require sealed
 ```
 
-Native Linux and Windows release archives provide the same two binaries
-together (with `.exe` names on Windows).
+Native Linux release archives provide the public CLI and sealed agent together.
+Windows release archives additionally provide the package-owned target desktop
+bootstrap and session broker helpers. The runtime manifest binds the complete
+component inventory; installing the agent alone is not a complete Windows
+provider installation.
 
 ## Run
 

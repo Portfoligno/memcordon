@@ -26,20 +26,22 @@ fn revoke_then_drain_keeps_each_live_admission_revoked() {
         endpoints: BoundedVec::default(),
         expected_epoch: epoch.clone(),
     };
-    let snapshot = ProviderAdmissionSnapshotV1 {
+    let snapshot = RuntimeAdmissionSnapshot {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
         private_invocation_digest: digest.clone(),
         caller_invocation_reference: Nonce128([9; 16]),
         request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
         request,
         registry_digest: digest.clone(),
-        qualification_digest: digest,
         admission_nonce: Nonce128([2; 16]),
         caller: CallerSelector::Linux { uid: 1000 },
         native_profile: profile,
     };
     let live = vec![("attempt-a".into(), snapshot)];
-    let registry = PolicyRegistryV1 {
-        schema_version: ContractVersionOne::default(),
+    let registry = RuntimePolicyRegistry {
+        format: "memcordon.local-policy".into(),
+        revision: 1,
         profiles: BoundedVec::default(),
         grants: BoundedVec::default(),
         active_attempt_disposition: GrantChangeDisposition::RevokeActive,
@@ -47,7 +49,8 @@ fn revoke_then_drain_keeps_each_live_admission_revoked() {
     let revoked =
         Activation::next_revocations(None, GrantChangeDisposition::RevokeActive, &live).unwrap();
     let activation = Activation {
-        schema_version: ContractVersionOne::default(),
+        format: "memcordon.local-activation".into(),
+        revision: 1,
         registry_digest: registry.canonical_digest().unwrap(),
         registry,
         epoch,

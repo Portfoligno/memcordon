@@ -1,62 +1,11 @@
 use memcordon_core::{
     BoundaryMechanismEvidence, ChildTermination, NativeWindowsCommandV1, RestartSafetyProof,
-    RunOutcome, WINDOWS_CONTROL_PIPE, WINDOWS_PREAUTHORIZATION_FAULTS,
-    WINDOWS_PUBLIC_PROTOCOL_VERSION, WINDOWS_QUALIFICATION_SCHEMA_VERSION,
-    WINDOWS_RETIREMENT_FAULTS, WindowsCertificationObservationsV1,
-    WindowsFaultRejectionObservationV1, WindowsLaunchPolicyV1, WindowsLaunchRequestV1,
-    WindowsLifetimeV1, WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsProviderRequestV1,
-    WindowsProviderResponseV1, WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1,
-    WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1, WindowsRelayEventV1,
-    WindowsRelayPhaseV1, WindowsRetirementFaultMatrixEvidenceV1, WindowsSealedEvidenceV2,
-    WindowsSealedFault, WindowsSealedMutant, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
+    RunOutcome, WINDOWS_CONTROL_PIPE, WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchPolicyV1,
+    WindowsLaunchRequestV1, WindowsLifetimeV1, WindowsProviderRequestV3, WindowsProviderResponseV3,
+    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
+    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsSealedEvidenceV2, WindowsStreamRoleV1,
     WindowsTerminalReplayDecisionV1, WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1,
 };
-
-struct NativeCanary {
-    evidence: WindowsSealedEvidenceV2,
-    exact_handle_inheritance_verified: bool,
-    public_pipe_security_verified: bool,
-    private_pipe_security_verified: bool,
-    nested_alternate_token_verified: bool,
-}
-
-pub(super) struct QualificationFailure {
-    pub(super) detail: String,
-    pub(super) loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
-}
-
-impl QualificationFailure {
-    fn with_loader_qualification(
-        detail: String,
-        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2,
-    ) -> Self {
-        Self {
-            detail,
-            loader_qualification: Some(loader_qualification),
-        }
-    }
-
-    fn append_secondary(mut self, detail: impl std::fmt::Display) -> Self {
-        self.detail.push_str("; ");
-        self.detail.push_str(&detail.to_string());
-        self
-    }
-}
-
-impl From<String> for QualificationFailure {
-    fn from(detail: String) -> Self {
-        Self {
-            detail,
-            loader_qualification: None,
-        }
-    }
-}
-
-impl std::fmt::Display for QualificationFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -564,7 +513,7 @@ fn acknowledge_and_confirm_terminal_retirement(
 ) -> Result<(), String> {
     super::pipe::write_frame(
         pipe,
-        &WindowsProviderRequestV1::TerminalAcknowledged {
+        &WindowsProviderRequestV3::TerminalAcknowledged {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
@@ -572,8 +521,24 @@ fn acknowledge_and_confirm_terminal_retirement(
             terminal_response_sha256: terminal_response_sha256.to_owned(),
         },
     )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe)? {
-        WindowsProviderResponseV1::TerminalRetired(retired)
+    confirm_terminal_retirement_response(
+        super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe)?,
+        attempt_id,
+        nonce,
+        request_sha256,
+        terminal_response_sha256,
+    )
+}
+
+pub(crate) fn confirm_terminal_retirement_response(
+    response: WindowsProviderResponseV3,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    terminal_response_sha256: &str,
+) -> Result<(), String> {
+    match response {
+        WindowsProviderResponseV3::TerminalRetiredV2(retired)
             if retired.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -583,7 +548,7 @@ fn acknowledge_and_confirm_terminal_retirement(
         {
             Ok(())
         }
-        WindowsProviderResponseV1::AttemptRetained(retained)
+        WindowsProviderResponseV3::AttemptRetainedV2(retained)
             if retained.is_consistent_for(
                 attempt_id,
                 nonce,
@@ -618,7 +583,7 @@ pub(crate) fn acknowledge_latched_qualification_terminal_for_test<T>(
     )
 }
 
-fn publish_qualification_receipt<T: serde::Serialize + ?Sized>(
+fn publish_native_fixture_result<T: serde::Serialize + ?Sized>(
     destination: &std::path::Path,
     producer: QualificationPublicationProducerV1,
     receipt: &T,
@@ -697,7 +662,7 @@ pub(crate) struct QualificationPublicationFailureForTest {
 }
 
 #[cfg(test)]
-pub(crate) fn publish_qualification_receipt_for_test(
+pub(crate) fn publish_native_fixture_result_for_test(
     destination: &std::path::Path,
     producer: QualificationPublicationProducerForTest,
 ) -> Result<(), QualificationPublicationFailureForTest> {
@@ -719,7 +684,7 @@ pub(crate) fn publish_qualification_receipt_for_test(
         schema_version: 1,
         producer: producer.name(),
     };
-    publish_qualification_receipt(destination, producer, &receipt).map_err(|failure| {
+    publish_native_fixture_result(destination, producer, &receipt).map_err(|failure| {
         QualificationPublicationFailureForTest {
             producer: failure.producer.name().to_owned(),
             stage: failure.stage.name().to_owned(),
@@ -848,175 +813,6 @@ impl Drop for CertificationWorkspaceGuard {
     }
 }
 
-pub(super) struct QualificationAdmission {
-    pipe: super::pipe::OwnedHandle,
-    challenge: String,
-    control_attestation: WindowsServiceSelfAttestationV1,
-    launcher_attestation: WindowsServiceSelfAttestationV1,
-    ended: bool,
-}
-
-impl QualificationAdmission {
-    pub(super) fn begin(
-        scope: &str,
-        _package_lease: &crate::windows::package::PackageLease,
-    ) -> Result<Self, String> {
-        let challenge = super::token::service_attestation_challenge("qualification-frontend")
-            .map_err(|error| error.to_string())?;
-        let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE).map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-connect endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-            )
-        })?;
-        super::pipe::write_frame(
-            pipe.raw(),
-            &WindowsProviderRequestV1::QualificationBegin {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                scope: scope.to_owned(),
-                challenge: challenge.clone(),
-            },
-        )
-        .map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-begin-write endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-            )
-        })?;
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-begin-read endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-            )
-        })? {
-            WindowsProviderResponseV1::QualificationAuthenticated {
-                schema_version,
-                control_attestation,
-                launcher_attestation,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION => {
-                if control_attestation.challenge != challenge
-                    || launcher_attestation.challenge != challenge
-                {
-                    return Err(
-                        "MCSEALED-WINDOWS-SERVICE-ATTESTATION: component=qualification-frontend stage=challenge-verify api=protocol role=service-attestation native_code=none detail=service response challenge does not match"
-                            .to_owned(),
-                    );
-                }
-                Self::acquire(
-                    pipe,
-                    challenge,
-                    control_attestation,
-                    launcher_attestation,
-                )
-            }
-            WindowsProviderResponseV1::QualificationRejected(rejection)
-                if rejection.matches_challenge(&challenge) =>
-            {
-                Err(format!(
-                    "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-rejected detail_truncated={} detail={}",
-                    rejection.detail_truncated,
-                    rejection.detail.as_str()
-                ))
-            }
-            WindowsProviderResponseV1::Reject { rejection, .. } => {
-                Err(format!("{}: {}", rejection.code, rejection.detail))
-            }
-            _ => Err(
-                "control service did not authenticate the qualification admission".to_owned(),
-            ),
-        }
-    }
-
-    fn acquire(
-        pipe: super::pipe::OwnedHandle,
-        challenge: String,
-        control_attestation: WindowsServiceSelfAttestationV1,
-        launcher_attestation: WindowsServiceSelfAttestationV1,
-    ) -> Result<Self, String> {
-        super::pipe::write_frame(
-            pipe.raw(),
-            &WindowsProviderRequestV1::QualificationAcquire {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            },
-        )
-        .map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-acquire-write endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-            )
-        })?;
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-acquire-read endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-            )
-        })? {
-            WindowsProviderResponseV1::QualificationReady { schema_version }
-                if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
-            {
-                Ok(Self {
-                    pipe,
-                    challenge,
-                    control_attestation,
-                    launcher_attestation,
-                    ended: false,
-                })
-            }
-            WindowsProviderResponseV1::Reject { rejection, .. } => {
-                Err(format!("{}: {}", rejection.code, rejection.detail))
-            }
-            _ => Err("control service returned an invalid qualification admission".to_owned()),
-        }
-    }
-
-    fn authorize_child(
-        &mut self,
-        child_process: windows_sys::Win32::Foundation::HANDLE,
-    ) -> Result<(), String> {
-        super::pipe::write_frame(
-            self.pipe.raw(),
-            &WindowsProviderRequestV1::QualificationAuthorizeChild {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                child_process_identity: super::process::process_identity(child_process)?,
-            },
-        )?;
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
-            WindowsProviderResponseV1::QualificationChildAuthorized { schema_version }
-                if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
-            {
-                Ok(())
-            }
-            _ => Err("control service did not authorize the qualification child".to_owned()),
-        }
-    }
-
-    fn finish(mut self) -> Result<(), String> {
-        super::pipe::write_frame(
-            self.pipe.raw(),
-            &WindowsProviderRequestV1::QualificationEnd {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            },
-        )?;
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
-            WindowsProviderResponseV1::QualificationEnded { schema_version }
-                if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
-            {
-                self.ended = true;
-                Ok(())
-            }
-            _ => Err("control service did not retire qualification admission".to_owned()),
-        }
-    }
-}
-
-impl Drop for QualificationAdmission {
-    fn drop(&mut self) {
-        if !self.ended {
-            let _ = super::pipe::write_frame(
-                self.pipe.raw(),
-                &WindowsProviderRequestV1::QualificationEnd {
-                    schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                },
-            );
-        }
-    }
-}
-
 fn signal_relay_retirement(event: &mut Option<super::pipe::OwnedHandle>) -> Result<(), String> {
     let event = event
         .take()
@@ -1030,105 +826,40 @@ fn signal_relay_retirement(event: &mut Option<super::pipe::OwnedHandle>) -> Resu
     }
 }
 
-impl std::ops::Deref for NativeCanary {
-    type Target = WindowsSealedEvidenceV2;
-
-    fn deref(&self) -> &Self::Target {
-        &self.evidence
-    }
-}
-
-pub fn local_receipt() -> Result<WindowsQualificationReceiptV1, String> {
-    let path = qualification_path();
-    let bytes = std::fs::read(&path).map_err(|error| {
-        format!(
-            "MCSEALED-WINDOWS-UNQUALIFIED: {}: {error}; run package verify and qualify from an elevated terminal",
-            path.display()
-        )
-    })?;
-    let receipt: WindowsQualificationReceiptV1 =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if !receipt.qualified || !receipt.is_consistent() {
-        return Err(
-            "stored Windows qualification receipt is incomplete or inconsistent".to_owned(),
-        );
-    }
-    Ok(receipt)
-}
-
-pub fn token_observations() -> Result<WindowsTokenMatrixEvidenceV1, String> {
-    let path = crate::windows::package::state_root()
-        .join("package")
-        .join("token-matrix.json");
-    let observations: WindowsTokenMatrixEvidenceV1 = serde_json::from_slice(
-        &std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-    )
-    .map_err(|error| error.to_string())?;
-    if observations.is_complete() {
-        Ok(observations)
-    } else {
-        Err("stored Windows token-matrix evidence is incomplete".to_owned())
-    }
-}
-
-pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
+pub fn probe() -> Result<memcordon_core::WindowsProviderProbeV1, String> {
     let pipe = super::pipe::connect(memcordon_core::WINDOWS_CONTROL_PIPE)?;
+    let peer = qualification_control_peer_identity(pipe.raw())?;
+    let manager = super::service_manager::manager()?;
+    if super::service_manager::running_process_id(
+        &manager,
+        memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
+    )? != peer.process_id
+    {
+        return Err("live provider probe peer differs from SCM control service".into());
+    }
+    let expected = super::package::installed_public_provider_binding()?;
     super::pipe::write_frame(
         pipe.raw(),
-        &memcordon_core::WindowsProviderRequestV1::Probe {
+        &memcordon_core::WindowsProviderRequestV3::Probe {
             schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
         },
     )?;
-    match super::pipe::read_response_frame::<memcordon_core::WindowsProviderResponseV1>(pipe.raw())?
+    match super::pipe::read_response_frame::<memcordon_core::WindowsProviderResponseV3>(pipe.raw())?
     {
-        memcordon_core::WindowsProviderResponseV1::Probe { qualification, .. }
-            if qualification.qualified && qualification.is_consistent() =>
+        memcordon_core::WindowsProviderResponseV3::Probe {
+            schema_version,
+            observation,
+        } if schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && observation.validate().is_ok()
+            && observation.provider_binding == expected =>
         {
-            Ok(qualification)
+            Ok(observation)
         }
-        memcordon_core::WindowsProviderResponseV1::Reject { rejection, .. } => {
+        memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => {
             Err(format!("{}: {}", rejection.code, rejection.detail))
         }
         _ => Err("Windows sealed control service returned an invalid probe receipt".to_owned()),
     }
-}
-
-pub fn qualify_and_store() -> Result<WindowsQualificationReceiptV1, String> {
-    let lease = crate::windows::package::PackageLease::acquire()?;
-    let (result, _lease) = qualify_and_store_for_scope("direct", lease)?;
-    result.map_err(|failure| failure.detail)
-}
-
-pub(super) fn qualify_and_store_for_scope(
-    scope: &str,
-    lease: crate::windows::package::PackageLease,
-) -> Result<
-    (
-        Result<WindowsQualificationReceiptV1, QualificationFailure>,
-        crate::windows::package::PackageLease,
-    ),
-    String,
-> {
-    let mut admission = match QualificationAdmission::begin(scope, &lease) {
-        Ok(admission) => admission,
-        Err(error) => return Ok((Err(QualificationFailure::from(error)), lease)),
-    };
-    let result = qualify_admitted(&mut admission);
-    let result = match result {
-        Ok(receipt) => finalize_qualification_after_admission(
-            receipt,
-            || admission.finish(),
-            recovery_complete,
-            store_qualification_receipt,
-        ),
-        Err(error) => match admission.finish() {
-            Ok(()) => Err(error),
-            Err(finish) => Err(error.append_secondary(format_args!(
-                "qualification admission retirement failed: {finish}"
-            ))),
-        },
-    };
-    Ok((result, lease))
 }
 
 fn service_process_identity(
@@ -1162,327 +893,8 @@ fn service_process_identity(
     })
 }
 
-fn qualify_admitted(
-    admission: &mut QualificationAdmission,
-) -> Result<WindowsQualificationReceiptV1, QualificationFailure> {
-    crate::windows::package::verify_installed()?;
-    let manager = super::service_manager::manager()?;
-    let control_process_id = super::service_manager::running_process_id(
-        &manager,
-        memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
-    )?;
-    let launcher_process_id = super::service_manager::running_process_id(
-        &manager,
-        memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
-    )?;
-    let control_process_identity = service_process_identity(
-        control_process_id,
-        "control-process-identity",
-        "control-service-process",
-    )?;
-    let launcher_process_identity = service_process_identity(
-        launcher_process_id,
-        "launcher-process-identity",
-        "launcher-service-process",
-    )?;
-    let control_sid = super::security::service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
-    admission
-        .control_attestation
-        .validate_for(
-            &admission.challenge,
-            memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
-            &control_process_identity,
-            &control_sid,
-            super::package::CONTROL_PRIVILEGES,
-        )
-        .map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-SERVICE-ATTESTATION: component=qualification-frontend stage=control-token-privileges api=service-self-attestation role=control-service native_code=none detail={detail}"
-            )
-        })?;
-    let launcher_sid = super::security::service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
-    admission
-        .launcher_attestation
-        .validate_for(
-            &admission.challenge,
-            memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
-            &launcher_process_identity,
-            &launcher_sid,
-            super::package::LAUNCHER_PRIVILEGES,
-        )
-        .map_err(|detail| {
-            format!(
-                "MCSEALED-WINDOWS-SERVICE-ATTESTATION: component=qualification-frontend stage=launcher-token-privileges api=service-self-attestation role=launcher-service native_code=none detail={detail}"
-            )
-        })?;
-    let control_service_privileges_observed = true;
-    let launcher_service_privileges_observed = true;
-    super::security::prepare_current_process_for_restricted_broker()?;
-    let elevated_observation = TokenFixtureObservation::current()?;
-    if !elevated_observation.envelope.elevated {
-        return Err("elevated-admin qualification fixture is not elevated"
-            .to_owned()
-            .into());
-    }
-    let native = {
-        let frontend_canaries = prepare_frontend_canaries("elevated-admin")?;
-        let mut loader_rejection = None;
-        match native_public_canary(
-            "windows-certification-nested-target",
-            "elevated-admin",
-            &frontend_canaries,
-            &mut loader_rejection,
-        ) {
-            Ok(native) => native,
-            Err(detail) => {
-                return Err(QualificationFailure {
-                    detail,
-                    loader_qualification: loader_rejection,
-                });
-            }
-        }
-    };
-    let loader_qualification = native
-        .evidence
-        .loader_qualification
-        .clone()
-        .ok_or_else(|| {
-            QualificationFailure::from(
-                "production loader qualification outcome is absent".to_owned(),
-            )
-        })?;
-    let failure_loader_qualification = loader_qualification.clone();
-    (|| -> Result<WindowsQualificationReceiptV1, String> {
-        // Token variants, AppContainer rejection, frontend-loss, recursive-provider,
-        // and fault experiments belong to the explicit diagnostic/lifecycle suites.
-        // Package qualification runs exactly one unobserved production launch.
-        let frontend_loss_cleanup_verified = false;
-        let recursive_provider_request_denied = false;
-        super::process::certify_target_handle_list_negatives()?;
-        super::process::certify_guardian_loader_context_negatives()?;
-        super::guardian_service::certify_slot_contract_negatives()?;
-        let nested_alternate_token = false;
-        let receipt = WindowsQualificationReceiptV1 {
-            schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
-            provider_identity: format!(
-                "memcordon-sealed-agent-windows-v1:{}",
-                env!("CARGO_PKG_VERSION")
-            ),
-            control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
-            launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
-            guardian_pool_identity:
-                "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand".to_owned(),
-            package_verified: crate::windows::package::verify_installed().is_ok(),
-            public_pipe_security_verified: native.public_pipe_security_verified,
-            private_pipe_security_verified: native.private_pipe_security_verified,
-            control_service_privileges_verified: control_service_privileges_observed,
-            launcher_service_privileges_verified: launcher_service_privileges_observed,
-            guardian_slot_tokens_verified: native.guardian_ready && native.guardian_reaped,
-            guardian_slot_loader_verified: native.guardian_ready && native.guardian_reaped,
-            guardian_capacity_verified: true,
-            caller_token_authentication_verified: native.caller_token_authenticated,
-            restricted_caller_token_verified: false,
-            primary_token_duplication_verified: native.caller_token_authenticated
-                && native.initial_target_token_matches_caller,
-            create_process_as_user_verified: native.target_created_suspended,
-            job_list_supported: native.job_list_applied_at_creation,
-            handle_list_supported: native.handle_list_applied_at_creation,
-            nested_host_job_supported: native.job_list_applied_at_creation,
-            kill_on_close_verified: native.kill_on_close_verified,
-            breakaway_denied: native.breakaway_denied,
-            completion_port_verified: native.completion_port_associated,
-            guardian_verified: native.guardian_ready && native.guardian_reaped,
-            frontend_loss_cleanup_verified,
-            alternate_token_child_contained: nested_alternate_token,
-            nested_child_job_contained: nested_alternate_token,
-            recursive_provider_request_denied,
-            exact_handle_inheritance_verified: native.exact_handle_inheritance_verified
-                && native.inherited_handles_verified,
-            active_processes_zero_verified: native.active_processes_zero,
-            relays_retired_verified: native.relays_retired,
-            // The live recovery-empty proof must run only after the durable
-            // qualification admission has been retired and acknowledged.
-            recovery_complete: false,
-            loader_qualification,
-            qualified: false,
-        };
-        if !receipt.is_consistent() {
-            return Err("native Windows qualification produced an inconsistent draft".to_owned());
-        }
-        Ok(receipt)
-    })()
-    .map_err(|detail| {
-        QualificationFailure::with_loader_qualification(detail, failure_loader_qualification)
-    })
-}
-
-fn finalize_qualification_after_admission<Finish, Recovery, Store>(
-    mut receipt: WindowsQualificationReceiptV1,
-    finish_admission: Finish,
-    observe_recovery_complete: Recovery,
-    store_receipt: Store,
-) -> Result<WindowsQualificationReceiptV1, QualificationFailure>
-where
-    Finish: FnOnce() -> Result<(), String>,
-    Recovery: FnOnce() -> Result<bool, String>,
-    Store: FnOnce(&WindowsQualificationReceiptV1) -> Result<(), String>,
-{
-    let loader_qualification = receipt.loader_qualification.clone();
-    (|| -> Result<WindowsQualificationReceiptV1, String> {
-        finish_admission()
-            .map_err(|error| format!("qualification admission retirement failed: {error}"))?;
-        receipt.recovery_complete = observe_recovery_complete()
-            .map_err(|error| format!("post-retirement recovery proof failed: {error}"))?;
-        receipt.qualified = receipt.is_consistent_if_qualified();
-        if !receipt.recovery_complete {
-            return Err(
-                "post-retirement recovery proof found active attempt or admission state".to_owned(),
-            );
-        }
-        if !receipt.qualified || !receipt.is_consistent() {
-            return Err(
-                "native Windows qualification did not produce a qualified consistent receipt"
-                    .to_owned(),
-            );
-        }
-        store_receipt(&receipt)
-            .map_err(|error| format!("qualification receipt persistence failed: {error}"))?;
-        Ok(receipt)
-    })()
-    .map_err(|detail| QualificationFailure::with_loader_qualification(detail, loader_qualification))
-}
-
 #[cfg(test)]
-pub(crate) fn finalize_qualification_after_admission_for_test<Finish, Recovery, Store>(
-    receipt: WindowsQualificationReceiptV1,
-    finish_admission: Finish,
-    observe_recovery_complete: Recovery,
-    store_receipt: Store,
-) -> Result<
-    WindowsQualificationReceiptV1,
-    (
-        String,
-        Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
-    ),
->
-where
-    Finish: FnOnce() -> Result<(), String>,
-    Recovery: FnOnce() -> Result<bool, String>,
-    Store: FnOnce(&WindowsQualificationReceiptV1) -> Result<(), String>,
-{
-    finalize_qualification_after_admission(
-        receipt,
-        finish_admission,
-        observe_recovery_complete,
-        store_receipt,
-    )
-    .map_err(|failure| (failure.detail, failure.loader_qualification))
-}
-
-fn store_qualification_receipt(receipt: &WindowsQualificationReceiptV1) -> Result<(), String> {
-    let path = qualification_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| "qualification path has no parent".to_owned())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let staged = path.with_extension("json.new");
-    let mut bytes = serde_json::to_vec_pretty(receipt).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    std::fs::write(&staged, bytes).map_err(|error| error.to_string())?;
-    super::record::replace_atomically(&staged, &path)
-}
-
-fn store_package_evidence<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
-    let path = crate::windows::package::state_root()
-        .join("package")
-        .join(name);
-    let staged = path.with_extension("json.new");
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    std::fs::write(&staged, bytes).map_err(|error| error.to_string())?;
-    super::record::replace_atomically(&staged, &path)
-}
-
-fn preauthorization_fault_matrix() -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let marker_root = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers");
-    std::fs::create_dir_all(&marker_root).map_err(|error| error.to_string())?;
-    let mut rejections = Vec::with_capacity(WINDOWS_PREAUTHORIZATION_FAULTS.len());
-    for (index, fault) in WINDOWS_PREAUTHORIZATION_FAULTS.iter().copied().enumerate() {
-        let marker = marker_root.join(format!(
-            "{}-{}-{}.marker",
-            std::process::id(),
-            index,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_nanos()
-        ));
-        let _marker_cleanup = RemoveFileGuard(marker.clone());
-        let request = WindowsLaunchRequestV1 {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            expected_provider_binding: super::package::installed_public_provider_binding()?,
-            workload_contract: None,
-            restart_attempt: 0,
-            nonce: format!(
-                "qualification-fault-{}-{}-{}",
-                std::process::id(),
-                index,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|error| error.to_string())?
-                    .as_nanos()
-            ),
-            command: NativeWindowsCommandV1 {
-                program: crate::windows::package::installed_binary()
-                    .as_os_str()
-                    .encode_wide()
-                    .collect(),
-                arguments: vec![
-                    "windows-certification-marker".encode_utf16().collect(),
-                    marker.as_os_str().encode_wide().collect(),
-                ],
-            },
-            environment: Vec::new(),
-            current_directory: crate::windows::package::install_root()
-                .as_os_str()
-                .encode_wide()
-                .collect(),
-            policy: WindowsLaunchPolicyV1 {
-                memory_limit_bytes: None,
-                absolute_deadline_millis: None,
-                lifetime: WindowsLifetimeV1::Command,
-                poll_interval_millis: 10,
-                signal_grace_millis: 1_000,
-                command_exit_grace_millis: 0,
-                limit_grace_millis: 0,
-            },
-        };
-        rejections.push(WindowsFaultRejectionObservationV1 {
-            fault,
-            rejection: run_certification_fault(fault, request, &marker, false)?,
-        });
-    }
-    let evidence = WindowsPreauthorizationFaultMatrixEvidenceV1 {
-        schema_version: 1,
-        faults: WINDOWS_PREAUTHORIZATION_FAULTS.to_vec(),
-        first_instruction_markers_absent: true,
-        recovery_clear_after_each_fault: true,
-        rejections,
-        terminal_frame_truncation_rejected: terminal_frame_truncation_canary()?,
-    };
-    let path = crate::windows::package::state_root()
-        .join("package")
-        .join("preauthorization-fault-matrix.json");
-    let mut bytes = serde_json::to_vec_pretty(&evidence).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    std::fs::write(path, bytes).map_err(|error| error.to_string())
-}
-
-fn terminal_frame_truncation_canary() -> Result<bool, String> {
+pub(crate) fn terminal_frame_truncation_canary() -> Result<bool, String> {
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
@@ -1522,1541 +934,11 @@ fn terminal_frame_truncation_canary() -> Result<bool, String> {
         Ok(())
     });
     let rejected =
-        super::pipe::read_response_frame::<WindowsProviderResponseV1>(reader.raw()).is_err();
+        super::pipe::read_response_frame::<WindowsProviderResponseV3>(reader.raw()).is_err();
     writer_thread
         .join()
         .map_err(|_| "terminal-frame writer panicked".to_owned())??;
     Ok(rejected)
-}
-
-fn retirement_fault_matrix() -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let marker_root = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers");
-    let mut rejections = Vec::with_capacity(WINDOWS_RETIREMENT_FAULTS.len());
-    for (index, fault) in WINDOWS_RETIREMENT_FAULTS.iter().copied().enumerate() {
-        let marker = marker_root.join(format!(
-            "retirement-{}-{}-{}.marker",
-            std::process::id(),
-            index,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_nanos()
-        ));
-        let _marker_cleanup = RemoveFileGuard(marker.clone());
-        let request = WindowsLaunchRequestV1 {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            expected_provider_binding: super::package::installed_public_provider_binding()?,
-            workload_contract: None,
-            restart_attempt: 0,
-            nonce: format!(
-                "qualification-retirement-fault-{}-{}-{}",
-                std::process::id(),
-                index,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|error| error.to_string())?
-                    .as_nanos()
-            ),
-            command: NativeWindowsCommandV1 {
-                program: crate::windows::package::installed_binary()
-                    .as_os_str()
-                    .encode_wide()
-                    .collect(),
-                arguments: vec![
-                    if fault == memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization
-                    {
-                        "windows-certification-marker-hold".encode_utf16().collect()
-                    } else {
-                        "windows-certification-marker".encode_utf16().collect()
-                    },
-                    marker.as_os_str().encode_wide().collect(),
-                ],
-            },
-            environment: Vec::new(),
-            current_directory: crate::windows::package::install_root()
-                .as_os_str()
-                .encode_wide()
-                .collect(),
-            policy: WindowsLaunchPolicyV1 {
-                memory_limit_bytes: None,
-                absolute_deadline_millis: None,
-                lifetime: WindowsLifetimeV1::Command,
-                poll_interval_millis: 10,
-                signal_grace_millis: 1_000,
-                command_exit_grace_millis: 0,
-                limit_grace_millis: 0,
-            },
-        };
-        rejections.push(WindowsFaultRejectionObservationV1 {
-            fault,
-            rejection: run_certification_fault(fault, request, &marker, true)?,
-        });
-    }
-    let path = crate::windows::package::state_root()
-        .join("package")
-        .join("retirement-fault-matrix.json");
-    let evidence = WindowsRetirementFaultMatrixEvidenceV1 {
-        schema_version: 1,
-        faults: WINDOWS_RETIREMENT_FAULTS.to_vec(),
-        first_instruction_markers_observed: true,
-        recovery_clear_after_each_fault: true,
-        rejections,
-    };
-    let mut bytes = serde_json::to_vec_pretty(&evidence).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    std::fs::write(path, bytes).map_err(|error| error.to_string())
-}
-
-pub fn certification_observations() -> Result<WindowsCertificationObservationsV1, String> {
-    let package = crate::windows::package::state_root().join("package");
-    let preauthorization: WindowsPreauthorizationFaultMatrixEvidenceV1 = serde_json::from_slice(
-        &std::fs::read(package.join("preauthorization-fault-matrix.json"))
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let retirement: WindowsRetirementFaultMatrixEvidenceV1 = serde_json::from_slice(
-        &std::fs::read(package.join("retirement-fault-matrix.json"))
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let evidence = WindowsCertificationObservationsV1 {
-        schema_version: 1,
-        preauthorization,
-        retirement,
-    };
-    if evidence.is_complete() {
-        Ok(evidence)
-    } else {
-        Err("Windows certification fault-matrix observations are incomplete".to_owned())
-    }
-}
-
-fn run_certification_fault(
-    fault: memcordon_core::WindowsSealedFault,
-    request: WindowsLaunchRequestV1,
-    marker: &std::path::Path,
-    expect_release: bool,
-) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    let caller_process_identity = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let mut attempt_identity = request.nonce.as_bytes().to_vec();
-    attempt_identity.extend_from_slice(&caller_process_identity.process_id.to_le_bytes());
-    attempt_identity.extend_from_slice(&caller_process_identity.creation_time_100ns.to_le_bytes());
-    attempt_identity.extend_from_slice(request_sha256.as_bytes());
-    let expected_attempt_id = super::record::digest(&attempt_identity);
-    super::pipe::write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV1::CertificationFault {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            fault,
-            attempt_id: expected_attempt_id.clone(),
-            request_sha256: request_sha256.clone(),
-            caller_process_identity,
-            launch: request,
-        },
-    )?;
-    let mut attempt_id = None;
-    let mut streams = Vec::new();
-    let mut relay_retired_event = None;
-    let mut authorized = false;
-    loop {
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-            WindowsProviderResponseV1::StreamsPrepared {
-                schema_version,
-                attempt_id: received,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                streams: remote,
-                relay_retired_event_handle,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned_nonce == nonce
-                && returned_digest == request_sha256
-                && received == expected_attempt_id
-                && attempt_id.is_none() =>
-            {
-                memcordon_core::validate_windows_stream_manifest(&remote).map_err(str::to_owned)?;
-                streams = remote
-                    .into_iter()
-                    .map(|stream| {
-                        super::pipe::OwnedHandle::new(
-                            stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                relay_retired_event = Some(super::pipe::OwnedHandle::new(
-                    relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?);
-                attempt_id = Some(received.clone());
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysReady {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-            }
-            WindowsProviderResponseV1::RelaysAbort {
-                schema_version,
-                attempt_id: received,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && attempt_id.as_deref() == Some(received.as_str())
-                && returned_nonce == nonce
-                && returned_digest == request_sha256
-                && !authorized =>
-            {
-                streams.clear();
-                signal_relay_retirement(&mut relay_retired_event)?;
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysRetired {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-            }
-            WindowsProviderResponseV1::Reject {
-                schema_version,
-                attempt_id: received,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                rejection,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned_nonce == nonce
-                && returned_digest == request_sha256
-                && received == expected_attempt_id
-                && attempt_id
-                    .as_ref()
-                    .is_none_or(|expected| expected == &received) =>
-            {
-                drop(streams);
-                drop(relay_retired_event);
-                if rejection.code != "MCSEALED-WINDOWS-CERTIFICATION-FAULT"
-                    || rejection.target_released != expect_release
-                    || authorized != expect_release
-                    || !rejection.is_consistent()
-                    || (rejection.cleanup_attempted
-                        && !rejection
-                            .restart_safety
-                            .is_safe_for(memcordon_core::BoundaryRequirement::Sealed))
-                    || marker.exists() != expect_release
-                    || !recovery_status()?
-                {
-                    return Err(format!(
-                        "fault {fault:?} failed preauthorization, marker, cleanup, or recovery proof"
-                    ));
-                }
-                if marker.exists() {
-                    std::fs::remove_file(marker).map_err(|error| error.to_string())?;
-                }
-                return Ok(rejection);
-            }
-            WindowsProviderResponseV1::TargetAuthorized {
-                schema_version,
-                attempt_id: received,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                child_pid: _,
-            } if expect_release
-                && !authorized
-                && schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && received == expected_attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                authorized = true;
-            }
-            WindowsProviderResponseV1::TargetRetired {
-                schema_version,
-                attempt_id: received,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            } if expect_release
-                && authorized
-                && schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && received == expected_attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                streams.clear();
-                signal_relay_retirement(&mut relay_retired_event)?;
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysRetired {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-            }
-            WindowsProviderResponseV1::Terminal(_) => {
-                return Err(format!(
-                    "fault {fault:?} returned terminal success instead of the injected rejection"
-                ));
-            }
-            _ => return Err(format!("fault {fault:?} returned an unbound response")),
-        }
-    }
-}
-
-fn frontend_loss_canary(admission: &mut QualificationAdmission) -> Result<bool, String> {
-    use std::os::windows::io::AsRawHandle;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let marker_root = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers");
-    std::fs::create_dir_all(&marker_root).map_err(|error| error.to_string())?;
-    let release_marker = marker_root.join(format!(
-        "frontend-release-{}-{}.marker",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos()
-    ));
-    let _release_marker_cleanup = RemoveFileGuard(release_marker.clone());
-    let mut frontend = Command::new(executable)
-        .arg("windows-certification-frontend")
-        .arg(&release_marker)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    admission.authorize_child(frontend.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE)?;
-    std::fs::write(&release_marker, b"authorized\n").map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = frontend.try_wait().map_err(|error| error.to_string())? {
-            if status.success() {
-                break;
-            }
-            return Err(format!(
-                "frontend-loss qualification client failed: {status}"
-            ));
-        }
-        if Instant::now() >= deadline {
-            let _ = frontend.kill();
-            let _ = frontend.wait();
-            return Err("frontend-loss qualification attempt was not observed".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while !recovery_status()? {
-        if Instant::now() >= deadline {
-            return Err("frontend-loss qualification record did not retire".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(true)
-}
-
-fn verify_target_process_is_protected(process_id: u32) -> Result<(), String> {
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
-
-    let _restricted = super::token::impersonate_restricted_current_thread()?;
-    // SAFETY: the PID is authenticated from the durable authorized-attempt
-    // record and the probe requests no inherited handle.
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, process_id) };
-    if handle.is_null() {
-        Ok(())
-    } else {
-        drop(super::pipe::OwnedHandle::new(handle)?);
-        Err("restricted frontend retained target process termination access".to_owned())
-    }
-}
-
-pub fn frontend_loss_client(release_marker: &std::ffi::OsStr) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::time::{Duration, Instant};
-
-    let release_marker = std::path::Path::new(release_marker);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !release_marker.is_file() {
-        if Instant::now() >= deadline {
-            return Err("frontend-loss qualification release was not authorized".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    let executable = crate::windows::package::installed_binary();
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce: format!("frontend-loss-{}", std::process::id()),
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments: vec!["windows-certification-hold".encode_utf16().collect()],
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: None,
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 1_000,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    let mut streams = Vec::new();
-    let mut relay_retired_event = None;
-    let mut active_attempt_id = None;
-    loop {
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-            WindowsProviderResponseV1::StreamsPrepared {
-                attempt_id,
-                schema_version,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                streams: received,
-                relay_retired_event_handle,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                for stream in received {
-                    streams.push(super::pipe::OwnedHandle::new(
-                        stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                    )?);
-                }
-                relay_retired_event = Some(super::pipe::OwnedHandle::new(
-                    relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?);
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysReady {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: attempt_id.clone(),
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-                active_attempt_id = Some(attempt_id);
-            }
-            WindowsProviderResponseV1::TargetAuthorized {
-                schema_version,
-                attempt_id,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                child_pid,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && active_attempt_id.as_deref() == Some(attempt_id.as_str())
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                verify_target_process_is_protected(child_pid)?;
-                drop(relay_retired_event);
-                return Ok(());
-            }
-            WindowsProviderResponseV1::Reject { rejection, .. } => {
-                return Err(format!("{}: {}", rejection.code, rejection.detail));
-            }
-            _ => {
-                return Err(
-                    "frontend-loss client reached terminal state before external loss".to_owned(),
-                );
-            }
-        }
-    }
-}
-
-fn authority_fault_name(fault: WindowsSealedFault) -> &'static str {
-    match fault {
-        WindowsSealedFault::FrontendDisconnectedAfterAuthorization => "frontend-disconnected",
-        WindowsSealedFault::FrontendKilledAfterAuthorization => "frontend-killed",
-        WindowsSealedFault::ControlWorkerKilledAfterAuthorization => "control-worker-killed",
-        WindowsSealedFault::ControlServiceKilledAfterAuthorization => "control-service-killed",
-        WindowsSealedFault::LauncherWorkerKilledAfterAuthorization => "launcher-worker-killed",
-        WindowsSealedFault::LauncherServiceKilledAfterAuthorization => "launcher-service-killed",
-        WindowsSealedFault::AllJobOwnersClosedAfterAuthorization => "all-job-owners-closed",
-        _ => "unsupported",
-    }
-}
-
-fn parse_authority_fault(value: &std::ffi::OsStr) -> Result<WindowsSealedFault, String> {
-    match value.to_string_lossy().as_ref() {
-        "frontend-disconnected" => Ok(WindowsSealedFault::FrontendDisconnectedAfterAuthorization),
-        "frontend-killed" => Ok(WindowsSealedFault::FrontendKilledAfterAuthorization),
-        "control-worker-killed" => Ok(WindowsSealedFault::ControlWorkerKilledAfterAuthorization),
-        "control-service-killed" => Ok(WindowsSealedFault::ControlServiceKilledAfterAuthorization),
-        "launcher-worker-killed" => Ok(WindowsSealedFault::LauncherWorkerKilledAfterAuthorization),
-        "launcher-service-killed" => {
-            Ok(WindowsSealedFault::LauncherServiceKilledAfterAuthorization)
-        }
-        "all-job-owners-closed" => Ok(WindowsSealedFault::AllJobOwnersClosedAfterAuthorization),
-        _ => Err("unknown Windows authority-loss scenario".to_owned()),
-    }
-}
-
-pub fn authority_loss_client(
-    fault: &std::ffi::OsStr,
-    marker: &std::ffi::OsStr,
-) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let fault = parse_authority_fault(fault)?;
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    let executable = crate::windows::package::installed_binary();
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce: format!(
-            "authority-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_nanos()
-        ),
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments: vec![
-                "windows-certification-marker-hold".encode_utf16().collect(),
-                marker.encode_wide().collect(),
-            ],
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: None,
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 1_000,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    let caller = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let mut identity = Vec::new();
-    identity.extend_from_slice(nonce.as_bytes());
-    identity.extend_from_slice(&caller.process_id.to_le_bytes());
-    identity.extend_from_slice(&caller.creation_time_100ns.to_le_bytes());
-    identity.extend_from_slice(request_sha256.as_bytes());
-    let attempt_id = super::record::digest(&identity);
-    super::pipe::write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV1::CertificationFault {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            fault,
-            attempt_id: attempt_id.clone(),
-            request_sha256: request_sha256.clone(),
-            caller_process_identity: caller,
-            launch: request,
-        },
-    )?;
-    let mut stream_handles = Vec::new();
-    let mut relay_event = None;
-    loop {
-        let response =
-            match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()) {
-                Ok(response) => response,
-                Err(_)
-                    if fault == WindowsSealedFault::ControlWorkerKilledAfterAuthorization
-                        && std::path::Path::new(marker).is_file() =>
-                {
-                    let worker_lost =
-                        std::path::Path::new(marker).with_extension("control-worker-lost");
-                    let release = std::path::Path::new(marker).with_extension("frontend-release");
-                    std::fs::write(&worker_lost, b"control worker retired\n")
-                        .map_err(|error| error.to_string())?;
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    while !release.is_file() {
-                        if std::time::Instant::now() >= deadline {
-                            return Err("control-worker fixture did not receive frontend release"
-                                .to_owned());
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    return Ok(());
-                }
-                Err(_) if std::path::Path::new(marker).is_file() => return Ok(()),
-                Err(error) => return Err(error),
-            };
-        match response {
-            WindowsProviderResponseV1::StreamsPrepared {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                streams,
-                relay_retired_event_handle,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned == attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                stream_handles = streams
-                    .into_iter()
-                    .map(|stream| {
-                        super::pipe::OwnedHandle::new(
-                            stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                relay_event = Some(super::pipe::OwnedHandle::new(
-                    relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?);
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysReady {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: returned,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-            }
-            WindowsProviderResponseV1::TargetAuthorized {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                child_pid: _,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned == attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                if fault == WindowsSealedFault::FrontendDisconnectedAfterAuthorization {
-                    drop(stream_handles);
-                    drop(relay_event);
-                    return Ok(());
-                }
-                if fault == WindowsSealedFault::FrontendKilledAfterAuthorization {
-                    std::thread::sleep(std::time::Duration::from_secs(5 * 60));
-                    return Err("frontend-kill fixture was not externally terminated".to_owned());
-                }
-            }
-            WindowsProviderResponseV1::Reject { rejection, .. } => {
-                return Err(format!("{}: {}", rejection.code, rejection.detail));
-            }
-            _ => {}
-        }
-    }
-}
-
-pub fn authority_loss_observations()
--> Result<memcordon_core::WindowsAuthorityLossEvidenceV1, String> {
-    use std::os::windows::io::AsRawHandle;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    if !crate::windows::package::certification_faults_enabled() {
-        return Err("authority-loss certification requires ephemeral CI installation".to_owned());
-    }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let marker_root = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers");
-    std::fs::create_dir_all(&marker_root).map_err(|error| error.to_string())?;
-    let scenarios = [
-        WindowsSealedFault::FrontendDisconnectedAfterAuthorization,
-        WindowsSealedFault::FrontendKilledAfterAuthorization,
-        WindowsSealedFault::ControlWorkerKilledAfterAuthorization,
-        WindowsSealedFault::ControlServiceKilledAfterAuthorization,
-        WindowsSealedFault::LauncherWorkerKilledAfterAuthorization,
-        WindowsSealedFault::LauncherServiceKilledAfterAuthorization,
-        WindowsSealedFault::AllJobOwnersClosedAfterAuthorization,
-    ];
-    let mut observed = Vec::with_capacity(scenarios.len());
-    for (index, fault) in scenarios.into_iter().enumerate() {
-        let marker = marker_root.join(format!(
-            "authority-{}-{}-{}.marker",
-            std::process::id(),
-            index,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_nanos()
-        ));
-        let _marker_cleanup = RemoveFileGuard(marker.clone());
-        let worker_lost = marker.with_extension("control-worker-lost");
-        let _worker_lost_cleanup = RemoveFileGuard(worker_lost.clone());
-        let frontend_release = marker.with_extension("frontend-release");
-        let _frontend_release_cleanup = RemoveFileGuard(frontend_release.clone());
-        let mut frontend = Command::new(&executable)
-            .arg("windows-certification-authority-frontend")
-            .arg(authority_fault_name(fault))
-            .arg(&marker)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !marker.is_file() {
-            if let Some(status) = frontend.try_wait().map_err(|error| error.to_string())? {
-                return Err(format!(
-                    "authority-loss frontend exited before authorization for {fault:?}: {status}"
-                ));
-            }
-            if Instant::now() >= deadline {
-                let _ = frontend.kill();
-                let _ = frontend.wait();
-                return Err(format!(
-                    "authority-loss target did not authorize for {fault:?}"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if fault == WindowsSealedFault::FrontendKilledAfterAuthorization {
-            // SAFETY: child is the exact frontend spawned above and this native
-            // scenario deliberately removes it after the target marker exists.
-            if unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(
-                    frontend.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-                    0xC000_013A,
-                )
-            } == 0
-            {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-        }
-        if fault == WindowsSealedFault::ControlWorkerKilledAfterAuthorization {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !worker_lost.is_file() {
-                if let Some(status) = frontend.try_wait().map_err(|error| error.to_string())? {
-                    return Err(format!(
-                        "control-worker fixture lost frontend authority early: {status}"
-                    ));
-                }
-                if Instant::now() >= deadline {
-                    let _ = frontend.kill();
-                    let _ = frontend.wait();
-                    return Err("control worker did not retire after authorization".to_owned());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            // Keep the authenticated frontend and all adopted relay handles
-            // alive after the isolated worker has gone. The launcher and
-            // guardian must not retire a healthy workload merely because the
-            // private control path disappeared.
-            let read_heartbeat = || -> Result<(u32, u64), String> {
-                let value = std::fs::read_to_string(&marker).map_err(|error| error.to_string())?;
-                let mut fields = value.split_whitespace();
-                let process_id = fields
-                    .next()
-                    .ok_or_else(|| "authority target process id is absent".to_owned())?
-                    .parse::<u32>()
-                    .map_err(|error| error.to_string())?;
-                let heartbeat = fields
-                    .next()
-                    .ok_or_else(|| "authority target heartbeat is absent".to_owned())?
-                    .parse::<u64>()
-                    .map_err(|error| error.to_string())?;
-                if fields.next().is_some() {
-                    return Err("authority target marker has extra fields".to_owned());
-                }
-                Ok((process_id, heartbeat))
-            };
-            let heartbeat_deadline = Instant::now() + Duration::from_secs(5);
-            let (target_pid, heartbeat_before) = loop {
-                if let Ok(value) = read_heartbeat() {
-                    break value;
-                }
-                if Instant::now() >= heartbeat_deadline {
-                    return Err(
-                        "target heartbeat was not readable after control-worker loss".to_owned(),
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-            loop {
-                if frontend
-                    .try_wait()
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-                    || super::process::process_identity_for_pid(target_pid)?.is_none()
-                {
-                    return Err(
-                        "control-worker loss retired live frontend or target authority prematurely"
-                            .to_owned(),
-                    );
-                }
-                match read_heartbeat() {
-                    Ok((observed_pid, heartbeat_after))
-                        if observed_pid == target_pid && heartbeat_after > heartbeat_before =>
-                    {
-                        break;
-                    }
-                    Ok(_) | Err(_) => {}
-                }
-                if Instant::now() >= heartbeat_deadline {
-                    return Err(
-                        "target did not execute after isolated control-worker loss".to_owned()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            std::fs::write(&frontend_release, b"remove frontend authority\n")
-                .map_err(|error| error.to_string())?;
-        }
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            if frontend
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = frontend.kill();
-                let _ = frontend.wait();
-                return Err(format!(
-                    "authority-loss frontend did not retire for {fault:?}"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        restart_provider_for_authority_fault(fault)?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !recovery_status()? {
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "authority-loss record did not recover for {fault:?}"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        observed.push(fault);
-    }
-    let machine_restart_recovery_exercised = certify_machine_restart_through_provider()?;
-    let fault_matrix = certification_observations()?;
-    let evidence = memcordon_core::WindowsAuthorityLossEvidenceV1 {
-        schema_version: 1,
-        frontend_killed: observed.contains(&WindowsSealedFault::FrontendKilledAfterAuthorization),
-        frontend_disconnected: observed
-            .contains(&WindowsSealedFault::FrontendDisconnectedAfterAuthorization),
-        control_worker_lost: observed
-            .contains(&WindowsSealedFault::ControlWorkerKilledAfterAuthorization),
-        control_service_lost: observed
-            .contains(&WindowsSealedFault::ControlServiceKilledAfterAuthorization),
-        launcher_worker_lost: observed
-            .contains(&WindowsSealedFault::LauncherWorkerKilledAfterAuthorization),
-        launcher_service_lost: observed
-            .contains(&WindowsSealedFault::LauncherServiceKilledAfterAuthorization),
-        guardian_killed_before_authorization: fault_matrix
-            .preauthorization
-            .faults
-            .contains(&WindowsSealedFault::GuardianKilledBeforeAuthorization),
-        guardian_killed_after_authorization: fault_matrix
-            .retirement
-            .faults
-            .contains(&WindowsSealedFault::GuardianKilledAfterAuthorization),
-        all_job_owners_closed: observed
-            .contains(&WindowsSealedFault::AllJobOwnersClosedAfterAuthorization),
-        durable_service_restart_recovered: observed
-            .contains(&WindowsSealedFault::LauncherWorkerKilledAfterAuthorization)
-            && observed.contains(&WindowsSealedFault::LauncherServiceKilledAfterAuthorization),
-        machine_restart_recovery_exercised,
-        active_processes_zero_after_each: observed.len() == scenarios.len(),
-        relays_retired_after_each: observed.len() == scenarios.len(),
-        records_retired_after_each: observed.len() == scenarios.len(),
-    };
-    if !evidence.is_complete() {
-        return Err("native Windows authority-loss evidence is incomplete".to_owned());
-    }
-    store_package_evidence("authority-loss.json", &evidence)?;
-    Ok(evidence)
-}
-
-pub fn runtime_mutant_observations() -> Result<memcordon_core::WindowsMutantKillEvidenceV1, String>
-{
-    if !crate::windows::package::certification_faults_enabled() {
-        return Err("mutant certification requires ephemeral CI installation".to_owned());
-    }
-    let runtime_count = memcordon_core::WINDOWS_RELEASE_MUTANT_VARIANTS
-        .iter()
-        .position(|mutant| *mutant == WindowsSealedMutant::FallBackToStandard)
-        .ok_or_else(|| "runtime mutant boundary is absent".to_owned())?;
-    let mut observations = Vec::with_capacity(runtime_count);
-    for (mutant, (_, mapped_test)) in memcordon_core::WINDOWS_RELEASE_MUTANT_VARIANTS
-        [..runtime_count]
-        .iter()
-        .copied()
-        .zip(&memcordon_core::WINDOWS_RELEASE_MUTANTS[..runtime_count])
-    {
-        let native_observation = run_provider_mutant(mutant)?;
-        if !native_observation.rejects(mutant) {
-            return Err(format!(
-                "runtime mutant {} survived its external checker",
-                mutant.as_str()
-            ));
-        }
-        observations.push(memcordon_core::WindowsMutantObservationV1 {
-            mutant,
-            mapped_test: (*mapped_test).to_owned(),
-            native_observation,
-        });
-    }
-    for mutant in [
-        WindowsSealedMutant::FallBackToStandard,
-        WindowsSealedMutant::AdvertiseWithoutCertificate,
-    ] {
-        let mapped_test = memcordon_core::WINDOWS_RELEASE_MUTANTS
-            .iter()
-            .find_map(|(name, mapped_test)| (*name == mutant.as_str()).then_some(*mapped_test))
-            .ok_or_else(|| format!("mutant {} has no mapped test", mutant.as_str()))?;
-        let native_observation = memcordon_platform::certify_windows_platform_mutant(mutant)
-            .ok_or_else(|| format!("platform mutant {} was not observed", mutant.as_str()))?;
-        if !native_observation.rejects(mutant) {
-            return Err(format!(
-                "platform mutant {} survived its external checker",
-                mutant.as_str()
-            ));
-        }
-        observations.push(memcordon_core::WindowsMutantObservationV1 {
-            mutant,
-            mapped_test: mapped_test.to_owned(),
-            native_observation,
-        });
-    }
-    let evidence = memcordon_core::WindowsMutantKillEvidenceV1 {
-        schema_version: 1,
-        observations,
-    };
-    store_package_evidence("runtime-mutants.json", &evidence)?;
-    Ok(evidence)
-}
-
-fn run_provider_mutant(
-    mutant: WindowsSealedMutant,
-) -> Result<memcordon_core::WindowsMutantNativeObservationV1, String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::Threading::SetEvent;
-
-    let marker = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers")
-        .join(format!(
-            "mutant-{}-{}.marker",
-            std::process::id(),
-            mutant.as_str()
-        ));
-    let _marker_cleanup = RemoveFileGuard(marker.clone());
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    let executable = crate::windows::package::installed_binary();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| error.to_string())?;
-    let target_mode = if mutant == WindowsSealedMutant::AcceptRecursiveProvider {
-        "windows-certification-recursive-mutant"
-    } else {
-        "windows-certification-marker-hold"
-    };
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce: format!("mutant-{}-{}", std::process::id(), now.as_nanos()),
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments: vec![
-                target_mode.encode_utf16().collect(),
-                marker.as_os_str().encode_wide().collect(),
-            ],
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: Some(
-                u64::try_from(now.as_millis())
-                    .map_err(|error| error.to_string())?
-                    .saturating_add(5_000),
-            ),
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 100,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    let caller = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let mut identity = Vec::new();
-    identity.extend_from_slice(nonce.as_bytes());
-    identity.extend_from_slice(&caller.process_id.to_le_bytes());
-    identity.extend_from_slice(&caller.creation_time_100ns.to_le_bytes());
-    identity.extend_from_slice(request_sha256.as_bytes());
-    let attempt_id = super::record::digest(&identity);
-    super::pipe::write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV1::CertificationMutant {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            mutant,
-            attempt_id: attempt_id.clone(),
-            request_sha256: request_sha256.clone(),
-            caller_process_identity: caller,
-            launch: request,
-        },
-    )?;
-    let mut streams = Vec::new();
-    let mut relay_event = None;
-    let mut relays_ready = false;
-    let mut external_observation = None;
-    let mut hook_observation = None;
-    let mut hook_process = None;
-    loop {
-        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-            WindowsProviderResponseV1::CertificationMutantHookObserved(receipt) => {
-                let remote = receipt.remote_observation_handle.ok_or_else(|| {
-                    "mutant hook omitted its query-only process handle".to_owned()
-                })?;
-                let process = super::pipe::OwnedHandle::new(
-                    remote as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?;
-                if !receipt.binding_matches(&attempt_id, &nonce, &request_sha256)
-                    || receipt.mutant != mutant
-                    || receipt.terminal_candidate.is_some()
-                {
-                    return Err("mutant hook receipt binding is invalid".to_owned());
-                }
-                if hook_observation.replace(receipt.hook_observation).is_some()
-                    || hook_process.replace(process).is_some()
-                {
-                    return Err("mutant hook emitted more than one native receipt".to_owned());
-                }
-            }
-            WindowsProviderResponseV1::StreamsPrepared {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                streams: remote_streams,
-                relay_retired_event_handle,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned == attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                streams = remote_streams
-                    .into_iter()
-                    .map(|stream| {
-                        super::pipe::OwnedHandle::new(
-                            stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                relay_event = Some(super::pipe::OwnedHandle::new(
-                    relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?);
-                if mutant != WindowsSealedMutant::ResumeBeforeRelays {
-                    super::pipe::write_frame(
-                        pipe.raw(),
-                        &WindowsProviderRequestV1::RelaysReady {
-                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                            attempt_id: attempt_id.clone(),
-                            nonce: nonce.clone(),
-                            request_sha256: request_sha256.clone(),
-                        },
-                    )?;
-                    relays_ready = true;
-                }
-            }
-            WindowsProviderResponseV1::TargetAuthorized {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                child_pid,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned == attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                if mutant == WindowsSealedMutant::ResumeBeforeRelays && !relays_ready {
-                    external_observation = Some(
-                        memcordon_core::WindowsMutantNativeObservationV1::PrematureAuthorization {
-                            guardian_ready: true,
-                            relays_ready: false,
-                            target_marker_observed: true,
-                        },
-                    );
-                    super::pipe::write_frame(
-                        pipe.raw(),
-                        &WindowsProviderRequestV1::Cancel {
-                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                            attempt_id: attempt_id.clone(),
-                            nonce: nonce.clone(),
-                            request_sha256: request_sha256.clone(),
-                            signal: 15,
-                        },
-                    )?;
-                }
-                if mutant == WindowsSealedMutant::SkipTargetTokenReadback {
-                    if !matches!(
-                        hook_observation.as_ref(),
-                        Some(memcordon_core::WindowsMutantHookObservationV1::TargetTokenReadbackSkipped {
-                            child_pid: hooked_pid,
-                        }) if *hooked_pid == child_pid
-                    ) {
-                        return Err(
-                            "target-token hook receipt child identity is invalid".to_owned()
-                        );
-                    }
-                    let process = hook_process.as_ref().ok_or_else(|| {
-                        "target-token mutant omitted its adopted query handle".to_owned()
-                    })?;
-                    let target_token = super::token::process_token(process.raw())?;
-                    let target_envelope = super::token::envelope(target_token.raw())?;
-                    let authenticated_envelope = super::token::current_thread_envelope()?;
-                    if target_envelope == authenticated_envelope {
-                        return Err(
-                            "target-token readback mutant did not change the target envelope"
-                                .to_owned(),
-                        );
-                    }
-                    external_observation = Some(
-                        memcordon_core::WindowsMutantNativeObservationV1::ExternalTargetTokenMismatch {
-                            authenticated_envelope_sha256: super::record::digest(
-                                &serde_json::to_vec(&authenticated_envelope)
-                                    .map_err(|error| error.to_string())?,
-                            ),
-                            target_envelope_sha256: super::record::digest(
-                                &serde_json::to_vec(&target_envelope)
-                                    .map_err(|error| error.to_string())?,
-                            ),
-                        },
-                    );
-                    super::pipe::write_frame(
-                        pipe.raw(),
-                        &WindowsProviderRequestV1::Cancel {
-                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                            attempt_id: attempt_id.clone(),
-                            nonce: nonce.clone(),
-                            request_sha256: request_sha256.clone(),
-                            signal: 15,
-                        },
-                    )?;
-                }
-                if mutant == WindowsSealedMutant::SkipJobMembershipReadback {
-                    if !matches!(
-                        hook_observation.as_ref(),
-                        Some(memcordon_core::WindowsMutantHookObservationV1::JobMembershipReadbackSkipped {
-                            child_pid: hooked_pid,
-                        }) if *hooked_pid == child_pid
-                    ) {
-                        return Err(
-                            "Job-membership hook receipt child identity is invalid".to_owned()
-                        );
-                    }
-                    let process = hook_process.as_ref().ok_or_else(|| {
-                        "Job-membership mutant omitted its adopted query handle".to_owned()
-                    })?;
-                    if !super::job::Job::process_is_in_any_job(process.raw())? {
-                        external_observation = Some(
-                            memcordon_core::WindowsMutantNativeObservationV1::ExternalJobMembershipMissing {
-                                process_in_any_job: false,
-                            },
-                        );
-                        super::pipe::write_frame(
-                            pipe.raw(),
-                            &WindowsProviderRequestV1::Cancel {
-                                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                                attempt_id: attempt_id.clone(),
-                                nonce: nonce.clone(),
-                                request_sha256: request_sha256.clone(),
-                                signal: 15,
-                            },
-                        )?;
-                    }
-                }
-                if matches!(
-                    mutant,
-                    WindowsSealedMutant::LeakJobHandleToTarget
-                        | WindowsSealedMutant::LeakLauncherPipe
-                ) {
-                    wait_for_marker(&marker, std::time::Duration::from_secs(10))?;
-                    let kind = if mutant == WindowsSealedMutant::LeakJobHandleToTarget {
-                        "job"
-                    } else {
-                        "pipe"
-                    };
-                    let expected = format!("leaked-{kind}-handle-observed\n");
-                    if std::fs::read_to_string(&marker).map_err(|error| error.to_string())?
-                        != expected
-                    {
-                        return Err("target leaked-handle receipt is invalid".to_owned());
-                    }
-                    external_observation = Some(
-                        memcordon_core::WindowsMutantNativeObservationV1::LeakedHandleObserved {
-                            kind: kind.to_owned(),
-                        },
-                    );
-                    super::pipe::write_frame(
-                        pipe.raw(),
-                        &WindowsProviderRequestV1::Cancel {
-                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                            attempt_id: attempt_id.clone(),
-                            nonce: nonce.clone(),
-                            request_sha256: request_sha256.clone(),
-                            signal: 15,
-                        },
-                    )?;
-                }
-            }
-            WindowsProviderResponseV1::TargetRetired {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            }
-            | WindowsProviderResponseV1::RelaysAbort {
-                schema_version,
-                attempt_id: returned,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && returned == attempt_id
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                drop(streams);
-                streams = Vec::new();
-                if let Some(event) = relay_event.take() {
-                    if unsafe { SetEvent(event.raw()) } == 0 {
-                        return Err(std::io::Error::last_os_error().to_string());
-                    }
-                }
-                if mutant != WindowsSealedMutant::SkipRelayAck {
-                    super::pipe::write_frame(
-                        pipe.raw(),
-                        &WindowsProviderRequestV1::RelaysRetired {
-                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                            attempt_id: attempt_id.clone(),
-                            nonce: nonce.clone(),
-                            request_sha256: request_sha256.clone(),
-                        },
-                    )?;
-                }
-            }
-            WindowsProviderResponseV1::CertificationMutantObserved(receipt)
-                if receipt.binding_matches(&attempt_id, &nonce, &request_sha256)
-                    && receipt.mutant == mutant =>
-            {
-                let observation = match &receipt.hook_observation {
-                    memcordon_core::WindowsMutantHookObservationV1::Native { observation }
-                        if observation.rejects(mutant) =>
-                    {
-                        observation
-                    }
-                    _ => {
-                        return Err("terminal mutant receipt lacks a native observation".to_owned());
-                    }
-                };
-                let retirement_candidate_required = matches!(
-                    mutant,
-                    WindowsSealedMutant::AcceptCompletionWithoutAccounting
-                        | WindowsSealedMutant::SuccessBeforeActiveZero
-                        | WindowsSealedMutant::SkipRelayAck
-                        | WindowsSealedMutant::CloseJobBeforeEvidence
-                );
-                if retirement_candidate_required != receipt.terminal_candidate.is_some() {
-                    return Err("mutant receipt candidate cardinality is invalid".to_owned());
-                }
-                if let Some(candidate) = receipt.terminal_candidate.as_deref() {
-                    if !mapped_checker_rejects_terminal_candidate(mutant, observation, candidate) {
-                        return Err(
-                            "mapped external checker accepted a forbidden mutant terminal candidate"
-                                .to_owned(),
-                        );
-                    }
-                }
-                return match receipt.hook_observation {
-                    memcordon_core::WindowsMutantHookObservationV1::Native { observation } => {
-                        Ok(observation)
-                    }
-                    _ => Err(
-                        "terminal mutant receipt used a nonterminal hook observation".to_owned(),
-                    ),
-                };
-            }
-            WindowsProviderResponseV1::Reject { rejection, .. } => {
-                return Err(format!(
-                    "mutant operation failed without its native observation receipt: {}: {}",
-                    rejection.code, rejection.detail
-                ));
-            }
-            WindowsProviderResponseV1::Terminal(receipt)
-                if receipt.schema_version == 1
-                    && receipt.attempt_id == attempt_id
-                    && receipt.nonce == nonce
-                    && receipt.request_sha256 == request_sha256
-                    && receipt.process_identity_inventory_is_bounded() =>
-            {
-                if let Some(observation) = external_observation {
-                    match (mutant, hook_observation.as_ref()) {
-                        (
-                            WindowsSealedMutant::SkipTargetTokenReadback,
-                            Some(memcordon_core::WindowsMutantHookObservationV1::TargetTokenReadbackSkipped { child_pid }),
-                        )
-                        | (
-                            WindowsSealedMutant::SkipJobMembershipReadback,
-                            Some(memcordon_core::WindowsMutantHookObservationV1::JobMembershipReadbackSkipped { child_pid }),
-                        ) if *child_pid != 0 => {}
-                        (
-                            WindowsSealedMutant::SkipTargetTokenReadback
-                            | WindowsSealedMutant::SkipJobMembershipReadback,
-                            _,
-                        ) => {
-                            return Err(
-                                "external mutant rejection lacks its exact hook receipt"
-                                    .to_owned(),
-                            );
-                        }
-                        _ => {}
-                    }
-                    return if observation.rejects(mutant) {
-                        Ok(observation)
-                    } else {
-                        Err("external mutant observation did not reject its selector".to_owned())
-                    };
-                }
-                if mutant == WindowsSealedMutant::AcceptRecursiveProvider && marker.is_file() {
-                    return Ok(
-                        memcordon_core::WindowsMutantNativeObservationV1::RecursiveLaunchAccepted,
-                    );
-                }
-                if matches!(
-                    mutant,
-                    WindowsSealedMutant::LeakJobHandleToTarget
-                        | WindowsSealedMutant::LeakLauncherPipe
-                ) {
-                    let expected = match mutant {
-                        WindowsSealedMutant::LeakJobHandleToTarget => {
-                            "leaked-job-handle-observed\n"
-                        }
-                        WindowsSealedMutant::LeakLauncherPipe => "leaked-pipe-handle-observed\n",
-                        _ => unreachable!(),
-                    };
-                    if std::fs::read_to_string(&marker).map_err(|error| error.to_string())?
-                        == expected
-                    {
-                        return Ok(memcordon_core::WindowsMutantNativeObservationV1::LeakedHandleObserved {
-                            kind: if mutant == WindowsSealedMutant::LeakJobHandleToTarget {
-                                "job"
-                            } else {
-                                "pipe"
-                            }
-                            .to_owned(),
-                        });
-                    }
-                }
-                return Err(
-                    "mutant reached an ordinary terminal without a rejecting observation"
-                        .to_owned(),
-                );
-            }
-            _ => return Err("mutant runner received an invalid bound provider frame".to_owned()),
-        }
-    }
-}
-
-fn mapped_checker_rejects_terminal_candidate(
-    mutant: WindowsSealedMutant,
-    observation: &memcordon_core::WindowsMutantNativeObservationV1,
-    candidate: &memcordon_core::WindowsTerminalReceiptV1,
-) -> bool {
-    let BoundaryMechanismEvidence::WindowsJobObjectV2(evidence) = &candidate.boundary_detail else {
-        return false;
-    };
-    match (mutant, observation) {
-        (
-            WindowsSealedMutant::SuccessBeforeActiveZero,
-            memcordon_core::WindowsMutantNativeObservationV1::SuccessBeforeActiveZero {
-                active_processes,
-            },
-        ) => *active_processes != 0 && !evidence.active_processes_zero,
-        (
-            WindowsSealedMutant::AcceptCompletionWithoutAccounting,
-            memcordon_core::WindowsMutantNativeObservationV1::CompletionAcceptedWithoutAccounting {
-                completion_zero_observed: true,
-                active_process_query_performed: false,
-            },
-        ) => {
-            evidence.active_processes_zero
-                && candidate.restart_safety == RestartSafetyProof::default()
-        }
-        (
-            WindowsSealedMutant::SkipRelayAck,
-            memcordon_core::WindowsMutantNativeObservationV1::RelayAckSkipped {
-                target_retired_sent: true,
-                relays_retired_received: false,
-            },
-        ) => evidence.relays_retired,
-        (
-            WindowsSealedMutant::CloseJobBeforeEvidence,
-            memcordon_core::WindowsMutantNativeObservationV1::EvidenceAfterFinalHandleClose {
-                final_handles_closed: true,
-                evidence_constructed_after_close: true,
-            },
-        ) => evidence.final_job_handles_closed,
-        _ => false,
-    }
-}
-
-fn wait_for_marker(path: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + timeout;
-    while !path.is_file() {
-        if std::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for {}", path.display()));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    Ok(())
-}
-
-pub fn recursive_mutant_target(marker: &std::ffi::OsStr) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    let executable = crate::windows::package::installed_binary();
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce: format!("recursive-mutant-{}", std::process::id()),
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments: vec!["--version".encode_utf16().collect()],
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: None,
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 100,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    let caller = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let mut identity = Vec::new();
-    identity.extend_from_slice(nonce.as_bytes());
-    identity.extend_from_slice(&caller.process_id.to_le_bytes());
-    identity.extend_from_slice(&caller.creation_time_100ns.to_le_bytes());
-    identity.extend_from_slice(request_sha256.as_bytes());
-    let attempt_id = super::record::digest(&identity);
-    super::pipe::write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV1::CertificationMutant {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            mutant: WindowsSealedMutant::AcceptRecursiveProvider,
-            attempt_id: attempt_id.clone(),
-            request_sha256: request_sha256.clone(),
-            caller_process_identity: caller,
-            launch: request,
-        },
-    )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::StreamsPrepared {
-            schema_version,
-            attempt_id: returned_attempt,
-            nonce: returned_nonce,
-            request_sha256: returned_digest,
-            streams,
-            relay_retired_event_handle,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-            && returned_attempt == attempt_id
-            && returned_nonce == nonce
-            && returned_digest == request_sha256 =>
-        {
-            let mut adopted = streams
-                .into_iter()
-                .map(|stream| {
-                    super::pipe::OwnedHandle::new(
-                        stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            adopted.push(super::pipe::OwnedHandle::new(
-                relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-            )?);
-            std::fs::write(marker, b"recursive request accepted\n")
-                .map_err(|error| error.to_string())?;
-            drop(adopted);
-            Ok(())
-        }
-        WindowsProviderResponseV1::Reject {
-            schema_version,
-            attempt_id: returned_attempt,
-            nonce: returned_nonce,
-            request_sha256: returned_digest,
-            rejection,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-            && returned_attempt == attempt_id
-            && returned_nonce == nonce
-            && returned_digest == request_sha256 =>
-        {
-            Err(format!(
-                "recursive mutant did not change the membership decision: {}",
-                rejection.code
-            ))
-        }
-        _ => Err("recursive mutant received an invalid provider response".to_owned()),
-    }
 }
 
 pub fn leaked_handle_mutant_target(
@@ -3097,149 +979,6 @@ pub fn leaked_handle_mutant_target(
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     Ok(())
-}
-
-fn certify_machine_restart_through_provider() -> Result<bool, String> {
-    let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-    super::pipe::write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV1::CertificationMachineRestart {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        },
-    )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::CertificationMachineRestart {
-            schema_version,
-            recovered,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION => Ok(recovered),
-        _ => Err("provider returned invalid machine-restart evidence".to_owned()),
-    }
-}
-
-fn restart_provider_for_authority_fault(fault: WindowsSealedFault) -> Result<(), String> {
-    use windows_sys::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STOP};
-
-    let manager = super::service_manager::manager()?;
-    let access = SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP;
-    let control = super::service_manager::open(
-        &manager,
-        memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
-        access,
-    )?;
-    let launcher = super::service_manager::open(
-        &manager,
-        memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
-        access,
-    )?;
-    match fault {
-        WindowsSealedFault::FrontendDisconnectedAfterAuthorization
-        | WindowsSealedFault::FrontendKilledAfterAuthorization
-        | WindowsSealedFault::ControlWorkerKilledAfterAuthorization => {}
-        WindowsSealedFault::ControlServiceKilledAfterAuthorization => {
-            super::service_manager::start(&control, memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
-        }
-        WindowsSealedFault::LauncherWorkerKilledAfterAuthorization
-        | WindowsSealedFault::LauncherServiceKilledAfterAuthorization
-        | WindowsSealedFault::AllJobOwnersClosedAfterAuthorization => {
-            let _ = super::service_manager::stop(
-                &control,
-                memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
-            );
-            let _ = super::service_manager::stop(
-                &launcher,
-                memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
-            );
-            super::service_manager::start(
-                &launcher,
-                memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
-            )?;
-            super::service_manager::start(&control, memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
-        }
-        _ => return Err("unsupported authority-loss service recovery".to_owned()),
-    }
-    Ok(())
-}
-
-pub fn appcontainer_rejection_client() -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING,
-    };
-
-    if !super::token::current_thread_envelope()?.appcontainer {
-        return Err("AppContainer rejection fixture is not running in an AppContainer".to_owned());
-    }
-    let pipe_name = super::pipe::wide_null(WINDOWS_CONTROL_PIPE);
-    // AppContainer processes cannot use the global named-pipe namespace. A
-    // kernel access denial is itself the production endpoint's pretarget
-    // policy rejection; if the kernel admits the connection, the provider
-    // must instead return its typed AppContainer rejection below.
-    let raw_pipe = unsafe {
-        CreateFileW(
-            pipe_name.as_ptr(),
-            0x0012_019b,
-            FILE_SHARE_NONE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if raw_pipe == INVALID_HANDLE_VALUE {
-        let error = std::io::Error::last_os_error();
-        return if error
-            .raw_os_error()
-            .and_then(|value| u32::try_from(value).ok())
-            == Some(ERROR_ACCESS_DENIED)
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "AppContainer public-pipe rejection had the wrong kernel status: {error}"
-            ))
-        };
-    }
-    let pipe = super::pipe::OwnedHandle::new(raw_pipe)?;
-    let executable = crate::windows::package::installed_binary();
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce: format!("appcontainer-rejection-{}", std::process::id()),
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments: vec!["--version".encode_utf16().collect()],
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: Some(30_000),
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 1_000,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::Reject { rejection, .. }
-            if rejection.code == "MCSEALED-WINDOWS-APPCONTAINER-UNSUPPORTED"
-                && !rejection.target_created
-                && !rejection.target_released =>
-        {
-            Ok(())
-        }
-        response => Err(format!(
-            "AppContainer launch did not produce the typed pretarget rejection: {response:?}"
-        )),
-    }
 }
 
 #[derive(Default)]
@@ -3286,7 +1025,7 @@ fn qualification_control_peer_identity(
         .ok_or_else(|| "qualification control-service process identity is unavailable".to_owned())
 }
 
-pub(crate) fn render_replay_pending(pending: &memcordon_core::WindowsReplayPendingV1) -> String {
+pub(crate) fn render_replay_pending(pending: &memcordon_core::WindowsReplayPendingV2) -> String {
     let last_error_stage = pending
         .terminalization
         .last_error
@@ -3318,11 +1057,13 @@ pub(crate) fn render_replay_pending(pending: &memcordon_core::WindowsReplayPendi
         .map(|error| format!("{:?}", error.observed_unix_millis))
         .unwrap_or_else(|| "None".to_owned());
     format!(
-        "attempt_id={} relay_phase={:?} durable_state={:?} terminal_disposition={:?} authorization_present={} resume_attempted={} target_released={} termination_requested={} active_processes_zero={} guardian_reaped={} final_handles_closed={} outbox_stage={:?} terminalization_owner={:?} terminalization_sequence={} terminalization_checkpoint={:?} last_error_stage={} last_error_code={} last_error_detail={} last_error_native_code={} last_error_observed_unix_millis={}",
+        "attempt_id={} relay_phase={:?} durable_state={:?} terminal_disposition={:?} checkpoint={:?} missing_proofs={:?} authorization_present={} resume_attempted={} target_released={} termination_requested={} active_processes_zero={} guardian_reaped={} final_handles_closed={} outbox_stage={:?} terminalization_owner={:?} terminalization_sequence={} terminalization_checkpoint={:?} last_error_stage={} last_error_code={} last_error_detail={} last_error_native_code={} last_error_observed_unix_millis={}",
         pending.attempt_id,
         pending.relay_phase,
         pending.durable_state,
         pending.terminal_disposition,
+        pending.checkpoint,
+        pending.missing_proofs,
         pending.authorization_present,
         pending.resume_attempted,
         pending.target_released,
@@ -3340,580 +1081,6 @@ pub(crate) fn render_replay_pending(pending: &memcordon_core::WindowsReplayPendi
         last_error_native_code,
         last_error_observed_unix_millis,
     )
-}
-
-fn native_public_canary(
-    target_mode: &str,
-    token_scenario: &str,
-    frontend_canaries: &PreparedFrontendCanaries,
-    loader_rejection: &mut Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
-) -> Result<NativeCanary, String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let mut pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE).map_err(|detail| {
-        format!(
-            "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-public-pipe-connect scenario={token_scenario} endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
-        )
-    })?;
-    let control_peer_identity = qualification_control_peer_identity(pipe.raw())?;
-    let executable = crate::windows::package::installed_binary();
-    let nonce = format!(
-        "qualification-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos()
-    );
-    let certification_workspace = crate::windows::package::state_root()
-        .join("package")
-        .join("certification-markers")
-        .join(format!(
-            "attempt-{}",
-            super::record::digest(nonce.as_bytes())
-        ));
-    std::fs::create_dir(&certification_workspace).map_err(|error| {
-        format!(
-            "MCSEALED-WINDOWS-QUALIFICATION: scenario={token_scenario} detail={}",
-            qualification_native_failure(
-                "qualification-workspace-create",
-                "CreateDirectoryW",
-                "certification-workspace",
-                Some(&certification_workspace),
-                &error,
-            )
-        )
-    })?;
-    let _certification_workspace_cleanup =
-        CertificationWorkspaceGuard(certification_workspace.clone());
-    let mut arguments = vec![target_mode.encode_utf16().collect()];
-    let target_result = certification_workspace.join("target.result");
-    let _target_result_cleanup = TargetResultGuard(target_result.clone());
-    arguments.push(target_result.as_os_str().encode_wide().collect());
-    let nested_marker = if target_mode == "windows-certification-nested-target" {
-        Some(certification_workspace.join("nested-child.json"))
-    } else {
-        None
-    };
-    let _nested_marker_cleanup = nested_marker.clone().map(RemoveFileGuard);
-    let _nested_marker_staged_cleanup = nested_marker
-        .as_ref()
-        .map(|marker| RemoveFileGuard(nested_child_staged_receipt(marker)));
-    if let Some(marker) = &nested_marker {
-        arguments.push(marker.as_os_str().encode_wide().collect());
-    }
-    let cleanup_marker = certification_workspace.join("cleanup.marker");
-    let mut cleanup_marker_cleanup = CleanupCreationMarkerGuard(Some(cleanup_marker.clone()));
-    arguments.push(cleanup_marker.as_os_str().encode_wide().collect());
-    // These six unrelated inheritable objects were prepared before any
-    // fixture impersonation. The borrowed owner remains live through the
-    // complete request/response attempt while the fixture identity stays
-    // installed for every operation that is part of the qualification proof.
-    arguments.extend(frontend_canaries.raw_values().into_iter().map(|handle| {
-        (handle as usize as u64)
-            .to_string()
-            .encode_utf16()
-            .collect()
-    }));
-    let request = WindowsLaunchRequestV1 {
-        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-        expected_provider_binding: super::package::installed_public_provider_binding()?,
-        workload_contract: None,
-        restart_attempt: 0,
-        nonce,
-        command: NativeWindowsCommandV1 {
-            program: executable.as_os_str().encode_wide().collect(),
-            arguments,
-        },
-        environment: Vec::new(),
-        current_directory: crate::windows::package::install_root()
-            .as_os_str()
-            .encode_wide()
-            .collect(),
-        policy: WindowsLaunchPolicyV1 {
-            memory_limit_bytes: None,
-            absolute_deadline_millis: None,
-            lifetime: WindowsLifetimeV1::Command,
-            poll_interval_millis: 10,
-            signal_grace_millis: 1_000,
-            command_exit_grace_millis: 0,
-            limit_grace_millis: 0,
-        },
-    };
-    let nonce = request.nonce.clone();
-    let request_sha256 =
-        super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    let caller_process_identity = super::process::process_identity(unsafe {
-        windows_sys::Win32::System::Threading::GetCurrentProcess()
-    })?;
-    let expected_process_attempt_id =
-        qualification_process_attempt_id(&nonce, &request_sha256, &caller_process_identity);
-    let expected_pretarget_attempt_id = qualification_pretarget_attempt_id(&nonce, &request_sha256);
-    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    let mut relay_retirement = QualificationRelayRetirement::default();
-    let mut attempt_id = None;
-    let mut target_authorized = false;
-    let mut target_retired = false;
-    let mut target_result_receipt = None;
-    let mut relay_phase = WindowsRelayPhaseV1::AwaitStreams;
-    let mut terminal_recovery = WindowsPublicTerminalRecoveryV1::default();
-    let mut replay_deadline = None;
-    let mut original_transport_failure = None;
-    loop {
-        let response = if terminal_recovery.replay_consumed() {
-            read_qualification_replay_response(
-                pipe.raw(),
-                replay_deadline.expect("active replay has a fixed deadline"),
-                original_transport_failure
-                    .as_deref()
-                    .expect("active replay retains its original trigger"),
-            )?
-        } else {
-            match super::pipe::read_response_frame_detailed::<WindowsProviderResponseV1>(pipe.raw())
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    let failure = qualification_public_frame_failure(&error);
-                    if terminal_recovery.observe_failure(failure)
-                        != WindowsTerminalReplayDecisionV1::ReplayOnce
-                    {
-                        return Err(error.to_string());
-                    }
-                    let primary = error.to_string();
-                    original_transport_failure = Some(primary.clone());
-                    if terminal_recovery.retire_local_relays_once() {
-                        relay_retirement.retire().map_err(|secondary| {
-                        format!(
-                            "{primary}; secondary qualification relay retirement failure: {secondary}"
-                        )
-                    })?;
-                    }
-                    replay_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-                    pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE).map_err(|secondary| {
-                    format!(
-                        "{primary}; secondary qualification terminal replay reconnect failure: {secondary}"
-                    )
-                })?;
-                    let replay_peer = qualification_control_peer_identity(pipe.raw()).map_err(|secondary| {
-                    format!(
-                        "{primary}; secondary qualification terminal replay peer authentication failure: {secondary}"
-                    )
-                })?;
-                    if replay_peer != control_peer_identity {
-                        return Err(format!(
-                            "{primary}; secondary qualification terminal replay control-service identity changed"
-                        ));
-                    }
-                    write_qualification_terminal_replay(
-                    pipe.raw(),
-                    attempt_id.as_deref().expect("replay requires an active binding"),
-                    &nonce,
-                    &request_sha256,
-                    relay_phase,
-                )
-                .map_err(|secondary| {
-                    format!(
-                        "{primary}; secondary qualification terminal replay request failure: {secondary}"
-                    )
-                })?;
-                    read_qualification_replay_response(
-                        pipe.raw(),
-                        replay_deadline.expect("new replay has a fixed deadline"),
-                        &primary,
-                    )?
-                }
-            }
-        };
-        let response_sha256 = super::record::digest(
-            &serde_json::to_vec(&response).map_err(|error| error.to_string())?,
-        );
-        match response {
-            WindowsProviderResponseV1::StreamsPrepared {
-                attempt_id: received,
-                schema_version,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                streams: received_streams,
-                relay_retired_event_handle,
-            } => {
-                if schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION {
-                    return Err(invalid_native_response(
-                        "streams-prepared",
-                        relay_phase,
-                        "schema",
-                    ));
-                }
-                if returned_nonce != nonce {
-                    return Err(invalid_native_response(
-                        "streams-prepared",
-                        relay_phase,
-                        "nonce",
-                    ));
-                }
-                if returned_digest != request_sha256 {
-                    return Err(invalid_native_response(
-                        "streams-prepared",
-                        relay_phase,
-                        "request-digest",
-                    ));
-                }
-                if received != expected_process_attempt_id {
-                    return Err(invalid_native_response(
-                        "streams-prepared",
-                        relay_phase,
-                        "attempt-id",
-                    ));
-                }
-                if attempt_id.is_some()
-                    || target_authorized
-                    || target_retired
-                    || received_streams.len() != 3
-                {
-                    return Err(
-                        "qualification canary received an invalid stream manifest".to_owned()
-                    );
-                }
-                for stream in received_streams {
-                    relay_retirement.streams.push(super::pipe::OwnedHandle::new(
-                        stream.remote_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                    )?);
-                }
-                relay_retirement.event = Some(super::pipe::OwnedHandle::new(
-                    relay_retired_event_handle as usize as windows_sys::Win32::Foundation::HANDLE,
-                )?);
-                attempt_id = Some(received.clone());
-                terminal_recovery.bind_attempt()?;
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::StreamsPrepared,
-                )?;
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysReady {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::RelaysReady,
-                )?;
-            }
-            WindowsProviderResponseV1::TargetAuthorized {
-                attempt_id: received,
-                schema_version,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                child_pid,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && attempt_id.as_deref() == Some(received.as_str())
-                && returned_nonce == nonce
-                && returned_digest == request_sha256
-                && !target_authorized
-                && !target_retired
-                && child_pid != 0 =>
-            {
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::TargetAuthorized,
-                )?;
-                target_authorized = true;
-            }
-            WindowsProviderResponseV1::TargetRetired {
-                attempt_id: received,
-                schema_version,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && attempt_id.as_deref() == Some(received.as_str())
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                if !target_authorized || target_retired {
-                    return Err(
-                        "qualification canary received an out-of-order target retirement"
-                            .to_owned(),
-                    );
-                }
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::TargetRetired,
-                )?;
-                target_retired = true;
-                relay_retirement.retire()?;
-                target_result_receipt = Some(read_bound_target_result(
-                    &target_result,
-                    &nonce,
-                    target_mode,
-                )?);
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysRetired {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::RelaysRetired,
-                )?;
-            }
-            WindowsProviderResponseV1::RelaysAbort {
-                attempt_id: received,
-                schema_version,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-            } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
-                && attempt_id.as_deref() == Some(received.as_str())
-                && returned_nonce == nonce
-                && returned_digest == request_sha256 =>
-            {
-                if target_retired {
-                    return Err(
-                        "qualification canary received duplicate relay retirement".to_owned()
-                    );
-                }
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::RelaysAbort,
-                )?;
-                target_retired = true;
-                relay_retirement.retire()?;
-                super::pipe::write_frame(
-                    pipe.raw(),
-                    &WindowsProviderRequestV1::RelaysRetired {
-                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                        attempt_id: received,
-                        nonce: nonce.clone(),
-                        request_sha256: request_sha256.clone(),
-                    },
-                )?;
-                advance_qualification_relay_phase(
-                    &mut relay_phase,
-                    WindowsRelayEventV1::RelaysRetired,
-                )?;
-            }
-            WindowsProviderResponseV1::Terminal(terminal)
-                if attempt_id.as_deref() == Some(terminal.attempt_id.as_str())
-                    && terminal.nonce == nonce
-                    && terminal.request_sha256 == request_sha256
-                    && ((target_authorized && target_retired)
-                        || terminal_recovery.replay_consumed())
-                    && terminal.process_identity_inventory_shape_is_bounded() =>
-            {
-                if !terminal_recovery.replay_consumed() {
-                    advance_qualification_relay_phase(
-                        &mut relay_phase,
-                        WindowsRelayEventV1::Terminal,
-                    )?;
-                }
-                if target_result_receipt.is_none() && terminal_recovery.replay_consumed() {
-                    target_result_receipt = Some(read_bound_target_result(
-                        &target_result,
-                        &nonce,
-                        target_mode,
-                    )?);
-                }
-                let semantic_result = (|| {
-                    let target_result_receipt = target_result_receipt.as_ref().ok_or_else(|| {
-                        "qualification terminal arrived without a retained target-result receipt"
-                            .to_owned()
-                    })?;
-                    let native_evidence =
-                        validate_qualification_terminal(&terminal, target_result_receipt)?.clone();
-                    let nested_alternate_token_verified = if let Some(marker) = &nested_marker {
-                        let expected_binding =
-                            format!("attempt-{}", super::record::digest(nonce.as_bytes()));
-                        let observation =
-                            read_bound_nested_child_receipt(marker, &expected_binding)?;
-                        observation.success
-                            && terminal
-                                .job_process_identities
-                                .contains(&observation.child_identity)
-                    } else {
-                        false
-                    };
-                    Ok(NativeCanary {
-                        // The public client reads back the exact public pipe
-                        // DACL and mandatory label above. Control verifies the
-                        // exact private descriptor on its launcher connection
-                        // before forwarding this attempt.
-                        public_pipe_security_verified: true,
-                        private_pipe_security_verified: true,
-                        evidence: native_evidence,
-                        // This target exits zero only after proving the
-                        // unrelated inheritable frontend handle was absent.
-                        exact_handle_inheritance_verified: true,
-                        nested_alternate_token_verified,
-                    })
-                })();
-                let terminal_result = acknowledge_latched_qualification_terminal(
-                    semantic_result,
-                    &terminal.attempt_id,
-                    &nonce,
-                    &request_sha256,
-                    || {
-                        acknowledge_and_confirm_terminal_retirement(
-                            pipe.raw(),
-                            &terminal.attempt_id,
-                            &nonce,
-                            &request_sha256,
-                            &response_sha256,
-                        )
-                    },
-                );
-                if terminal_result.is_ok() {
-                    cleanup_marker_cleanup.remove_after_success();
-                }
-                return terminal_result;
-            }
-            WindowsProviderResponseV1::Reject {
-                schema_version,
-                attempt_id: returned_attempt,
-                nonce: returned_nonce,
-                request_sha256: returned_digest,
-                rejection,
-            } => {
-                validate_native_reject(
-                    schema_version,
-                    &returned_attempt,
-                    &returned_nonce,
-                    &returned_digest,
-                    &rejection,
-                    attempt_id.as_deref(),
-                    &expected_process_attempt_id,
-                    &expected_pretarget_attempt_id,
-                    &nonce,
-                    &request_sha256,
-                    relay_phase,
-                )?;
-                if !terminal_recovery.replay_consumed() {
-                    advance_qualification_relay_phase(
-                        &mut relay_phase,
-                        WindowsRelayEventV1::Reject,
-                    )?;
-                }
-                let mut primary = format!(
-                    "{}: phase={:?} os_code={:?} target_created={} target_released={} cleanup_attempted={} terminal_receipt={} detail={}",
-                    rejection.code,
-                    rejection.phase,
-                    rejection.os_code,
-                    rejection.target_created,
-                    rejection.target_released,
-                    rejection.cleanup_attempted,
-                    rejection.terminal_receipt.is_some(),
-                    rejection.detail,
-                );
-                if let Some(prior) = &original_transport_failure {
-                    primary.push_str(&format!(
-                        "; prior public transport recovery trigger: {prior}"
-                    ));
-                }
-                if rejection.terminal_ack_required {
-                    *loader_rejection = rejection.loader_qualification.clone();
-                    return acknowledge_latched_qualification_terminal(
-                        Err(primary),
-                        &returned_attempt,
-                        &nonce,
-                        &request_sha256,
-                        || {
-                            acknowledge_and_confirm_terminal_retirement(
-                                pipe.raw(),
-                                &returned_attempt,
-                                &nonce,
-                                &request_sha256,
-                                &response_sha256,
-                            )
-                        },
-                    );
-                }
-                *loader_rejection = rejection.loader_qualification;
-                return Err(primary);
-            }
-            WindowsProviderResponseV1::ReplayPending(pending)
-                if attempt_id.as_deref().is_some_and(|attempt_id| {
-                    pending.is_consistent_for(attempt_id, &nonce, &request_sha256, relay_phase)
-                }) =>
-            {
-                if !terminal_recovery.replay_consumed() {
-                    if terminal_recovery.begin_replay_after_bound_pending()
-                        != WindowsTerminalReplayDecisionV1::ReplayOnce
-                    {
-                        return Err("qualification replay pending was not bound".to_owned());
-                    }
-                    if terminal_recovery.retire_local_relays_once() {
-                        relay_retirement.retire()?;
-                    }
-                    replay_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-                    let first_pending = format!(
-                        "typed qualification replay pending before durable outbox: {}",
-                        render_replay_pending(&pending)
-                    );
-                    original_transport_failure = Some(
-                        original_transport_failure
-                            .take()
-                            .map_or(first_pending.clone(), |prior| {
-                                format!("{prior}; first_pending={first_pending}")
-                            }),
-                    );
-                    pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
-                    if qualification_control_peer_identity(pipe.raw())? != control_peer_identity {
-                        return Err(
-                            "qualification replay control-service identity changed".to_owned()
-                        );
-                    }
-                } else if replay_deadline
-                    .is_none_or(|deadline| std::time::Instant::now() >= deadline)
-                {
-                    return Err(format!(
-                        "{}; secondary qualification terminal replay deadline expired last_pending={}",
-                        original_transport_failure
-                            .as_deref()
-                            .unwrap_or("qualification replay pending"),
-                        render_replay_pending(&pending),
-                    ));
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                write_qualification_terminal_replay(
-                    pipe.raw(),
-                    attempt_id.as_deref().expect("pending replay is bound"),
-                    &nonce,
-                    &request_sha256,
-                    relay_phase,
-                )?;
-            }
-            WindowsProviderResponseV1::AttemptRetained(retained)
-                if attempt_id.as_deref().is_some_and(|attempt_id| {
-                    retained.is_consistent_for(attempt_id, &nonce, &request_sha256, relay_phase)
-                }) =>
-            {
-                return Err(format!(
-                    "MCSEALED-WINDOWS-ATTEMPT-RETAINED: relay_phase={:?} durable_state={:?} terminal_disposition={:?} cleanup_complete={} terminal_replay_available={} primary={} secondary={}",
-                    retained.relay_phase,
-                    retained.durable_state,
-                    retained.terminal_disposition,
-                    retained.cleanup_complete,
-                    retained.terminal_replay_available,
-                    retained.primary_detail,
-                    retained.secondary_failures.join(" | "),
-                ));
-            }
-            response => {
-                return Err(invalid_native_response(
-                    provider_response_variant(&response),
-                    relay_phase,
-                    "relay-phase-or-binding",
-                ));
-            }
-        }
-    }
 }
 
 fn qualification_public_frame_failure(
@@ -3935,7 +1102,7 @@ fn read_qualification_replay_response(
     pipe: windows_sys::Win32::Foundation::HANDLE,
     deadline: std::time::Instant,
     primary: &str,
-) -> Result<WindowsProviderResponseV1, String> {
+) -> Result<WindowsProviderResponseV3, String> {
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(format!(
@@ -3969,7 +1136,7 @@ fn write_qualification_terminal_replay(
 ) -> Result<(), String> {
     super::pipe::write_frame(
         pipe,
-        &WindowsProviderRequestV1::ReplayTerminal {
+        &WindowsProviderRequestV3::ReplayTerminal {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             attempt_id: attempt_id.to_owned(),
             nonce: nonce.to_owned(),
@@ -4004,7 +1171,7 @@ pub(crate) fn validate_native_reject(
     returned_attempt: &str,
     returned_nonce: &str,
     returned_digest: &str,
-    rejection: &memcordon_core::ProviderRejectionEvidence,
+    rejection: &memcordon_core::WindowsProviderRejectionV2,
     active_attempt: Option<&str>,
     expected_process_attempt: &str,
     expected_pretarget_attempt: &str,
@@ -4042,7 +1209,7 @@ pub(crate) fn validate_native_reject(
             "rejection-consistency",
         ));
     }
-    if !rejection.terminal_receipt.as_ref().is_none_or(|terminal| {
+    if !rejection.terminal_receipt().is_none_or(|terminal| {
         terminal.attempt_id == returned_attempt
             && terminal.nonce == returned_nonce
             && terminal.request_sha256 == returned_digest
@@ -4066,40 +1233,39 @@ fn invalid_native_response(
     )
 }
 
-fn provider_response_variant(response: &WindowsProviderResponseV1) -> &'static str {
+fn provider_response_variant(response: &WindowsProviderResponseV3) -> &'static str {
     match response {
-        WindowsProviderResponseV1::Probe { .. } => "probe",
-        WindowsProviderResponseV1::WorkloadPlan { .. } => "workload-plan",
-        WindowsProviderResponseV1::WorkloadDiscovery { .. } => "workload-discovery",
-        WindowsProviderResponseV1::StreamsPrepared { .. } => "streams-prepared",
-        WindowsProviderResponseV1::RecoveryStatus { .. } => "recovery-status",
-        WindowsProviderResponseV1::PackageCleanupResult { .. } => "package-cleanup-result",
-        WindowsProviderResponseV1::QualificationReady { .. } => "qualification-ready",
-        WindowsProviderResponseV1::QualificationRejected(_) => "qualification-rejected",
-        WindowsProviderResponseV1::QualificationAuthenticated { .. } => {
-            "qualification-authenticated"
+        WindowsProviderResponseV3::Probe { .. } => "probe",
+        WindowsProviderResponseV3::WorkloadPlan { .. } => "workload-plan",
+        WindowsProviderResponseV3::WorkloadDiscovery { .. } => "workload-discovery",
+        WindowsProviderResponseV3::StreamsPrepared { .. } => "streams-prepared",
+        WindowsProviderResponseV3::RecoveryStatus { .. } => "recovery-status",
+        WindowsProviderResponseV3::RecoveryInventory(_) => "recovery-inventory",
+        WindowsProviderResponseV3::ReadOnlyQueryFailure(_) => "read-only-query-failure",
+        WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. } => {
+            "recovery-attempt-unavailable"
         }
-        WindowsProviderResponseV1::QualificationChildAuthorized { .. } => {
-            "qualification-child-authorized"
-        }
-        WindowsProviderResponseV1::QualificationEnded { .. } => "qualification-ended",
-        WindowsProviderResponseV1::CertificationMachineRestart { .. } => {
+        WindowsProviderResponseV3::PackageCleanupResult { .. } => "package-cleanup-result",
+        WindowsProviderResponseV3::CertificationMachineRestart { .. } => {
             "certification-machine-restart"
         }
-        WindowsProviderResponseV1::TargetAuthorized { .. } => "target-authorized",
-        WindowsProviderResponseV1::TargetRetired { .. } => "target-retired",
-        WindowsProviderResponseV1::RelaysAbort { .. } => "relays-abort",
-        WindowsProviderResponseV1::CertificationMutantHookObserved(_) => {
+        WindowsProviderResponseV3::TargetAuthorized { .. } => "target-authorized",
+        WindowsProviderResponseV3::TargetRetired { .. } => "target-retired",
+        WindowsProviderResponseV3::RelaysAbort { .. } => "relays-abort",
+        WindowsProviderResponseV3::CertificationMutantHookObserved(_) => {
             "certification-mutant-hook-observed"
         }
-        WindowsProviderResponseV1::CertificationMutantObserved(_) => {
+        WindowsProviderResponseV3::CertificationMutantObserved(_) => {
             "certification-mutant-observed"
         }
-        WindowsProviderResponseV1::Terminal(_) => "terminal",
-        WindowsProviderResponseV1::Reject { .. } => "reject",
-        WindowsProviderResponseV1::AttemptRetained(_) => "attempt-retained",
-        WindowsProviderResponseV1::ReplayPending(_) => "replay-pending",
-        WindowsProviderResponseV1::TerminalRetired(_) => "terminal-retired",
+        WindowsProviderResponseV3::Terminal(_) => "terminal",
+        WindowsProviderResponseV3::Reject { .. } => "reject",
+        WindowsProviderResponseV3::AttemptRetained(_) => "attempt-retained",
+        WindowsProviderResponseV3::AttemptRetainedV2(_) => "attempt-retained-v2",
+        WindowsProviderResponseV3::ReplayPending(_) => "replay-pending",
+        WindowsProviderResponseV3::ReplayPendingV2(_) => "replay-pending-v2",
+        WindowsProviderResponseV3::TerminalRetired(_) => "terminal-retired",
+        WindowsProviderResponseV3::TerminalRetiredV2(_) => "terminal-retired-v2",
     }
 }
 
@@ -4158,10 +1324,10 @@ pub(super) fn read_bound_target_result(
 }
 
 fn validate_qualification_terminal<'a>(
-    terminal: &'a memcordon_core::WindowsTerminalReceiptV1,
+    terminal: &'a memcordon_core::WindowsTerminalReceiptV2,
     target_result: &TargetResultReceiptV1,
 ) -> Result<&'a WindowsSealedEvidenceV2, String> {
-    if terminal.schema_version != 1 {
+    if terminal.schema_version != 2 {
         return Err(format!(
             "qualification terminal schema-version invariant failed: observed={}",
             terminal.schema_version
@@ -4173,7 +1339,9 @@ fn validate_qualification_terminal<'a>(
     {
         return Err("qualification terminal restart-safety invariant failed".to_owned());
     }
-    let BoundaryMechanismEvidence::WindowsJobObjectV2(evidence) = &terminal.boundary_detail else {
+    let Some((_, outcome, BoundaryMechanismEvidence::WindowsJobObjectV2(evidence))) =
+        terminal.execution()
+    else {
         return Err("qualification terminal boundary-evidence variant invariant failed".to_owned());
     };
     if !evidence.active_processes_zero
@@ -4199,16 +1367,23 @@ fn validate_qualification_terminal<'a>(
         "qualification terminal cleanup-process-creation presence invariant failed".to_owned()
     })?;
     validate_cleanup_process_creation_evidence(cleanup)?;
-    if terminal.job_total_processes < QUALIFICATION_JOB_TOTAL_PROCESSES_MINIMUM {
+    let accounting = terminal
+        .process_observation
+        .final_accounting
+        .as_ref()
+        .ok_or_else(|| {
+            "qualification terminal final native accounting is unavailable".to_owned()
+        })?;
+    if accounting.total_processes_native_u32 < QUALIFICATION_JOB_TOTAL_PROCESSES_MINIMUM {
         return Err(format!(
             "qualification terminal cumulative-job-accounting invariant failed: observed={} required_minimum={QUALIFICATION_JOB_TOTAL_PROCESSES_MINIMUM}",
-            terminal.job_total_processes
+            accounting.total_processes_native_u32
         ));
     }
-    if terminal.job_total_processes < cleanup.total_processes_after {
+    if accounting.total_processes_native_u32 < cleanup.total_processes_after {
         return Err(format!(
             "qualification terminal cumulative-job-accounting contradicted cleanup evidence: observed={} cleanup_total={}",
-            terminal.job_total_processes, cleanup.total_processes_after
+            accounting.total_processes_native_u32, cleanup.total_processes_after
         ));
     }
     let validated = terminal
@@ -4219,7 +1394,7 @@ fn validate_qualification_terminal<'a>(
         .map_err(|field| {
             format!("qualification terminal complete-evidence invariant failed: field={field}")
         })?;
-    match terminal.outcome {
+    match outcome {
         RunOutcome::Exited {
             child: ChildTermination::ExitCode { code: 0 },
             ..
@@ -4372,7 +1547,7 @@ fn publish_target_result(
         success,
         detail,
     };
-    publish_qualification_receipt(
+    publish_native_fixture_result(
         path,
         QualificationPublicationProducerV1::TargetResult,
         &receipt,
@@ -5291,6 +2466,16 @@ pub fn orphan_descendant_canary() -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+pub(crate) const FRONTEND_CANARY_HANDLE_ROLES: [&str;
+    memcordon_core::WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT] = [
+    "installed-binary-file-canary",
+    "event-canary",
+    "anonymous-pipe-canary",
+    "frontend-process-canary",
+    "section-canary",
+    "registry-key-canary",
+];
+
 pub(crate) struct PreparedFrontendCanaries {
     installed_image: super::pipe::OwnedHandle,
     event: super::pipe::OwnedHandle,
@@ -5323,7 +2508,7 @@ impl PreparedFrontendCanaries {
 
         let advertised = self.raw_values();
         for (index, handle) in advertised.iter().copied().enumerate() {
-            let role = super::control_service::CERTIFICATION_FRONTEND_HANDLE_ROLES[index];
+            let role = FRONTEND_CANARY_HANDLE_ROLES[index];
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 return Err(qualification_frontend_handle_validation_failure(
                     "inventory",
@@ -5738,9 +2923,9 @@ fn recursive_provider_canary() -> Result<(), String> {
     let nonce = request.nonce.clone();
     let request_sha256 =
         super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
-    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::Reject {
+    super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV3::Launch(request))?;
+    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
+        WindowsProviderResponseV3::Reject {
             schema_version,
             attempt_id,
             nonce: returned_nonce,
@@ -6314,12 +3499,13 @@ pub fn certification_nested_child(
         success: true,
         detail: "complete".to_owned(),
     };
-    publish_qualification_receipt(
+    publish_native_fixture_result(
         receipt,
         QualificationPublicationProducerV1::NestedChild,
         &receipt_value,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn nested_child_staged_receipt(receipt: &std::path::Path) -> std::path::PathBuf {
@@ -6461,10 +3647,6 @@ fn read_bound_nested_child_receipt(
     Ok(receipt)
 }
 
-fn recovery_complete() -> Result<bool, String> {
-    recovery_status()
-}
-
 fn control_request_challenge(operation: &str) -> String {
     let mut challenge = b"memcordon-windows-control-request-v1".to_vec();
     challenge.extend_from_slice(operation.as_bytes());
@@ -6483,13 +3665,13 @@ pub fn recovery_status() -> Result<bool, String> {
     let challenge = control_request_challenge("recovery-status");
     super::pipe::write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::RecoveryStatus {
+        &WindowsProviderRequestV3::RecoveryStatus {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
         },
     )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::RecoveryStatus {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
+        WindowsProviderResponseV3::RecoveryStatus {
             schema_version,
             challenge: returned_challenge,
             status,
@@ -6521,14 +3703,14 @@ pub fn prepare_package_cleanup(
     let challenge = control_request_challenge("package-cleanup");
     super::pipe::write_frame(
         pipe.raw(),
-        &WindowsProviderRequestV1::PackageCleanup {
+        &WindowsProviderRequestV3::PackageCleanup {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
             deadline_millis,
         },
     )?;
-    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
-        WindowsProviderResponseV1::PackageCleanupResult {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV3>(pipe.raw())? {
+        WindowsProviderResponseV3::PackageCleanupResult {
             schema_version,
             challenge: returned_challenge,
             status,
@@ -6569,10 +3751,4 @@ pub fn prepare_package_cleanup(
             "control service returned an invalid package cleanup response".to_owned(),
         )),
     }
-}
-
-fn qualification_path() -> std::path::PathBuf {
-    crate::windows::package::state_root()
-        .join("package")
-        .join("qualification.json")
 }

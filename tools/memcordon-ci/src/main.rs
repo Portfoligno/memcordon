@@ -1,90 +1,76 @@
 #![forbid(unsafe_code)]
 
-mod release;
-mod sealed_linux;
-mod sealed_windows;
 mod suites;
 
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use memcordon_ci::{CiError, Result, command, config, policy};
+use memcordon_ci::{CiError, Result, command, config, native_acceptance_catalogue, policy};
+pub use memcordon_ci::{bootstrap_profile, performance_plan, preparation};
 
 #[derive(Parser)]
-#[command(
-    name = "memcordon-ci",
-    about = "Typed MemCordon CI and release orchestrator"
-)]
+#[command(name = "memcordon-ci", about = "Typed MemCordon product CI runner")]
 struct Cli {
-    /// Previously measured immutable compilation context; never supplied by env.
-    #[arg(long)]
-    build_context: Option<PathBuf>,
-    /// Cargo's credential-provider protocol mode marker.
-    #[arg(long, hide = true)]
-    cargo_plugin: bool,
     #[command(subcommand)]
     command: Option<TopLevel>,
 }
 
 #[derive(Subcommand)]
 enum TopLevel {
-    InventoryProfile {
-        #[arg(long)]
-        plan: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
+    Ci {
+        #[command(subcommand)]
+        command: CiCommand,
     },
-    InventoryScan {
-        #[arg(long)]
-        request: PathBuf,
-        #[arg(long)]
-        report_dir: PathBuf,
+    Release {
+        #[command(subcommand)]
+        command: memcordon_ci::release::ReleaseCommand,
     },
-    InventoryBenchmark {
+    ExternalConsumer {
         #[arg(long)]
-        plan: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    QualifyNativeProfile {
-        #[arg(long)]
-        policy: PathBuf,
-        #[arg(long)]
-        selection: PathBuf,
+        input: PathBuf,
         #[arg(long)]
         destination: PathBuf,
     },
-    AuditNativeProfile {
+    #[command(hide = true)]
+    DelegatedLinuxBackend {
         #[arg(long)]
-        specification: PathBuf,
-    },
-    BuildContext {
+        rustup: PathBuf,
         #[arg(long)]
-        output: PathBuf,
-        #[arg(long)]
-        observation_dir: Option<PathBuf>,
-    },
-    AuditBuildContext {
-        #[arg(long)]
-        input: PathBuf,
+        uid: String,
     },
     Suite {
         #[arg(value_enum)]
         suite: Suite,
     },
-    Release {
-        #[command(subcommand)]
-        command: ReleaseCommand,
+}
+
+#[derive(Subcommand)]
+enum CiCommand {
+    Prepare {
+        #[arg(long, value_enum)]
+        profile: memcordon_ci::bootstrap_profile::BootstrapProfile,
     },
-    #[command(hide = true)]
-    DelegatedLinuxCertification {
+    CacheContext {
+        #[arg(long, default_value = "native")]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
         #[arg(long)]
-        rustup: PathBuf,
-        #[arg(long)]
-        uid: String,
-        #[arg(long)]
-        context_file: PathBuf,
+        external: Vec<PathBuf>,
+    },
+    CheckWorkflows,
+    PerformancePlan,
+    AggregateStress {
+        #[arg(long, default_value = "target/ci/stress-artifacts")]
+        input: PathBuf,
+        #[arg(long, default_value = "target/ci/reports/stress-assessment.json")]
+        destination: PathBuf,
+    },
+    AggregateMacos {
+        #[arg(long, default_value = "target/ci/macos-artifacts")]
+        input: PathBuf,
+        #[arg(long, default_value = "target/ci/reports/macos-assessment.json")]
+        destination: PathBuf,
     },
 }
 
@@ -96,52 +82,26 @@ enum Suite {
     Native,
     SupplyChain,
     Miri,
+    MiriFirst,
+    MiriSecond,
     Fuzz,
     FuzzFirst,
     FuzzSecond,
+    FuzzQuarterOne,
+    FuzzQuarterTwo,
+    FuzzQuarterThree,
+    FuzzQuarterFour,
     Stress,
+    StressPackages,
+    StressLifecycle,
     BackendLinuxCgroup,
-    BackendLinuxSealedV2,
+    BackendLinuxPrivate,
     BackendWindowsJob,
-    BackendWindowsSealedV2,
-    WindowsLoaderProduction,
-    WindowsProviderLifecycle,
-    WindowsPackageChannel,
-    WindowsLoaderLab,
-    PackageWindowsSealed,
-    ChannelParityWindowsSealed,
+    BackendWindowsSealed,
     BackendMacosWatchdog,
+    ReleaseMacosNative,
+    ReleaseMacosAcceptance,
     MacosDeadline,
-    ReleasePreflight,
-    ReleaseNative,
-    ReleaseMacos,
-}
-
-#[derive(Debug, Subcommand)]
-enum ReleaseCommand {
-    Assemble,
-    StageGithub,
-    AttemptOidc {
-        #[arg(long)]
-        publication_slot: NonZeroUsize,
-    },
-    AuthorizeNewCrateFallback {
-        #[arg(long)]
-        publication_slot: NonZeroUsize,
-    },
-    PublishTokenFallback {
-        #[arg(long)]
-        publication_slot: NonZeroUsize,
-    },
-    VerifyCrates,
-    FinalizeGithub,
-    RehearsePublic {
-        #[arg(long)]
-        bundle: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-    VerifyPublic,
 }
 
 fn workspace_root(start: &Path) -> Result<PathBuf> {
@@ -159,71 +119,57 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = workspace_root(&std::env::current_dir()?)?;
-    if let Some(path) = cli.build_context {
-        memcordon_ci::inventory_benchmark::require_admission(&path)?;
-        memcordon_ci::build_context::activate(
-            memcordon_ci::build_context::ValidatedBuildContext::read(&path)?,
-        )?;
-    }
-    let result = match (cli.cargo_plugin, cli.command) {
-        (false, Some(TopLevel::InventoryProfile { plan, output })) => {
-            memcordon_ci::inventory_profile::profile(&plan, &output, &root)
+    let current = std::env::current_dir()?;
+    let root = match &cli.command {
+        Some(TopLevel::ExternalConsumer { .. }) => current,
+        Some(TopLevel::Release {
+            command:
+                memcordon_ci::release::ReleaseCommand::Publish { .. }
+                | memcordon_ci::release::ReleaseCommand::Inspect { .. }
+                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. },
+        }) => current,
+        _ => workspace_root(&current)?,
+    };
+    let result = match cli.command {
+        Some(TopLevel::Ci { command }) => match command {
+            CiCommand::Prepare { profile } => memcordon_ci::preparation::prepare(&root, profile),
+            CiCommand::CacheContext {
+                purpose,
+                shard,
+                external,
+            } => memcordon_ci::cache::emit(&root, &purpose, &shard, &external),
+            CiCommand::CheckWorkflows => policy::run(&root),
+            CiCommand::PerformancePlan => {
+                memcordon_ci::performance_plan::PerformancePlan::read(&root)?.emit()
+            }
+            CiCommand::AggregateStress { input, destination } => {
+                memcordon_ci::performance_plan::aggregate_stress(&root, &input, &destination)
+            }
+            CiCommand::AggregateMacos { input, destination } => {
+                memcordon_ci::macos_performance::aggregate(&root, &input, &destination)
+            }
+        },
+        Some(TopLevel::Release { command }) => memcordon_ci::release::run(&root, command),
+        Some(TopLevel::ExternalConsumer { input, destination }) => {
+            let assessment = memcordon_ci::external_consumer::run_file(&input, &destination)?;
+            if assessment.passed() {
+                Ok(())
+            } else {
+                Err(CiError::Message(
+                    "external consumer execution, collection or retirement assessment failed"
+                        .into(),
+                ))
+            }
         }
-        (
-            false,
-            Some(TopLevel::InventoryScan {
-                request,
-                report_dir,
-            }),
-        ) => memcordon_ci::inventory_benchmark::scan(&request, &report_dir),
-        (false, Some(TopLevel::InventoryBenchmark { plan, output })) => {
-            memcordon_ci::inventory_benchmark::benchmark(&plan, &output)
+        Some(TopLevel::DelegatedLinuxBackend { rustup, uid }) => {
+            suites::delegated_linux_backend(&root, &rustup, &uid)
         }
-        (
-            false,
-            Some(TopLevel::QualifyNativeProfile {
-                policy,
-                selection,
-                destination,
-            }),
-        ) => memcordon_ci::native_profile::qualify(&policy, &selection, &destination),
-        (false, Some(TopLevel::AuditNativeProfile { specification })) => {
-            memcordon_ci::native_profile::audit(&specification)
-        }
-        (
-            false,
-            Some(TopLevel::BuildContext {
-                output,
-                observation_dir,
-            }),
-        ) => {
-            memcordon_ci::inventory_progress::set_report_directory(observation_dir)?;
-            memcordon_ci::build_context::ValidatedBuildContext::prepare(&root)?.write(&output)
-        }
-        (false, Some(TopLevel::AuditBuildContext { input })) => {
-            memcordon_ci::inventory_benchmark::require_admission(&input)?;
-            memcordon_ci::build_context::ValidatedBuildContext::read(&input)?.audit()
-        }
-        (true, None) => release::cargo_credential_provider(&root),
-        (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
-        (false, Some(TopLevel::Release { command })) => release::run(&root, command),
-        (
-            false,
-            Some(TopLevel::DelegatedLinuxCertification {
-                rustup,
-                uid,
-                context_file,
-            }),
-        ) => suites::delegated_linux_certification(&root, &rustup, &uid, &context_file),
-        _ => Err(CiError::Message(
-            "exactly one CI command or --cargo-plugin is required".to_owned(),
+        Some(TopLevel::Suite { suite }) => suites::run(&root, suite, suites::SuiteOptions),
+        None => Err(CiError::Message(
+            "exactly one CI command is required".to_owned(),
         )),
     };
-    if let Some(context) = memcordon_ci::build_context::active() {
-        context.audit()?;
-    }
-    result
+    memcordon_ci::workflow_output::quiescent(result)
 }
 
 fn main() {

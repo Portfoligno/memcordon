@@ -11,6 +11,8 @@ use crate::request::{
 };
 
 pub const SOCKET_PATH: &str = "/run/memcordon/sealed-launcher.sock";
+pub const NETWORK_SOCKET_PATH: &str = "/run/memcordon/sealed-network-launcher.sock";
+const NETWORK_LAUNCHER_UNIT: &str = "memcordon-sealed-network-launcher.service";
 const CONTROL_UNIT: &str = "memcordon-sealed-agent.service";
 const LAUNCHER_UNIT: &str = "memcordon-sealed-launcher.service";
 const INSTALLED_BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
@@ -34,7 +36,27 @@ impl Drop for AllocatedRecordGuard {
 }
 
 pub fn serve() -> Result<(), String> {
-    let qualification = super::qualification::qualify()?;
+    serve_selected(false)
+}
+
+#[cfg(feature = "private-tcp")]
+pub fn serve_network() -> Result<(), String> {
+    serve_selected(true)
+}
+
+fn serve_selected(network: bool) -> Result<(), String> {
+    let qualification = if network {
+        #[cfg(feature = "private-tcp")]
+        {
+            super::qualification::observe_network_readiness()?
+        }
+        #[cfg(not(feature = "private-tcp"))]
+        {
+            return Err("private network launcher is unavailable".into());
+        }
+    } else {
+        super::qualification::observe_readiness()?
+    };
     let listener = activated_listener()?;
     loop {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
@@ -48,7 +70,7 @@ pub fn serve() -> Result<(), String> {
         }
         if worker == 0 {
             drop(listener);
-            let code = match handle(&mut stream, &qualification) {
+            let code = match handle(&mut stream, &qualification, network) {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("sealed launcher rejected request: {error}");
@@ -63,7 +85,7 @@ pub fn serve() -> Result<(), String> {
     }
 }
 
-pub fn probe() -> Result<super::qualification::QualificationReceipt, String> {
+pub fn probe() -> Result<super::qualification::ReadinessObservation, String> {
     let request = Frame {
         kind: MessageKind::BrokerProbe,
         nonce: nonce()?,
@@ -79,8 +101,7 @@ pub fn probe() -> Result<super::qualification::QualificationReceipt, String> {
     {
         return Err("MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: invalid probe response".to_owned());
     }
-    let qualification: super::qualification::QualificationReceipt =
-        serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
+    let qualification = super::qualification::ReadinessObservation::parse(&response.payload)?;
     if qualification.complete() {
         Ok(qualification)
     } else {
@@ -121,7 +142,8 @@ pub fn launch(
 
 fn handle(
     stream: &mut UnixStream,
-    qualification: &super::qualification::QualificationReceipt,
+    qualification: &super::qualification::ReadinessObservation,
+    network: bool,
 ) -> Result<(), String> {
     let peer = authenticate_peer(stream, CONTROL_UNIT)?;
     // The listener belongs to systemd, so the client authenticates this accepted-stream worker
@@ -160,7 +182,18 @@ fn handle(
         )?
     } else {
         match request.kind {
-            MessageKind::BrokerProbe if descriptors.is_empty() && request.payload.is_empty() => {
+            MessageKind::PrivateBrokerLaunch if network && cfg!(feature = "private-tcp") => {
+                super::private_runtime::execute_brokered(
+                    stream,
+                    &request,
+                    descriptors,
+                    peer.pid,
+                    peer.process_start_time,
+                )?
+            }
+            MessageKind::BrokerProbe
+                if !network && descriptors.is_empty() && request.payload.is_empty() =>
+            {
                 Frame {
                     kind: MessageKind::ProbeReceipt,
                     nonce: request.nonce,
@@ -168,9 +201,7 @@ fn handle(
                     payload: qualification.render().into_bytes(),
                 }
             }
-            MessageKind::BrokerLaunch => {
-                launch_response(&request, descriptors, peer, qualification)?
-            }
+            MessageKind::BrokerLaunch if !network => launch_response(&request, descriptors, peer)?,
             _ => rejected(
                 &request,
                 &RejectionV1::request_error(
@@ -187,7 +218,6 @@ fn launch_response(
     request: &Frame,
     descriptors: Vec<OwnedFd>,
     peer: AuthenticatedPeer,
-    qualification: &super::qualification::QualificationReceipt,
 ) -> Result<Frame, String> {
     let broker = match decode_launch_broker_request(&request.payload) {
         Ok(broker) => broker,
@@ -277,7 +307,6 @@ fn launch_response(
         mount_namespace,
         root,
         record.take(),
-        &qualification.receipt_digest,
     ) {
         Ok(facts) => Ok(Frame {
             kind: MessageKind::Terminal,
@@ -299,7 +328,16 @@ fn rejected(request: &Frame, rejection: &RejectionV1) -> Result<Frame, String> {
 }
 
 fn connect_authenticated(nonce: [u8; 16], attempt_id: [u8; 16]) -> Result<UnixStream, String> {
-    let mut stream = UnixStream::connect(SOCKET_PATH)
+    connect_selected(SOCKET_PATH, LAUNCHER_UNIT, nonce, attempt_id)
+}
+
+fn connect_selected(
+    path: &str,
+    unit: &str,
+    nonce: [u8; 16],
+    attempt_id: [u8; 16],
+) -> Result<UnixStream, String> {
+    let mut stream = UnixStream::connect(path)
         .map_err(|error| format!("MCSEALED-LAUNCHER-CONNECTION: {error}"))?;
     // SO_PEERCRED identifies systemd for an activation-owned listener. SCM_CREDENTIALS on the
     // response instead identifies the launcher worker that holds this accepted connection.
@@ -312,9 +350,108 @@ fn connect_authenticated(nonce: [u8; 16], attempt_id: [u8; 16]) -> Result<UnixSt
     };
     write_frame(&mut stream, &authentication).map_err(|error| error.to_string())?;
     let credentials = receive_authentication_response(&stream, &authentication)?;
-    let _ = authenticate_credentials(credentials, LAUNCHER_UNIT)?;
+    let _ = authenticate_credentials(credentials, unit)?;
     set_receive_credentials(&stream, false)?;
     Ok(stream)
+}
+
+pub(super) fn forward_private(
+    frontend_stream: &UnixStream,
+    request: &Frame,
+    payload: Vec<u8>,
+    descriptors: &[RawFd],
+) -> Result<Frame, String> {
+    if !cfg!(feature = "private-tcp") || descriptors.len() != 7 {
+        return Err("MCSEALED-PRIVATE-DESCRIPTORS: selected runtime and exact descriptor inventory required".into());
+    }
+    let mut stream = connect_selected(
+        NETWORK_SOCKET_PATH,
+        NETWORK_LAUNCHER_UNIT,
+        request.nonce,
+        request.attempt_id,
+    )?;
+    let frame = Frame {
+        kind: MessageKind::PrivateBrokerLaunch,
+        nonce: request.nonce,
+        attempt_id: request.attempt_id,
+        payload,
+    };
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &frame).map_err(|error| error.to_string())?;
+    super::transport::send(&stream, &bytes, descriptors)?;
+    let mut cancelled = false;
+    loop {
+        let mut sockets = [
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if cancelled {
+                    -1
+                } else {
+                    frontend_stream.as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, 100) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        if !cancelled && sockets[1].revents != 0 {
+            // Invalid follow-up input also fails closed by cancelling owned
+            // target resources before forwarding their terminal observation.
+            if super::private_runtime::cancellation_requested(frontend_stream).unwrap_or(true) {
+                let byte = [1_u8];
+                let sent = unsafe {
+                    libc::send(
+                        stream.as_raw_fd(),
+                        byte.as_ptr().cast(),
+                        byte.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent != byte.len() as isize {
+                    stream
+                        .shutdown(std::net::Shutdown::Write)
+                        .map_err(|error| error.to_string())?;
+                }
+                cancelled = true;
+            }
+        }
+        if sockets[0].revents != 0 {
+            break;
+        }
+    }
+    let response = read_frame(&mut stream).map_err(|error| error.to_string())?;
+    if response.nonce != request.nonce
+        || response.attempt_id != request.attempt_id
+        || !matches!(
+            response.kind,
+            MessageKind::PrivateTerminal | MessageKind::PrivateRejected | MessageKind::Rejected
+        )
+    {
+        return Err("MCSEALED-PRIVATE-BINDING: network worker response differs".into());
+    }
+    Ok(response)
+}
+
+pub(super) fn check_network_endpoint() -> Result<(), String> {
+    let stream = connect_selected(
+        NETWORK_SOCKET_PATH,
+        NETWORK_LAUNCHER_UNIT,
+        nonce()?,
+        [0; 16],
+    )?;
+    drop(stream);
+    Ok(())
 }
 
 fn write_authentication_response(stream: &UnixStream, response: &Frame) -> Result<(), String> {
@@ -377,6 +514,10 @@ fn authenticate_peer(
 ) -> Result<AuthenticatedPeer, String> {
     let credentials = peer_credentials(stream)?;
     authenticate_credentials(credentials, expected_unit)
+}
+
+pub(crate) fn authenticate_control_service(stream: &UnixStream) -> Result<(), String> {
+    authenticate_peer(stream, CONTROL_UNIT).map(|_| ())
 }
 
 fn authenticate_credentials(
@@ -484,7 +625,7 @@ fn reap_workers() {
     }
 }
 
-fn nonce() -> Result<[u8; 16], String> {
+pub(crate) fn nonce() -> Result<[u8; 16], String> {
     let mut nonce = [0_u8; 16];
     std::io::Read::read_exact(
         &mut std::fs::File::open("/dev/urandom").map_err(|error| error.to_string())?,

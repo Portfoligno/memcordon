@@ -2,15 +2,15 @@
 #![cfg(any(target_os = "linux", target_os = "windows"))]
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_contract::WorkloadContractV1;
-pub use memcordon_core::workload_registry::ProviderAdmissionSnapshotV1 as FrozenAdmission;
+pub use memcordon_core::workload_registry::RuntimeAdmissionSnapshot as FrozenAdmission;
 use memcordon_core::workload_registry::{AdmissionRejectionV1, BaselineProfile, CallerSelector};
 #[cfg(target_os = "windows")]
 pub fn discover_windows(
     sid: &str,
-) -> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+) -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String> {
     let lease = crate::windows::policy_registry::Lease::acquire()?;
     let activation = lease.read()?;
-    memcordon_core::workload_discovery::WorkloadDiscoveryV1::authenticated(
+    memcordon_core::workload_discovery::WorkloadDiscovery::authenticated(
         activation
             .as_ref()
             .map(|activation| (&activation.registry, &activation.epoch)),
@@ -18,7 +18,6 @@ pub fn discover_windows(
             sid: memcordon_core::BoundedText::new(sid).map_err(str::to_owned)?,
         },
         BaselineProfile::WindowsHostNetworkExternal,
-        windows_qualification_digest()?,
         crate::windows::package::installed_public_provider_binding()?,
         memcordon_core::BoundedText::new(&crate::windows::record::boot_identity()?)
             .map_err(str::to_owned)?,
@@ -28,34 +27,31 @@ pub fn discover_windows(
 pub fn inspect_windows(
     contract: &WorkloadContractV1,
     sid: &str,
-) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
+) -> Result<memcordon_core::workload_evidence::RuntimeWorkloadResolution, String> {
     use memcordon_core::workload_evidence::*;
     let request_binding = RequestBindingV1::from_contract(contract)?;
-    let result = (|| -> Result<WorkloadResolutionReportV1, String> {
+    let result = (|| -> Result<RuntimeWorkloadResolution, String> {
         let lease = crate::windows::policy_registry::Lease::acquire()?;
         let activation = lease.read()?.ok_or("policy activation absent")?;
         let caller = CallerSelector::Windows {
             sid: memcordon_core::BoundedText::new(sid).map_err(str::to_owned)?,
         };
-        let qualification = windows_qualification_digest()?;
         if let Err(rejection) = memcordon_core::workload_registry::resolve(
             &activation.registry,
             &activation.epoch,
             contract,
             &caller,
             BaselineProfile::WindowsHostNetworkExternal,
-            &qualification,
         ) {
-            return Ok(WorkloadResolutionReportV1::Rejected {
+            return Ok(RuntimeWorkloadResolution::Rejected {
                 binding: request_binding.clone(),
                 rejection,
                 target_authorized: False::default(),
             });
         }
-        let binding = PlanBindingV1::from_authorized(
+        let binding = RuntimePlanBinding::from_local_grant(
             contract,
             activation.registry_digest,
-            qualification,
             crate::windows::package::installed_public_provider_binding()?,
             memcordon_core::BoundedText::new(&crate::windows::record::boot_identity()?)
                 .map_err(str::to_owned)?,
@@ -72,7 +68,7 @@ pub fn inspect_windows(
         ] {
             pending.try_push(check).expect("fixed prelaunch checks fit");
         }
-        Ok(WorkloadResolutionReportV1::Planned {
+        Ok(RuntimeWorkloadResolution::Planned {
             binding,
             effective: EffectiveWorkloadPolicyV1 {
                 profile: BaselineProfile::WindowsHostNetworkExternal,
@@ -83,7 +79,7 @@ pub fn inspect_windows(
         })
     })();
     Ok(
-        result.unwrap_or_else(|_| WorkloadResolutionReportV1::Unavailable {
+        result.unwrap_or_else(|_| RuntimeWorkloadResolution::Unavailable {
             request: Some(request_binding),
             reason: AdmissionAvailabilityFailure::BindingUnavailable,
             authorization: AuthorizationKnowledge::NotAuthorized,
@@ -110,19 +106,19 @@ pub fn plan_windows(
     let caller = CallerSelector::Windows {
         sid: memcordon_core::BoundedText::new(sid).map_err(|_| unavailable())?,
     };
-    let qualification = windows_qualification_digest().map_err(|_| unavailable())?;
     resolve(
         &activation.registry,
         &activation.epoch,
         request,
         &caller,
         BaselineProfile::WindowsHostNetworkExternal,
-        &qualification,
     )?;
     lease
         .retain_snapshot(&activation.registry)
         .map_err(|_| unavailable())?;
     let snapshot = FrozenAdmission {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
         request: request.clone(),
         request_digest: memcordon_core::workload_codec::contract_digest(request)
             .map_err(|_| unavailable())?,
@@ -130,21 +126,12 @@ pub fn plan_windows(
         caller_invocation_reference: crate::windows::policy_registry::random_nonce()
             .map_err(|_| unavailable())?,
         registry_digest: activation.registry_digest,
-        qualification_digest: qualification,
         admission_nonce: crate::windows::policy_registry::random_nonce()
             .map_err(|_| unavailable())?,
         caller,
         native_profile: BaselineProfile::WindowsHostNetworkExternal,
     };
     Ok((snapshot, lease))
-}
-
-#[cfg(target_os = "windows")]
-fn windows_qualification_digest() -> Result<DiagnosticSha256, String> {
-    let receipt = crate::windows::qualification::local_receipt()?;
-    Ok(memcordon_core::workload_codec::hash_bytes(
-        &serde_json::to_vec(&receipt).map_err(|error| error.to_string())?,
-    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -158,10 +145,6 @@ pub fn revalidate_windows(
     if activation.registry_digest != snapshot.registry_digest {
         return Err("MCSEALED-POLICY-EPOCH-STALE: activated registry changed".into());
     }
-    let qualification = windows_qualification_digest()?;
-    if qualification != snapshot.qualification_digest {
-        return Err("MCSEALED-POLICY-DRIFT: qualification changed before authorization".into());
-    }
     crate::windows::package::installed_public_provider_binding()?;
     memcordon_core::workload_registry::resolve(
         &activation.registry,
@@ -169,7 +152,6 @@ pub fn revalidate_windows(
         &snapshot.request,
         &snapshot.caller,
         snapshot.native_profile,
-        &qualification,
     )
     .map_err(|rejection| format!("MCSEALED-POLICY-ADMISSION: {:?}", rejection))?;
     Ok(lease)
@@ -191,7 +173,6 @@ pub fn revoked_windows(snapshot: &FrozenAdmission) -> Result<bool, String> {
 pub fn plan_linux(
     request: &WorkloadContractV1,
     uid: u32,
-    qualification: &str,
     private_invocation_digest: DiagnosticSha256,
 ) -> Result<(FrozenAdmission, crate::policy_registry::native::Lease), AdmissionRejectionV1> {
     use memcordon_core::workload_registry::{AdmissionCode, resolve};
@@ -204,10 +185,6 @@ pub fn plan_linux(
         .read()
         .map_err(|_| unavailable())?
         .ok_or_else(|| AdmissionRejectionV1::single(AdmissionCode::ProfileNotAuthorized))?;
-    let digest = DiagnosticSha256::try_from(
-        memcordon_core::BoundedText::new(qualification).map_err(|_| unavailable())?,
-    )
-    .map_err(|_| unavailable())?;
     let caller = CallerSelector::Linux { uid };
     resolve(
         &activation.registry,
@@ -215,9 +192,11 @@ pub fn plan_linux(
         request,
         &caller,
         BaselineProfile::LinuxUnixCreate,
-        &digest,
     )?;
-    if lease.live_bindings().map_err(|_| unavailable())?.len()
+    if lease
+        .versioned_live_bindings()
+        .map_err(|_| unavailable())?
+        .len()
         >= memcordon_core::workload_limits::LIVE_BINDINGS
     {
         return Err(unavailable());
@@ -227,6 +206,8 @@ pub fn plan_linux(
         .map_err(|_| unavailable())?;
     Ok((
         FrozenAdmission {
+            format: "memcordon.local-admission".into(),
+            revision: 1,
             private_invocation_digest,
             caller_invocation_reference: crate::policy_registry::native::random_nonce()
                 .map_err(|_| unavailable())?,
@@ -234,7 +215,6 @@ pub fn plan_linux(
             request_digest: memcordon_core::workload_codec::contract_digest(request)
                 .map_err(|_| unavailable())?,
             registry_digest: activation.registry_digest,
-            qualification_digest: digest,
             admission_nonce: crate::policy_registry::native::random_nonce()
                 .map_err(|_| unavailable())?,
             caller,
@@ -245,11 +225,7 @@ pub fn plan_linux(
 }
 
 #[cfg(target_os = "linux")]
-pub fn check_linux(
-    request: &WorkloadContractV1,
-    uid: u32,
-    qualification: &str,
-) -> Result<(), AdmissionRejectionV1> {
+pub fn check_linux(request: &WorkloadContractV1, uid: u32) -> Result<(), AdmissionRejectionV1> {
     use memcordon_core::workload_registry::{AdmissionCode, resolve};
     let unavailable = || AdmissionRejectionV1::single(AdmissionCode::HostPrerequisiteUnavailable);
     let lease = crate::policy_registry::native::Lease::acquire().map_err(|_| unavailable())?;
@@ -257,17 +233,12 @@ pub fn check_linux(
         .read()
         .map_err(|_| unavailable())?
         .ok_or_else(|| AdmissionRejectionV1::single(AdmissionCode::ProfileNotAuthorized))?;
-    let digest = DiagnosticSha256::try_from(
-        memcordon_core::BoundedText::new(qualification).map_err(|_| unavailable())?,
-    )
-    .map_err(|_| unavailable())?;
     resolve(
         &activation.registry,
         &activation.epoch,
         request,
         &CallerSelector::Linux { uid },
         BaselineProfile::LinuxUnixCreate,
-        &digest,
     )
     .map(|_| ())
 }
@@ -304,7 +275,6 @@ impl LinuxAdmission for FrozenAdmission {
             &self.request,
             &self.caller,
             self.native_profile,
-            &self.qualification_digest,
         )
         .map_err(|rejection| format!("MCSEALED-POLICY-ADMISSION: {:?}", rejection.code))?;
         Ok(lease)

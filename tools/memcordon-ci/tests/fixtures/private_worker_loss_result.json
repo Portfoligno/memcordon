@@ -1,0 +1,269 @@
+{
+  "format": "memcordon.result",
+  "revision": 1,
+  "tool": {
+    "name": "memcordon",
+    "version": "0.5.7-dev",
+    "os": "linux",
+    "architecture": "x86_64",
+    "runtime_features": [
+      "sealed-runtime",
+      "private-tcp"
+    ]
+  },
+  "invocation": {
+    "association_sha256": "f492980d2e212b77c1fae6e18484dc65f6ea9ca280e42f3f4c8d115dfa8d6030",
+    "requested_memory": null,
+    "requested_deadline": null,
+    "applied_memory": null,
+    "applied_deadline": null
+  },
+  "policy": {
+    "requested": {
+      "workload": {
+        "state": "legacy-unspecified"
+      },
+      "boundary": "sealed",
+      "memory": null,
+      "deadline": null,
+      "wait_for": "command",
+      "signal_grace_ms": 2000,
+      "command_exit_grace_ms": 0,
+      "limit_grace_ms": 0,
+      "restart": {
+        "enabled": false,
+        "enablement_source": null,
+        "configured_conditions": [],
+        "limit": {
+          "kind": "unlimited"
+        },
+        "backoff": null,
+        "circuit_breaker": null
+      }
+    },
+    "effective": {
+      "workload": {
+        "state": "legacy-unspecified",
+        "restrictions": "linux-unix-only-socket-syscall-filter-alternate-paths-unknown"
+      },
+      "boundary": "sealed",
+      "memory": null,
+      "deadline": null,
+      "wait_for": "command",
+      "signal_grace_ms": 2000,
+      "command_exit_grace_ms": 0,
+      "limit_grace_ms": 0,
+      "restart": {
+        "enabled": false,
+        "conditions": [],
+        "dormant_conditions": [],
+        "cleanup_proof_required": false
+      }
+    },
+    "effects": [
+      {
+        "kind": "adjusted",
+        "option": "enforcement",
+        "requested": "auto",
+        "effective": "hard",
+        "reason": "auto selected backend linux-sealed-provider"
+      },
+      {
+        "kind": "applied",
+        "option": "wait-for"
+      },
+      {
+        "kind": "applied",
+        "option": "metric"
+      },
+      {
+        "kind": "applied",
+        "option": "poll-interval"
+      },
+      {
+        "kind": "applied",
+        "option": "swap"
+      }
+    ]
+  },
+  "attempts": [
+    {
+      "runtime": null,
+      "policy_enforcement": {
+        "state": "legacy-unspecified"
+      },
+      "number": 1,
+      "kind": "initial",
+      "phase": "failed",
+      "target_pid": null,
+      "started_offset_ms": 0,
+      "authorized_offset_ms": null,
+      "terminal_offset_ms": null,
+      "finished_offset_ms": 50,
+      "outcome": null,
+      "error": {
+        "category": "monitor",
+        "code": "MCSEALED-PRIVATE-TRANSACTION",
+        "message": "private launch rejected [MCSEALED-PRIVATE-INGRESS]: protocol I/O failed: UnexpectedEof",
+        "os_code": null,
+        "attempt_number": 1,
+        "supervision_phase": "attempt-setup",
+        "launch_phase": null,
+        "target_released": false,
+        "workload_may_be_alive": true,
+        "initial_spawn_failure": null,
+        "provider_rejection": null
+      },
+      "restart_decision": {
+        "trigger": null,
+        "decision": "none-disabled",
+        "restart_number": null,
+        "half_life_logistic_sequence_index": null,
+        "configured_wait_ms": null,
+        "actual_wait_ms": null,
+        "wait_kind": null,
+        "circuit_state": "closed",
+        "supervision_deadline_truncated_wait": false
+      },
+      "launch": {
+        "mechanism": "linux-tcp4-private-v1",
+        "target_released": false,
+        "containment_verified_before_authorization": false,
+        "guardian_started_before_authorization": false,
+        "target_spawn_error_reported": false,
+        "boundary_requested": "sealed",
+        "boundary_effective": "unavailable",
+        "boundary_assignment_verified": false,
+        "boundary_reconfiguration_denied": false,
+        "inherited_resources_restricted": false,
+        "frontend_loss_cleanup_authority_verified": false
+      },
+      "restart_safety": {
+        "direct_child_reaped": false,
+        "workload_empty": null,
+        "helpers_reaped": false,
+        "containment_removed": false,
+        "containment_incapable_of_live_members": false,
+        "sealed_boundary_retired": false,
+        "errors": [
+          "MCSEALED-PRIVATE-TRANSACTION: setup failure has no complete backend resource proof"
+        ]
+      },
+      "boundary_detail": {
+        "mechanism": "setup-failure",
+        "provider_mechanism": "linux-tcp4-private-v1",
+        "requested": "sealed"
+      }
+    }
+  ],
+  "supervision": {
+    "phase": "completed",
+    "duration_ms": 50,
+    "attempt_records_created": 1,
+    "targets_authorized": 0,
+    "wrapper_exit_code": 125,
+    "terminal": {
+      "kind": "error",
+      "attempt_number": 1,
+      "error": {
+        "category": "monitor",
+        "code": "MCSEALED-PRIVATE-TRANSACTION",
+        "message": "private launch rejected [MCSEALED-PRIVATE-INGRESS]: protocol I/O failed: UnexpectedEof",
+        "os_code": null,
+        "attempt_number": 1,
+        "supervision_phase": "attempt-setup",
+        "launch_phase": null,
+        "target_released": false,
+        "workload_may_be_alive": true,
+        "initial_spawn_failure": null,
+        "provider_rejection": null
+      }
+    },
+    "attempt_history": {
+      "capacity": 256,
+      "retained": 1,
+      "total": 1,
+      "omitted": 0,
+      "truncated": false
+    },
+    "aggregate": {
+      "confirmed_authorizations": 0,
+      "unknown_authorization_attempts": 0,
+      "retry_attempts_started": 0,
+      "confirmed_retry_authorizations": 0,
+      "child_exits": 0,
+      "memory_limits": 0,
+      "deadlines": 0,
+      "interruptions": 0,
+      "monitor_failures": 0,
+      "setup_failures": 1,
+      "max_peak": null
+    },
+    "restart": {
+      "enabled": false,
+      "restarts_launched": 0,
+      "restart_limit_exhausted": false,
+      "half_life_logistic_waits": 0,
+      "cooldowns": 0,
+      "circuit_open_count": 0,
+      "final_circuit_state": "closed"
+    }
+  },
+  "error": null,
+  "backend": {
+    "name": "linux-sealed-provider",
+    "containment": {
+      "supported": true,
+      "reason": null
+    },
+    "boundary": "sealed",
+    "memory": {
+      "supported": true,
+      "class": "hard",
+      "metric": "linux-cgroup-memory",
+      "reason": null
+    },
+    "deadline": {
+      "supported": true,
+      "reason": null
+    },
+    "limitations": [
+      "requires installed root MemCordon provider"
+    ]
+  },
+  "authorization": "uncertain",
+  "launch": {
+    "state": "unknown",
+    "target_pid": null
+  },
+  "outcome": {
+    "kind": "unknown",
+    "native_termination": null,
+    "wrapper_status": 125
+  },
+  "cleanup": {
+    "state": "incomplete",
+    "direct_child_reaped": false,
+    "workload_empty": null,
+    "outstanding": [],
+    "failed_operations": []
+  },
+  "restart": {
+    "enabled": false,
+    "restarts_launched": 0,
+    "restart_limit_exhausted": false,
+    "half_life_logistic_waits": 0,
+    "cooldowns": 0,
+    "circuit_open_count": 0,
+    "final_circuit_state": "closed"
+  },
+  "runtime": {
+    "kind": "unavailable",
+    "reason": "no operational runtime observation available"
+  },
+  "private_execution": null,
+  "private_rejection": null,
+  "diagnostics": null,
+  "provider_association": null,
+  "delivery": "prepared"
+}

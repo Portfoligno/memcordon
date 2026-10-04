@@ -72,6 +72,28 @@ impl TargetCreateError {
 }
 
 impl SuspendedTarget {
+    pub fn desktop_owner_binding(&self) -> Option<(WindowsProcessIdentityV1, String, u64, u64)> {
+        self._desktop_lease
+            .as_ref()
+            .map(TargetDesktopLease::owner_binding)
+    }
+
+    pub fn launch_gate_handle(&self) -> HANDLE {
+        self.thread.raw()
+    }
+
+    pub fn close_for_retirement(mut self) -> Result<(), String> {
+        let thread_result = self.thread.close_checked();
+        let process_result = self.process.close_checked();
+        let desktop_result = self
+            ._desktop_lease
+            .as_mut()
+            .map_or(Ok(()), TargetDesktopLease::close_checked);
+        thread_result?;
+        process_result?;
+        desktop_result
+    }
+
     #[allow(clippy::too_many_arguments)] // Native creation requires each authority input explicitly.
     pub fn create(
         token: HANDLE,
@@ -791,179 +813,6 @@ pub fn encode_command_line(arguments: &[Vec<u16>]) -> Vec<u16> {
     memcordon_core::encode_windows_command_line(arguments)
 }
 
-pub(super) struct AppContainerProfile {
-    name: Vec<u16>,
-    sid: *mut c_void,
-    active: bool,
-}
-
-impl Drop for AppContainerProfile {
-    fn drop(&mut self) {
-        // SAFETY: name remains NUL-terminated and sid is the exact allocation
-        // returned by CreateAppContainerProfile.
-        unsafe {
-            if self.active {
-                DeleteAppContainerProfile(self.name.as_ptr());
-            }
-            FreeSid(self.sid);
-        }
-    }
-}
-
-impl AppContainerProfile {
-    fn delete_and_verify(mut self) -> Result<(), String> {
-        // SAFETY: name remains a live NUL-terminated profile name.
-        let deleted = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
-        if deleted < 0 {
-            return Err(format!(
-                "cannot delete AppContainer qualification profile: HRESULT {deleted:#x}"
-            ));
-        }
-        self.active = false;
-        // Re-create the exact same profile name. Fresh creation succeeding is
-        // the native absence readback (DeleteAppContainerProfile itself is
-        // intentionally idempotent and also succeeds for an absent profile).
-        let display = super::pipe::wide_null("MemCordon sealed AppContainer absence readback");
-        let description = super::pipe::wide_null("Ephemeral native qualification fixture");
-        let mut proof_sid = ptr::null_mut();
-        let recreated = unsafe {
-            CreateAppContainerProfile(
-                self.name.as_ptr(),
-                display.as_ptr(),
-                description.as_ptr(),
-                ptr::null(),
-                0,
-                &raw mut proof_sid,
-            )
-        };
-        if recreated < 0 || proof_sid.is_null() {
-            return Err(format!(
-                "AppContainer qualification profile absence readback returned HRESULT {recreated:#x}"
-            ));
-        }
-        let proof_deleted = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
-        unsafe { FreeSid(proof_sid) };
-        if proof_deleted < 0 {
-            return Err(format!(
-                "cannot delete AppContainer absence-readback profile: HRESULT {proof_deleted:#x}"
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub fn run_appcontainer_rejection_client() -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let profile_name = format!(
-        "memcordon.certification.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos()
-    );
-    let name = super::pipe::wide_null(&profile_name);
-    let display = super::pipe::wide_null("MemCordon sealed AppContainer rejection canary");
-    let description = super::pipe::wide_null("Ephemeral native qualification fixture");
-    let mut sid = ptr::null_mut();
-    // SAFETY: all strings are NUL-terminated, the empty capability inventory
-    // permits a null pointer, and sid receives a FreeSid-owned allocation.
-    let result = unsafe {
-        CreateAppContainerProfile(
-            name.as_ptr(),
-            display.as_ptr(),
-            description.as_ptr(),
-            ptr::null(),
-            0,
-            &raw mut sid,
-        )
-    };
-    if result < 0 || sid.is_null() {
-        return Err(format!(
-            "cannot create AppContainer qualification profile: HRESULT {result:#x}"
-        ));
-    }
-    let profile = AppContainerProfile {
-        name,
-        sid,
-        active: true,
-    };
-    let capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: profile.sid,
-        Capabilities: ptr::null_mut(),
-        CapabilityCount: 0,
-        Reserved: 0,
-    };
-    let attributes = AttributeList::new(
-        &[Attribute::new(
-            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-            (&raw const capabilities).cast(),
-            std::mem::size_of::<SECURITY_CAPABILITIES>(),
-        )],
-        None,
-    )?;
-    let executable = crate::windows::package::installed_binary();
-    let mut command_line = encode_command_line(&[
-        executable.as_os_str().encode_wide().collect(),
-        "windows-certification-appcontainer"
-            .encode_utf16()
-            .collect(),
-    ]);
-    command_line.push(0);
-    let mut startup = STARTUPINFOEXW::default();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup.lpAttributeList = attributes.raw();
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: command line and attribute list remain live for the synchronous
-    // call; no handles are inherited into the AppContainer fixture.
-    if unsafe {
-        create_process_native(
-            ptr::null(),
-            command_line.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT,
-            ptr::null(),
-            ptr::null(),
-            &raw const startup.StartupInfo,
-            &raw mut process,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "cannot create AppContainer qualification client: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let thread = OwnedHandle::new(process.hThread)?;
-    let process = OwnedHandle::new(process.hProcess)?;
-    drop(thread);
-    match unsafe { WaitForSingleObject(process.raw(), 30_000) } {
-        WAIT_OBJECT_0 => {}
-        WAIT_TIMEOUT => {
-            // SAFETY: process is live and owned; forced termination bounds the
-            // native rejection fixture without granting it target authority.
-            unsafe { TerminateProcess(process.raw(), 125) };
-            let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
-            return Err("AppContainer rejection client timed out".to_owned());
-        }
-        _ => return Err(io::Error::last_os_error().to_string()),
-    }
-    let mut exit_code = 0_u32;
-    // SAFETY: the process is signaled and the output is writable.
-    if unsafe { GetExitCodeProcess(process.raw(), &raw mut exit_code) } == 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    if exit_code != 0 {
-        return Err(format!(
-            "AppContainer rejection client failed with status {exit_code:#x}"
-        ));
-    }
-    profile.delete_and_verify()
-}
-
 pub(super) fn target_user_object_policy_role(
     command: &NativeWindowsCommandV1,
 ) -> super::security::TargetUserObjectPolicyRoleV1 {
@@ -1098,6 +947,16 @@ pub(crate) fn process_identity_for_pid_as_authenticated_caller(
     authenticated_primary: HANDLE,
     job: &Job,
 ) -> Result<Option<WindowsProcessIdentityV1>, ProcessIdentityObservationError> {
+    process_identity_for_pid_with_membership(process_id, authenticated_primary, |process| {
+        job.contains(process)
+    })
+}
+
+pub(crate) fn process_identity_for_pid_with_membership(
+    process_id: u32,
+    authenticated_primary: HANDLE,
+    contains: impl FnOnce(HANDLE) -> Result<bool, String>,
+) -> Result<Option<WindowsProcessIdentityV1>, ProcessIdentityObservationError> {
     let mut service_os_code = None;
     let mut retry_os_code = None;
     // SAFETY: the PID came from a Job process-list kernel readback and the
@@ -1227,7 +1086,7 @@ pub(crate) fn process_identity_for_pid_as_authenticated_caller(
             format!("opened_process_id={}", identity.process_id),
         ));
     }
-    let still_contained = job.contains(process.raw()).map_err(|detail| {
+    let still_contained = contains(process.raw()).map_err(|detail| {
         ProcessIdentityObservationError::new(
             process_id,
             "process-job-membership-readback",

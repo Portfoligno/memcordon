@@ -3,9 +3,7 @@
 #[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
 mod schema;
 
-use memcordon_core::runtime_manifest::{
-    InstalledPolicyObservationV1, NativeProviderProtocols, QualificationArtifactReferenceV1,
-};
+use memcordon_core::runtime_manifest::{InstalledPolicyObservationV1, NativeProviderProtocols};
 use schema::*;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -61,18 +59,19 @@ fn platform(windows: bool) -> ProviderPackageMetadataV4 {
     }
 }
 
-fn agent(windows: bool) -> AgentPackageInspectionV5 {
-    AgentPackageInspectionV5 {
-        schema_version: 5,
+fn agent(windows: bool) -> AgentPackageInspection {
+    AgentPackageInspection {
+        format: AgentInspectionFormat::Ordinary,
+        revision: InspectionRevision,
         version: env!("CARGO_PKG_VERSION").into(),
         source_commit: "a".repeat(40),
         executable_sha256: "b".repeat(64),
-        provider_protocol: if windows { 2 } else { 3 },
+        provider_protocol: 3,
         native_protocols: if windows {
             NativeProviderProtocols::Windows {
                 provider_contract: 3,
-                public_wire: 2,
-                private_wire: 2,
+                public_wire: 3,
+                private_wire: 3,
             }
         } else {
             NativeProviderProtocols::Linux {
@@ -80,7 +79,7 @@ fn agent(windows: bool) -> AgentPackageInspectionV5 {
                 launch_wire: 3,
             }
         },
-        runtime_manifest_schema: 2,
+        runtime_manifest_schema: 1,
         workload_contract_schema: 1,
         profile_catalog_sha256: "c".repeat(64),
         mechanism: "sealed-v2".into(),
@@ -122,7 +121,11 @@ fn check<T: Serialize + DeserializeOwned + std::fmt::Debug>(value: &T, windows: 
         );
     }
     for key in [
-        "schema_version",
+        if original.get("format").is_some() {
+            "format"
+        } else {
+            "schema_version"
+        },
         "platform",
         if windows {
             "control_pipe"
@@ -204,29 +207,22 @@ fn flattened_inspections_preserve_all_versions_and_platforms_strictly() {
             compiled_metadata_valid: true,
         };
         check(&historical, windows);
-        let installed = InstalledProviderInspectionV5 {
-            schema_version: 5,
+        let installed = InstalledProviderInspection {
+            format: InstalledInspectionFormat::Ordinary,
+            revision: InspectionRevision,
             agent: current,
             installed_executable_sha256: "b".repeat(64),
             installed_artifacts_valid: true,
             provider_identity: Some("provider".into()),
             provider_reachable: true,
-            qualification_complete: true,
             policy: InstalledPolicyObservationV1::Unconfigured,
-            profile_qualification: QualificationArtifactReferenceV1 {
-                schema_version: 1,
-                artifact: "qualification.json".into(),
-                qualified_target: "native-target".into(),
-                qualifies_package_target: true,
-            },
-            diagnostic_qualification: None,
         };
         let wire = serde_json::to_value(&installed).unwrap();
-        let decoded: InstalledProviderInspectionV5 = serde_json::from_value(wire.clone()).unwrap();
+        let decoded: InstalledProviderInspection = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
         let mut invalid = wire;
         invalid["unexpected"] = json!(true);
-        assert!(serde_json::from_value::<InstalledProviderInspectionV5>(invalid).is_err());
+        assert!(serde_json::from_value::<InstalledProviderInspection>(invalid).is_err());
     }
 }
 
@@ -237,7 +233,7 @@ fn nested_protocol_duplicate_fields_are_not_lost_to_buffering() {
     assert!(wire.contains(original));
     let duplicate = wire.replace(original, "\"launch_wire\":3,\"launch_wire\":3");
     assert!(
-        serde_json::from_str::<AgentPackageInspectionV5>(&duplicate)
+        serde_json::from_str::<AgentPackageInspection>(&duplicate)
             .unwrap_err()
             .to_string()
             .contains("duplicate field")

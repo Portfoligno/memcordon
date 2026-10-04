@@ -9,12 +9,14 @@ pub use memcordon_core::{WindowsAttemptStateV1, WindowsAttemptTerminalDispositio
 use memcordon_core::{
     WindowsProcessIdentityV1, WindowsTerminalizationCheckpointV1,
     WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
-    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
+    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1, WindowsWorkerThreadIdentityV1,
     windows_attempt_transition_allowed,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, FILETIME, WAIT_FAILED, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo,
@@ -23,7 +25,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     VOLUME_NAME_NT,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    GetThreadTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+    THREAD_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
 };
 
 use super::package;
@@ -32,6 +35,7 @@ use super::pipe::OwnedHandle;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
+const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 const MAX_TERMINALIZATION_CODE_BYTES: usize = 128;
 const MAX_TERMINALIZATION_DETAIL_BYTES: usize = 2 * 1024;
 
@@ -54,6 +58,8 @@ pub struct WindowsAttemptRecordV1 {
     pub provider_generation: String,
     #[serde(deserialize_with = "memcordon_core::deserialize_bounded_record_text::<_, 256>")]
     pub boot_identity: String,
+    pub launch_incarnation: String,
+    pub nonce: String,
     #[serde(deserialize_with = "memcordon_core::deserialize_bounded_record_text::<_, 256>")]
     pub request_sha256: String,
     pub caller_process_identity: WindowsProcessIdentityV1,
@@ -62,12 +68,21 @@ pub struct WindowsAttemptRecordV1 {
     #[serde(deserialize_with = "memcordon_core::deserialize_bounded_record_text::<_, 256>")]
     pub job_identity_sha256: String,
     pub guardian_identity: Option<WindowsProcessIdentityV1>,
+    pub worker_identity: Option<WindowsProcessIdentityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_thread_identity: Option<WindowsWorkerThreadIdentityV1>,
     pub target_identity: Option<WindowsProcessIdentityV1>,
     pub state: WindowsAttemptStateV1,
+    pub lifecycle: memcordon_core::WindowsTerminalLifecycleV1,
     pub authorization_unix_millis: Option<u64>,
     pub resume_attempted: bool,
     pub target_released: bool,
     pub cleanup_state: WindowsCleanupStateV1,
+    pub owner_manifest: Option<memcordon_core::WindowsCapabilityOwnerManifestV1>,
+    pub recovery_authorization: Option<memcordon_core::WindowsRecoveryAuthorizationV1>,
+    pub terminal_publication_reserved: bool,
+    pub terminal_seed: Option<memcordon_core::WindowsTerminalSeedV2>,
+    pub retirement_proof: Option<memcordon_core::WindowsRetirementProofV2>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -79,9 +94,9 @@ pub struct WindowsAttemptRecordV1 {
     pub terminalization: WindowsTerminalizationStatusV1,
     pub causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1,
     pub diagnostic_retention: memcordon_core::DiagnosticRetentionV1,
-    pub workload_admission: Option<memcordon_core::workload_registry::ProviderAdmissionSnapshotV1>,
+    pub workload_admission: Option<memcordon_core::workload_registry::RuntimeAdmissionSnapshot>,
     pub workload_checkpoint: Option<(
-        memcordon_core::workload_evidence::AttemptBindingV1,
+        memcordon_core::workload_evidence::RuntimeAttemptBinding,
         memcordon_core::workload_evidence::VerifiedCheckpointV1,
     )>,
     pub record_revision: u64,
@@ -91,21 +106,47 @@ pub struct WindowsAttemptRecordV1 {
     pub integrity_sha256: String,
 }
 
+pub fn current_worker_thread_identity() -> Result<WindowsWorkerThreadIdentityV1, String> {
+    // SAFETY: the pseudo handle names the calling worker thread.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() };
+    // SAFETY: a live thread handle has a stable kernel thread id.
+    let thread_id = unsafe { windows_sys::Win32::System::Threading::GetThreadId(thread) };
+    let creation_time_100ns = thread_creation_time(thread)?;
+    if thread_id == 0 || creation_time_100ns == 0 {
+        return Err("worker thread identity is invalid".to_owned());
+    }
+    Ok(WindowsWorkerThreadIdentityV1 {
+        thread_id,
+        creation_time_100ns,
+    })
+}
+
+fn thread_creation_time(thread: windows_sys::Win32::Foundation::HANDLE) -> Result<u64, String> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all four FILETIME outputs are writable; the handle has query access.
+    if unsafe {
+        GetThreadTimes(
+            thread,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
 fn deserialize_shared_outbox<'de, D: serde::Deserializer<'de>>(
     decoder: D,
 ) -> Result<Option<std::sync::Arc<str>>, D::Error> {
     memcordon_core::deserialize_record_outbox(decoder)
         .map(|outbox| outbox.map(std::sync::Arc::from))
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WindowsGuardianReceiptV1 {
-    schema_version: u32,
-    attempt_id: String,
-    termination_requested: bool,
-    active_processes_zero: bool,
-    integrity_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,21 +194,31 @@ impl WindowsAttemptRecordV1 {
         job_identity_sha256: String,
     ) -> Result<Self, String> {
         Ok(Self {
-            schema_version: 3,
+            schema_version: 4,
             attempt_id,
             provider_generation: provider_generation(),
             boot_identity: boot_identity()?,
+            launch_incarnation: digest(&super::policy_registry::random_nonce()?.0),
+            nonce: digest(&super::policy_registry::random_nonce()?.0),
             request_sha256,
             caller_process_identity,
             caller_token_sha256,
             job_identity_sha256,
             guardian_identity: None,
+            worker_identity: None,
+            worker_thread_identity: None,
             target_identity: None,
             state: WindowsAttemptStateV1::BoundaryCreated,
+            lifecycle: memcordon_core::WindowsTerminalLifecycleV1::Executing,
             authorization_unix_millis: None,
             resume_attempted: false,
             target_released: false,
             cleanup_state: WindowsCleanupStateV1::default(),
+            owner_manifest: None,
+            recovery_authorization: None,
+            terminal_publication_reserved: false,
+            terminal_seed: None,
+            retirement_proof: None,
             terminal_response_json: None,
             terminal_disposition: None,
             terminalization: WindowsTerminalizationStatusV1 {
@@ -197,7 +248,7 @@ impl WindowsAttemptRecordV1 {
 
     pub fn bind_workload_admission(
         &mut self,
-        snapshot: memcordon_core::workload_registry::ProviderAdmissionSnapshotV1,
+        snapshot: memcordon_core::workload_registry::RuntimeAdmissionSnapshot,
     ) -> Result<(), String> {
         if self.authorization_unix_millis.is_some()
             || self.resume_attempted
@@ -225,7 +276,7 @@ impl WindowsAttemptRecordV1 {
 
     pub(super) fn bind_workload_checkpoint(
         &mut self,
-        binding: memcordon_core::workload_evidence::AttemptBindingV1,
+        binding: memcordon_core::workload_evidence::RuntimeAttemptBinding,
         checkpoint: memcordon_core::workload_evidence::VerifiedCheckpointV1,
     ) -> Result<(), String> {
         if !self
@@ -290,10 +341,39 @@ impl WindowsAttemptRecordV1 {
                         != self.diagnostic_retention.tombstone
                         && !expiry)
                     || previous.provider_incarnation != self.provider_incarnation
+                    || previous.launch_incarnation != self.launch_incarnation
+                    || previous.nonce != self.nonce
+                    || previous
+                        .owner_manifest
+                        .as_ref()
+                        .is_some_and(|manifest| self.owner_manifest.as_ref() != Some(manifest))
+                    || previous
+                        .recovery_authorization
+                        .as_ref()
+                        .is_some_and(|authorization| {
+                            self.recovery_authorization.as_ref() != Some(authorization)
+                        })
+                    || (previous.terminal_publication_reserved
+                        && !self.terminal_publication_reserved)
+                    || previous
+                        .terminal_seed
+                        .as_ref()
+                        .is_some_and(|seed| self.terminal_seed.as_ref() != Some(seed))
+                    || previous
+                        .retirement_proof
+                        .as_ref()
+                        .is_some_and(|proof| self.retirement_proof.as_ref() != Some(proof))
                     || previous.request_sha256 != self.request_sha256
                     || previous.caller_process_identity != self.caller_process_identity
                     || previous.caller_token_sha256 != self.caller_token_sha256
                     || previous.job_identity_sha256 != self.job_identity_sha256
+                    || previous
+                        .worker_identity
+                        .as_ref()
+                        .is_some_and(|identity| self.worker_identity.as_ref() != Some(identity))
+                    || previous
+                        .worker_thread_identity
+                        .is_some_and(|identity| self.worker_thread_identity != Some(identity))
                     || previous.boot_identity != self.boot_identity
                     || previous
                         .authorization_unix_millis
@@ -402,6 +482,19 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn authorize(&mut self) -> Result<(), String> {
+        if !self
+            .worker_thread_identity
+            .is_some_and(|identity| identity.thread_id != 0 && identity.creation_time_100ns != 0)
+        {
+            return Err(
+                "authorization requires an exact launcher worker thread identity".to_owned(),
+            );
+        }
+        self.owner_manifest
+            .as_ref()
+            .ok_or_else(|| "authorization requires a frozen capability owner manifest".to_owned())?
+            .validate()
+            .map_err(str::to_owned)?;
         self.transition(WindowsAttemptStateV1::Authorized)?;
         self.authorization_unix_millis = Some(
             SystemTime::now()
@@ -432,7 +525,125 @@ impl WindowsAttemptRecordV1 {
 
     pub fn complete_retirement(&mut self) -> Result<(), String> {
         self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
+        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
         self.store()
+    }
+
+    pub fn stage_terminal_proof(
+        &mut self,
+        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    ) -> Result<(), String> {
+        self.stage_terminal_proof_with_store(receipt, primary_failure, &mut |record| record.store())
+    }
+
+    fn stage_terminal_proof_with_store<F>(
+        &mut self,
+        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+        store: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        if self.state != WindowsAttemptStateV1::Empty
+            || self.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::Retiring
+            || self.owner_manifest.is_none()
+            || self.retirement_proof.is_some()
+            || receipt.attempt_id != self.attempt_id
+            || receipt.nonce != self.nonce
+            || receipt.request_sha256 != self.request_sha256
+        {
+            return Err("terminal proof cannot be staged outside exact retired attempt".to_owned());
+        }
+        receipt.validate_for_attempt().map_err(str::to_owned)?;
+        let seed = memcordon_core::WindowsTerminalSeedV2 {
+            schema_version: 2,
+            attempt_id: self.attempt_id.clone(),
+            nonce: self.nonce.clone(),
+            request_sha256: self.request_sha256.clone(),
+            process_observation: receipt.process_observation.clone(),
+            primary_failure,
+        };
+        if self
+            .terminal_seed
+            .as_ref()
+            .is_some_and(|frozen| frozen != &seed)
+        {
+            return Err("terminal proof differs from the frozen seed".to_owned());
+        }
+        self.terminal_seed = Some(seed);
+        self.retirement_proof = Some(receipt.retirement_proof.clone());
+        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::ProofReady;
+        store(self)
+    }
+
+    #[cfg(test)]
+    pub fn stage_terminal_proof_for_test<F>(
+        &mut self,
+        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+        mut store: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        self.stage_terminal_proof_with_store(receipt, primary_failure, &mut store)
+    }
+
+    pub fn freeze_terminal_seed(
+        &mut self,
+        process_observation: memcordon_core::WindowsProcessObservationV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    ) -> Result<(), String> {
+        self.freeze_terminal_seed_with_store(process_observation, primary_failure, &mut |record| {
+            record.store()
+        })
+    }
+
+    fn freeze_terminal_seed_with_store<F>(
+        &mut self,
+        process_observation: memcordon_core::WindowsProcessObservationV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+        store: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        if self.state != WindowsAttemptStateV1::Terminating
+            || self.authorization_unix_millis.is_none()
+            || self.owner_manifest.is_none()
+            || self.terminal_seed.is_some()
+            || self.retirement_proof.is_some()
+            || self.terminal_response_json.is_some()
+        {
+            return Err("terminal seed cannot be frozen outside retiring authority".to_owned());
+        }
+        process_observation
+            .validate(&self.attempt_id, &self.nonce, &self.request_sha256)
+            .map_err(str::to_owned)?;
+        self.terminal_seed = Some(memcordon_core::WindowsTerminalSeedV2 {
+            schema_version: 2,
+            attempt_id: self.attempt_id.clone(),
+            nonce: self.nonce.clone(),
+            request_sha256: self.request_sha256.clone(),
+            process_observation,
+            primary_failure,
+        });
+        store(self)
+    }
+
+    #[cfg(test)]
+    pub fn freeze_terminal_seed_for_test<F>(
+        &mut self,
+        process_observation: memcordon_core::WindowsProcessObservationV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+        mut store: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        self.freeze_terminal_seed_with_store(process_observation, primary_failure, &mut store)
     }
 
     fn prepare_cleanup_completion(
@@ -581,14 +792,17 @@ impl WindowsAttemptRecordV1 {
 
     pub fn stage_terminal_response(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV1,
+        response: &memcordon_core::WindowsLauncherResponseV3,
     ) -> Result<(), String> {
-        self.stage_terminal_response_with_store(response, &mut |record| record.store())
+        self.stage_terminal_response_with_store(response, &mut |record| record.store())?;
+        // The exact relay event remains queryable until the outbox and its
+        // completed proof are durable. It no longer needs a service owner then.
+        super::launcher_service::retire_relay_retirement_event(&self.attempt_id)
     }
 
     fn stage_terminal_response_with_store<F>(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV1,
+        response: &memcordon_core::WindowsLauncherResponseV3,
         store: &mut F,
     ) -> Result<(), String>
     where
@@ -624,12 +838,15 @@ impl WindowsAttemptRecordV1 {
             ));
         }
         self.terminal_response_json = Some(response_json.into());
+        let pre_outbox_lifecycle = self.lifecycle;
+        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::OutboxStaged;
         self.advance_terminalization(
             WindowsTerminalizationOwnerV1::LauncherWorker,
             WindowsTerminalizationCheckpointV1::OutboxStaged,
         )?;
         if let Err(primary) = store(self) {
             self.terminal_response_json = None;
+            self.lifecycle = pre_outbox_lifecycle;
             return Err(self.persist_terminalization_failure(
                 WindowsTerminalizationOwnerV1::LauncherWorker,
                 WindowsTerminalizationErrorStageV1::AtomicStore,
@@ -835,17 +1052,12 @@ impl WindowsAttemptRecordV1 {
 
     fn prepare_terminal_response(
         &self,
-        response: &memcordon_core::WindowsLauncherResponseV1,
+        response: &memcordon_core::WindowsLauncherResponseV3,
     ) -> Result<String, String> {
         if self.state != WindowsAttemptStateV1::Empty || self.terminal_response_json.is_some() {
             return Err("attempt is not ready for a create-once terminal outbox".to_owned());
         }
-        if !memcordon_core::windows_terminal_outbox_is_bound(
-            &self.attempt_id,
-            &self.request_sha256,
-            self.terminal_disposition,
-            response,
-        ) {
+        if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(self), response) {
             return Err(
                 "terminal outbox response is not bound and consistent for the attempt".to_owned(),
             );
@@ -862,7 +1074,7 @@ impl WindowsAttemptRecordV1 {
     #[cfg(test)]
     pub fn stage_terminal_response_for_test(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV1,
+        response: &memcordon_core::WindowsLauncherResponseV3,
     ) -> Result<(), String> {
         self.terminal_response_json = Some(self.prepare_terminal_response(response)?.into());
         self.advance_terminalization(
@@ -875,7 +1087,7 @@ impl WindowsAttemptRecordV1 {
     #[cfg(test)]
     pub fn stage_terminal_response_with_store_for_test<F>(
         &mut self,
-        response: &memcordon_core::WindowsLauncherResponseV1,
+        response: &memcordon_core::WindowsLauncherResponseV3,
         mut store: F,
     ) -> Result<(), String>
     where
@@ -888,19 +1100,30 @@ impl WindowsAttemptRecordV1 {
         if self.terminal_response_json.is_none() {
             return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
         }
+        if self.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
+            self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::AckCommitted;
+            self.store()?;
+        }
+        let retired = self.terminal_retired_receipt(&self.nonce)?;
+        stage_ack_tombstone(self, &retired)?;
         remove_guardian_receipt(&self.attempt_id)?;
         super::attempt_store::retire(&self.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
         if self.workload_admission.is_some() {
             super::policy_registry::retire_reference(&self.attempt_id)?;
         }
-        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())
+        fs::remove_file(record_path(&self.attempt_id)?).map_err(|error| error.to_string())?;
+        complete_ack_tombstone(&self.attempt_id, &self.request_sha256)?;
+        Ok(())
     }
 
     pub fn terminal_retired_receipt(
         &self,
         nonce: &str,
     ) -> Result<memcordon_core::WindowsTerminalRetiredV1, String> {
+        if nonce != self.nonce {
+            return Err("terminal ACK nonce does not match durable attempt".to_owned());
+        }
         let response_json = self
             .terminal_response_json
             .as_ref()
@@ -916,6 +1139,12 @@ impl WindowsAttemptRecordV1 {
             terminal_response_sha256: digest(response_json.as_bytes()),
             disposition,
         })
+    }
+
+    pub fn completed_terminal_retired_receipt(
+        &self,
+    ) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
+        complete_ack_tombstone(&self.attempt_id, &self.request_sha256)
     }
 
     pub fn mark_released(&mut self) -> Result<(), String> {
@@ -1093,6 +1322,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
     fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
     fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
     fs::create_dir_all(replay_root()).map_err(|error| error.to_string())?;
+    recover_staged_ack_tombstones().map_err(PackageCleanupError::Ambiguous)?;
     fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
     fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
     let mut ambiguous = fs::read_dir(quarantine_root())
@@ -1193,10 +1423,44 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                 continue;
             }
         };
+        if record.lifecycle == memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
+            record.acknowledge_terminal_response()?;
+            continue;
+        }
         if record.terminal_response_json.is_some() {
             ambiguous.push(format!(
                 "{} (unacknowledged durable terminal outbox)",
                 path.to_string_lossy()
+            ));
+            continue;
+        }
+        if record.authorization_unix_millis.is_some()
+            || record.resume_attempted
+            || record.target_released
+        {
+            let current_boot = boot_identity()?;
+            let progress = if record.boot_identity != current_boot {
+                stage_recovered_closure(&mut record, &current_boot, None)
+            } else if guardian_receipt_path(&record.attempt_id)?.exists() {
+                let guardian = read_guardian_receipt(&record.attempt_id)?;
+                if guardian_receipt_binds_record(&guardian, &record)?
+                    && frozen_manifest_owners_extinct(&record)?
+                {
+                    stage_recovered_closure(&mut record, &current_boot, Some(&guardian))
+                } else {
+                    Err("guardian or owner closure evidence is incomplete".to_owned())
+                }
+            } else {
+                Err("guardian native zero receipt is unavailable".to_owned())
+            };
+            ambiguous.push(format!(
+                "{} ({})",
+                path.to_string_lossy(),
+                match progress {
+                    Ok(()) =>
+                        "recovered terminal authority staged; exact caller ACK pending".to_owned(),
+                    Err(error) => format!("postauthorization authority retained: {error}"),
+                }
             ));
             continue;
         }
@@ -1241,7 +1505,11 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                 ))
             } else {
                 let receipt = read_guardian_receipt(&record.attempt_id)?;
-                if receipt.termination_requested && receipt.active_processes_zero {
+                if receipt.termination_requested
+                    && receipt.native_job_query_succeeded
+                    && receipt.active_processes_zero_observed
+                    && guardian_receipt_binds_record(&receipt, &record)?
+                {
                     record.cleanup_state.termination_requested = true;
                     record.cleanup_state.active_processes_zero = true;
                     record.cleanup_state.guardian_reaped = true;
@@ -1267,6 +1535,30 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
         }
         fs::remove_file(path).map_err(|error| error.to_string())?;
         remove_guardian_receipt(&record.attempt_id)?;
+    }
+    for entry in fs::read_dir(replay_root()).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let bytes = read_record_bounded_with_limit(
+            &entry.path(),
+            memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        let replay: ReplayRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if replay
+            .acknowledged
+            .as_ref()
+            .is_some_and(|tombstone| !tombstone.retirement_complete)
+        {
+            if let Err(error) =
+                recover_incomplete_ack_tombstone(&replay.attempt_id, &replay.request_sha256)
+            {
+                ambiguous.push(format!(
+                    "incomplete ACK tombstone {}: {error}",
+                    replay.attempt_id
+                ));
+            }
+        }
     }
     if ambiguous.is_empty() {
         Ok(())
@@ -1524,6 +1816,29 @@ fn validate_replay_directory(path: &Path) -> Result<(), String> {
             serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         validate_attempt_id(&replay.attempt_id)?;
         validate_attempt_id(&replay.request_sha256)?;
+        if let Some(tombstone) = replay.acknowledged.as_ref() {
+            if tombstone.schema_version != 1
+                || tombstone.provider_generation.is_empty()
+                || tombstone.launch_incarnation.is_empty()
+                || tombstone.original_boot_id.is_empty()
+                || validate_attempt_id(&tombstone.proof_sha256).is_err()
+                || validate_attempt_id(&tombstone.job_identity).is_err()
+                || validate_attempt_id(&tombstone.owner_manifest_sha256).is_err()
+                || validate_attempt_id(&tombstone.ledger_generation).is_err()
+                || tombstone.caller_process_identity.process_id == 0
+                || tombstone.caller_process_identity.creation_time_100ns == 0
+                || validate_attempt_id(&tombstone.caller_token_sha256).is_err()
+                || !tombstone.recovery_authorization.is_consistent()
+                || !tombstone.retired.is_consistent_for(
+                    &replay.attempt_id,
+                    &tombstone.retired.nonce,
+                    &replay.request_sha256,
+                    &tombstone.retired.terminal_response_sha256,
+                )
+            {
+                return Err("replay terminal ACK tombstone is not bound".to_owned());
+            }
+        }
         let expected_name = format!("{}.json", replay.attempt_id);
         if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
             return Err("replay ledger filename does not match its attempt id".to_owned());
@@ -1582,8 +1897,16 @@ pub struct AdmissionLease {
 }
 
 #[derive(Deserialize, Serialize)]
+enum AdmissionRecordFormat {
+    #[serde(rename = "memcordon.windows-admission-record")]
+    Native,
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AdmissionRecordV1 {
+    format: AdmissionRecordFormat,
+    revision: memcordon_core::workload_contract::ContractVersionOne,
     attempt_id: String,
     request_sha256: String,
     owner_process_identities: Vec<memcordon_core::WindowsProcessIdentityV1>,
@@ -1595,6 +1918,26 @@ struct AdmissionRecordV1 {
 struct ReplayRecordV1 {
     attempt_id: String,
     request_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acknowledged: Option<TerminalAckTombstoneV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalAckTombstoneV1 {
+    schema_version: u32,
+    retired: memcordon_core::WindowsTerminalRetiredV1,
+    provider_generation: String,
+    launch_incarnation: String,
+    original_boot_id: String,
+    proof_sha256: String,
+    job_identity: String,
+    owner_manifest_sha256: String,
+    ledger_generation: String,
+    retirement_complete: bool,
+    caller_process_identity: memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: String,
+    recovery_authorization: memcordon_core::WindowsRecoveryAuthorizationV1,
 }
 
 impl Drop for AdmissionLease {
@@ -1604,32 +1947,22 @@ impl Drop for AdmissionLease {
 }
 
 pub fn reserve_admission(attempt_id: &str, request_sha256: &str) -> Result<AdmissionLease, String> {
-    reserve_admission_record(attempt_id, request_sha256, None)
-}
-
-fn reserve_admission_record(
-    attempt_id: &str,
-    request_sha256: &str,
-    owner_process_identity: Option<memcordon_core::WindowsProcessIdentityV1>,
-) -> Result<AdmissionLease, String> {
     validate_attempt_id(attempt_id)?;
     validate_attempt_id(request_sha256)?;
-    if owner_process_identity.is_none() {
-        sweep_expired_diagnostics()?;
-    }
+    sweep_expired_diagnostics()?;
     let _budget = super::attempt_store::PublicationGuard::acquire(&digest(
         b"installation-attempt-storage-budget-v1",
     ))?;
-    if owner_process_identity.is_none() {
-        enforce_storage_reservation(Some(attempt_id), false)?;
-    }
+    enforce_storage_reservation(Some(attempt_id), false)?;
     fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
     let path = admissions_root().join(format!("{attempt_id}.json"));
     let mut bytes = serde_json::to_vec(&AdmissionRecordV1 {
+        format: AdmissionRecordFormat::Native,
+        revision: Default::default(),
         attempt_id: attempt_id.to_owned(),
         request_sha256: request_sha256.to_owned(),
-        workload_reservation: owner_process_identity.is_none(),
-        owner_process_identities: owner_process_identity.into_iter().collect(),
+        workload_reservation: true,
+        owner_process_identities: Vec::new(),
     })
     .map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -1759,6 +2092,7 @@ pub fn reserve_attempt(attempt_id: &str, request_sha256: &str) -> Result<(), Str
     let mut bytes = serde_json::to_vec(&ReplayRecordV1 {
         attempt_id: attempt_id.to_owned(),
         request_sha256: request_sha256.to_owned(),
+        acknowledged: None,
     })
     .map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -1774,6 +2108,721 @@ pub fn reserve_attempt(attempt_id: &str, request_sha256: &str) -> Result<(), Str
                 error.to_string()
             }
         })
+}
+
+fn replay_record(
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<(PathBuf, ReplayRecordV1), String> {
+    validate_attempt_id(attempt_id)?;
+    validate_attempt_id(request_sha256)?;
+    super::security::SecurityDescriptor::from_sddl(&super::security::replay_state_sddl()?)?
+        .verify_path(&replay_root())?;
+    let path = replay_root().join(format!("{attempt_id}.json"));
+    let staged = path.with_extension("json.new");
+    if staged.exists() {
+        let prior_bytes =
+            read_record_bounded_with_limit(&path, memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES)
+                .map_err(|error| error.to_string())?;
+        let prior: ReplayRecordV1 =
+            serde_json::from_slice(&prior_bytes).map_err(|error| error.to_string())?;
+        let staged_bytes = read_record_bounded_with_limit(
+            &staged,
+            memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        let next: ReplayRecordV1 =
+            serde_json::from_slice(&staged_bytes).map_err(|error| error.to_string())?;
+        if prior.attempt_id != attempt_id
+            || prior.request_sha256 != request_sha256
+            || next.attempt_id != attempt_id
+            || next.request_sha256 != request_sha256
+            || !match (&prior.acknowledged, &next.acknowledged) {
+                (None, Some(next)) => !next.retirement_complete,
+                (Some(prior), Some(next)) => {
+                    !prior.retirement_complete
+                        && next.retirement_complete
+                        && TerminalAckTombstoneV1 {
+                            retirement_complete: false,
+                            ..next.clone()
+                        } == *prior
+                }
+                _ => false,
+            }
+        {
+            return Err("staged ACK tombstone conflicts with replay ledger".to_owned());
+        }
+        replace_atomically(&staged, &path)?;
+    }
+    let bytes =
+        read_record_bounded_with_limit(&path, memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES)
+            .map_err(|error| error.to_string())?;
+    let replay: ReplayRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if replay.attempt_id != attempt_id || replay.request_sha256 != request_sha256 {
+        return Err("replay record is not bound to the acknowledged attempt".to_owned());
+    }
+    Ok((path, replay))
+}
+
+fn recover_staged_ack_tombstones() -> Result<(), String> {
+    for entry in fs::read_dir(replay_root()).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| "replay ledger filename is not UTF-8".to_owned())?;
+        let Some(attempt_id) = name.strip_suffix(".json.new") else {
+            continue;
+        };
+        validate_attempt_id(attempt_id)?;
+        let bytes = read_record_bounded_with_limit(
+            &entry.path(),
+            memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        let staged: ReplayRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if staged.attempt_id != attempt_id || staged.acknowledged.is_none() {
+            return Err("staged ACK tombstone lacks exact attempt binding".to_owned());
+        }
+        replay_record(attempt_id, &staged.request_sha256)?;
+    }
+    Ok(())
+}
+
+fn stage_ack_tombstone(
+    record: &WindowsAttemptRecordV1,
+    retired: &memcordon_core::WindowsTerminalRetiredV1,
+) -> Result<(), String> {
+    let proof = record
+        .retirement_proof
+        .as_ref()
+        .ok_or_else(|| "ACK tombstone requires checked retirement proof".to_owned())?;
+    let proof_sha256 = digest(&serde_json::to_vec(proof).map_err(|error| error.to_string())?);
+    let owner_manifest_sha256 = record
+        .owner_manifest
+        .as_ref()
+        .ok_or_else(|| "ACK tombstone requires frozen owner manifest".to_owned())?
+        .canonical_sha256()
+        .map_err(str::to_owned)?;
+    let ledger_generation = digest(
+        &serde_json::to_vec(&(
+            &record.attempt_id,
+            &record.provider_generation,
+            &record.launch_incarnation,
+            &proof_sha256,
+        ))
+        .map_err(|error| error.to_string())?,
+    );
+    let tombstone = TerminalAckTombstoneV1 {
+        schema_version: 1,
+        retired: retired.clone(),
+        provider_generation: record.provider_generation.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        original_boot_id: record.boot_identity.clone(),
+        proof_sha256,
+        job_identity: record.job_identity_sha256.clone(),
+        owner_manifest_sha256,
+        ledger_generation,
+        retirement_complete: false,
+        caller_process_identity: record.caller_process_identity.clone(),
+        caller_token_sha256: record.caller_token_sha256.clone(),
+        recovery_authorization: record
+            .recovery_authorization
+            .clone()
+            .ok_or_else(|| "ACK tombstone has no admitted recovery authorization".to_owned())?,
+    };
+    let (path, mut replay) = replay_record(&record.attempt_id, &record.request_sha256)?;
+    if let Some(existing) = replay.acknowledged.as_ref() {
+        if existing.retired != tombstone.retired
+            || existing.proof_sha256 != tombstone.proof_sha256
+            || existing.launch_incarnation != tombstone.launch_incarnation
+            || existing.caller_process_identity != tombstone.caller_process_identity
+            || existing.caller_token_sha256 != tombstone.caller_token_sha256
+            || existing.recovery_authorization != tombstone.recovery_authorization
+            || existing.job_identity != tombstone.job_identity
+            || existing.owner_manifest_sha256 != tombstone.owner_manifest_sha256
+            || existing.ledger_generation != tombstone.ledger_generation
+        {
+            return Err("ACK tombstone conflicts with prior terminal authority".to_owned());
+        }
+        return Ok(());
+    }
+    replay.acknowledged = Some(tombstone);
+    let mut bytes = serde_json::to_vec(&replay).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    let staged = path.with_extension("json.new");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|error| error.to_string())?;
+    use std::io::Write;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    replace_atomically(&staged, &path)?;
+    let (_, committed) = replay_record(&record.attempt_id, &record.request_sha256)?;
+    if committed.acknowledged.is_none() {
+        return Err("ACK tombstone readback is absent".to_owned());
+    }
+    Ok(())
+}
+
+fn complete_ack_tombstone(
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
+    if record_path(attempt_id)?.exists() || guardian_receipt_path(attempt_id)?.exists() {
+        return Err(
+            "ACK tombstone completion still has active record or guardian receipt".to_owned(),
+        );
+    }
+    let (path, mut replay) = replay_record(attempt_id, request_sha256)?;
+    let tombstone = replay
+        .acknowledged
+        .as_mut()
+        .ok_or_else(|| "ACK tombstone completion has no committed ACK".to_owned())?;
+    if !tombstone.retirement_complete {
+        tombstone.retirement_complete = true;
+        let mut bytes = serde_json::to_vec(&replay).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        let staged = path.with_extension("json.new");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|error| error.to_string())?;
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        replace_atomically(&staged, &path)?;
+    }
+    let (_, committed) = replay_record(attempt_id, request_sha256)?;
+    let tombstone = committed
+        .acknowledged
+        .ok_or_else(|| "completed ACK tombstone readback is absent".to_owned())?;
+    if !tombstone.retirement_complete {
+        return Err("ACK tombstone completion did not survive readback".to_owned());
+    }
+    let retired = memcordon_core::WindowsTerminalRetiredV2 {
+        schema_version: 2,
+        attempt_id: tombstone.retired.attempt_id,
+        nonce: tombstone.retired.nonce,
+        request_sha256: tombstone.retired.request_sha256,
+        terminal_response_sha256: tombstone.retired.terminal_response_sha256,
+        disposition: tombstone.retired.disposition,
+        provider_generation: tombstone.provider_generation,
+        original_boot_id: tombstone.original_boot_id,
+        launch_incarnation: tombstone.launch_incarnation,
+        job_identity: tombstone.job_identity,
+        owner_manifest_sha256: tombstone.owner_manifest_sha256,
+        retirement_proof_sha256: tombstone.proof_sha256,
+        ledger_generation: tombstone.ledger_generation,
+        completion: memcordon_core::WindowsRetirementLedgerCompletionV1::RetirementComplete,
+    };
+    if !retired.is_consistent_for(
+        attempt_id,
+        &retired.nonce,
+        request_sha256,
+        &retired.terminal_response_sha256,
+    ) {
+        return Err("completed ACK tombstone does not bind V2 retirement".to_owned());
+    }
+    Ok(retired)
+}
+
+fn recover_incomplete_ack_tombstone(
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
+    let (_, replay) = replay_record(attempt_id, request_sha256)?;
+    let tombstone = replay
+        .acknowledged
+        .ok_or_else(|| "terminal acknowledgment has no ACK tombstone".to_owned())?;
+    if !tombstone.retirement_complete {
+        if record_path(attempt_id)?.exists() {
+            return Err("ACK tombstone still has a durable attempt record".to_owned());
+        }
+        remove_guardian_receipt(attempt_id)?;
+        super::attempt_store::retire(attempt_id)?;
+        super::policy_registry::retire_reference(attempt_id)?;
+    }
+    complete_ack_tombstone(attempt_id, request_sha256)
+}
+
+pub fn acknowledged_terminal_from_tombstone(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+) -> Result<Option<memcordon_core::WindowsTerminalRetiredV2>, String> {
+    let (_, replay) = replay_record(attempt_id, request_sha256)?;
+    let Some(tombstone) = replay.acknowledged else {
+        return Ok(None);
+    };
+    if tombstone.schema_version != 1
+        || tombstone.caller_process_identity != *caller_process_identity
+        || tombstone.caller_token_sha256 != caller_token_sha256
+        || tombstone.retired.nonce != nonce
+        || !tombstone.retired.is_consistent_for(
+            attempt_id,
+            nonce,
+            request_sha256,
+            &tombstone.retired.terminal_response_sha256,
+        )
+    {
+        return Err("terminal ACK tombstone does not match authenticated replay caller".to_owned());
+    }
+    Ok(Some(recover_incomplete_ack_tombstone(
+        attempt_id,
+        request_sha256,
+    )?))
+}
+
+pub fn recover_attempt_for_caller(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller: &memcordon_core::WindowsRecoveryCallerEvidenceV1,
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
+    if !caller.is_consistent() || caller.current_boot_identity != boot_identity()? {
+        return Err("recovery caller does not match the trusted current boot".to_owned());
+    }
+    let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
+    let path = record_path(attempt_id)?;
+    match read_record_bounded(&path) {
+        Ok(bytes) => {
+            let mut record: WindowsAttemptRecordV1 =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            authenticate(&record, attempt_id)?;
+            if record.request_sha256 != request_sha256 || record.nonce != nonce {
+                return Err("recovery request differs from durable attempt binding".to_owned());
+            }
+            let authorization = record.recovery_authorization.as_ref().ok_or_else(|| {
+                "legacy attempt has no admitted recovery authorization".to_owned()
+            })?;
+            let same_boot = record.boot_identity == caller.current_boot_identity;
+            if !authorization.admits_recovery(
+                &caller.user_sid,
+                caller.logon_identity,
+                &caller.access_floor,
+                same_boot,
+            ) || (same_boot
+                && authorization.launch_token_binding_sha256 != caller.token_binding_sha256)
+            {
+                return Err("recovery caller does not meet admitted owner access floor".to_owned());
+            }
+            if record.terminal_response_json.is_none() && record.authorization_unix_millis.is_some()
+            {
+                if !same_boot {
+                    stage_recovered_closure(&mut record, &caller.current_boot_identity, None)?;
+                } else if guardian_receipt_path(attempt_id)?.exists() {
+                    let guardian = read_guardian_receipt(attempt_id)?;
+                    if guardian_receipt_binds_record(&guardian, &record)?
+                        && frozen_manifest_owners_extinct(&record)?
+                    {
+                        stage_recovered_closure(
+                            &mut record,
+                            &caller.current_boot_identity,
+                            Some(&guardian),
+                        )?;
+                    }
+                }
+            }
+            let Some(outbox) = record.terminal_response_json.as_deref() else {
+                return Ok(None);
+            };
+            let response: memcordon_core::WindowsLauncherResponseV3 =
+                serde_json::from_str(outbox).map_err(|error| error.to_string())?;
+            if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(&record), &response)
+            {
+                return Err("recovery outbox is not bound to durable attempt".to_owned());
+            }
+            Ok(Some(response))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let (_, replay) = replay_record(attempt_id, request_sha256)?;
+            let Some(tombstone) = replay.acknowledged else {
+                return Ok(None);
+            };
+            if tombstone.retired.nonce != nonce {
+                return Err("recovery tombstone nonce differs".to_owned());
+            }
+            let same_boot = tombstone.original_boot_id == caller.current_boot_identity;
+            if !tombstone.recovery_authorization.admits_recovery(
+                &caller.user_sid,
+                caller.logon_identity,
+                &caller.access_floor,
+                same_boot,
+            ) || (same_boot
+                && tombstone.recovery_authorization.launch_token_binding_sha256
+                    != caller.token_binding_sha256)
+            {
+                return Err("recovery caller does not meet tombstone owner access floor".to_owned());
+            }
+            let retired = recover_incomplete_ack_tombstone(attempt_id, request_sha256)?;
+            Ok(Some(
+                memcordon_core::WindowsLauncherResponseV3::TerminalRetiredV2(retired),
+            ))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<bool, String> {
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or_else(|| "live recovery has no frozen owner manifest".to_owned())?;
+    for entry in &manifest.entries {
+        if !entry.present
+            || entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::PolicyReference
+        {
+            continue;
+        }
+        let Some(identity) = entry.process_identity.as_ref() else {
+            return Ok(false);
+        };
+        if process_identity_is_live(identity.clone())? {
+            if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay
+                && identity == &record.caller_process_identity
+                && super::launcher_service::frontend_relay_retired_for_recovery(
+                    &record.attempt_id,
+                    &record.nonce,
+                    &record.request_sha256,
+                    &record.caller_process_identity,
+                    &relay_retirement_event_name(record),
+                )?
+            {
+                continue;
+            }
+            // Several native handles belong to this attempt's launcher worker,
+            // rather than to every thread in the still-running service process.
+            // The exact thread must have exited and its active Job registration
+            // must be absent before its stack and registry handles are closed.
+            if matches!(
+                entry.role,
+                memcordon_core::WindowsCapabilityOwnerRoleV1::LauncherJob
+                    | memcordon_core::WindowsCapabilityOwnerRoleV1::ActiveRegistryDuplicate
+                    | memcordon_core::WindowsCapabilityOwnerRoleV1::ControlRelay
+                    | memcordon_core::WindowsCapabilityOwnerRoleV1::LaunchGate
+                    | memcordon_core::WindowsCapabilityOwnerRoleV1::DesktopBootstrapJob
+            ) && record.worker_identity.as_ref() == Some(identity)
+                && record
+                    .worker_thread_identity
+                    .map(worker_thread_is_extinct)
+                    .transpose()?
+                    .unwrap_or(false)
+                && super::launcher_service::attempt_job_registration_is_absent(&record.attempt_id)?
+            {
+                continue;
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn worker_thread_is_extinct(expected: WindowsWorkerThreadIdentityV1) -> Result<bool, String> {
+    if expected.thread_id == 0 || expected.creation_time_100ns == 0 {
+        return Err("worker thread identity is invalid".to_owned());
+    }
+    // SAFETY: authenticated durable identity supplies the id; only query and
+    // synchronization rights are requested.
+    let raw = unsafe {
+        OpenThread(
+            THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+            0,
+            expected.thread_id,
+        )
+    };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        return if error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            == Some(ERROR_INVALID_PARAMETER)
+        {
+            Ok(true)
+        } else {
+            Err(error.to_string())
+        };
+    }
+    let thread = OwnedHandle::new(raw)?;
+    if thread_creation_time(thread.raw())? != expected.creation_time_100ns {
+        return Ok(true);
+    }
+    // SAFETY: this is the same live thread object whose creation time was
+    // compared above; a signaled thread has completed all stack destructors.
+    match unsafe { WaitForSingleObject(thread.raw(), 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_FAILED => Err(io::Error::last_os_error().to_string()),
+        _ => Ok(false),
+    }
+}
+
+fn stage_recovered_closure(
+    record: &mut WindowsAttemptRecordV1,
+    current_boot_identity: &str,
+    guardian_receipt: Option<&memcordon_core::WindowsGuardianReceiptV2>,
+) -> Result<(), String> {
+    if current_boot_identity.is_empty()
+        || (current_boot_identity == record.boot_identity) != guardian_receipt.is_some()
+        || record.authorization_unix_millis.is_none()
+        || record.target_identity.is_none()
+        || record.owner_manifest.is_none()
+        || record.terminal_response_json.is_some()
+    {
+        return Err("recovery lacks exact authorized closure preconditions".to_owned());
+    }
+    let manifest_sha256 = record
+        .owner_manifest
+        .as_ref()
+        .expect("checked frozen manifest")
+        .canonical_sha256()
+        .map_err(str::to_owned)?;
+    let original = if matches!(
+        record.causal_diagnostics.original,
+        memcordon_core::OriginalFailureV1::Unavailable {
+            reason: memcordon_core::OriginalUnavailableReasonV1::NoEarlierErrorObserved,
+        }
+    ) {
+        memcordon_core::OriginalFailureV1::Unavailable {
+            reason: memcordon_core::OriginalUnavailableReasonV1::WorkerLostBeforeObservation,
+        }
+    } else {
+        record.causal_diagnostics.original.clone()
+    };
+    let mut journal = record.causal_diagnostics.clone();
+    journal.original = original.clone();
+    let binding = super::package::installed_public_provider_binding()?;
+    if binding.generation.as_str() != record.provider_generation {
+        return Err("prior-boot recovery provider generation differs".to_owned());
+    }
+    let provider_failure = memcordon_core::ProviderFailureDiagnosticV1::from_journal(
+        binding,
+        &record.attempt_id,
+        &record.request_sha256,
+        &journal,
+    )
+    .map_err(str::to_owned)?;
+    let mut process_observation = record
+        .terminal_seed
+        .as_ref()
+        .map(|seed| seed.process_observation.clone())
+        .unwrap_or_else(|| {
+            memcordon_core::WindowsProcessObservationV2::unavailable(
+                memcordon_core::ProcessObservationUnavailableReasonV1::WorkerLostBeforeFreeze,
+            )
+        });
+    if process_observation.root_identity.is_none() {
+        process_observation.root_identity = record.target_identity.clone();
+    }
+    let guardian_recovery = guardian_receipt.is_some();
+    let proof = memcordon_core::WindowsRetirementProofV2 {
+        schema_version: 2,
+        source: if guardian_recovery {
+            memcordon_core::WindowsRetirementProofSourceV2::GuardianRecovery
+        } else {
+            memcordon_core::WindowsRetirementProofSourceV2::PriorBoot
+        },
+        attempt_id: record.attempt_id.clone(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        provider_generation: record.provider_generation.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        original_boot_id: record.boot_identity.clone(),
+        job_identity: record.job_identity_sha256.clone(),
+        owner_manifest_sha256: manifest_sha256,
+        // Guardian Job-zero proves extinction, not an identity-matched direct
+        // target wait. Keep the historical completion observation absent.
+        target_completion_observed: false,
+        native_job_empty_observed: guardian_recovery,
+        relay_closure_observed: guardian_recovery,
+        guardian_completion_observed: guardian_recovery,
+        owner_capabilities_closed: true,
+        launch_gate_closed: true,
+        policy_reference_bound: record.workload_admission.is_none()
+            || record.workload_checkpoint.is_some(),
+        guardian_receipt_sha256: guardian_receipt.map(|receipt| receipt.integrity_sha256.clone()),
+        current_boot_id: (!guardian_recovery).then(|| current_boot_identity.to_owned()),
+    };
+    let restart_safety = memcordon_core::RestartSafetyProof {
+        direct_child_reaped: false,
+        workload_empty: Some(true),
+        helpers_reaped: false,
+        containment_removed: true,
+        containment_incapable_of_live_members: true,
+        sealed_boundary_retired: false,
+        errors: Vec::new(),
+    };
+    let receipt = memcordon_core::WindowsTerminalReceiptV2 {
+        policy_enforcement: None,
+        schema_version: 2,
+        attempt_id: record.attempt_id.clone(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        payload: memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+            primary_failure: original,
+            target_creation_observed: true,
+            resume_attempted: record.resume_attempted,
+        },
+        process_observation,
+        cleanup_process_creation: None,
+        restart_safety: restart_safety.clone(),
+        retirement_proof: proof,
+    };
+    receipt.validate_for_attempt().map_err(str::to_owned)?;
+    let rejection = memcordon_core::WindowsProviderRejectionV2 {
+        schema_version: 2,
+        workload_admission: None,
+        provider_failure: Some(provider_failure.clone()),
+        code: "MCSEALED-WINDOWS-OWNER-LOST".to_owned(),
+        phase: memcordon_core::BoundarySetupPhase::Retirement,
+        detail: if guardian_recovery {
+            "original worker exited before authenticated terminal delivery; guardian proved Job zero and owner processes exited".to_owned()
+        } else {
+            "prior boot ended before authenticated terminal delivery; execution outcome unavailable"
+                .to_owned()
+        },
+        os_code: None,
+        loader_qualification: None,
+        target_created: true,
+        target_released: record.target_released,
+        cleanup_attempted: true,
+        restart_safety,
+        disposition:
+            memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+                receipt: Box::new(receipt.clone()),
+            },
+    };
+    if !rejection.is_consistent() {
+        return Err("recovered closure rejection lacks canonical original failure".to_owned());
+    }
+    if record.state != WindowsAttemptStateV1::Empty {
+        if record.state != WindowsAttemptStateV1::Terminating {
+            record.transition(WindowsAttemptStateV1::Terminating)?;
+            record.store()?;
+        }
+        record.transition(WindowsAttemptStateV1::Empty)?;
+    }
+    record.causal_diagnostics = journal;
+    record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
+    record.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::Posttarget);
+    record.store()?;
+    match (&record.terminal_seed, &record.retirement_proof) {
+        (None, None) => record.stage_terminal_proof(&receipt, Some(provider_failure))?,
+        (Some(seed), None)
+            if seed.process_observation == receipt.process_observation
+                && seed.attempt_id == record.attempt_id
+                && seed.nonce == record.nonce
+                && seed.request_sha256 == record.request_sha256 =>
+        {
+            // Recovery completes proof without rewriting the pre-close seed.
+            // In particular, owner loss after freeze cannot rewrite a genuine
+            // earlier primary failure or turn it into observed exit data.
+            record.retirement_proof = Some(receipt.retirement_proof.clone());
+            record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::ProofReady;
+            record.store()?;
+        }
+        (Some(_), Some(proof)) if proof == &receipt.retirement_proof => {}
+        _ => return Err("recovered closure proof conflicts with durable terminal seed".to_owned()),
+    }
+    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
+        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        attempt_id: record.attempt_id.clone(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        rejection,
+    };
+    record.stage_terminal_response(&response)
+}
+
+pub fn recovery_inventory(
+    challenge: &str,
+) -> Result<memcordon_core::WindowsRecoveryInventoryV1, String> {
+    if challenge.is_empty() || challenge.len() > 256 {
+        return Err("recovery inventory challenge is invalid".to_owned());
+    }
+    let mut inventory = memcordon_core::WindowsRecoveryInventoryV1 {
+        schema_version: 1,
+        challenge: challenge.to_owned(),
+        provider_generation: provider_generation(),
+        current_boot_identity: boot_identity()?,
+        executing: 0,
+        incomplete_proof: 0,
+        unacknowledged_outboxes: 0,
+        ack_retirement_in_progress: 0,
+        completed_tombstones: 0,
+        active_admissions: 0,
+        quarantined: 0,
+    };
+    for entry in fs::read_dir(attempts_root()).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let attempt_id = record_attempt_id(&path)?;
+        let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
+        let record: WindowsAttemptRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        authenticate(&record, &attempt_id)?;
+        let counter =
+            if record.lifecycle == memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
+                &mut inventory.ack_retirement_in_progress
+            } else if record.terminal_response_json.is_some() {
+                &mut inventory.unacknowledged_outboxes
+            } else if record.authorization_unix_millis.is_some() || record.resume_attempted {
+                &mut inventory.incomplete_proof
+            } else {
+                &mut inventory.executing
+            };
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| "recovery inventory counter overflow".to_owned())?;
+    }
+    for entry in fs::read_dir(replay_root()).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let bytes =
+            read_record_bounded_with_limit(&path, memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES)
+                .map_err(|error| error.to_string())?;
+        let replay: ReplayRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if let Some(tombstone) = replay.acknowledged.as_ref() {
+            // An AckCommitted attempt record and its staged tombstone describe
+            // one retirement, not two outstanding authorities.
+            if !tombstone.retirement_complete && record_path(&replay.attempt_id)?.exists() {
+                continue;
+            }
+            let counter = if tombstone.retirement_complete {
+                &mut inventory.completed_tombstones
+            } else {
+                &mut inventory.ack_retirement_in_progress
+            };
+            *counter = counter
+                .checked_add(1)
+                .ok_or_else(|| "recovery tombstone count overflow".to_owned())?;
+        }
+    }
+    for entry in fs::read_dir(admissions_root()).map_err(|error| error.to_string())? {
+        entry.map_err(|error| error.to_string())?;
+        inventory.active_admissions = inventory
+            .active_admissions
+            .checked_add(1)
+            .ok_or_else(|| "recovery admission count overflow".to_owned())?;
+    }
+    for entry in fs::read_dir(quarantine_root()).map_err(|error| error.to_string())? {
+        entry.map_err(|error| error.to_string())?;
+        inventory.quarantined = inventory
+            .quarantined
+            .checked_add(1)
+            .ok_or_else(|| "recovery quarantine count overflow".to_owned())?;
+    }
+    if !inventory.is_consistent() {
+        return Err("recovery inventory is inconsistent".to_owned());
+    }
+    Ok(inventory)
 }
 
 pub(super) fn reserve_writer_admission(
@@ -1807,6 +2856,8 @@ pub(super) fn reserve_writer_admission(
         windows_sys::Win32::System::Threading::GetCurrentProcess()
     })?;
     let record = AdmissionRecordV1 {
+        format: AdmissionRecordFormat::Native,
+        revision: Default::default(),
         attempt_id: attempt_id.to_owned(),
         request_sha256: request_sha256.to_owned(),
         owner_process_identities: vec![owner],
@@ -1890,78 +2941,6 @@ pub fn retire_admission(attempt_id: &str) -> Result<(), String> {
     }
 }
 
-pub fn reserve_qualification_admission_for(
-    scope: &str,
-    owner: memcordon_core::WindowsProcessIdentityV1,
-) -> Result<AdmissionLease, String> {
-    let identity = qualification_admission_identity(scope);
-    reserve_admission_record(&identity, &identity, Some(owner))
-}
-
-pub fn qualification_in_progress() -> bool {
-    ["direct", "package"]
-        .iter()
-        .map(|scope| {
-            admissions_root().join(format!("{}.json", qualification_admission_identity(scope)))
-        })
-        .any(|path| path.is_file())
-}
-
-pub fn qualification_allows(
-    process_identity: &memcordon_core::WindowsProcessIdentityV1,
-) -> Result<bool, String> {
-    for scope in ["direct", "package"] {
-        let identity = qualification_admission_identity(scope);
-        let path = admissions_root().join(format!("{identity}.json"));
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        let admission: AdmissionRecordV1 =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        if admission.attempt_id != identity
-            || admission.request_sha256 != identity
-            || !admission
-                .owner_process_identities
-                .contains(process_identity)
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-pub fn authorize_qualification_child_for(
-    scope: &str,
-    owner: &memcordon_core::WindowsProcessIdentityV1,
-    child: memcordon_core::WindowsProcessIdentityV1,
-) -> Result<(), String> {
-    let identity = qualification_admission_identity(scope);
-    let path = admissions_root().join(format!("{identity}.json"));
-    let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
-    let mut admission: AdmissionRecordV1 =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if admission.attempt_id != identity
-        || admission.request_sha256 != identity
-        || !admission.owner_process_identities.contains(owner)
-    {
-        return Err("qualification admission is not owned by the authenticated client".to_owned());
-    }
-    if !admission.owner_process_identities.contains(&child) {
-        admission.owner_process_identities.push(child);
-    }
-    let mut bytes = serde_json::to_vec_pretty(&admission).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    let staged = path.with_extension("json.new");
-    fs::write(&staged, bytes).map_err(|error| error.to_string())?;
-    replace_atomically(&staged, &path)
-}
-
-fn qualification_admission_identity(scope: &str) -> String {
-    digest(format!("memcordon-windows-qualification-v1:{scope}").as_bytes())
-}
-
 pub fn rejection_evidence(
     attempt_id: &str,
     code: &str,
@@ -1969,8 +2948,8 @@ pub fn rejection_evidence(
     phase_override: Option<memcordon_core::BoundarySetupPhase>,
     os_code: Option<i32>,
     loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
-    terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV1>>,
-) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
+    terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV2>>,
+) -> Result<memcordon_core::WindowsProviderRejectionV2, String> {
     super::attempt_store::wait_for_pending(attempt_id)?;
     let detail = bounded_rejection_detail(detail);
     let path = match record_path(attempt_id) {
@@ -2011,6 +2990,8 @@ pub fn rejection_evidence(
         && record.cleanup_state.active_processes_zero
         && record.cleanup_state.guardian_reaped
         && !record.cleanup_state.final_handles_closed
+        && record.authorization_unix_millis.is_none()
+        && !record.resume_attempted
         && !live
     {
         record.complete_rejection_cleanup()?;
@@ -2048,10 +3029,10 @@ pub fn rejection_evidence(
             memcordon_core::BoundarySetupPhase::Retirement
         }
     });
-    Ok(memcordon_core::ProviderRejectionEvidence {
+    Ok(memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: provider_projection(Some(&record)).0,
         workload_admission: None,
-        schema_version: 1,
+        schema_version: 2,
         code: code.to_owned(),
         phase,
         detail,
@@ -2061,9 +3042,33 @@ pub fn rejection_evidence(
         target_released: record.target_released || record.resume_attempted,
         cleanup_attempted,
         restart_safety,
-        terminal_ack_required: record.terminal_disposition.is_some(),
-        terminal_receipt,
+        disposition: match terminal_receipt {
+            Some(receipt) => {
+                memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+                    receipt,
+                }
+            }
+            None => memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+                terminal_ack_required: record.terminal_disposition.is_some(),
+            },
+        },
     })
+}
+
+pub fn attempt_requires_authoritative_terminal(attempt_id: &str) -> Result<bool, String> {
+    let path = record_path(attempt_id)?;
+    let bytes = match read_record_bounded(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    Ok(record.authorization_unix_millis.is_some()
+        || record.resume_attempted
+        || record.target_released
+        || record.terminal_disposition == Some(WindowsAttemptTerminalDispositionV1::Posttarget))
 }
 
 fn posttarget_rejection(
@@ -2071,12 +3076,12 @@ fn posttarget_rejection(
     detail: String,
     phase: Option<memcordon_core::BoundarySetupPhase>,
     os_code: Option<i32>,
-    terminal: Box<memcordon_core::WindowsTerminalReceiptV1>,
-) -> memcordon_core::ProviderRejectionEvidence {
-    memcordon_core::ProviderRejectionEvidence {
+    terminal: Box<memcordon_core::WindowsTerminalReceiptV2>,
+) -> memcordon_core::WindowsProviderRejectionV2 {
+    memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: None,
         workload_admission: None,
-        schema_version: 1,
+        schema_version: 2,
         code: code.to_owned(),
         phase: phase.unwrap_or(memcordon_core::BoundarySetupPhase::Retirement),
         detail: bounded_rejection_detail(detail),
@@ -2086,14 +3091,16 @@ fn posttarget_rejection(
         target_released: true,
         cleanup_attempted: true,
         restart_safety: terminal.restart_safety.clone(),
-        terminal_ack_required: true,
-        terminal_receipt: Some(terminal),
+        disposition:
+            memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
+                receipt: terminal,
+            },
     }
 }
 
 pub fn stage_terminal_response(
     attempt_id: &str,
-    response: &memcordon_core::WindowsLauncherResponseV1,
+    response: &memcordon_core::WindowsLauncherResponseV3,
 ) -> Result<bool, String> {
     let path = record_path(attempt_id)?;
     let bytes = match read_record_bounded(&path) {
@@ -2109,11 +3116,11 @@ pub fn stage_terminal_response(
 }
 
 pub struct LeasedTerminalResponse {
-    response: Option<memcordon_core::WindowsLauncherResponseV1>,
+    response: Option<memcordon_core::WindowsLauncherResponseV3>,
     _reader: RecordReaderReservation,
 }
 impl std::ops::Deref for LeasedTerminalResponse {
-    type Target = memcordon_core::WindowsLauncherResponseV1;
+    type Target = memcordon_core::WindowsLauncherResponseV3;
     fn deref(&self) -> &Self::Target {
         self.response
             .as_ref()
@@ -2137,7 +3144,7 @@ impl LeasedTerminalResponse {
         attempt_id: &str,
         nonce: &str,
         request_sha256: &str,
-    ) -> Result<memcordon_core::WindowsTerminalRetiredV1, String> {
+    ) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
         acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
     }
 }
@@ -2170,18 +3177,18 @@ pub fn pending_terminal_response(
     let Some(response_json) = record.terminal_response_json.as_ref() else {
         return Ok(None);
     };
-    let mut response: memcordon_core::WindowsLauncherResponseV1 =
+    let mut response: memcordon_core::WindowsLauncherResponseV3 =
         serde_json::from_str(response_json).map_err(|error| error.to_string())?;
-    if let memcordon_core::WindowsLauncherResponseV1::Reject { rejection, .. } = &mut response {
+    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
         rejection.provider_failure = provider_projection(Some(&record)).0;
     }
     let binding_matches = match &response {
-        memcordon_core::WindowsLauncherResponseV1::Terminal(receipt) => {
+        memcordon_core::WindowsLauncherResponseV3::Terminal(receipt) => {
             receipt.attempt_id == attempt_id
                 && receipt.nonce == nonce
                 && receipt.request_sha256 == request_sha256
         }
-        memcordon_core::WindowsLauncherResponseV1::Reject {
+        memcordon_core::WindowsLauncherResponseV3::Reject {
             attempt_id: response_attempt_id,
             nonce: response_nonce,
             request_sha256: response_request_sha256,
@@ -2191,7 +3198,7 @@ pub fn pending_terminal_response(
             response_attempt_id == attempt_id
                 && response_nonce == nonce
                 && response_request_sha256 == request_sha256
-                && rejection.terminal_ack_required
+                && rejection.terminal_ack_required()
         }
         _ => false,
     };
@@ -2211,7 +3218,7 @@ pub fn replay_unavailable_evidence(
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
     caller_token_sha256: &str,
-) -> Result<memcordon_core::WindowsAttemptRetainedV1, String> {
+) -> Result<memcordon_core::WindowsAttemptRetainedV2, String> {
     let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
     let path = record_path(attempt_id)?;
     let record = match read_record_bounded(&path) {
@@ -2240,33 +3247,155 @@ pub fn replay_unavailable_evidence(
             && record.cleanup_state.final_handles_closed
     });
     let (provider_failure, diagnostic_availability) = provider_projection(record.as_ref());
-    Ok(memcordon_core::WindowsAttemptRetainedV1 {
-        schema_version: 2,
-        causal_diagnostics: record.as_ref().map_or_else(
-            memcordon_core::WindowsCausalDiagnosticsV1::default,
-            exportable_journal,
-        ),
-        provider_failure,
-        diagnostic_availability,
-        attempt_id: attempt_id.to_owned(),
-        nonce: nonce.to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        relay_phase,
-        durable_state: record.as_ref().map(|record| record.state),
-        terminal_disposition: record
-            .as_ref()
-            .and_then(|record| record.terminal_disposition),
-        cleanup_complete,
-        terminal_replay_available: false,
-        authority_retained: true,
-        primary_detail: "authenticated durable terminal response is unavailable".to_owned(),
-        secondary_failures: Vec::new(),
-    })
+    Ok(retained_v2(
+        memcordon_core::WindowsAttemptRetainedV1 {
+            schema_version: 2,
+            causal_diagnostics: record.as_ref().map_or_else(
+                memcordon_core::WindowsCausalDiagnosticsV1::default,
+                exportable_journal,
+            ),
+            provider_failure,
+            diagnostic_availability,
+            attempt_id: attempt_id.to_owned(),
+            nonce: nonce.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            relay_phase,
+            durable_state: record.as_ref().map(|record| record.state),
+            terminal_disposition: record
+                .as_ref()
+                .and_then(|record| record.terminal_disposition),
+            cleanup_complete,
+            terminal_replay_available: false,
+            authority_retained: true,
+            primary_detail: "authenticated durable terminal response is unavailable".to_owned(),
+            secondary_failures: Vec::new(),
+        },
+        record.as_ref(),
+        memcordon_core::WindowsRetainedRecordUnavailableReasonV1::ReadFailure,
+    ))
 }
 
 pub enum ReplayUnstagedEvidence {
-    Pending(memcordon_core::WindowsReplayPendingV1),
-    Retained(memcordon_core::WindowsAttemptRetainedV1),
+    Pending(memcordon_core::WindowsReplayPendingV2),
+    Retained(memcordon_core::WindowsAttemptRetainedV2),
+}
+
+fn missing_retirement_proofs(
+    record: Option<&WindowsAttemptRecordV1>,
+) -> Vec<memcordon_core::WindowsMissingRetirementProofV1> {
+    use memcordon_core::WindowsMissingRetirementProofV1 as Missing;
+    let Some(record) = record else {
+        return vec![Missing::OwnerManifest];
+    };
+    let mut missing = Vec::new();
+    if record.terminal_seed.is_none() {
+        missing.push(Missing::TerminalSeed);
+    }
+    if !record.cleanup_state.active_processes_zero {
+        missing.push(Missing::NativeJobEmpty);
+    }
+    if !record.cleanup_state.guardian_reaped {
+        missing.push(Missing::GuardianReceipt);
+    }
+    if !record.cleanup_state.final_handles_closed {
+        missing.push(Missing::OwnerCapabilityClosure);
+    }
+    if record.recovery_authorization.is_none() {
+        missing.push(Missing::RecoveryAuthorization);
+    }
+    if record.owner_manifest.is_none() {
+        missing.push(Missing::OwnerManifest);
+    }
+    if record.terminal_response_json.is_none() {
+        missing.push(Missing::DurableOutbox);
+    }
+    if record.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::RetirementComplete {
+        missing.push(Missing::Ack);
+    }
+    missing
+}
+
+fn retained_v2(
+    old: memcordon_core::WindowsAttemptRetainedV1,
+    record: Option<&WindowsAttemptRecordV1>,
+    unavailable_reason: memcordon_core::WindowsRetainedRecordUnavailableReasonV1,
+) -> memcordon_core::WindowsAttemptRetainedV2 {
+    let binding = record.map_or(
+        memcordon_core::WindowsRetainedRecordBindingV1::Unavailable {
+            reason: unavailable_reason,
+        },
+        |record| memcordon_core::WindowsRetainedRecordBindingV1::Bound {
+            provider_generation: record.provider_generation.clone(),
+            launch_incarnation: record.launch_incarnation.clone(),
+            boot_identity: record.boot_identity.clone(),
+            job_identity: record.job_identity_sha256.clone(),
+            owner_manifest_sha256: record.owner_manifest.as_ref().map(|manifest| {
+                manifest
+                    .canonical_sha256()
+                    .expect("authenticated manifest hashes")
+            }),
+        },
+    );
+    memcordon_core::WindowsAttemptRetainedV2 {
+        schema_version: 3,
+        attempt_id: old.attempt_id,
+        nonce: old.nonce,
+        request_sha256: old.request_sha256,
+        record_binding: binding,
+        relay_phase: old.relay_phase,
+        durable_state: old.durable_state,
+        terminal_disposition: old.terminal_disposition,
+        checkpoint: record.map_or(
+            memcordon_core::WindowsTerminalLifecycleV1::Retained,
+            |record| record.lifecycle,
+        ),
+        missing_proofs: missing_retirement_proofs(record),
+        cleanup_complete: old.cleanup_complete,
+        terminal_replay_available: old.terminal_replay_available,
+        authority_retained: old.authority_retained,
+        primary_detail: old.primary_detail,
+        secondary_failures: old.secondary_failures,
+        causal_diagnostics: old.causal_diagnostics,
+        provider_failure: old.provider_failure,
+        diagnostic_availability: old.diagnostic_availability,
+    }
+}
+
+fn pending_v2(
+    old: memcordon_core::WindowsReplayPendingV1,
+    record: &WindowsAttemptRecordV1,
+) -> memcordon_core::WindowsReplayPendingV2 {
+    memcordon_core::WindowsReplayPendingV2 {
+        schema_version: 4,
+        attempt_id: old.attempt_id,
+        nonce: old.nonce,
+        request_sha256: old.request_sha256,
+        provider_generation: record.provider_generation.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        boot_identity: record.boot_identity.clone(),
+        job_identity: record.job_identity_sha256.clone(),
+        owner_manifest_sha256: record.owner_manifest.as_ref().map(|manifest| {
+            manifest
+                .canonical_sha256()
+                .expect("authenticated manifest hashes")
+        }),
+        relay_phase: old.relay_phase,
+        durable_state: old.durable_state,
+        terminal_disposition: old.terminal_disposition,
+        checkpoint: record.lifecycle,
+        missing_proofs: missing_retirement_proofs(Some(record)),
+        authorization_present: old.authorization_present,
+        resume_attempted: old.resume_attempted,
+        target_released: old.target_released,
+        cleanup_state: old.cleanup_state,
+        cleanup_complete: old.cleanup_complete,
+        outbox_stage: old.outbox_stage,
+        terminalization: old.terminalization,
+        detail: old.detail,
+        causal_diagnostics: old.causal_diagnostics,
+        provider_failure: old.provider_failure,
+        diagnostic_availability: old.diagnostic_availability,
+    }
 }
 
 fn render_terminalization_error(error: &WindowsTerminalizationErrorV1) -> String {
@@ -2306,28 +3435,32 @@ fn classify_replay_unstaged_evidence(
                 )
             },
         );
-        return ReplayUnstagedEvidence::Retained(memcordon_core::WindowsAttemptRetainedV1 {
-            schema_version: 2,
-            causal_diagnostics: exportable_journal(record),
-            provider_failure,
-            diagnostic_availability,
-            attempt_id: record.attempt_id.clone(),
-            nonce: nonce.to_owned(),
-            request_sha256: record.request_sha256.clone(),
-            relay_phase,
-            durable_state: Some(record.state),
-            terminal_disposition: record.terminal_disposition,
-            cleanup_complete,
-            terminal_replay_available: false,
-            authority_retained: true,
-            primary_detail,
-            secondary_failures: record
-                .terminalization
-                .secondary_errors
-                .iter()
-                .map(render_terminalization_error)
-                .collect(),
-        });
+        return ReplayUnstagedEvidence::Retained(retained_v2(
+            memcordon_core::WindowsAttemptRetainedV1 {
+                schema_version: 2,
+                causal_diagnostics: exportable_journal(record),
+                provider_failure,
+                diagnostic_availability,
+                attempt_id: record.attempt_id.clone(),
+                nonce: nonce.to_owned(),
+                request_sha256: record.request_sha256.clone(),
+                relay_phase,
+                durable_state: Some(record.state),
+                terminal_disposition: record.terminal_disposition,
+                cleanup_complete,
+                terminal_replay_available: false,
+                authority_retained: true,
+                primary_detail,
+                secondary_failures: record
+                    .terminalization
+                    .secondary_errors
+                    .iter()
+                    .map(render_terminalization_error)
+                    .collect(),
+            },
+            Some(record),
+            memcordon_core::WindowsRetainedRecordUnavailableReasonV1::ReadFailure,
+        ));
     }
     let outbox_stage = match record.terminalization.checkpoint {
         WindowsTerminalizationCheckpointV1::OutboxStaging => {
@@ -2351,31 +3484,34 @@ fn classify_replay_unstaged_evidence(
             )
         },
     );
-    ReplayUnstagedEvidence::Pending(memcordon_core::WindowsReplayPendingV1 {
-        schema_version: 3,
-        causal_diagnostics: exportable_journal(record),
-        provider_failure,
-        diagnostic_availability,
-        attempt_id: record.attempt_id.clone(),
-        nonce: nonce.to_owned(),
-        request_sha256: record.request_sha256.clone(),
-        relay_phase,
-        durable_state: record.state,
-        terminal_disposition: record.terminal_disposition,
-        authorization_present: record.authorization_unix_millis.is_some(),
-        resume_attempted: record.resume_attempted,
-        target_released: record.target_released,
-        cleanup_state: memcordon_core::WindowsDurableCleanupStateV1 {
-            termination_requested: record.cleanup_state.termination_requested,
-            active_processes_zero: record.cleanup_state.active_processes_zero,
-            guardian_reaped: record.cleanup_state.guardian_reaped,
-            final_handles_closed: record.cleanup_state.final_handles_closed,
+    ReplayUnstagedEvidence::Pending(pending_v2(
+        memcordon_core::WindowsReplayPendingV1 {
+            schema_version: 3,
+            causal_diagnostics: exportable_journal(record),
+            provider_failure,
+            diagnostic_availability,
+            attempt_id: record.attempt_id.clone(),
+            nonce: nonce.to_owned(),
+            request_sha256: record.request_sha256.clone(),
+            relay_phase,
+            durable_state: record.state,
+            terminal_disposition: record.terminal_disposition,
+            authorization_present: record.authorization_unix_millis.is_some(),
+            resume_attempted: record.resume_attempted,
+            target_released: record.target_released,
+            cleanup_state: memcordon_core::WindowsDurableCleanupStateV1 {
+                termination_requested: record.cleanup_state.termination_requested,
+                active_processes_zero: record.cleanup_state.active_processes_zero,
+                guardian_reaped: record.cleanup_state.guardian_reaped,
+                final_handles_closed: record.cleanup_state.final_handles_closed,
+            },
+            cleanup_complete,
+            outbox_stage,
+            terminalization: record.terminalization.clone(),
+            detail,
         },
-        cleanup_complete,
-        outbox_stage,
-        terminalization: record.terminalization.clone(),
-        detail,
-    })
+        record,
+    ))
 }
 
 #[cfg(test)]
@@ -2426,7 +3562,7 @@ pub(super) fn retained_attempt_evidence(
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     primary_detail: String,
     secondary_failures: Vec<String>,
-) -> memcordon_core::WindowsAttemptRetainedV1 {
+) -> memcordon_core::WindowsAttemptRetainedV2 {
     let attempt_id = binding.attempt_id();
     let nonce = binding.nonce();
     let request_sha256 = binding.request_sha256();
@@ -2514,6 +3650,8 @@ impl RecordReaderReservation {
         }
         enforce_storage_reservation(None, true)?;
         let record = AdmissionRecordV1 {
+            format: AdmissionRecordFormat::Native,
+            revision: Default::default(),
             attempt_id: attempt_id.to_owned(),
             request_sha256: request_sha256.to_owned(),
             owner_process_identities: vec![super::process::process_identity(unsafe {
@@ -2555,7 +3693,7 @@ pub fn in_memory_retained_attempt_evidence(
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     primary_detail: String,
     secondary_failures: Vec<String>,
-) -> memcordon_core::WindowsAttemptRetainedV1 {
+) -> memcordon_core::WindowsAttemptRetainedV2 {
     retained_attempt_evidence_from_snapshot(
         attempt_id,
         nonce,
@@ -2575,7 +3713,7 @@ fn retained_attempt_evidence_from_snapshot(
     primary_detail: String,
     secondary_failures: Vec<String>,
     record: Option<&WindowsAttemptRecordV1>,
-) -> memcordon_core::WindowsAttemptRetainedV1 {
+) -> memcordon_core::WindowsAttemptRetainedV2 {
     let (provider_failure, diagnostic_availability) = provider_projection(record);
     let cleanup_complete = record.as_ref().is_some_and(|record| {
         record.state == WindowsAttemptStateV1::Empty
@@ -2584,30 +3722,34 @@ fn retained_attempt_evidence_from_snapshot(
             && record.cleanup_state.guardian_reaped
             && record.cleanup_state.final_handles_closed
     });
-    memcordon_core::WindowsAttemptRetainedV1 {
-        schema_version: 2,
-        causal_diagnostics: record.map_or_else(
-            memcordon_core::WindowsCausalDiagnosticsV1::default,
-            exportable_journal,
-        ),
-        provider_failure,
-        diagnostic_availability,
-        attempt_id: attempt_id.to_owned(),
-        nonce: nonce.to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        relay_phase,
-        durable_state: record.as_ref().map(|record| record.state),
-        terminal_disposition: record
-            .as_ref()
-            .and_then(|record| record.terminal_disposition),
-        cleanup_complete,
-        terminal_replay_available: record
-            .as_ref()
-            .is_some_and(|record| record.terminal_response_json.is_some()),
-        authority_retained: true,
-        primary_detail,
-        secondary_failures,
-    }
+    retained_v2(
+        memcordon_core::WindowsAttemptRetainedV1 {
+            schema_version: 2,
+            causal_diagnostics: record.map_or_else(
+                memcordon_core::WindowsCausalDiagnosticsV1::default,
+                exportable_journal,
+            ),
+            provider_failure,
+            diagnostic_availability,
+            attempt_id: attempt_id.to_owned(),
+            nonce: nonce.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            relay_phase,
+            durable_state: record.as_ref().map(|record| record.state),
+            terminal_disposition: record
+                .as_ref()
+                .and_then(|record| record.terminal_disposition),
+            cleanup_complete,
+            terminal_replay_available: record
+                .as_ref()
+                .is_some_and(|record| record.terminal_response_json.is_some()),
+            authority_retained: true,
+            primary_detail,
+            secondary_failures,
+        },
+        record,
+        memcordon_core::WindowsRetainedRecordUnavailableReasonV1::ReadFailure,
+    )
 }
 
 fn retained_attempt_evidence_after_inspection_failure(
@@ -2618,7 +3760,7 @@ fn retained_attempt_evidence_after_inspection_failure(
     primary_detail: String,
     mut secondary_failures: Vec<String>,
     error: String,
-) -> memcordon_core::WindowsAttemptRetainedV1 {
+) -> memcordon_core::WindowsAttemptRetainedV2 {
     secondary_failures.push(format!(
         "retained attempt record inspection failed: {error}"
     ));
@@ -2692,7 +3834,7 @@ pub(crate) fn retained_attempt_evidence_after_inspection_failure_for_test(
     primary_detail: String,
     secondary_failures: Vec<String>,
     error: String,
-) -> memcordon_core::WindowsAttemptRetainedV1 {
+) -> memcordon_core::WindowsAttemptRetainedV2 {
     retained_attempt_evidence_after_inspection_failure(
         attempt_id,
         nonce,
@@ -2778,7 +3920,7 @@ pub fn acknowledge_terminal_response(
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
-) -> Result<memcordon_core::WindowsTerminalRetiredV1, String> {
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
     let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
     acknowledge_terminal_response_reserved(attempt_id, nonce, request_sha256)
 }
@@ -2787,12 +3929,16 @@ fn acknowledge_terminal_response_reserved(
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
-) -> Result<memcordon_core::WindowsTerminalRetiredV1, String> {
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
     let path = record_path(attempt_id)?;
     let bytes = match read_record_bounded(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err("terminal acknowledgment has no retained attempt".to_owned());
+            let retired = recover_incomplete_ack_tombstone(attempt_id, request_sha256)?;
+            if retired.nonce != nonce {
+                return Err("terminal ACK tombstone nonce does not match".to_owned());
+            }
+            return Ok(retired);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -2804,13 +3950,17 @@ fn acknowledge_terminal_response_reserved(
     }
     let receipt = record.terminal_retired_receipt(nonce)?;
     record.acknowledge_terminal_response()?;
-    Ok(receipt)
+    let retired = complete_ack_tombstone(attempt_id, request_sha256)?;
+    if retired.terminal_response_sha256 != receipt.terminal_response_sha256 {
+        return Err("ACK tombstone changed terminal authority digest".to_owned());
+    }
+    Ok(retired)
 }
 
 pub fn pretarget_rejection(
     code: &str,
     detail: String,
-) -> memcordon_core::ProviderRejectionEvidence {
+) -> memcordon_core::WindowsProviderRejectionV2 {
     pretarget_rejection_at(
         code,
         memcordon_core::BoundarySetupPhase::ProviderConnection,
@@ -2822,11 +3972,11 @@ pub fn pretarget_rejection_at(
     code: &str,
     phase: memcordon_core::BoundarySetupPhase,
     detail: String,
-) -> memcordon_core::ProviderRejectionEvidence {
-    memcordon_core::ProviderRejectionEvidence {
+) -> memcordon_core::WindowsProviderRejectionV2 {
+    memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: None,
         workload_admission: None,
-        schema_version: 1,
+        schema_version: 2,
         code: code.to_owned(),
         phase,
         detail: bounded_rejection_detail(detail),
@@ -2836,13 +3986,79 @@ pub fn pretarget_rejection_at(
         target_released: false,
         cleanup_attempted: false,
         restart_safety: memcordon_core::RestartSafetyProof::default(),
-        terminal_ack_required: false,
-        terminal_receipt: None,
+        disposition: memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+            terminal_ack_required: false,
+        },
     }
 }
 
 pub fn attempts_root() -> PathBuf {
     package::state_root().join("attempts")
+}
+
+/// Read actual live association facts without reserving, authorizing, or
+/// mutating an admission. Called only by the authenticated launcher owner.
+pub fn observe_live_guardian_attempt(
+    expected: &WindowsProcessIdentityV1,
+) -> Result<memcordon_core::result_v1::ProviderAttemptAssociationV1, String> {
+    let root = attempts_root();
+    super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
+        .verify_path(&root)?;
+    if !process_identity_is_live(expected.clone())? {
+        return Err("observed guardian is no longer the live held process".into());
+    }
+    let provider = package::installed_public_provider_binding()?;
+    let boot = boot_identity()?;
+    let mut selected = None;
+    for (index, entry) in fs::read_dir(&root)
+        .map_err(|error| error.to_string())?
+        .enumerate()
+    {
+        if index >= 256 {
+            return Err("live association record inventory exceeds its bound".into());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let attempt = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or("live association record name is invalid")?;
+        validate_attempt_id(attempt)?;
+        let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
+        let record: WindowsAttemptRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        authenticate(&record, attempt)?;
+        if record.guardian_identity.as_ref() != Some(expected) {
+            continue;
+        }
+        if selected.is_some()
+            || record.boot_identity != boot
+            || record.provider_generation != provider.generation.as_str()
+            || !record.target_released
+            || !record.resume_attempted
+            || record.authorization_unix_millis.is_none()
+        {
+            return Err("live guardian association is ambiguous or not released".into());
+        }
+        selected = Some(memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+            provider: provider.clone(),
+            attempt_id: memcordon_core::DiagnosticSha256::try_from(
+                memcordon_core::BoundedText::new(&record.attempt_id).map_err(str::to_owned)?,
+            )
+            .map_err(str::to_owned)?,
+            request_sha256: memcordon_core::DiagnosticSha256::try_from(
+                memcordon_core::BoundedText::new(&record.request_sha256).map_err(str::to_owned)?,
+            )
+            .map_err(str::to_owned)?,
+        });
+    }
+    if !process_identity_is_live(expected.clone())? {
+        return Err("guardian retired during live association readback".into());
+    }
+    selected.ok_or_else(|| "held live guardian has no unique native attempt record".into())
 }
 
 pub fn quarantine_root() -> PathBuf {
@@ -2898,48 +4114,147 @@ fn record_path(attempt_id: &str) -> Result<PathBuf, String> {
     Ok(attempts_root().join(format!("{attempt_id}.json")))
 }
 
-pub fn write_guardian_receipt(attempt_id: &str) -> Result<(), String> {
+pub fn write_guardian_receipt(
+    attempt_id: &str,
+    worker_identity: &WindowsProcessIdentityV1,
+    guardian_identity: &WindowsProcessIdentityV1,
+) -> Result<(), String> {
     validate_attempt_id(attempt_id)?;
     fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
-    let mut receipt = WindowsGuardianReceiptV1 {
-        schema_version: 1,
+    let bytes =
+        read_record_bounded(&record_path(attempt_id)?).map_err(|error| error.to_string())?;
+    let record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    if record.worker_identity.as_ref() != Some(worker_identity)
+        || record.guardian_identity.as_ref() != Some(guardian_identity)
+    {
+        return Err(
+            "guardian receipt worker or guardian identity differs from durable record".to_owned(),
+        );
+    }
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or_else(|| "guardian receipt has no authorized owner manifest".to_owned())?;
+    let mut receipt = memcordon_core::WindowsGuardianReceiptV2 {
+        schema_version: 2,
         attempt_id: attempt_id.to_owned(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        provider_generation: record.provider_generation.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        original_boot_id: record.boot_identity.clone(),
+        job_identity: record.job_identity_sha256.clone(),
+        guardian_identity: guardian_identity.clone(),
+        worker_identity: worker_identity.clone(),
+        owner_manifest_sha256: manifest.canonical_sha256().map_err(str::to_owned)?,
         termination_requested: true,
-        active_processes_zero: true,
+        native_job_query_succeeded: true,
+        active_processes_zero_observed: true,
+        observed_unix_millis: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "guardian observation timestamp overflow".to_owned())?,
         integrity_sha256: String::new(),
     };
-    receipt.integrity_sha256 = guardian_receipt_digest(&receipt)?;
+    receipt.integrity_sha256 = receipt.canonical_sha256().map_err(str::to_owned)?;
+    if !receipt.is_consistent() {
+        return Err("guardian native receipt failed V2 validation".to_owned());
+    }
     let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     let path = guardian_receipt_path(attempt_id)?;
     let staged = path.with_extension("json.new");
-    fs::write(&staged, bytes).map_err(|error| error.to_string())?;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    let security = guardian_receipt_file_security()?;
+    let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security.raw(),
+        bInheritHandle: 0,
+    };
+    let wide: Vec<u16> = staged
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: the path and descriptor remain live; CREATE_NEW fails on collision.
+    let handle = unsafe {
+        windows_sys::Win32::Storage::FileSystem::CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE_ACCESS | READ_CONTROL_ACCESS,
+            0,
+            &attributes,
+            windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    // SAFETY: CREATE_NEW returned a uniquely owned Win32 file handle.
+    let mut file = unsafe { fs::File::from_raw_handle(handle as _) };
+    use std::io::Write;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    security.verify_path(&staged)?;
     replace_atomically(&staged, &path)
 }
 
-fn read_guardian_receipt(attempt_id: &str) -> Result<WindowsGuardianReceiptV1, String> {
+fn guardian_receipt_file_security() -> Result<super::security::SecurityDescriptor, String> {
+    // Both writer and reader are LocalSystem; the file is created with this
+    // protected descriptor, not an inherited or later-mutable DACL.
+    super::security::SecurityDescriptor::from_sddl("O:SYD:P(A;;FA;;;SY)")
+}
+
+fn read_guardian_receipt(
+    attempt_id: &str,
+) -> Result<memcordon_core::WindowsGuardianReceiptV2, String> {
+    super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
+        .verify_path(&guardian_receipts_root())?;
     let path = guardian_receipt_path(attempt_id)?;
-    let receipt: WindowsGuardianReceiptV1 =
-        serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    let expected = guardian_receipt_digest(&receipt)?;
-    if receipt.schema_version != 1
-        || receipt.attempt_id != attempt_id
-        || !receipt.termination_requested
-        || !receipt.active_processes_zero
-        || receipt.integrity_sha256 != expected
-    {
+    let security = guardian_receipt_file_security()?;
+    let bytes = read_record_bounded_with_limit_and_security(
+        &path,
+        memcordon_core::WINDOWS_MAX_FRAME_BYTES,
+        Some(&security),
+    )
+    .map_err(|error| error.to_string())?;
+    let receipt: memcordon_core::WindowsGuardianReceiptV2 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if receipt.attempt_id != attempt_id || !receipt.is_consistent() {
         return Err("guardian terminal receipt authentication failed".to_owned());
     }
     Ok(receipt)
 }
 
-fn guardian_receipt_digest(receipt: &WindowsGuardianReceiptV1) -> Result<String, String> {
-    let mut canonical = receipt.clone();
-    canonical.integrity_sha256.clear();
-    Ok(digest(
-        &serde_json::to_vec(&canonical).map_err(|error| error.to_string())?,
-    ))
+fn guardian_receipt_binds_record(
+    receipt: &memcordon_core::WindowsGuardianReceiptV2,
+    record: &WindowsAttemptRecordV1,
+) -> Result<bool, String> {
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or_else(|| "guardian receipt has no frozen owner manifest".to_owned())?;
+    let owner_manifest_sha256 = manifest.canonical_sha256().map_err(str::to_owned)?;
+    Ok(
+        receipt.binds(memcordon_core::WindowsGuardianReceiptBinding {
+            attempt_id: &record.attempt_id,
+            nonce: &record.nonce,
+            request_sha256: &record.request_sha256,
+            provider_generation: &record.provider_generation,
+            launch_incarnation: &record.launch_incarnation,
+            boot_identity: &record.boot_identity,
+            job_identity: &record.job_identity_sha256,
+            owner_manifest_sha256: &owner_manifest_sha256,
+        }) && record.guardian_identity.as_ref() == Some(&receipt.guardian_identity)
+            && record.worker_identity.as_ref() == Some(&receipt.worker_identity),
+    )
 }
 
 fn guardian_receipt_path(attempt_id: &str) -> Result<PathBuf, String> {
@@ -2988,19 +4303,39 @@ fn canonical_record_bytes(record: &WindowsAttemptRecordV1) -> Result<Vec<u8>, St
     Ok(bytes)
 }
 
-fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Result<(), String> {
-    let mut decoded = memcordon_core::WindowsDurableAttemptRecordV1 {
+pub(super) fn relay_retirement_event_name(record: &WindowsAttemptRecordV1) -> String {
+    let binding = serde_json::to_vec(&(
+        &record.attempt_id,
+        &record.nonce,
+        &record.provider_generation,
+        &record.boot_identity,
+        &record.launch_incarnation,
+    ))
+    .expect("validated attempt identity serializes");
+    format!(
+        "Global\\MemCordonSealedRelayRetirement-{}",
+        digest(&binding)
+    )
+}
+
+fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurableAttemptRecordV4 {
+    memcordon_core::WindowsDurableAttemptRecordV4 {
         schema_version: record.schema_version,
         attempt_id: record.attempt_id.clone(),
         provider_generation: record.provider_generation.clone(),
         boot_identity: record.boot_identity.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        nonce: record.nonce.clone(),
         request_sha256: record.request_sha256.clone(),
         caller_process_identity: record.caller_process_identity.clone(),
         caller_token_sha256: record.caller_token_sha256.clone(),
         job_identity_sha256: record.job_identity_sha256.clone(),
         guardian_identity: record.guardian_identity.clone(),
+        worker_identity: record.worker_identity.clone(),
+        worker_thread_identity: record.worker_thread_identity,
         target_identity: record.target_identity.clone(),
         state: record.state,
+        lifecycle: record.lifecycle,
         authorization_unix_millis: record.authorization_unix_millis,
         resume_attempted: record.resume_attempted,
         target_released: record.target_released,
@@ -3010,6 +4345,11 @@ fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Resul
             guardian_reaped: record.cleanup_state.guardian_reaped,
             final_handles_closed: record.cleanup_state.final_handles_closed,
         },
+        owner_manifest: record.owner_manifest.clone(),
+        recovery_authorization: record.recovery_authorization.clone(),
+        terminal_publication_reserved: record.terminal_publication_reserved,
+        terminal_seed: record.terminal_seed.clone(),
+        retirement_proof: record.retirement_proof.clone(),
         terminal_response_json: record.terminal_response_json.as_deref().map(str::to_owned),
         terminal_disposition: record.terminal_disposition,
         terminalization: record.terminalization.clone(),
@@ -3020,8 +4360,12 @@ fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Resul
         record_revision: record.record_revision,
         provider_incarnation: record.provider_incarnation.clone(),
         integrity_sha256: record.integrity_sha256.clone(),
-    };
-    memcordon_core::authenticate_decoded_windows_attempt_record(
+    }
+}
+
+fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Result<(), String> {
+    let mut decoded = decoded_v4(record);
+    memcordon_core::authenticate_decoded_windows_attempt_record_v4(
         &mut decoded,
         file_attempt_id,
         &provider_generation(),
@@ -3034,6 +4378,14 @@ fn read_record_bounded(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn read_record_bounded_with_limit(path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+    read_record_bounded_with_limit_and_security(path, maximum, None)
+}
+
+fn read_record_bounded_with_limit_and_security(
+    path: &Path,
+    maximum: usize,
+    security: Option<&super::security::SecurityDescriptor>,
+) -> io::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
@@ -3070,6 +4422,11 @@ fn read_record_bounded_with_limit(path: &Path, maximum: usize) -> io::Result<Vec
             io::ErrorKind::InvalidData,
             "attempt record has multiple links",
         ));
+    }
+    if let Some(security) = security {
+        security
+            .verify_file_object(file.as_raw_handle() as _)
+            .map_err(io::Error::other)?;
     }
     let expected = usize::try_from(metadata.len()).map_err(io::Error::other)?;
     let mut bytes = Vec::new();

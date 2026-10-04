@@ -3,20 +3,26 @@ use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use crate::protocol::{Frame, MAX_FRAME_LENGTH, read_frame};
+use crate::protocol::{Frame, MAX_FRAME_LENGTH, PROTOCOL_VERSION, read_frame};
 
 const FRAME_HEADER_LENGTH: usize = 72;
 const MAX_DESCRIPTORS: usize = 8;
 
 pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
-    let received = receive_inner(stream, false)?;
+    let received = receive_inner(stream, false, Some(PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors))
+}
+
+/// Receives the ordinary public channel envelope and its owned descriptors.
+pub fn receive_public(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>, u16), String> {
+    let received = receive_inner(stream, false, Some(PROTOCOL_VERSION))?;
+    Ok((received.frame, received.descriptors, received.version))
 }
 
 pub(crate) fn receive_with_credentials(
     stream: &UnixStream,
 ) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
-    let received = receive_inner(stream, true)?;
+    let received = receive_inner(stream, true, Some(PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors, received.credentials))
 }
 
@@ -24,9 +30,14 @@ struct ReceivedMessage {
     frame: Frame,
     descriptors: Vec<OwnedFd>,
     credentials: Option<libc::ucred>,
+    version: u16,
 }
 
-fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<ReceivedMessage, String> {
+fn receive_inner(
+    stream: &UnixStream,
+    accept_credentials: bool,
+    expected_version: Option<u16>,
+) -> Result<ReceivedMessage, String> {
     let mut header = [0_u8; FRAME_HEADER_LENGTH];
     let descriptor_capacity =
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -65,6 +76,10 @@ fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<Receiv
     }
     if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
         return Err("provider request or descriptor inventory was truncated".to_owned());
+    }
+    let version = u16::from_be_bytes([header[0], header[1]]);
+    if version != PROTOCOL_VERSION || expected_version.is_some_and(|expected| expected != version) {
+        return Err("unsupported provider frame version".to_owned());
     }
     let total = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if !(FRAME_HEADER_LENGTH..=MAX_FRAME_LENGTH).contains(&total) {
@@ -125,6 +140,7 @@ fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<Receiv
         frame,
         descriptors,
         credentials,
+        version,
     })
 }
 

@@ -997,7 +997,7 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
                 .expect("open bootstrap writer")
                 .raw(),
             &GuardianBootstrapMessageV1::Ready {
-                binding,
+                binding: binding.clone(),
                 roles: guardian_manifest_contract()
                     .map(|(role, _)| role.to_owned())
                     .to_vec(),
@@ -1034,7 +1034,12 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
         )? {
             return Ok(());
         }
-        super::record::write_guardian_receipt(&attempt_id).map_err(|_| {
+        super::record::write_guardian_receipt(
+            &attempt_id,
+            &binding.launcher_identity,
+            &binding.guardian_identity,
+        )
+        .map_err(|_| {
             GuardianFailure::new(GuardianStartupSubphase::Runtime, None, "terminal-receipt")
         })
     })();

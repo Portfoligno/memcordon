@@ -1,15 +1,13 @@
 //! Authenticated, caller-filtered discovery. Discovery conveys no launch authority.
-use crate::workload_contract::{
-    AuthorizationRef, ContractVersionOne, NetworkCeilingV1, PolicyEpoch, ProfileRef,
-};
-use crate::workload_registry::{BaselineProfile, CallerSelector, PolicyRegistryV1};
+use crate::workload_contract::{AuthorizationRef, NetworkCeilingV1, PolicyEpoch, ProfileRef};
+use crate::workload_registry::{BaselineProfile, CallerSelector, RuntimePolicyRegistry};
 use crate::{BoundedText, BoundedVec, DiagnosticSha256, PublicProviderBindingV1};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DiscoveryReportV1 {
-    Authenticated { discovery: Box<WorkloadDiscoveryV1> },
+    Authenticated { discovery: Box<WorkloadDiscovery> },
     Unavailable { reason: BoundedText<256> },
     Unsupported,
 }
@@ -23,8 +21,9 @@ pub struct DiscoverableGrantV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkloadDiscoveryV1 {
-    pub schema_version: ContractVersionOne,
+pub struct WorkloadDiscovery {
+    pub format: String,
+    pub revision: u32,
     pub provider: PublicProviderBindingV1,
     pub boot_identity: BoundedText<128>,
     pub epoch: Option<PolicyEpoch>,
@@ -33,7 +32,6 @@ pub struct WorkloadDiscoveryV1 {
     pub profile: ProfileRef,
     pub supported: bool,
     pub available: bool,
-    pub qualification_digest: DiagnosticSha256,
     pub restriction: crate::workload_evidence::BaselineRestrictionObservationV1,
     pub ceiling: NetworkCeilingV1,
     pub grants: BoundedVec<DiscoverableGrantV1, 2048>,
@@ -44,12 +42,11 @@ pub struct WorkloadDiscoveryV1 {
     pub target_authorized: crate::workload_evidence::False,
 }
 
-impl WorkloadDiscoveryV1 {
+impl WorkloadDiscovery {
     pub fn authenticated(
-        registry: Option<(&PolicyRegistryV1, &PolicyEpoch)>,
+        registry: Option<(&RuntimePolicyRegistry, &PolicyEpoch)>,
         caller: &CallerSelector,
         profile: BaselineProfile,
-        qualification_digest: DiagnosticSha256,
         provider: PublicProviderBindingV1,
         boot_identity: BoundedText<128>,
     ) -> Result<Self, String> {
@@ -58,10 +55,7 @@ impl WorkloadDiscoveryV1 {
         let (epoch, registry_digest) = if let Some((registry, epoch)) = registry {
             registry.validate()?;
             available = registry.profiles.as_slice().iter().any(|entry| {
-                entry.enabled
-                    && entry.profile == profile
-                    && entry.reference == profile.reference()
-                    && entry.qualification_digest == qualification_digest
+                entry.enabled && entry.profile == profile && entry.reference == profile.reference()
             });
             for grant in registry.grants.as_slice().iter().filter(|grant| {
                 grant.enabled
@@ -93,7 +87,8 @@ impl WorkloadDiscoveryV1 {
         )
         .map_err(str::to_owned)?;
         let result = Self {
-            schema_version: ContractVersionOne::default(),
+            format: "memcordon.capabilities".into(),
+            revision: 1,
             provider,
             boot_identity,
             epoch,
@@ -102,7 +97,6 @@ impl WorkloadDiscoveryV1 {
             profile: profile.reference(),
             supported: true,
             available,
-            qualification_digest,
             restriction: crate::workload_evidence::baseline_observation(profile),
             ceiling: profile.ceiling(),
             grants,
@@ -134,7 +128,9 @@ impl WorkloadDiscoveryV1 {
         }) {
             return false;
         }
-        self.provider.is_consistent()
+        self.format == "memcordon.capabilities"
+            && self.revision == 1
+            && self.provider.is_consistent()
             && !self.boot_identity.as_str().is_empty()
             && self.profile == profile.reference()
             && self.ceiling == profile.ceiling()

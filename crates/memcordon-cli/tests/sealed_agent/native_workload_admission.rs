@@ -39,7 +39,7 @@ fn caller() -> CallerSelector {
         }
     }
 }
-struct Restore(Option<PolicyRegistryV1>);
+struct Restore(Option<RuntimePolicyRegistry>);
 impl Restore {
     fn finish(mut self) {
         let registry = self
@@ -63,19 +63,17 @@ impl Drop for Restore {
     }
 }
 fn fixture() -> (WorkloadContractV1, Restore) {
-    let discovery =
-        memcordon_platform::workload_discovery().expect("installed qualified provider discovery");
+    memcordon_platform::workload_discovery().expect("installed provider discovery");
     let lease = Lease::acquire().unwrap();
     let previous = lease.read().unwrap().expect("service activation exists");
     let restore = Restore(Some(previous.registry));
     let plan = DiagnosticSha256::from_bytes([17; 32]);
     let mut profiles = BoundedVec::default();
     profiles
-        .try_push(ProfileDefinitionV1 {
+        .try_push(RuntimeProfileDefinition {
             profile: profile(),
             reference: profile().reference(),
             enabled: true,
-            qualification_digest: discovery.qualification_digest,
         })
         .unwrap();
     let mut callers = BoundedVec::default();
@@ -96,8 +94,9 @@ fn fixture() -> (WorkloadContractV1, Restore) {
         .unwrap();
     let active = lease
         .activate(
-            PolicyRegistryV1 {
-                schema_version: ContractVersionOne::default(),
+            RuntimePolicyRegistry {
+                format: "memcordon.local-policy".into(),
+                revision: 1,
                 profiles,
                 grants,
                 active_attempt_disposition: GrantChangeDisposition::DrainExisting,
@@ -146,11 +145,7 @@ fn frontend_command() -> std::process::Command {
 fn execute(
     contract: &WorkloadContractV1,
     tcp_port: Option<u16>,
-) -> (
-    std::process::ExitStatus,
-    memcordon_core::MemcordonReport,
-    bool,
-) {
+) -> (std::process::ExitStatus, memcordon_core::ResultV1, bool) {
     let directory = tempfile::TempDir::new().unwrap();
     #[cfg(target_os = "linux")]
     let staged = crate::linux_sealed::StagedFixture::from_source(std::path::Path::new(env!(
@@ -163,15 +158,19 @@ fn execute(
     let program = std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture"));
     let declaration = directory.path().join("contract.json");
     let report = directory.path().join("report.json");
+    let phase_report = report.with_extension("phases");
     let marker = directory.path().join("marker");
     std::fs::write(&declaration, serde_json::to_vec(contract).unwrap()).unwrap();
     let mut command = frontend_command();
+    #[cfg(all(target_os = "windows", feature = "test-support"))]
+    command.arg("--windows-stack-phases");
     command
         .arg("--sealed")
         .arg("--workload-contract")
         .arg(declaration)
         .arg("--report")
         .arg(&report)
+        .args(["--report-format", "result-v1"])
         .arg("--")
         .arg(program);
     if let Some(port) = tcp_port {
@@ -182,8 +181,10 @@ fn execute(
     command.arg(&marker);
     let status = command.status().unwrap();
     let report_bytes = std::fs::read(&report).unwrap_or_else(|error| {
+        let phases = std::fs::read_to_string(&phase_report)
+            .unwrap_or_else(|phase_error| format!("unavailable: {phase_error}"));
         panic!(
-            "frontend report read failed: status={status}; marker={}; path={}; error={error}",
+            "frontend report read failed: status={status}; marker={}; path={}; phases={phases:?}; error={error}",
             marker.exists(),
             report.display()
         )
@@ -199,12 +200,12 @@ fn execute(
 }
 
 #[test]
-#[ignore = "requires an installed qualified provider and administrative registry access"]
+#[ignore = "requires an installed provider and administrative registry access"]
 fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
     let (mut request, restore) = fixture();
     assert!(matches!(
         memcordon_platform::workload_plan(&request).unwrap(),
-        WorkloadResolutionReportV1::Planned { .. }
+        RuntimeWorkloadResolution::Planned { .. }
     ));
     let (status, report, marker) = execute(&request, None);
     assert!(
@@ -215,7 +216,7 @@ fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
     assert!(attempt.policy_enforcement.terminal_success());
     assert!(matches!(
         report.policy.effective.workload,
-        WorkloadResolutionReportV1::Admitted { .. }
+        RuntimeWorkloadResolution::Admitted { .. }
     ));
     let lease = Lease::acquire().unwrap();
     let active = lease.read().unwrap().unwrap();
@@ -228,7 +229,7 @@ fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
     );
     assert!(matches!(
         report.policy.effective.workload,
-        WorkloadResolutionReportV1::Rejected {
+        RuntimeWorkloadResolution::Rejected {
             rejection: AdmissionRejectionV1 {
                 code: AdmissionCode::PolicyEpochStale,
                 ..
@@ -240,7 +241,7 @@ fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
     request.authorization.grant_id = id("not-approved");
     assert!(matches!(
         memcordon_platform::workload_plan(&request).unwrap(),
-        WorkloadResolutionReportV1::Rejected {
+        RuntimeWorkloadResolution::Rejected {
             rejection: AdmissionRejectionV1 {
                 code: AdmissionCode::ProfileNotAuthorized,
                 ..
@@ -311,6 +312,7 @@ fn live_activation_preserves_drain_and_enforces_revoke() {
             .arg(declaration)
             .arg("--report")
             .arg(&report_path)
+            .args(["--report-format", "result-v1"])
             .arg("--")
             .arg(program)
             .arg("gate-wait")
@@ -346,7 +348,7 @@ fn live_activation_preserves_drain_and_enforces_revoke() {
         assert_ne!(next.epoch, request.expected_epoch);
         assert!(matches!(
             memcordon_platform::workload_plan(&request).unwrap(),
-            WorkloadResolutionReportV1::Rejected {
+            RuntimeWorkloadResolution::Rejected {
                 rejection: AdmissionRejectionV1 {
                     code: AdmissionCode::PolicyEpochStale,
                     ..
@@ -376,7 +378,7 @@ fn live_activation_preserves_drain_and_enforces_revoke() {
             !revoke,
             "revocation must terminate the waiting workload unsuccessfully"
         );
-        let report: memcordon_core::MemcordonReport =
+        let report: memcordon_core::ResultV1 =
             serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
         let attempt = report
             .attempts
@@ -397,7 +399,7 @@ fn live_activation_preserves_drain_and_enforces_revoke() {
 }
 
 #[test]
-#[ignore = "requires an installed qualified provider and administrative registry access"]
+#[ignore = "requires an installed provider and administrative registry access"]
 fn native_tcp_requirement_preserves_baseline_authority() {
     #[cfg(target_os = "windows")]
     use std::io::{Read, Write};
@@ -436,7 +438,7 @@ fn native_tcp_requirement_preserves_baseline_authority() {
             !status.success() && !marker,
             "strict TCP must reject before execution: status={status}; marker={marker}; report={report:#?}"
         );
-        let WorkloadResolutionReportV1::Rejected {
+        let RuntimeWorkloadResolution::Rejected {
             binding: observed,
             rejection,
             ..
@@ -506,7 +508,7 @@ fn native_tcp_requirement_preserves_baseline_authority() {
                 !status.success() && !marker,
                 "Windows baseline must reject stronger network ceilings before execution: status={status}; marker={marker}; report={report:#?}"
             );
-            let WorkloadResolutionReportV1::Rejected {
+            let RuntimeWorkloadResolution::Rejected {
                 binding, rejection, ..
             } = &report.policy.effective.workload
             else {
@@ -559,7 +561,7 @@ fn native_tcp_requirement_preserves_baseline_authority() {
         );
         assert!(matches!(
             report.policy.effective.workload,
-            WorkloadResolutionReportV1::Admitted {
+            RuntimeWorkloadResolution::Admitted {
                 effective: EffectiveWorkloadPolicyV1 {
                     restriction: BaselineRestrictionObservationV1::WindowsNetworkExternallyGoverned,
                     ..

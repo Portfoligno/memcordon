@@ -21,6 +21,20 @@ pub use macos_deadline::continuous_nanos as macos_continuous_nanos;
 #[cfg(target_os = "macos")]
 mod macos_launch;
 #[cfg(target_os = "macos")]
+mod macos_result_delivery;
+#[cfg(target_os = "macos")]
+mod macos_result_frame;
+#[cfg(target_os = "macos")]
+pub use macos_launch::LaunchRuntime as MacosLaunchRuntime;
+#[cfg(target_os = "macos")]
+pub use macos_result_delivery::{
+    DeliveryLimits, DeliveryObservation, DeliveryOutcome, DeliveryRequest, DeliveryStage,
+    MacosDeliveryRuntime, WriterImage,
+};
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos_result_frame::WriterFrame;
+#[cfg(target_os = "macos")]
 mod macos_watchdog;
 #[cfg(target_os = "macos")]
 pub use macos_launch::enveloped_helper as macos_enveloped_helper;
@@ -32,13 +46,22 @@ pub use macos_launch::helper as macos_helper;
 pub use macos_launch::inspector_helper as macos_inspector;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+#[doc(hidden)]
+pub use sealed::client::NativeByteRelayProbe;
+#[cfg(target_os = "linux")]
+pub use sealed::client::{private_discovery, private_plan};
+#[cfg(target_os = "windows")]
+pub use sealed::windows::{
+    converge_windows_recovery, observe_windows_guardian_attempt, recover_windows_attempt,
+};
 mod signal;
 mod supervisor;
 /// Resolve an exact workload declaration with the authenticated provider without
 /// creating an attempt or reserving target resources.
 pub fn workload_plan(
     contract: &memcordon_core::workload_contract::WorkloadContractV1,
-) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
+) -> Result<memcordon_core::workload_evidence::RuntimeWorkloadResolution, String> {
     #[cfg(target_os = "linux")]
     {
         sealed::client::workload_plan(contract)
@@ -54,8 +77,8 @@ pub fn workload_plan(
     }
 }
 /// Read caller-filtered profiles and exact grant/plan references without allocating an attempt.
-pub fn workload_discovery()
--> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+pub fn workload_discovery() -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String>
+{
     #[cfg(target_os = "linux")]
     {
         sealed::client::workload_discovery()
@@ -74,11 +97,18 @@ pub mod test_support;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 mod unix_watchdog;
 #[cfg(target_os = "windows")]
+pub mod windows_file;
+#[cfg(target_os = "windows")]
 mod windows_job;
+#[cfg(all(target_os = "windows", feature = "test-support"))]
+mod windows_stack_diagnostics;
+#[cfg(all(target_os = "windows", feature = "test-support"))]
+#[doc(hidden)]
+pub use windows_stack_diagnostics::WindowsStackPhaseCaptureGuard;
 
 pub use backend::{
-    BackendCleanupFacts, BackendInfo, BoundaryQualification, BoundarySupport, Execution,
-    ProbeReport, SealedAvailability, cleanup_stale, probe, run,
+    BackendCleanupFacts, BackendInfo, BoundaryReadiness, BoundarySupport, Execution, ProbeReport,
+    SealedAvailability, cleanup_stale, probe, run,
 };
 #[cfg(target_os = "macos")]
 pub use signal::{CallerSignalSnapshot, CancellationHandle};

@@ -9,17 +9,17 @@ fuzz_target!(|data: &[u8]| {
     {
         return;
     }
-    let Ok(receipt) = serde_json::from_slice::<AttemptPolicyEnforcementV1>(data) else {
+    let Ok(receipt) = serde_json::from_slice::<RuntimePolicyEnforcement>(data) else {
         return;
     };
     if receipt.terminal_success() {
         assert!(receipt.is_consistent());
         assert!(matches!(
             receipt.resolution(),
-            Some(WorkloadResolutionReportV1::Admitted { .. })
+            Some(RuntimeWorkloadResolution::Admitted { .. })
         ));
         let mut unavailable = receipt.clone();
-        if let AttemptPolicyEnforcementV1::Authorized { terminal, .. } = &mut unavailable {
+        if let RuntimePolicyEnforcement::Authorized { terminal, .. } = &mut unavailable {
             *terminal = PolicyTerminalEvidenceV1::Unavailable {
                 reason: AdmissionAvailabilityFailure::TerminalUnavailable,
             };
@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(!unavailable.terminal_success());
         let json = serde_json::to_vec(&receipt).unwrap();
         assert!(
-            serde_json::from_slice::<AttemptPolicyEnforcementV1>(&json)
+            serde_json::from_slice::<RuntimePolicyEnforcement>(&json)
                 .unwrap()
                 .terminal_success()
         );

@@ -6,21 +6,24 @@ use crate::workload_limits as limits;
 /// Private provider snapshot. Caller identities are excluded from public projections.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderAdmissionSnapshotV1 {
+pub struct RuntimeAdmissionSnapshot {
+    pub format: String,
+    pub revision: u32,
     pub request: WorkloadContractV1,
     pub request_digest: DiagnosticSha256,
     pub registry_digest: DiagnosticSha256,
-    pub qualification_digest: DiagnosticSha256,
     pub admission_nonce: Nonce128,
     pub caller_invocation_reference: Nonce128,
     pub private_invocation_digest: DiagnosticSha256,
     pub caller: CallerSelector,
     pub native_profile: BaselineProfile,
 }
-impl ProviderAdmissionSnapshotV1 {
+impl RuntimeAdmissionSnapshot {
     pub fn validate(&self) -> Result<(), String> {
         self.request.validate()?;
-        if crate::workload_codec::contract_digest(&self.request)? != self.request_digest
+        if self.format != "memcordon.local-admission"
+            || self.revision != 1
+            || crate::workload_codec::contract_digest(&self.request)? != self.request_digest
             || self.request.authorized_profile != self.native_profile.reference()
         {
             return Err("provider admission snapshot request binding differs".into());
@@ -112,11 +115,10 @@ pub enum GrantChangeDisposition {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileDefinitionV1 {
+pub struct RuntimeProfileDefinition {
     pub profile: BaselineProfile,
     pub reference: ProfileRef,
     pub enabled: bool,
-    pub qualification_digest: DiagnosticSha256,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,17 +133,19 @@ pub struct PolicyGrantV1 {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PolicyRegistryV1 {
-    pub schema_version: ContractVersionOne,
-    pub profiles: BoundedVec<ProfileDefinitionV1, { limits::PROFILES }>,
+pub struct RuntimePolicyRegistry {
+    pub format: String,
+    pub revision: u32,
+    pub profiles: BoundedVec<RuntimeProfileDefinition, { limits::PROFILES }>,
     pub grants: BoundedVec<PolicyGrantV1, { limits::GRANTS }>,
     pub active_attempt_disposition: GrantChangeDisposition,
 }
 
-impl PolicyRegistryV1 {
+impl RuntimePolicyRegistry {
     pub fn canonical_digest(&self) -> Result<DiagnosticSha256, String> {
         self.validate()?;
-        let mut encoder = Encoder::new(b"authorization-snapshot-v1", limits::REGISTRY_BYTES)?;
+        let mut encoder =
+            Encoder::new(b"memcordon.local-policy/revision1", limits::REGISTRY_BYTES)?;
         let mut profiles: Vec<_> = self.profiles.as_slice().iter().collect();
         profiles.sort_by_key(|profile| &profile.reference.id);
         encoder.count(profiles.len())?;
@@ -149,7 +153,6 @@ impl PolicyRegistryV1 {
             encoder.id(&profile.reference.id)?;
             encoder.digest(&profile.reference.semantic_digest)?;
             encoder.byte(u8::from(profile.enabled))?;
-            encoder.digest(&profile.qualification_digest)?;
         }
         let mut grants: Vec<_> = self.grants.as_slice().iter().collect();
         grants.sort_by_key(|grant| &grant.id);
@@ -210,6 +213,9 @@ impl PolicyRegistryV1 {
         Ok(registry)
     }
     pub fn validate(&self) -> Result<(), String> {
+        if self.format != "memcordon.local-policy" || self.revision != 1 {
+            return Err("local policy format differs".into());
+        }
         let profiles = self.profiles.as_slice();
         for (index, profile) in profiles.iter().enumerate() {
             if profile.reference != profile.profile.reference()
@@ -322,12 +328,11 @@ impl AdmissionRejectionV1 {
 
 /// Caller must originate from authenticated OS channel acquisition, never request JSON.
 pub fn resolve<'a>(
-    registry: &'a PolicyRegistryV1,
+    registry: &'a RuntimePolicyRegistry,
     current_epoch: &PolicyEpoch,
     request: &WorkloadContractV1,
     caller: &CallerSelector,
     native_profile: BaselineProfile,
-    qualification: &DiagnosticSha256,
 ) -> Result<&'a PolicyGrantV1, AdmissionRejectionV1> {
     let reject = AdmissionRejectionV1::single;
     let grant = registry
@@ -358,7 +363,7 @@ pub fn resolve<'a>(
         .iter()
         .find(|profile| profile.reference == grant.profile && profile.enabled)
         .ok_or_else(|| reject(AdmissionCode::ProfileNotAuthorized))?;
-    if profile.profile != native_profile || &profile.qualification_digest != qualification {
+    if profile.profile != native_profile {
         return Err(reject(AdmissionCode::HostPrerequisiteUnavailable));
     }
     if !ceiling_contains(&grant.ceiling, &request.ceiling)

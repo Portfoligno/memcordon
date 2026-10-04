@@ -1,7 +1,97 @@
 mod application;
 #[cfg(target_os = "macos")]
 mod result_delivery;
+#[cfg(target_os = "macos")]
+mod result_frame;
 pub(crate) use application::{clean, doctor, execute, plan};
+
+#[cfg(windows)]
+pub(crate) fn windows_guardian_observation(pid: &std::ffi::OsStr, birth: &std::ffi::OsStr) -> i32 {
+    let operation = (|| -> Result<_, String> {
+        let process_id = pid
+            .to_str()
+            .ok_or("guardian PID is not Unicode")?
+            .parse::<u32>()
+            .map_err(|error| error.to_string())?;
+        let creation_time_100ns = birth
+            .to_str()
+            .ok_or("guardian birth is not Unicode")?
+            .parse::<u64>()
+            .map_err(|error| error.to_string())?;
+        let observation = memcordon_platform::observe_windows_guardian_attempt(
+            memcordon_core::WindowsProcessIdentityV1 {
+                process_id,
+                creation_time_100ns,
+            },
+        )?;
+        serde_json::to_string(&observation).map_err(|error| error.to_string())
+    })();
+    match operation {
+        Ok(observation) => {
+            println!("{observation}");
+            0
+        }
+        Err(error) => {
+            eprintln!("error[MCCLI-WINDOWS-LIVE-GUARDIAN]: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_recovery(args: memcordon::invocation::WindowsRecoveryArgs) -> i32 {
+    use memcordon::invocation::WindowsRecoveryArgs;
+    let result = match args {
+        WindowsRecoveryArgs::Attempt {
+            attempt_id,
+            nonce,
+            request_sha256,
+        } => memcordon_platform::recover_windows_attempt(&attempt_id, &nonce, &request_sha256)
+            .and_then(|(response, delivery)| {
+                if matches!(
+                    response,
+                    memcordon_core::WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. }
+                ) {
+                    return Err("authenticated provider denied recovery authority".to_owned());
+                }
+                serde_json::to_value(serde_json::json!({
+                    "schema_version": 1,
+                    "provider_response": response,
+                    "frontend_delivery": delivery,
+                }))
+                .map_err(|error| error.to_string())
+            }),
+        WindowsRecoveryArgs::Converge { deadline_millis } => {
+            memcordon_platform::converge_windows_recovery(std::time::Duration::from_millis(
+                deadline_millis,
+            ))
+            .and_then(|inventory| {
+                serde_json::to_value(inventory).map_err(|error| error.to_string())
+            })
+        }
+    };
+    match result {
+        Ok(value) => {
+            println!(
+                "{}",
+                serde_json::to_string(&value).expect("recovery result serializes")
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("error[MCCLI-WINDOWS-RECOVERY]: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn windows_recovery(_args: memcordon::invocation::WindowsRecoveryArgs) -> i32 {
+    eprintln!(
+        "error[MCCLI-WINDOWS-RECOVERY-PLATFORM]: Windows recovery is available only on Windows"
+    );
+    2
+}
 #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
 pub(crate) use result_delivery::observe_failures;
 
@@ -149,7 +239,7 @@ pub(crate) fn route_internal(
         })());
     }
     #[cfg(target_os = "macos")]
-    if name == "__result-writer-v1" {
+    if name == "__result-writer-v2" {
         return Some(if argv.len() == 1 {
             Ok(InternalInvocation::ResultWriter)
         } else {
@@ -157,7 +247,7 @@ pub(crate) fn route_internal(
         });
     }
     #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
-    if name == "__result-writer-observed-v1" {
+    if name == "__result-writer-observed-v2" {
         return Some(if argv.len() == 1 {
             Ok(InternalInvocation::ResultWriterObserved)
         } else {

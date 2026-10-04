@@ -2,5 +2,7 @@
 pub mod client;
 #[cfg(target_os = "linux")]
 mod linux_runtime;
+#[cfg(target_os = "linux")]
+mod verification_exchange;
 #[cfg(target_os = "windows")]
 pub mod windows;

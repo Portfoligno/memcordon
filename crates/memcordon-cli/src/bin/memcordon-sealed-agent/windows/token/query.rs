@@ -713,6 +713,24 @@ pub fn envelope(token: HANDLE) -> Result<WindowsCallerTokenEnvelopeV1, String> {
     envelope_with_statistics(token, &statistics)
 }
 
+pub(crate) fn token_appcontainer_sid(token: HANDLE) -> Result<Option<String>, String> {
+    if scalar_u32(token, TokenIsAppContainer)? == 0 {
+        return Ok(None);
+    }
+    let bytes = query(token, TokenAppContainerSid)?;
+    if bytes.len() < std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>() {
+        return Err("AppContainer SID response is truncated".to_owned());
+    }
+    // SAFETY: the fixed header fits in the live token-query buffer; the SID
+    // pointer remains valid until sid_string finishes its checked conversion.
+    let information =
+        unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()) };
+    if information.TokenAppContainer.is_null() {
+        return Err("AppContainer token has no package SID".to_owned());
+    }
+    sid_string(information.TokenAppContainer).map(Some)
+}
+
 pub(super) fn token_statistics(token: HANDLE) -> Result<TOKEN_STATISTICS, String> {
     let statistics = query(token, TokenStatistics)?;
     if statistics.len() < std::mem::size_of::<TOKEN_STATISTICS>() {

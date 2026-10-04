@@ -2,8 +2,8 @@ use memcordon_core::{
     BoundarySetupPhase, PROVIDER_REJECTION_MAX_DETAIL_BYTES, ProviderRejectionEvidence,
     RestartSafetyProof, WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS,
     WINDOWS_PRIVATE_PROTOCOL_VERSION, WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1,
-    WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsLauncherResponseV1,
-    WindowsProcessIdentityV1, WindowsProviderResponseV1, WindowsRelayPhaseV1,
+    WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsLauncherResponseV3,
+    WindowsProcessIdentityV1, WindowsProviderResponseV3, WindowsRelayPhaseV1,
     WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsTerminalizationCheckpointV1,
     WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
     WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
@@ -59,7 +59,9 @@ fn completed_preauthorization_record() -> crate::windows::record::WindowsAttempt
     )
     .unwrap();
     record.guardian_identity = Some(identity.clone());
-    record.target_identity = Some(identity);
+    record.target_identity = Some(identity.clone());
+    record.nonce = binding().1;
+    super::windows_v3_fixture::bind_owner_manifest(&mut record, &identity);
     record.state = WindowsAttemptStateV1::Empty;
     record.cleanup_state.termination_requested = true;
     record.cleanup_state.active_processes_zero = true;
@@ -78,39 +80,54 @@ fn completed_preauthorization_record() -> crate::windows::record::WindowsAttempt
     record
 }
 
+#[test]
+fn preauthorization_outbox_authenticates_without_posttarget_proof() {
+    let mut record = completed_preauthorization_record();
+    let response = bound_preauthorization_rejection(&record);
+    record
+        .stage_terminal_response_with_store_for_test(&response, |candidate| {
+            candidate.validate_for_store_for_test()
+        })
+        .unwrap();
+    assert_eq!(
+        record.lifecycle,
+        memcordon_core::WindowsTerminalLifecycleV1::OutboxStaged
+    );
+    assert!(record.terminal_seed.is_none());
+    assert!(record.retirement_proof.is_none());
+    assert!(
+        memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+            &serde_json::to_vec(&record).unwrap(),
+            &record.attempt_id,
+            &record.provider_generation,
+        )
+        .is_ok()
+    );
+    let mut misclassified = record.clone();
+    misclassified.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::Posttarget);
+    assert!(
+        misclassified
+            .validate_for_store_for_test()
+            .unwrap_err()
+            .ends_with("reason=proof-checkpoint")
+    );
+}
+
 fn bound_preauthorization_rejection(
     record: &crate::windows::record::WindowsAttemptRecordV1,
-) -> WindowsLauncherResponseV1 {
+) -> WindowsLauncherResponseV3 {
     let (_, nonce, _) = binding();
-    WindowsLauncherResponseV1::Reject {
+    WindowsLauncherResponseV3::Reject {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: record.attempt_id.clone(),
         nonce,
         request_sha256: record.request_sha256.clone(),
-        rejection: ProviderRejectionEvidence {
-            workload_admission: None,
-            provider_failure: None,
-            schema_version: 1,
-            code: "MCSEALED-WINDOWS-PREAUTHORIZATION-ABORT".to_owned(),
-            phase: BoundarySetupPhase::TargetCreation,
-            detail: "preauthorization target creation failed".to_owned(),
-            os_code: Some(5),
-            loader_qualification: None,
-            target_created: true,
-            target_released: false,
-            cleanup_attempted: true,
-            restart_safety: RestartSafetyProof {
-                direct_child_reaped: true,
-                workload_empty: Some(true),
-                helpers_reaped: true,
-                containment_removed: true,
-                containment_incapable_of_live_members: true,
-                sealed_boundary_retired: true,
-                errors: Vec::new(),
-            },
-            terminal_ack_required: true,
-            terminal_receipt: None,
-        },
+        rejection: super::windows_v3_fixture::preauthorization_rejection(
+            record,
+            "MCSEALED-WINDOWS-PREAUTHORIZATION-ABORT",
+            BoundarySetupPhase::TargetCreation,
+            true,
+        ),
     }
 }
 
@@ -155,8 +172,8 @@ fn launcher_record_inspection_failure_returns_bound_retained_evidence() {
             "record authentication failed".to_owned(),
         );
 
-    let WindowsLauncherResponseV1::AttemptRetained(retained) = response else {
-        panic!("launcher replay failure did not return AttemptRetained");
+    let WindowsLauncherResponseV3::AttemptRetainedV2(retained) = response else {
+        panic!("launcher replay failure did not return AttemptRetainedV2");
     };
     assert!(retained.is_consistent_for(
         &attempt_id,
@@ -183,8 +200,8 @@ fn control_private_replay_failure_returns_public_retained_evidence() {
         "private launcher pipe peer disconnected".to_owned(),
     );
 
-    let WindowsProviderResponseV1::AttemptRetained(retained) = response else {
-        panic!("control replay failure did not return AttemptRetained");
+    let WindowsProviderResponseV3::AttemptRetainedV2(retained) = response else {
+        panic!("control replay failure did not return AttemptRetainedV2");
     };
     assert!(retained.is_consistent_for(
         &attempt_id,
@@ -338,7 +355,7 @@ fn final_outbox_store_failure_preserves_primary_and_bounds_secondary_diagnostics
         WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS
     );
 
-    let authenticated = parse_and_authenticate_windows_attempt_record(
+    let authenticated = memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
         &serde_json::to_vec(&record).unwrap(),
         &record.attempt_id,
         &record.provider_generation,

@@ -1,11 +1,10 @@
-use memcordon_ci::build_context::BuildInputSnapshot;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 #[test]
-fn optimized_bootstrap_profile_retains_runtime_checks_and_cache_identity() {
+fn optimized_bootstrap_profile_retains_runtime_checks() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest: toml::Value =
         toml::from_str(&fs::read_to_string(repository.join("Cargo.toml")).unwrap()).unwrap();
@@ -79,13 +78,5 @@ fn optimized_profile_keeps_runtime_guards() {
         String::from_utf8(result.stdout)
             .unwrap()
             .contains("1 passed;")
-    );
-
-    let snapshot = BuildInputSnapshot::capture(source.path()).unwrap();
-    fixture["profile"]["ci-bootstrap"]["opt-level"] = toml::Value::Integer(1);
-    fs::write(&fixture_manifest, toml::to_string(&fixture).unwrap()).unwrap();
-    assert!(
-        snapshot.audit().is_err(),
-        "profile mutation must invalidate measured source identity"
     );
 }

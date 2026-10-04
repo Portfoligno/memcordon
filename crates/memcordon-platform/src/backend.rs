@@ -30,7 +30,7 @@ pub struct BoundarySupport {
 pub enum SealedAvailability {
     Available {
         capability: BoundaryCapability,
-        qualification: BoundaryQualification,
+        observation: BoundaryReadiness,
     },
     Unavailable {
         reason: String,
@@ -39,9 +39,8 @@ pub enum SealedAvailability {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct BoundaryQualification {
+pub struct BoundaryReadiness {
     pub provider_identity: String,
-    pub receipt_digest: String,
     pub mechanism: String,
 }
 
@@ -60,7 +59,8 @@ pub struct UnavailableBackend {
 
 #[derive(Clone, Debug)]
 pub struct Execution {
-    pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
+    pub private_execution: Option<memcordon_core::private_runtime::PrivateRuntimeExecution>,
+    pub policy_enforcement: memcordon_core::workload_evidence::RuntimePolicyEnforcement,
     pub outcome: RunOutcome,
     pub backend: BackendInfo,
     pub child_pid: Option<std::num::NonZeroU32>,

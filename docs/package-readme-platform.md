@@ -7,10 +7,11 @@ is for applications that embed backend probing or execution.
 
 Boundary capability is reported separately from memory enforcement. Sealed
 requests never fall back to standard backends. Linux and Windows report sealed
-capability only when their matching mechanism-v2 providers are installed and
-qualified; missing, stale, or mismatched providers reject the request before
-target authorization. Execution reports use schema 10, including observed
-standard launch facts and optional exact-grant sealed workload admission.
+capability only when matching components and live native readiness are verified;
+missing or mismatched providers reject before target authorization. Local grants
+are checked independently on every launch. Named ResultV1 retains current admission
+and private native facts; supported numeric execution formats retain their frozen
+historical meanings.
 
 ## Install
 
