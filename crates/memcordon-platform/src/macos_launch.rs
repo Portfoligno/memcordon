@@ -354,6 +354,10 @@ enum Message {
     ExpireGuardianReadyRetirementDelayed,
     #[cfg(feature = "test-support")]
     ExpireGuardianInspectors,
+    #[cfg(feature = "test-support")]
+    ReadinessFaultReached {
+        normal_inspector_created: bool,
+    },
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -1034,6 +1038,8 @@ impl Message {
             #[cfg(feature = "test-support")]
             Self::ExpireGuardianInspectors => "ExpireGuardianInspectors",
             #[cfg(feature = "test-support")]
+            Self::ReadinessFaultReached { .. } => "ReadinessFaultReached",
+            #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
             Self::InspectorsStalled { .. } => "InspectorsStalled",
@@ -1670,6 +1676,10 @@ pub(crate) struct Launch {
 }
 pub(crate) struct StartupError {
     #[cfg(feature = "test-support")]
+    pub(crate) configuration_written: bool,
+    #[cfg(feature = "test-support")]
+    pub(crate) fault_phase_reached: bool,
+    #[cfg(feature = "test-support")]
     pub(crate) cleanup_observations: Vec<runtime::StartupCleanupObservation>,
     pub(crate) terminal_observed: Option<u64>,
     pub(crate) retirement_observed: Option<u64>,
@@ -1871,6 +1881,10 @@ fn launch_configured(
     let mut guardian_owner = None;
     let mut pending_creation = None;
     let mut configured = false;
+    #[cfg(feature = "test-support")]
+    let mut configuration_written = false;
+    #[cfg(feature = "test-support")]
+    let mut fault_phase_reached = false;
     let mut release = memcordon_core::ReleaseEvidence::NotIssued;
     let mut phase = "helper-spawn";
     #[cfg(feature = "test-support")]
@@ -1878,6 +1892,10 @@ fn launch_configured(
     if Instant::now() >= deadline {
         diagnostic.cleanup.state = CleanupState::Complete;
         return Err(Box::new(StartupError {
+            #[cfg(feature = "test-support")]
+            configuration_written,
+            #[cfg(feature = "test-support")]
+            fault_phase_reached,
             #[cfg(feature = "test-support")]
             cleanup_observations,
             terminal_observed: crate::macos_deadline::continuous_nanos().ok(),
@@ -2019,6 +2037,27 @@ fn launch_configured(
             },
             deadline,
         )?;
+        #[cfg(feature = "test-support")]
+        {
+            configuration_written = true;
+            if matches!(
+                fault,
+                Some(
+                    LaunchFault::GuardianReadyExpired
+                        | LaunchFault::GuardianReadyExpiredRetirementDelayed
+                        | LaunchFault::GuardianInspectorsExpired
+                )
+            ) {
+                control.expect(
+                    Message::ReadinessFaultReached {
+                        normal_inspector_created: fault
+                            == Some(LaunchFault::GuardianInspectorsExpired),
+                    },
+                    deadline,
+                )?;
+                fault_phase_reached = true;
+            }
+        }
         control.expect(Message::Ready, deadline)?;
         diagnostic.guardian_ready = true;
         #[cfg(feature = "test-support")]
@@ -2360,6 +2399,10 @@ fn launch_configured(
                 });
             }
             Err(Box::new(StartupError {
+                #[cfg(feature = "test-support")]
+                configuration_written,
+                #[cfg(feature = "test-support")]
+                fault_phase_reached,
                 #[cfg(feature = "test-support")]
                 cleanup_observations,
                 terminal_observed,
@@ -3108,6 +3151,17 @@ fn guardian_main(
     }
     #[cfg(feature = "test-support")]
     if expire_ready || delay_ready_retirement {
+        let phase_deadline = Instant::now()
+            .checked_add(Duration::from_nanos(
+                startup.saturating_sub(crate::macos_deadline::continuous_nanos()?),
+            ))
+            .ok_or_else(|| io::Error::other("fault phase deadline overflow"))?;
+        control.send(
+            Message::ReadinessFaultReached {
+                normal_inspector_created: false,
+            },
+            phase_deadline,
+        )?;
         while crate::macos_deadline::continuous_nanos()? < startup {
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -3150,6 +3204,12 @@ fn guardian_main(
         }
         #[cfg(feature = "test-support")]
         if expire_inspectors {
+            control.send(
+                Message::ReadinessFaultReached {
+                    normal_inspector_created: true,
+                },
+                inspector_deadline,
+            )?;
             while crate::macos_deadline::continuous_nanos()? < startup {
                 std::thread::sleep(Duration::from_millis(2));
             }

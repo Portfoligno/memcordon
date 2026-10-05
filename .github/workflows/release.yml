@@ -2,12 +2,19 @@ name: Release
 
 on:
   push:
+    branches: ["**"]
     tags: ["[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing unprefixed release tag
+      preparation-mode:
+        description: Candidate preparation or an existing tagged release
         required: true
+        default: release
+        type: choice
+        options: [candidate, release]
+      tag:
+        description: Existing unprefixed release tag; release mode only
+        required: false
         type: string
       recovery-mode:
         description: Rebuild or reuse the original prepared bytes
@@ -29,31 +36,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: memcordon-release-${{ github.event.inputs.tag || github.ref }}
-  cancel-in-progress: false
+  group: memcordon-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}
 
 jobs:
   select:
+    if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       selected-commit: ${{ steps.source.outputs.selected-commit }}
       public-consumer: ${{ steps.source.outputs.public-consumer }}
       recovery-mode: ${{ steps.source.outputs.recovery-mode }}
-      tool-artifact-id: ${{ steps.tool.outputs.artifact-id || steps.recovery.outputs.tool-artifact-id }}
-      prepared-artifact-id: ${{ steps.recovery.outputs.prepared-artifact-id }}
-      original-run-id: ${{ steps.recovery.outputs.original-run-id }}
+      preparation-kind: ${{ steps.source.outputs.preparation-kind }}
+      selection-artifact-id: ${{ steps.selection.outputs.artifact-id }}
+      preparation-tool-artifact-id: ${{ steps.tool.outputs.artifact-id }}
     steps:
-      - if: github.event_name == 'push'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -67,28 +70,29 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - id: source
-        run: ./target/ci/release/memcordon-ci release select
-      - id: recovery
-        name: Read original preparation artifacts
-        if: steps.source.outputs.recovery-mode == 'publication-only'
-        run: ./target/ci/release/memcordon-ci release recovery-inputs
-        env:
-          GH_TOKEN: ${{ github.token }}
+        run: ./target/ci/release/memcordon-ci release select-preparation
       - if: steps.source.outputs.recovery-mode == 'reprepare'
         run: ./target/ci/release/memcordon-ci release publication-tool
-      - if: steps.source.outputs.recovery-mode == 'reprepare'
-        uses: ./.github/actions/upload-artifact
+      - id: selection
+        if: steps.source.outputs.recovery-mode == 'reprepare'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: selected-source-${{ github.run_id }}
-          path: .release/source.json
+          name: selected-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .release/build-source.json
+            .release/source.json
           if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - id: tool
         if: steps.source.outputs.recovery-mode == 'reprepare'
-        uses: ./.github/actions/upload-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: publication-tool-${{ github.run_id }}
+          name: preparation-tool-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/tool
           if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - if: always() && steps.deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -98,11 +102,27 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: &diagnostic-paths |
+            target/ci/reports/execution
+            target/ci/deadline-evidence
+            .release/installed-results
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   packages:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -111,8 +131,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -124,19 +145,33 @@ jobs:
           key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
       - id: packages
-        run: ./target/ci/release/memcordon-ci release packages
-      - uses: ./.github/actions/upload-artifact
+        run: ./target/ci/release/memcordon-ci release packages --build-source .release/build-source.json
+      - id: payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: packages-${{ github.run_id }}
+          name: packages-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/packages
           if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - if: always() && steps.packages.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: *release-check-source-paths
           key: ${{ steps.deps.outputs.cache-primary-key }}
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
 
   source-checks:
     needs: select
@@ -151,8 +186,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -161,7 +197,7 @@ jobs:
           key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
       - run: ./target/ci/release/memcordon-ci suite policy
       - id: quality-context
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose quality --shard complete
@@ -217,6 +253,17 @@ jobs:
           path: *release-check-source-paths
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   miri:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
@@ -234,8 +281,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -244,7 +292,7 @@ jobs:
           key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
       - run: ./target/ci/release/memcordon-ci ci prepare --profile miri
       - id: context
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard complete
@@ -271,6 +319,17 @@ jobs:
           path: *release-check-source-paths
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   fuzz:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
@@ -288,8 +347,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -298,7 +358,7 @@ jobs:
           key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source
+      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
       - id: prepare
         run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz
       - id: context
@@ -329,6 +389,17 @@ jobs:
           path: *release-check-source-paths
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   native-linux-x64:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
@@ -339,7 +410,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: &native-target-steps
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -350,8 +423,9 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -374,12 +448,15 @@ jobs:
             target/ci/native
           key: ${{ steps.cache.outputs.product-key }}
       - id: build
-        run: ./target/ci/release/memcordon-ci release build-target
-      - uses: ./.github/actions/upload-artifact
+        run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json
+      - id: payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: native-${{ matrix.target }}-${{ github.run_id }}
+          name: native-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/target
           if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -396,6 +473,17 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   native-linux-arm64:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
@@ -404,7 +492,9 @@ jobs:
       matrix:
         include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
   native-macos-x64:
@@ -415,7 +505,9 @@ jobs:
       matrix:
         include: [{target: x86_64-apple-darwin, runner: macos-15-intel}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
   native-macos-arm64:
@@ -426,7 +518,9 @@ jobs:
       matrix:
         include: [{target: aarch64-apple-darwin, runner: macos-15}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
   native-windows-x64:
@@ -437,7 +531,9 @@ jobs:
       matrix:
         include: [{target: x86_64-pc-windows-msvc, runner: windows-2025}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
   native-windows-arm64:
@@ -448,7 +544,9 @@ jobs:
       matrix:
         include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
   installed-linux-x64:
@@ -457,7 +555,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, channel: both}]
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, native-job: native-linux-x64, channel: both}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: &installed-target-steps
@@ -470,13 +568,15 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: native-${{ matrix.target }}-${{ github.run_id }}
+          artifact-ids: ${{ needs[matrix.native-job].outputs.artifact-id }}
           path: .release/target
+          merge-multiple: true
           digest-mismatch: error
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: packages-${{ github.run_id }}
+          artifact-ids: ${{ needs.packages.outputs.artifact-id }}
           path: .release/packages
+          merge-multiple: true
           digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -505,11 +605,14 @@ jobs:
         if: matrix.channel != 'native'
         run: ./target/ci/release/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo
       - if: always()
-        uses: ./.github/actions/upload-artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: installed-results-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}
+          name: installed-results-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/installed-results
           if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
       - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.consumers.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -526,13 +629,24 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   installed-linux-arm64:
     needs: [select, packages, native-linux-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, channel: both}]
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, native-job: native-linux-arm64, channel: both}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -543,7 +657,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, channel: both}]
+        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, native-job: native-macos-x64, channel: both}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -554,7 +668,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-apple-darwin, runner: macos-15, channel: both}]
+        include: [{target: aarch64-apple-darwin, runner: macos-15, native-job: native-macos-arm64, channel: both}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -565,7 +679,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, channel: native}]
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: native}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -576,7 +690,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, channel: cargo}]
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: cargo}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -587,7 +701,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: native}]
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: native}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
@@ -598,17 +712,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: cargo}]
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: cargo}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps: *installed-target-steps
 
   assemble:
     needs: [select, packages, source-checks, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, installed-linux-x64, installed-linux-arm64, installed-macos-x64, installed-macos-arm64, installed-windows-x64-native, installed-windows-x64-cargo, installed-windows-arm64-native, installed-windows-arm64-cargo]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       prepared-artifact-id: ${{ steps.prepared.outputs.artifact-id }}
+      publication-tool-artifact-id: ${{ steps.publication-tool.outputs.artifact-id }}
     steps:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -618,36 +734,141 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: publication-tool-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
           path: .release/tool
+          merge-multiple: true
           digest-mismatch: error
       - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: selected-source-${{ github.run_id }}
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
+          merge-multiple: true
           digest-mismatch: error
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: packages-${{ github.run_id }}
+          artifact-ids: ${{ needs.packages.outputs.artifact-id }}
           path: .release/packages
+          merge-multiple: true
           digest-mismatch: error
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: native-*-${{ github.run_id }}
-          path: .release/targets
+          artifact-ids: ${{ needs.native-linux-x64.outputs.artifact-id }}
+          path: .release/targets/linux-x64
+          merge-multiple: true
           digest-mismatch: error
-      - run: ./.release/tool/memcordon-ci release assemble
-      - id: prepared
-        uses: ./.github/actions/upload-artifact
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: prepared-${{ github.run_id }}
+          artifact-ids: ${{ needs.native-linux-arm64.outputs.artifact-id }}
+          path: .release/targets/linux-arm64
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.native-macos-x64.outputs.artifact-id }}
+          path: .release/targets/macos-x64
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.native-macos-arm64.outputs.artifact-id }}
+          path: .release/targets/macos-arm64
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.native-windows-x64.outputs.artifact-id }}
+          path: .release/targets/windows-x64
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.native-windows-arm64.outputs.artifact-id }}
+          path: .release/targets/windows-arm64
+          merge-multiple: true
+          digest-mismatch: error
+      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json
+      - id: candidate
+        if: needs.select.outputs.preparation-kind == 'candidate'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/prepared-candidate
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: true
+          overwrite: false
+      - id: prepared
+        if: needs.select.outputs.preparation-kind == 'tagged'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: prepared-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/prepared
           if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+      - id: publication-tool
+        if: needs.select.outputs.preparation-kind == 'tagged'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: publication-tool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/tool/memcordon-publication-tool.tar.gz
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
+  recovery-inputs:
+    needs: select
+    if: needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      original-run-id: ${{ steps.recovery.outputs.original-run-id }}
+      prepared-artifact-id: ${{ steps.recovery.outputs.prepared-artifact-id }}
+      tool-artifact-id: ${{ steps.recovery.outputs.tool-artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: ./target/ci/release/memcordon-ci release select-preparation
+      - id: recovery
+        name: Read original preparation artifacts
+        run: ./target/ci/release/memcordon-ci release recovery-inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
 
   publish:
     needs: [select, assemble]
-    if: always() && needs.select.result == 'success' && (needs.assemble.result == 'success' || needs.select.outputs.recovery-mode == 'publication-only')
+    if: needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'reprepare' && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
@@ -658,38 +879,18 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - if: needs.select.outputs.recovery-mode == 'reprepare'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
-      - if: needs.select.outputs.recovery-mode == 'reprepare'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
           run-id: ${{ github.run_id }}
-          github-token: ${{ github.token }}
-          path: .release/prepared
-          merge-multiple: true
-          digest-mismatch: error
-      - if: needs.select.outputs.recovery-mode == 'publication-only'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
-          run-id: ${{ needs.select.outputs.original-run-id }}
-          github-token: ${{ github.token }}
-          path: .release/tool
-          merge-multiple: true
-          digest-mismatch: error
-      - if: needs.select.outputs.recovery-mode == 'publication-only'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.select.outputs.prepared-artifact-id }}
-          run-id: ${{ needs.select.outputs.original-run-id }}
           github-token: ${{ github.token }}
           path: .release/prepared
           merge-multiple: true
@@ -703,9 +904,49 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
 
+  recovery-publish:
+    needs: [select, recovery-inputs]
+    if: needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: memcordon-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - id: registry-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Publish original prepared bytes
+        run: ./.release/tool/memcordon-ci release publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
+
   published-consumer:
-    needs: [select, assemble, publish]
-    if: always() && needs.publish.result == 'success' && needs.select.outputs.public-consumer == 'true'
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.public-consumer == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -715,7 +956,7 @@ jobs:
       - if: needs.select.outputs.recovery-mode == 'reprepare'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
+          artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
@@ -729,8 +970,9 @@ jobs:
       - if: needs.select.outputs.recovery-mode == 'publication-only'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.tool-artifact-id }}
-          run-id: ${{ needs.select.outputs.original-run-id }}
+          artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
           github-token: ${{ github.token }}
           path: .release/tool
           merge-multiple: true
@@ -738,8 +980,9 @@ jobs:
       - if: needs.select.outputs.recovery-mode == 'publication-only'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.prepared-artifact-id }}
-          run-id: ${{ needs.select.outputs.original-run-id }}
+          artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
           github-token: ${{ github.token }}
           path: .release/prepared
           merge-multiple: true

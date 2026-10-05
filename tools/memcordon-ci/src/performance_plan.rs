@@ -85,6 +85,7 @@ impl Experiment {
                 "measurement coverage or actual timing dimensions differ".into(),
             ));
         }
+        let mut improvement = true;
         for category in &self.available_categories {
             let mut durations = Vec::new();
             for layout in [Layout::Serial, Layout::Parallel] {
@@ -123,10 +124,10 @@ impl Experiment {
                 || parallel.2.0 > serial.2.0
                 || parallel.2.1 > serial.2.1
             {
-                return Ok(false);
+                improvement = false;
             }
         }
-        Ok(true)
+        Ok(improvement)
     }
 }
 
@@ -161,6 +162,22 @@ pub struct StressSelection {
     pub platform: String,
     pub selected: Layout,
     pub experiment: Option<Experiment>,
+}
+
+impl StressSelection {
+    /// Layout is a coverage decision; comparative speedup remains advisory.
+    pub fn validate_layout(&self) -> Result<()> {
+        if let Some(experiment) = &self.experiment {
+            experiment.supports_parallel()?;
+        }
+        Ok(())
+    }
+
+    pub fn supports_parallel(&self) -> Result<bool> {
+        self.experiment
+            .as_ref()
+            .map_or(Ok(false), Experiment::supports_parallel)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,11 +219,7 @@ impl PerformancePlan {
             ));
         }
         for entry in &self.stress {
-            Selection {
-                selected: entry.selected,
-                experiment: entry.experiment.clone(),
-            }
-            .validate()?;
+            entry.validate_layout()?;
         }
         for selection in [&self.macos_release, &self.preparation, &self.quality] {
             selection.validate()?;

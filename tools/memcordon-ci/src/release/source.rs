@@ -255,12 +255,13 @@ pub fn metadata(root: &Path) -> Result<Metadata> {
         ["metadata", "--locked", "--format-version", "1", "--no-deps"],
         std::time::Duration::from_secs(120),
     )
+    .phase(crate::command::CiPhase::SourceCheck)
     .output_quiet()?;
     if !bytes.status.success() {
         return Err(CiError::Message(format!(
             "Cargo metadata failed with {} using toolchain {toolchain}: {}",
             bytes.status,
-            String::from_utf8_lossy(&bytes.stderr).trim(),
+            crate::command::bounded_excerpt(&bytes.stderr).trim(),
         )));
     }
     Ok(serde_json::from_slice(&bytes.stdout)?)

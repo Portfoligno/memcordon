@@ -34,6 +34,29 @@ selected tag.
 
 ## Tag and workflow operations
 
+Every branch push runs the same release preparation jobs on the exact event
+commit, including all six native producers, architecture-local installed
+consumers and fresh-runner assembly. Manual candidate dispatch selects
+`preparation-mode: candidate` with no tag or recovery IDs. Candidate output uses
+`memcordon.prepared-candidate` under `.release/prepared-candidate`; it cannot be
+published or used for publication-only recovery. Candidate notes record an exact
+version section, `Unreleased`, or unavailable notes. The real tag run still
+requires exact release notes and independently prepares its own payloads.
+
+Required artifacts use immutable provider IDs and names containing the producing
+run and attempt. Rerun consumers may reuse an earlier producer's returned ID;
+they never resolve a name pattern or overwrite an uncertain upload. Tagged
+assembly uploads its completed prepared bundle and the unchanged executable
+archive it used together. Recovery accepts only a pair associated with the same
+successful final assembly attempt. Candidate artifacts have seven-day retention;
+tagged artifacts retain the repository's configured release retention. Expired
+bytes require tagged repreparation.
+
+Normal publication and publication-only recovery have separate tag-only writer
+jobs. Original-artifact validation runs first in a read-only job. Writers receive
+only the selected tool and prepared bytes, with no compilation or executable
+cache restore. Old tags continue to use their own workflow and artifact format.
+
 Build the ordinary CI driver with the pinned toolchain in `ci/toolchains.toml`.
 From the reviewed release commit, run these separate operations:
 
@@ -72,7 +95,7 @@ anonymous reads share one deadline and throttle budget.
 
 For a failed run, `release reconcile-tag` observes the recorded tag and reports the
 actual workflow state. `--dispatch --mode reprepare` requests a fresh run at that
-same tag. `--mode use-original` additionally requires the exact original run,
+same tag. `--mode publication-only` additionally requires the exact original run,
 prepared-artifact and publication-tool artifact IDs. Recovery verifies their source,
 names, bytes and producer association before using them. Expired or unverifiable
 artifacts require repreparation.
@@ -92,7 +115,16 @@ administration is a maintainer operation; editing workflow files does not update
 branch protection automatically.
 
 Performance forms remain serial or combined by default. `ci/performance.toml` can
-select bounded split forms only from the required comparative measurements.
-Missing measurements keep the complete default execution. Unknown cache inputs
+select a bounded stress split as an explicit scheduling choice. Both selected
+phases retain their full coverage and budgets; optional comparative measurements
+must be honest when supplied. Other performance forms retain their existing
+measurement requirements. Unknown cache inputs
 disable compiled reuse and allow an ordinary build; the first CI driver build may
 be cold. Reports, installed state and prepared package bytes are not build caches.
+
+Combined stress keeps its 120-minute envelope. Native release production admits
+30, 25, 15 and 60-minute sequential child ceilings inside a 180-minute planning
+envelope, with one original operation deadline. Product deadlines remain strict.
+Preparation jobs retain bounded execution/deadline/installed diagnostics with
+best-effort uploads. Missing final evidence remains incomplete; a retained report
+does not change a failed or cancelled workflow outcome.

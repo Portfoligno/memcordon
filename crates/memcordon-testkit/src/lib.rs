@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod harness_budget;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use memcordon_platform::test_support::unsearchable_directory;
 
@@ -14,6 +16,7 @@ pub use memcordon_platform::test_support::{
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -47,6 +50,12 @@ pub enum ProcessTestError {
     Spawn(io::Error),
     Wait(io::Error),
     Output(io::Error),
+    OutputLimit {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        cleanup: Result<(), String>,
+        termination: Option<ExitStatus>,
+    },
     Timeout {
         deadline: Duration,
         stdout: Vec<u8>,
@@ -62,6 +71,17 @@ impl fmt::Display for ProcessTestError {
             Self::Spawn(error) => write!(formatter, "test command failed to spawn: {error}"),
             Self::Wait(error) => write!(formatter, "test command wait failed: {error}"),
             Self::Output(error) => write!(formatter, "test output reader failed: {error}"),
+            Self::OutputLimit {
+                stdout,
+                stderr,
+                cleanup,
+                termination,
+            } => write!(
+                formatter,
+                "subprocess output exceeds byte limit; cleanup={cleanup:?}; termination={termination:?}; stdout-bytes={}; stderr-bytes={}",
+                stdout.len(),
+                stderr.len()
+            ),
             Self::Timeout {
                 deadline,
                 stdout,
@@ -83,6 +103,7 @@ impl std::error::Error for ProcessTestError {}
 struct OutputReader {
     bytes: Arc<Mutex<Vec<u8>>>,
     worker: thread::JoinHandle<io::Result<()>>,
+    output_limited: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -125,6 +146,8 @@ impl OutputReader {
 fn reader(mut stream: impl Read + Send + 'static, limit: Option<usize>) -> OutputReader {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&bytes);
+    let output_limited = Arc::new(AtomicBool::new(false));
+    let worker_limited = Arc::clone(&output_limited);
     let worker = thread::spawn(move || {
         let mut chunk = [0_u8; 8192];
         loop {
@@ -136,12 +159,21 @@ fn reader(mut stream: impl Read + Send + 'static, limit: Option<usize>) -> Outpu
             };
             let mut captured = captured.lock().expect("output reader buffer poisoned");
             if limit.is_some_and(|limit| captured.len().saturating_add(length) > limit) {
+                if let Some(limit) = limit {
+                    let remaining = limit.saturating_sub(captured.len());
+                    captured.extend_from_slice(&chunk[..remaining]);
+                }
+                worker_limited.store(true, Ordering::Release);
                 return Err(io::Error::other("subprocess output exceeds byte limit"));
             }
             captured.extend_from_slice(&chunk[..length]);
         }
     });
-    OutputReader { bytes, worker }
+    OutputReader {
+        bytes,
+        worker,
+        output_limited,
+    }
 }
 
 pub fn run_with_deadline(
@@ -283,6 +315,31 @@ fn observe_deadline_child(
     let mut observed_status = None;
 
     let status = loop {
+        if stdout_reader.output_limited.load(Ordering::Acquire)
+            || stderr_reader.output_limited.load(Ordering::Acquire)
+        {
+            // Preserve the first cap violation and settle the owned boundary before
+            // any report formatting. A full pipe must not consume the whole guard.
+            let cleanup = boundary
+                .terminate_and_reap(&mut child)
+                .map_err(|error| error.to_string());
+            if cleanup.is_err() {
+                let _ = child.kill();
+            }
+            let wait = child.wait().map_err(|error| error.to_string());
+            let stdout = stdout_reader.snapshot();
+            let stderr = stderr_reader.snapshot();
+            if cleanup.is_ok() {
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+            }
+            return Err(ProcessTestError::OutputLimit {
+                stdout,
+                stderr,
+                termination: wait.as_ref().ok().copied(),
+                cleanup: cleanup.and(wait.map(|_| ())),
+            });
+        }
         if callback_result.is_none() {
             match callback_receiver.try_recv() {
                 Ok(result) => callback_result = Some(result),

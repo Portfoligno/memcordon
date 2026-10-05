@@ -39,6 +39,35 @@ fn cargo_with_deadline(
 }
 
 fn quality(root: &Path, stable: &str) -> Result<()> {
+    let directory = root.join("target/ci/reports/execution");
+    let started = Instant::now();
+    let record = |state: &str, error: Option<&CiError>| {
+        let write = || -> Result<()> {
+            fs::create_dir_all(&directory)?;
+            let temporary = directory.join("source-check.tmp");
+            let value = serde_json::json!({"phase":"source-check", "state":state, "expected-operation":"pinned format, metadata, check, Clippy and rustdoc", "toolchain":stable, "declared-budget-ms":Duration::from_secs(90*60).as_millis(), "elapsed-ms":started.elapsed().as_millis(), "error":error.map(|error| crate::command::bounded_excerpt(error.to_string().as_bytes()))});
+            memcordon_ci::release::source::write_json(&temporary, &value)?;
+            fs::rename(temporary, directory.join("source-check.json"))?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            eprintln!("diagnostic retention incomplete: {error}");
+        }
+    };
+    record("in-progress", None);
+    let result = quality_inner(root, stable);
+    record(
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        result.as_ref().err(),
+    );
+    result
+}
+
+fn quality_inner(root: &Path, stable: &str) -> Result<()> {
     let layout = crate::performance_plan::PerformancePlan::read(root)?
         .quality
         .selected;
@@ -631,6 +660,7 @@ pub fn delegated_linux_backend(root: &Path, rustup: &Path, expected_uid: &str) -
 }
 
 fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
+    let mut exact = memcordon_ci::exact_harness::ExactHarnessRunner::default();
     if !cfg!(target_os = "macos") {
         return Err(CiError::Message(
             "macos-deadline requires native macOS".into(),
@@ -657,100 +687,47 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             "detached_child_survives_root_exit_and_group_change",
             "new_confirmed_members_survive_a_concurrent_metadata_failure",
         ] {
-            let output = cargo(
+            exact.run(
                 root,
                 stable,
-                "test",
-                [
-                    "--locked",
-                    "--target-dir",
-                    "target/ci/deadline-build",
-                    "--package",
-                    "memcordon-platform",
-                    "--features",
-                    "test-support",
-                    "--test",
-                    "macos_inventory",
-                    scenario,
-                    "--",
-                    "--exact",
-                    "--test-threads=1",
-                ],
+                "target/ci/deadline-build",
+                "memcordon-platform",
+                "test-support",
+                "macos_inventory",
+                scenario,
             )?;
-            capability::require_exact_standard_test_success(&output, scenario)?;
         }
-        for scenario in crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS {
-            let output = cargo(
-                root,
-                stable,
-                "test",
-                [
-                    "--locked",
-                    "--target-dir",
-                    "target/ci/deadline-build",
-                    "--package",
-                    "memcordon",
-                    "--features",
-                    "test-fixtures",
-                    "--test",
-                    "macos_remediation",
-                    scenario,
-                    "--",
-                    "--exact",
-                    "--test-threads=1",
-                ],
-            )?;
-            capability::require_exact_standard_test_success(&output, scenario)?;
-        }
-        let output = cargo(
+        exact.run_selected(
             root,
             stable,
-            "test",
-            [
-                "--locked",
-                "--target-dir",
-                "target/ci/deadline-build",
-                "--package",
-                "memcordon",
-                "--features",
-                "test-fixtures",
-                "--test",
-                "result_delivery",
-                "result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped",
-                "--",
-                "--exact",
-                "--test-threads=1",
-            ],
+            "target/ci/deadline-build",
+            "memcordon",
+            "test-fixtures",
+            "macos_remediation",
+            crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS,
         )?;
-        capability::require_exact_standard_test_success(
-            &output,
+        exact.run(
+            root,
+            stable,
+            "target/ci/deadline-build",
+            "memcordon",
+            "test-fixtures",
+            "result_delivery",
             "result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped",
         )?;
         let mut admission = Vec::new();
         for (package, feature, scenario) in
             crate::native_acceptance_catalogue::MACOS_ADMISSION_SCENARIOS
         {
-            let output = cargo(
+            exact.run(
                 root,
                 stable,
-                "test",
-                [
-                    "--locked",
-                    "--target-dir",
-                    "target/ci/deadline-build",
-                    "--package",
-                    package,
-                    "--features",
-                    feature,
-                    "--test",
-                    "macos_admission",
-                    scenario,
-                    "--",
-                    "--exact",
-                    "--test-threads=1",
-                ],
+                "target/ci/deadline-build",
+                package,
+                feature,
+                "macos_admission",
+                scenario,
             )?;
-            capability::require_exact_standard_test_success(&output, scenario)?;
             admission.push(serde_json::json!({"package": package, "target": "macos_admission", "scenario": scenario, "executed": 1, "passed": 1}));
         }
         fs::write(
@@ -761,27 +738,15 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         for (package, target, scenario) in
             crate::native_acceptance_catalogue::MACOS_MUTATION_SCENARIOS
         {
-            let output = cargo(
+            exact.run(
                 root,
                 stable,
-                "test",
-                [
-                    "--locked",
-                    "--target-dir",
-                    "target/ci/deadline-build",
-                    "--package",
-                    package,
-                    "--features",
-                    "test-support",
-                    "--test",
-                    target,
-                    scenario,
-                    "--",
-                    "--exact",
-                    "--test-threads=1",
-                ],
+                "target/ci/deadline-build",
+                package,
+                "test-support",
+                target,
+                scenario,
             )?;
-            capability::require_exact_standard_test_success(&output, scenario)?;
             mutations.push(serde_json::json!({"package": package, "target": target, "scenario": scenario, "executed": 1, "passed": 1}));
         }
         let mut inventory = serde_json::to_vec_pretty(
@@ -836,6 +801,7 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
 }
 
 pub fn release_macos_native(root: &Path, stable: &str) -> Result<()> {
+    let mut exact = memcordon_ci::exact_harness::ExactHarnessRunner::default();
     memcordon_ci::macos_performance::require_native_host(root, stable)?;
     if !cfg!(target_os = "macos") {
         return Err(CiError::Message(
@@ -852,30 +818,15 @@ pub fn release_macos_native(root: &Path, stable: &str) -> Result<()> {
             crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS,
         ),
     ] {
-        for scenario in scenarios {
-            let output = cargo(
-                root,
-                stable,
-                "test",
-                [
-                    "--target-dir",
-                    "target/ci/backend-macos",
-                    "--locked",
-                    "--package",
-                    "memcordon",
-                    "--features",
-                    "test-support",
-                    "--test",
-                    target,
-                    scenario,
-                    "--",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads=1",
-                ],
-            )?;
-            capability::require_exact_standard_test_success(&output, scenario)?;
-        }
+        exact.run_selected(
+            root,
+            stable,
+            "target/ci/backend-macos",
+            "memcordon",
+            "test-support",
+            target,
+            scenarios,
+        )?;
     }
     macos_deadline(root, stable)?;
     write_macos_report(

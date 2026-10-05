@@ -55,6 +55,8 @@ pub fn prepare_build(
     let output = PackageOutput::new(root, Some(target))?;
     output
         .command(root, &crate::config::toolchains(root)?.stable, &order)
+        .phase(crate::command::CiPhase::Package)
+        .selection(source, None)
         .run()?;
     source.recheck(root)?;
     fs::create_dir_all(destination)?;

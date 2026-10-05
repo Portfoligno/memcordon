@@ -8,6 +8,7 @@ pub mod http;
 pub mod installed_consumer;
 pub mod linux_installed_consumer;
 pub mod packages;
+pub mod preparation;
 pub mod public_consumer;
 pub mod publish;
 pub mod recovery;
@@ -29,6 +30,7 @@ pub enum ConsumerChannel {
 
 #[derive(Subcommand)]
 pub enum ReleaseCommand {
+    SelectPreparation,
     WorkingWindowsPrepare {
         #[arg(long, default_value = "target/ci/windows-prepared")]
         destination: PathBuf,
@@ -48,8 +50,10 @@ pub enum ReleaseCommand {
         packages: PathBuf,
     },
     VerifySource {
-        #[arg(long, default_value = ".release/source.json")]
-        source: PathBuf,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
     },
     PublicConsumer {
         #[arg(long, default_value = ".release/prepared")]
@@ -71,24 +75,30 @@ pub enum ReleaseCommand {
         prepared: PathBuf,
     },
     BuildTarget {
-        #[arg(long, default_value = ".release/source.json")]
-        source: PathBuf,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
         #[arg(long, default_value = ".release/target")]
         destination: PathBuf,
     },
     Assemble {
-        #[arg(long, default_value = ".release/source.json")]
-        source: PathBuf,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
         #[arg(long, default_value = ".release/packages")]
         packages: PathBuf,
         #[arg(long)]
         targets: Vec<PathBuf>,
-        #[arg(long, default_value = ".release/prepared")]
-        destination: PathBuf,
+        #[arg(long)]
+        destination: Option<PathBuf>,
     },
     Packages {
-        #[arg(long, default_value = ".release/source.json")]
-        source: PathBuf,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
         #[arg(long, default_value = "target/ci-packages")]
         target: PathBuf,
         #[arg(long, default_value = ".release/packages")]
@@ -155,6 +165,10 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
+        ReleaseCommand::SelectPreparation => {
+            let selected = preparation::select_preparation(root)?;
+            preparation::write_preparation_files(root, &selected)
+        }
         ReleaseCommand::WorkingWindowsPrepare { destination } => {
             windows_installed_consumer::prepare_working(root, &destination)
         }
@@ -189,9 +203,11 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             inputs.extend(crates.files.iter().map(|file| packages.join(&file.name)));
             crate::cache::emit(root, "installed", "complete", &inputs)
         }
-        ReleaseCommand::VerifySource { source } => {
-            source::read_json::<source::SelectedSource>(&source)?.recheck(root)
-        }
+        ReleaseCommand::VerifySource {
+            source,
+            build_source,
+        } => preparation::read_build_source(source.as_deref(), build_source.as_deref())?
+            .recheck(root),
         ReleaseCommand::PublicConsumer {
             prepared,
             toolchain,
@@ -252,10 +268,17 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Inspect { prepared } => publish::run(&prepared, false),
         ReleaseCommand::BuildTarget {
             source,
+            build_source,
             destination,
-        } => target::build(root, &source, &destination),
+        } => {
+            let selected =
+                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
+            let distribution = distribution::Distribution::read(root)?.native()?.clone();
+            target::build_selected(root, &selected, &distribution, &destination)
+        }
         ReleaseCommand::Assemble {
             source,
+            build_source,
             packages,
             targets,
             destination,
@@ -275,13 +298,30 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             } else {
                 targets
             };
-            bundle::assemble(root, &source, &packages, &targets, &destination)
+            let selected =
+                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
+            let destination = destination.unwrap_or_else(|| {
+                root.join(
+                    if matches!(selected, source::BuildSourceIdentity::Working { .. }) {
+                        ".release/prepared-candidate"
+                    } else {
+                        ".release/prepared"
+                    },
+                )
+            });
+            bundle::assemble_build(root, &selected, &packages, &targets, &destination)
         }
         ReleaseCommand::Packages {
             source,
+            build_source,
             target,
             destination,
-        } => packages::prepare(root, &source, &target, &destination),
+        } => packages::prepare_build(
+            root,
+            &preparation::read_build_source(source.as_deref(), build_source.as_deref())?,
+            &target,
+            &destination,
+        ),
         ReleaseCommand::Select {
             repository: supplied,
             tag_ref,

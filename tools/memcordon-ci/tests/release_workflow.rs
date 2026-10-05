@@ -22,7 +22,7 @@ fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_sou
     let assembly = steps
         .iter()
         .position(|step| {
-            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble")
+            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json")
         })
         .unwrap();
     let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
@@ -190,5 +190,115 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
             _ => unreachable!(),
         }
         assert!(check(&changed).is_err(), "{case}");
+    }
+}
+
+#[test]
+fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
+    let baseline: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    check(&baseline).unwrap();
+    for case in [
+        "branches",
+        "moving-ref",
+        "lf",
+        "quality-components",
+        "assembly-toolchain",
+        "native-budget",
+        "writer-event",
+        "recovery-writer-event",
+        "wildcard",
+        "overwrite",
+        "hidden",
+        "diagnostic-fatal",
+        "staging-cache",
+    ] {
+        let mut changed = baseline.clone();
+        match case {
+            "branches" => changed["on"]["push"]["branches"] = Value::Null,
+            "moving-ref" => {
+                changed["jobs"]["select"]["steps"][1]["with"]["ref"] =
+                    Value::String("${{ github.ref }}".into())
+            }
+            "lf" => {
+                changed["jobs"]["native-windows-arm64"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .remove(0);
+            }
+            "quality-components" | "assembly-toolchain" => {
+                let job = if case == "quality-components" {
+                    "source-checks"
+                } else {
+                    "assemble"
+                };
+                changed["jobs"][job]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .retain(|step| {
+                        !step["run"]
+                            .as_str()
+                            .is_some_and(|run| run.starts_with("rustup toolchain install 1.97.1"))
+                    });
+            }
+            "native-budget" => {
+                changed["jobs"]["native-linux-x64"]["timeout-minutes"] = Value::Number(90.into())
+            }
+            "writer-event" | "recovery-writer-event" => {
+                let job = if case == "writer-event" {
+                    "publish"
+                } else {
+                    "recovery-publish"
+                };
+                changed["jobs"][job]["if"] = Value::String("always()".into());
+            }
+            "wildcard" => {
+                let step = changed["jobs"]["assemble"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| {
+                        step["with"]["path"].as_str() == Some(".release/targets/linux-x64")
+                    })
+                    .unwrap();
+                step["with"]["pattern"] = Value::String("native-*".into());
+            }
+            "overwrite" | "hidden" => {
+                let step = changed["jobs"]["packages"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| step["id"].as_str() == Some("payload"))
+                    .unwrap();
+                step["with"][if case == "overwrite" {
+                    "overwrite"
+                } else {
+                    "include-hidden-files"
+                }] = Value::Bool(case == "overwrite");
+            }
+            "diagnostic-fatal" => {
+                let step = changed["jobs"]["source-checks"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap();
+                step["continue-on-error"] = Value::Bool(false);
+            }
+            "staging-cache" => {
+                let step = changed["jobs"]["packages"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| {
+                        step["uses"]
+                            .as_str()
+                            .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
+                    })
+                    .unwrap();
+                step["with"]["path"] = Value::String(".release/prepared".into());
+            }
+            _ => unreachable!(),
+        }
+        assert!(check(&changed).is_err(), "mutation {case} must fail");
     }
 }

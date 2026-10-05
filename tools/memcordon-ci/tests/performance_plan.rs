@@ -134,7 +134,7 @@ fn split_selection_requires_distinct_actual_phase_roots() {
 }
 
 #[test]
-fn serial_remains_default_until_comparable_queue_inclusive_improvement() {
+fn checked_in_stress_is_serial_while_other_selectors_require_measured_improvement() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let plan = PerformancePlan::read(&root).unwrap();
     assert_eq!(plan.stress_cells(Layout::Serial).unwrap().len(), 5);
@@ -208,4 +208,30 @@ fn platform_omissions_duplicates_and_unknown_fields_are_rejected() {
     let mut unknown = serde_json::to_value(plan).unwrap();
     unknown["certificate"] = serde_json::Value::Bool(true);
     assert!(serde_json::from_value::<PerformancePlan>(unknown).is_err());
+}
+
+#[test]
+fn stress_split_is_valid_without_a_speedup_claim() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut plan = PerformancePlan::read(&root).unwrap();
+    plan.stress[0].selected = Layout::Parallel;
+    plan.stress[0].experiment = None;
+    plan.validate().unwrap();
+    assert!(!plan.stress[0].supports_parallel().unwrap());
+    plan.stress[0].experiment = Some(measurements(950));
+    plan.validate().unwrap();
+    assert!(!plan.stress[0].supports_parallel().unwrap());
+    let mut invalid_later_category = plan.clone();
+    invalid_later_category.stress[0]
+        .experiment
+        .as_mut()
+        .unwrap()
+        .samples[10]
+        .layout = Layout::Parallel;
+    assert!(
+        invalid_later_category.validate().is_err(),
+        "a non-improving first category cannot conceal malformed later measurements"
+    );
+    plan.stress[0].experiment.as_mut().unwrap().samples.pop();
+    assert!(plan.validate().is_err());
 }

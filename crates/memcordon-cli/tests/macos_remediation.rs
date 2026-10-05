@@ -1,6 +1,7 @@
 #![cfg(all(target_os = "macos", feature = "test-fixtures"))]
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -16,6 +17,48 @@ fn image() -> &'static Path {
 }
 fn fixture() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture"))
+}
+
+fn require_native_backend() {
+    let mut probe = Command::new(image());
+    probe.args(["doctor", "--json"]);
+    let output = run_with_deadline(&mut probe, Duration::from_secs(30))
+        .expect("required native backend probe must complete before scenario work begins");
+    assert!(
+        output.status.success(),
+        "native backend probe failed: {output:?}"
+    );
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("native backend probe must produce its actual JSON observation");
+    assert_eq!(
+        probe["selected"]["name"], "macos-watchdog",
+        "required native scenario backend unavailable: {probe:#}"
+    );
+    assert_eq!(
+        probe["selected"]["containment"]["supported"], true,
+        "required native containment unavailable: {probe:#}"
+    );
+    assert_eq!(
+        probe["selected"]["deadline"]["supported"], true,
+        "required native deadline unavailable: {probe:#}"
+    );
+}
+
+struct ReadinessFailureEvidence<'a>(
+    &'a memcordon_platform::test_support::StartupDeadlineObservations,
+);
+
+impl Drop for ReadinessFailureEvidence<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Existing native observations are bounded to two frames/eight slots.
+            // Do not resample processes or infer absent birth/final-settlement evidence.
+            eprintln!(
+                "retained actual native readiness observations: {:#?}",
+                self.0
+            );
+        }
+    }
 }
 
 fn native_runtime() -> std::sync::MutexGuard<'static, ()> {
@@ -343,6 +386,7 @@ fn native_accounting_backend_preserves_consistent_retirement() {
 #[test]
 fn large_poll_interval_cannot_postpone_a_short_deadline() {
     let _runtime = native_runtime();
+    require_native_backend();
     let directory = tempfile::Builder::new()
         .prefix("memcordon-short-deadline-")
         .tempdir_in("/tmp")
@@ -363,7 +407,17 @@ fn large_poll_interval_cannot_postpone_a_short_deadline() {
         + Duration::from_secs(3)
         + Duration::from_secs(1)
         + Duration::from_secs(1);
-    let output = run_with_deadline(&mut command, harness_budget).unwrap();
+    let output = run_with_deadline(&mut command, harness_budget).unwrap_or_else(|error| {
+        // Retain actual bounded bytes before TempDir cleanup; absent evidence stays absent.
+        let evidence = std::fs::File::open(&report_path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+            let truncated = bytes.len() > 16 * 1024;
+            bytes.truncate(16 * 1024);
+            Ok((bytes, truncated))
+        });
+        panic!("short-deadline harness failed; intended phase unconfirmed; {error}; actual report prefix/truncated or read error={evidence:?}");
+    });
     let elapsed = started.elapsed();
     let diagnostic = format!(
         "status={:?}; elapsed={elapsed:?}; stdout({} bytes)={:?}; stderr({} bytes)={:?}",
@@ -553,6 +607,7 @@ fn naturally_exited_inspector_drop_retires_without_suppressing_group_errors() {
 #[test]
 fn guardian_readiness_expiry_reports_timeout_after_verified_cleanup() {
     let _runtime = native_runtime();
+    require_native_backend();
     for fault in [
         MacosLaunchFault::GuardianReadyExpired,
         MacosLaunchFault::GuardianInspectorsExpired,
@@ -573,12 +628,21 @@ fn guardian_readiness_expiry_reports_timeout_after_verified_cleanup() {
             )
             .unwrap();
         let kind = observation.kind;
+        let _failure_evidence = ReadinessFailureEvidence(&observation);
+        assert!(
+            observation.configuration_written,
+            "fixture configuration was not delivered; {fault:?}: {observation:#?}"
+        );
+        assert!(
+            observation.fault_phase_reached,
+            "fixture did not reach its acknowledged readiness fault phase; {fault:?}: {observation:#?}"
+        );
         let diagnostic = &observation.diagnostic;
         let release = &observation.release;
         assert_eq!(
             kind,
             std::io::ErrorKind::TimedOut,
-            "{fault:?}: {diagnostic:#?}"
+            "{fault:?}: {observation:#?}"
         );
         assert_eq!(
             diagnostic.native_errno,

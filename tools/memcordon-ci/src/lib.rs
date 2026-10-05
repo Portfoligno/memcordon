@@ -71,6 +71,7 @@ pub enum CiError {
 
 pub type Result<T> = std::result::Result<T, CiError>;
 pub mod arm32_abi_helper;
+pub mod exact_harness;
 pub mod external_consumer;
 pub mod macos_performance;
 pub mod native_acceptance_catalogue;

@@ -177,8 +177,6 @@ pub fn validate_original(
             "original run is not this tag/source/repository release preparation".into(),
         ));
     }
-    let mut jobs = Vec::new();
-    let mut job_ids = std::collections::BTreeSet::new();
     let attempts = run
         .get("run_attempt")
         .and_then(Value::as_u64)
@@ -186,7 +184,39 @@ pub fn validate_original(
         .ok_or_else(|| {
             CiError::Message("original run attempt inventory unavailable or exceeds bound".into())
         })?;
-    for attempt in 1..=attempts {
+    let mut artifacts = Vec::new();
+    let mut producing_attempt = None;
+    for (artifact_id, kind) in [
+        (original.prepared_artifact_id, "prepared"),
+        (original.tool_artifact_id, "publication-tool"),
+    ] {
+        let artifact = get(&["actions", "artifacts", &artifact_id.to_string()])?;
+        let name = string(&artifact, "name")?;
+        let suffix = name
+            .strip_prefix(kind)
+            .and_then(|value| value.strip_prefix('-'))
+            .ok_or_else(|| CiError::Message("original artifact role/name differs".into()))?;
+        let (named_run, named_attempt) = suffix
+            .split_once('-')
+            .ok_or_else(|| CiError::Message("original artifact run/attempt absent".into()))?;
+        let attempt = decimal(named_attempt)?;
+        if decimal(named_run)? != original.run_id
+            || named_run != original.run_id.to_string()
+            || named_attempt != attempt.to_string()
+            || attempt > attempts
+            || producing_attempt.is_some_and(|previous| previous != attempt)
+        {
+            return Err(CiError::Message(
+                "final prepared/tool pair must share the original run and assembly attempt".into(),
+            ));
+        }
+        producing_attempt = Some(attempt);
+        artifacts.push((artifact_id, kind, artifact));
+    }
+    let producing_attempt = producing_attempt.expect("two original artifacts validated");
+    let mut jobs = Vec::new();
+    let mut job_ids = std::collections::BTreeSet::new();
+    for attempt in [producing_attempt] {
         let mut complete = false;
         for page in 1..=8_u16 {
             let mut url = http::github_url(
@@ -240,12 +270,7 @@ pub fn validate_original(
             ));
         }
     }
-    let mut producing_attempt = None;
-    for (artifact_id, kind) in [
-        (original.prepared_artifact_id, "prepared"),
-        (original.tool_artifact_id, "publication-tool"),
-    ] {
-        let artifact = get(&["actions", "artifacts", &artifact_id.to_string()])?;
+    for (artifact_id, kind, artifact) in artifacts {
         let run = artifact
             .get("workflow_run")
             .ok_or_else(|| CiError::Message("artifact run binding absent".into()))?;
@@ -257,7 +282,6 @@ pub fn validate_original(
                 .is_none_or(|size| size == 0 || size > 1024 * 1024 * 1024)
             || run.get("id").and_then(Value::as_u64) != Some(original.run_id)
             || string(run, "head_sha")? != source.commit
-            || string(&artifact, "name")? != format!("{kind}-{}", original.run_id)
         {
             return Err(CiError::Message(
                 "recovery artifact association/expiry/size differs".into(),
@@ -271,11 +295,7 @@ pub fn validate_original(
             .map_err(|_| CiError::Message("original artifact/job timestamp invalid".into()))
         };
         let created = timestamp(&artifact, "created_at")?;
-        let producer = if kind == "prepared" {
-            "assemble"
-        } else {
-            "select"
-        };
+        let producer = "assemble";
         let mut matching = Vec::new();
         for (attempt, job) in &jobs {
             if job.get("name").and_then(Value::as_str) != Some(producer)
@@ -292,10 +312,9 @@ pub fn validate_original(
                 matching.push(*attempt);
             }
         }
-        if matching.len() != 1 || producing_attempt.is_some_and(|attempt| attempt != matching[0]) {
+        if matching.len() != 1 || producing_attempt != matching[0] {
             return Err(CiError::Message("original artifact is not uniquely bound to successful producers in one actual run attempt".into()));
         }
-        producing_attempt = Some(matching[0]);
         let digest = string(&artifact, "digest")?
             .strip_prefix("sha256:")
             .ok_or_else(|| CiError::Message("artifact digest absent".into()))?;

@@ -913,7 +913,15 @@ fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
         .ok_or_else(|| failure(format!("{context} steps absent")))?;
     for value in steps {
         let step = mapping(value, context)?;
-        if step.contains_key(key("continue-on-error"))
+        let diagnostic = step.get(key("uses")).and_then(Value::as_str)
+            == Some(PINNED_UPLOAD_ARTIFACT_ACTION)
+            && scalar(step, "if") == Some("always()")
+            && step
+                .get(key("with"))
+                .and_then(|with| with.get(key("if-no-files-found")))
+                .and_then(Value::as_str)
+                == Some("warn");
+        if step.contains_key(key("continue-on-error")) && !diagnostic
             || context != "publisher" && step.contains_key(key("env"))
             || step.contains_key(key("shell"))
         {
@@ -1689,7 +1697,9 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
         if job
             .get(key("timeout-minutes"))
             .and_then(Value::as_u64)
-            .is_none_or(|minutes| minutes == 0 || minutes > 90)
+            .is_none_or(|minutes| {
+                minutes == 0 || minutes > if name.starts_with("native-") { 180 } else { 90 }
+            })
         {
             return Err(failure("release operation deadline missing or excessive"));
         }
@@ -1731,7 +1741,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             .iter()
             .position(|step| {
                 step.get(key("run")).and_then(Value::as_str)
-                    == Some("./target/ci/release/memcordon-ci release build-target")
+                    == Some("./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json")
             })
             .ok_or_else(|| failure("actual native build absent"))?;
         if steps[build].get(key("if")).is_some() {
@@ -1812,7 +1822,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             .iter()
             .position(|step| {
                 step.get(key("run")).and_then(Value::as_str)
-                    == Some("./target/ci/release/memcordon-ci release verify-source")
+                    == Some("./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json")
             })
             .ok_or_else(|| failure("release source identity recheck absent"))?;
         ordinary_driver_before_suite(steps, verify)?;
@@ -1862,72 +1872,98 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
         .ok_or_else(|| failure("assembly dependencies absent"))?;
     let actual: BTreeSet<_> = needs.iter().filter_map(Value::as_str).collect();
     let expected: BTreeSet<_> = required.iter().map(String::as_str).collect();
-    if needs.len() != expected.len() || actual != expected || assemble.contains_key(key("if")) {
+    if needs.len() != expected.len()
+        || actual != expected
+        || scalar(assemble, "if") != Some("needs.select.outputs.recovery-mode == 'reprepare'")
+    {
         return Err(failure(
             "assembly requires every selected producer and installed/check leaf success",
         ));
     }
-    let publish = mapping(
-        jobs.get(key("publish"))
-            .ok_or_else(|| failure("publisher absent"))?,
-        "publisher",
-    )?;
-    let permissions = mapping(
-        publish
-            .get(key("permissions"))
-            .ok_or_else(|| failure("publisher permissions absent"))?,
-        "publisher permissions",
-    )?;
-    exact_mapping_keys(
-        permissions,
-        &["contents", "actions", "id-token"],
-        "publisher permissions",
-    )?;
-    if scalar(permissions, "contents") != Some("write")
-        || scalar(permissions, "actions") != Some("read")
-        || scalar(permissions, "id-token") != Some("write")
-    {
-        return Err(failure("publisher permissions differ"));
-    }
-    let concurrency = mapping(
-        publish
-            .get(key("concurrency"))
-            .ok_or_else(|| failure("publication serialization absent"))?,
-        "publisher concurrency",
-    )?;
-    if scalar(concurrency, "group") != Some("memcordon-publication")
-        || concurrency
-            .get(key("cancel-in-progress"))
-            .and_then(Value::as_bool)
-            != Some(false)
-    {
-        return Err(failure("publication must serialize without cancellation"));
-    }
-    let publisher_steps = ordinary_steps(publish, "publisher")?;
-    let mut writes = 0;
-    for step in publisher_steps {
-        if let Some(run) = step.get(key("run")).and_then(Value::as_str) {
-            if run == "./.release/tool/memcordon-ci release publish" {
-                writes += 1;
-            } else if run
-                != "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool"
+    for writer in ["publish", "recovery-publish"] {
+        let publish = mapping(
+            jobs.get(key(writer))
+                .ok_or_else(|| failure("publisher absent"))?,
+            "publisher",
+        )?;
+        let permissions = mapping(
+            publish
+                .get(key("permissions"))
+                .ok_or_else(|| failure("publisher permissions absent"))?,
+            "publisher permissions",
+        )?;
+        exact_mapping_keys(
+            permissions,
+            &["contents", "actions", "id-token"],
+            "publisher permissions",
+        )?;
+        if scalar(permissions, "contents") != Some("write")
+            || scalar(permissions, "actions") != Some("read")
+            || scalar(permissions, "id-token") != Some("write")
+        {
+            return Err(failure("publisher permissions differ"));
+        }
+        let concurrency = mapping(
+            publish
+                .get(key("concurrency"))
+                .ok_or_else(|| failure("publication serialization absent"))?,
+            "publisher concurrency",
+        )?;
+        if scalar(concurrency, "group") != Some("memcordon-publication")
+            || concurrency
+                .get(key("cancel-in-progress"))
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(failure("publication must serialize without cancellation"));
+        }
+        let publisher_steps = ordinary_steps(publish, "publisher")?;
+        let mut writes = 0;
+        for step in publisher_steps {
+            if let Some(run) = step.get(key("run")).and_then(Value::as_str) {
+                if run == "./.release/tool/memcordon-ci release publish" {
+                    writes += 1;
+                } else if run
+                    != "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool"
+                {
+                    return Err(failure(
+                        "publisher cannot build/test or invoke source tools",
+                    ));
+                }
+            }
+            if let Some(uses) = step.get(key("uses")).and_then(Value::as_str)
+                && !uses.starts_with("actions/download-artifact@")
+                && !uses.starts_with("rust-lang/crates-io-auth-action@")
             {
                 return Err(failure(
-                    "publisher cannot build/test or invoke source tools",
+                    "publisher cannot checkout/restore cache or run another action",
                 ));
             }
         }
-        if let Some(uses) = step.get(key("uses")).and_then(Value::as_str)
-            && !uses.starts_with("actions/download-artifact@")
-            && !uses.starts_with("rust-lang/crates-io-auth-action@")
-        {
+        if writes != 1 {
+            return Err(failure("publisher needs one prepared-byte write operation"));
+        }
+        let expected_condition = if writer == "publish" {
+            "needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'reprepare' && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/'))"
+        } else {
+            "needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')"
+        };
+        if scalar(publish, "if") != Some(expected_condition) {
             return Err(failure(
-                "publisher cannot checkout/restore cache or run another action",
+                "writer must retain exact tagged event and preparation mode guards",
             ));
         }
-    }
-    if writes != 1 {
-        return Err(failure("publisher needs one prepared-byte write operation"));
+        exact_string_sequence(
+            publish
+                .get(key("needs"))
+                .ok_or_else(|| failure("writer dependencies absent"))?,
+            if writer == "publish" {
+                &["select", "assemble"]
+            } else {
+                &["select", "recovery-inputs"]
+            },
+            "writer preparation dependencies",
+        )?;
     }
     Ok(())
 }
@@ -2225,6 +2261,336 @@ fn validate_workflow_bytes_into(
     }
     if relative == Path::new(".github/workflows/release.yml") {
         check_release_structure(jobs)?;
+        check_preparation_transport(workflow, jobs)?;
+    }
+    Ok(())
+}
+
+fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
+    let permissions = mapping(
+        workflow
+            .get(key("permissions"))
+            .ok_or_else(|| failure("workflow read permissions absent"))?,
+        "preparation permissions",
+    )?;
+    exact_mapping_keys(permissions, &["contents"], "preparation permissions")?;
+    if scalar(permissions, "contents") != Some("read") {
+        return Err(failure("preparation workflow must be read-only"));
+    }
+    let events = workflow
+        .get(key("on"))
+        .ok_or_else(|| failure("preparation events absent"))?;
+    exact_string_sequence(
+        &events["push"]["branches"],
+        &["**"],
+        "candidate branch coverage",
+    )?;
+    exact_string_sequence(
+        &events["push"]["tags"],
+        &["[0-9]+.[0-9]+.[0-9]+*"],
+        "release tag coverage",
+    )?;
+    exact_string_sequence(
+        &events["workflow_dispatch"]["inputs"]["preparation-mode"]["options"],
+        &["candidate", "release"],
+        "explicit preparation choices",
+    )?;
+    exact_string_sequence(
+        &events["workflow_dispatch"]["inputs"]["recovery-mode"]["options"],
+        &["reprepare", "publication-only"],
+        "explicit recovery choices",
+    )?;
+    let concurrency = mapping(
+        workflow
+            .get(key("concurrency"))
+            .ok_or_else(|| failure("preparation concurrency absent"))?,
+        "preparation concurrency",
+    )?;
+    if scalar(concurrency, "group") != Some("memcordon-release-${{ github.ref }}")
+        || scalar(concurrency, "cancel-in-progress")
+            != Some("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}")
+    {
+        return Err(failure(
+            "preparation must serialize canonical refs and cancel only superseded branch pushes",
+        ));
+    }
+    if !events["push"]["paths"].is_null() || !events["push"]["paths-ignore"].is_null() {
+        return Err(failure("preparation cannot omit branch paths"));
+    }
+    if events["workflow_dispatch"]["inputs"]["preparation-mode"]["default"].as_str()
+        != Some("release")
+        || events["workflow_dispatch"]["inputs"]["tag"]["required"].as_bool() != Some(false)
+    {
+        return Err(failure("dispatch must distinguish candidate from release"));
+    }
+    for (name, job) in jobs {
+        let name = name.as_str().ok_or_else(|| failure("job name invalid"))?;
+        let job = mapping(job, "preparation job")?;
+        let writer = matches!(name, "publish" | "recovery-publish");
+        let preparation = !writer && name != "published-consumer";
+        if name == "recovery-inputs" && !job.contains_key(key("permissions")) {
+            return Err(failure(
+                "recovery validation requires explicit read-only artifact access",
+            ));
+        }
+        if preparation && let Some(permissions) = job.get(key("permissions")) {
+            let permissions = mapping(permissions, "preparation permissions")?;
+            if name != "recovery-inputs" {
+                return Err(failure("preparation must inherit read-only permissions"));
+            }
+            exact_mapping_keys(
+                permissions,
+                &["contents", "actions"],
+                "recovery read permissions",
+            )?;
+            if scalar(permissions, "contents") != Some("read")
+                || scalar(permissions, "actions") != Some("read")
+            {
+                return Err(failure(
+                    "recovery validation requires only source and artifact read permissions",
+                ));
+            }
+        }
+        let steps = job
+            .get(key("steps"))
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| failure("preparation steps absent"))?;
+        let mut diagnostic = false;
+        if name.starts_with("native-") || name.starts_with("installed-") || name == "select" {
+            let checkout = steps
+                .iter()
+                .position(|step| {
+                    step["uses"]
+                        .as_str()
+                        .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+                })
+                .ok_or_else(|| failure("preparation checkout absent"))?;
+            if !steps[..checkout].iter().any(|step| {
+                step["run"].as_str() == Some("git config --global core.autocrlf false")
+                    && step["if"].is_null()
+                    && step["continue-on-error"].is_null()
+            }) {
+                return Err(failure("preparation must configure LF before checkout"));
+            }
+        }
+        if name == "source-checks" {
+            let quality = steps
+                .iter()
+                .position(|step| {
+                    step["run"].as_str() == Some("./target/ci/release/memcordon-ci suite quality")
+                })
+                .ok_or_else(|| failure("quality absent"))?;
+            if !steps[..quality].iter().any(|step| step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt") && step["if"].is_null() && step["continue-on-error"].is_null()) {
+                return Err(failure("quality must provision pinned Clippy and rustfmt"));
+            }
+        }
+        if name == "assemble" {
+            let assembly = steps.iter().position(|step| step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json")).ok_or_else(|| failure("assembly absent"))?;
+            if !steps[..assembly].iter().any(|step| {
+                step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal")
+                    && step["if"].is_null()
+                    && step["continue-on-error"].is_null()
+            }) {
+                return Err(failure(
+                    "fresh assembly must provision the pinned metadata toolchain",
+                ));
+            }
+        }
+        for step in steps {
+            let step = mapping(step, "preparation step")?;
+            let uses = scalar(step, "uses").unwrap_or_default();
+            let with = step.get(key("with"));
+            if uses.starts_with("actions/checkout@") {
+                let expected = if name == "select" {
+                    "${{ github.sha }}"
+                } else {
+                    "${{ needs.select.outputs.selected-commit }}"
+                };
+                if with
+                    .and_then(|with| with.get(key("ref")))
+                    .and_then(Value::as_str)
+                    != Some(expected)
+                {
+                    return Err(failure(
+                        "preparation checkout must use exact selected event commit",
+                    ));
+                }
+            }
+            if uses == UPLOAD_ARTIFACT_ACTION && preparation {
+                return Err(failure(
+                    "required preparation artifacts cannot use destructive retry wrapper",
+                ));
+            }
+            if uses == PINNED_UPLOAD_ARTIFACT_ACTION && preparation {
+                let with = mapping(
+                    with.ok_or_else(|| failure("upload inputs absent"))?,
+                    "upload inputs",
+                )?;
+                if with.get(key("overwrite")).and_then(Value::as_bool) != Some(false)
+                    || with
+                        .get(key("include-hidden-files"))
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    || !scalar(with, "name")
+                        .is_some_and(|value| value.contains("github.run_attempt"))
+                {
+                    return Err(failure(
+                        "preparation uploads must be immutable attempt-specific narrow hidden inventories",
+                    ));
+                }
+                if scalar(with, "if-no-files-found") == Some("warn") {
+                    diagnostic |=
+                        scalar(step, "name") == Some("Retain bounded preparation diagnostics");
+                    if scalar(step, "if") != Some("always()")
+                        || step.get(key("continue-on-error")).and_then(Value::as_bool) != Some(true)
+                    {
+                        return Err(failure("diagnostics must be nonfatal and always retained"));
+                    }
+                    if matches!(name, "miri" | "fuzz")
+                        && !scalar(with, "name").is_some_and(|value| value.contains("matrix.shard"))
+                    {
+                        return Err(failure("matrix diagnostics require their actual shard"));
+                    }
+                } else if step.contains_key(key("continue-on-error")) {
+                    return Err(failure("required artifact failure cannot be ignored"));
+                }
+            }
+            if uses.starts_with("actions/download-artifact@") && preparation {
+                let with = mapping(
+                    with.ok_or_else(|| failure("download inputs absent"))?,
+                    "download inputs",
+                )?;
+                if with.contains_key(key("name"))
+                    || with.contains_key(key("pattern"))
+                    || scalar(with, "artifact-ids").is_none()
+                {
+                    return Err(failure(
+                        "preparation downloads must select immutable producer IDs",
+                    ));
+                }
+                let destination = scalar(with, "path").unwrap_or_default();
+                let expected = match destination {
+                    ".release" => Some("${{ needs.select.outputs.selection-artifact-id }}"),
+                    ".release/packages" => Some("${{ needs.packages.outputs.artifact-id }}"),
+                    ".release/target" => {
+                        Some("${{ needs[matrix.native-job].outputs.artifact-id }}")
+                    }
+                    ".release/tool" if name == "assemble" => {
+                        Some("${{ needs.select.outputs.preparation-tool-artifact-id }}")
+                    }
+                    _ => None,
+                };
+                if expected.is_some_and(|expected| scalar(with, "artifact-ids") != Some(expected)) {
+                    return Err(failure(
+                        "preparation download must use its exact producer output ID",
+                    ));
+                }
+            }
+            if uses.starts_with("actions/cache/") {
+                let path = with
+                    .and_then(|with| with.get(key("path")))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if path.lines().any(|path| {
+                    [".release", "reports", "installed", "credentials"]
+                        .iter()
+                        .any(|excluded| path.contains(excluded))
+                }) {
+                    return Err(failure(
+                        "cache paths include staging, diagnostics, installation or credentials",
+                    ));
+                }
+            }
+        }
+        if preparation && !diagnostic {
+            return Err(failure(
+                "each preparation job must retain bounded diagnostics",
+            ));
+        }
+        if name.starts_with("native-")
+            && job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)
+        {
+            return Err(failure(
+                "native serial phase budgets require the 180 minute planning envelope",
+            ));
+        }
+        if name.starts_with("installed-") {
+            let native = job
+                .get(key("needs"))
+                .and_then(Value::as_sequence)
+                .and_then(|needs| needs.get(2))
+                .and_then(Value::as_str)
+                .ok_or_else(|| failure("installed native dependency absent"))?;
+            if job
+                .get(key("strategy"))
+                .and_then(|value| value.get(key("matrix")))
+                .and_then(|value| value.get(key("include")))
+                .and_then(Value::as_sequence)
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get(key("native-job")))
+                .and_then(Value::as_str)
+                != Some(native)
+            {
+                return Err(failure(
+                    "installed immutable artifact route must use its architecture-local producer",
+                ));
+            }
+        }
+    }
+    let assemble = jobs
+        .get(key("assemble"))
+        .ok_or_else(|| failure("assembly absent"))?;
+    let steps = assemble["steps"]
+        .as_sequence()
+        .ok_or_else(|| failure("assembly steps absent"))?;
+    for (id, path, role) in [
+        ("prepared", ".release/prepared", "prepared"),
+        (
+            "publication-tool",
+            ".release/tool/memcordon-publication-tool.tar.gz",
+            "publication-tool",
+        ),
+    ] {
+        let expected_name =
+            format!("{role}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}");
+        let matches: Vec<_> = steps
+            .iter()
+            .filter(|step| step["id"].as_str() == Some(id))
+            .collect();
+        if matches.len() != 1
+            || matches[0]["with"]["path"].as_str() != Some(path)
+            || matches[0]["with"]["name"].as_str() != Some(expected_name.as_str())
+            || matches[0]["if"].as_str()
+                != Some("needs.select.outputs.preparation-kind == 'tagged'")
+        {
+            return Err(failure(
+                "tagged assembly must upload the prepared and unchanged tool archive final pair",
+            ));
+        }
+    }
+    for platform in [
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64",
+        "windows-x64",
+        "windows-arm64",
+    ] {
+        let expected_id = format!("${{{{ needs.native-{platform}.outputs.artifact-id }}}}");
+        let expected_path = format!(".release/targets/{platform}");
+        if steps
+            .iter()
+            .filter(|step| {
+                step["with"]["artifact-ids"].as_str() == Some(expected_id.as_str())
+                    && step["with"]["path"].as_str() == Some(expected_path.as_str())
+            })
+            .count()
+            != 1
+        {
+            return Err(failure(
+                "assembly requires six exact immutable target downloads in separate roots",
+            ));
+        }
     }
     Ok(())
 }

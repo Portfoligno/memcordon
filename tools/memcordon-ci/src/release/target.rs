@@ -345,6 +345,9 @@ pub fn build_selected(
     destination: &Path,
 ) -> Result<()> {
     selected.recheck(root)?;
+    let operation_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(140 * 60))
+        .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?;
     distribution.validate()?;
     if distribution.target != super::distribution::native_target()? {
         return Err(CiError::Message(
@@ -360,6 +363,9 @@ pub fn build_selected(
         Duration::from_secs(60),
     )
     .arg("-vV")
+    .bounded_until(operation_deadline)
+    .phase(crate::command::CiPhase::ProductBuild)
+    .selection(selected, Some(&distribution.target))
     .output_quiet()?;
     if !rustc.status.success()
         || !std::str::from_utf8(&rustc.stdout).ok().is_some_and(|text| {
@@ -394,10 +400,22 @@ pub fn build_selected(
     for binary in &distribution.binaries {
         command = command.arg("--bin").arg(binary);
     }
-    command.run()?;
+    command
+        .bounded_until(operation_deadline)
+        .phase(crate::command::CiPhase::ProductBuild)
+        .selection(selected, Some(&distribution.target))
+        .run()?;
     for phase in crate::native_test_plan::commands(true) {
+        let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
+            crate::command::CiPhase::NativeCompile
+        } else {
+            crate::command::CiPhase::NativeExecute
+        };
         rustup_cargo(root, &toolchain, ["test"], phase.deadline)
             .args(phase.arguments)
+            .bounded_until(operation_deadline)
+            .phase(diagnostic_phase)
+            .selection(selected, Some(&distribution.target))
             .run()?;
     }
     let backend = if distribution.target.contains("linux") {
@@ -409,6 +427,9 @@ pub fn build_selected(
     };
     crate::command::CommandSpec::new(std::env::current_exe()?, root, Duration::from_secs(3600))
         .args(["suite", backend])
+        .bounded_until(operation_deadline)
+        .phase(crate::command::CiPhase::NativeExecute)
+        .selection(selected, Some(&distribution.target))
         .run()?;
     selected.recheck(root)?;
     if destination.exists() {
@@ -481,6 +502,9 @@ pub fn build_selected(
         )
         .args(["__export-unit-files"])
         .arg(directory.path())
+        .bounded_until(operation_deadline)
+        .phase(crate::command::CiPhase::ProductBuild)
+        .selection(selected, Some(&distribution.target))
         .run()?;
         for unit in &distribution.units {
             members.insert(
@@ -556,5 +580,10 @@ pub fn build_selected(
         },
     )?;
     TargetBundle::load(destination)?;
+    if std::time::Instant::now() >= operation_deadline {
+        return Err(CiError::Message(
+            "native operation deadline exhausted during archive assembly".into(),
+        ));
+    }
     Ok(())
 }

@@ -503,62 +503,107 @@ pub fn run_channel_with_external(
     channel: InstalledChannel,
     external_input: Option<&Path>,
 ) -> Result<()> {
-    let (bundle, _) = TargetBundle::load(target_directory)?;
-    bundle.source.recheck(root)?;
-    if bundle.distribution.target != native_target()? {
-        return Err(CiError::Message(
-            "installed consumer requires the actual selected native host".into(),
-        ));
-    }
-    create_fresh_destination(destination)?;
-    let payload = match channel {
-        InstalledChannel::NativeBundle => materialize_native(target_directory, destination)?,
-        InstalledChannel::CargoPackage => {
-            let consumer = PackageConsumer::prepare(root, package_directory)?;
-            if consumer.bundle.source != bundle.source {
-                return Err(CiError::Message(
-                    "installed channel source selections differ".into(),
-                ));
-            }
-            materialize_cargo(
-                root,
-                target_directory,
-                package_directory,
-                &bundle,
-                &consumer,
-                &root.join("target/ci-consumers"),
-                destination,
-            )?
+    let started = std::time::Instant::now();
+    let channel_name = match channel {
+        InstalledChannel::NativeBundle => "native",
+        InstalledChannel::CargoPackage => "cargo",
+    };
+    let record = |state: &str, selection: &Option<serde_json::Value>, error: Option<&CiError>| {
+        let write = || -> Result<()> {
+            let directory = root.join("target/ci/reports/execution");
+            std::fs::create_dir_all(&directory)?;
+            let value = serde_json::json!({
+                "phase": "installed-consumer",
+                "expected-operation": "validate and execute selected installed native or Cargo payload",
+                "channel": channel_name,
+                "selection": selection,
+                "state": state,
+                "elapsed-ms": started.elapsed().as_millis(),
+                "error": error.map(|error| crate::command::bounded_excerpt(error.to_string().as_bytes())),
+            });
+            let temporary = directory.join("installed-consumer.tmp");
+            source::write_json(&temporary, &value)?;
+            std::fs::rename(temporary, directory.join("installed-consumer.json"))?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            eprintln!("diagnostic retention incomplete: {error}");
         }
     };
-    run_materialized_channel(root, &payload, &destination.join("cases"))?;
-    if let Some(input) = external_input {
-        let spec = crate::external_consumer::ExternalConsumerSpec::parse(
-            &super::artifacts::read_file(input)?,
-        )?;
-        let assessment = crate::external_consumer::run_materialized(
-            &payload,
-            &spec,
-            &destination.join("external"),
-        )?;
-        if !assessment.passed() {
+    let mut selection = None;
+    record("in-progress", &selection, None);
+    let result = (|| -> Result<()> {
+        let (bundle, _) = TargetBundle::load(target_directory)?;
+        selection = Some(
+            serde_json::json!({"source": bundle.source, "target": bundle.distribution.target}),
+        );
+        record("in-progress", &selection, None);
+        bundle.source.recheck(root)?;
+        if bundle.distribution.target != native_target()? {
             return Err(CiError::Message(
+                "installed consumer requires the actual selected native host".into(),
+            ));
+        }
+        create_fresh_destination(destination)?;
+        let payload = match channel {
+            InstalledChannel::NativeBundle => materialize_native(target_directory, destination)?,
+            InstalledChannel::CargoPackage => {
+                let consumer = PackageConsumer::prepare(root, package_directory)?;
+                if consumer.bundle.source != bundle.source {
+                    return Err(CiError::Message(
+                        "installed channel source selections differ".into(),
+                    ));
+                }
+                materialize_cargo(
+                    root,
+                    target_directory,
+                    package_directory,
+                    &bundle,
+                    &consumer,
+                    &root.join("target/ci-consumers"),
+                    destination,
+                )?
+            }
+        };
+        run_materialized_channel(root, &payload, &destination.join("cases"))?;
+        if let Some(input) = external_input {
+            let spec = crate::external_consumer::ExternalConsumerSpec::parse(
+                &super::artifacts::read_file(input)?,
+            )?;
+            let assessment = crate::external_consumer::run_materialized(
+                &payload,
+                &spec,
+                &destination.join("external"),
+            )?;
+            if !assessment.passed() {
+                return Err(CiError::Message(
                 "external installed consumer did not complete execution, collection, and retirement"
                     .into(),
             ));
-        }
-    }
-    let measured = BTreeMap::from([
-        ("source", bundle.source.commit().to_owned()),
-        ("target", bundle.distribution.target),
-        (
-            "channel",
-            match channel {
-                InstalledChannel::NativeBundle => "native",
-                InstalledChannel::CargoPackage => "cargo",
             }
-            .to_owned(),
-        ),
-    ]);
-    source::write_json(&destination.join("consumer.json"), &measured)
+        }
+        let measured = BTreeMap::from([
+            ("source", bundle.source.commit().to_owned()),
+            ("target", bundle.distribution.target),
+            (
+                "channel",
+                match channel {
+                    InstalledChannel::NativeBundle => "native",
+                    InstalledChannel::CargoPackage => "cargo",
+                }
+                .to_owned(),
+            ),
+        ]);
+        source::write_json(&destination.join("consumer.json"), &measured)
+    })();
+    record(
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        &selection,
+        result.as_ref().err(),
+    );
+    result
 }

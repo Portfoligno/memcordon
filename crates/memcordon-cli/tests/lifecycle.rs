@@ -16,6 +16,201 @@ use memcordon_testkit::{ObservedOutput, assert_stdout_empty, run_with_deadline};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaseRun {
+    Executed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+enum CaseSelection {
+    Optional,
+    Required,
+}
+
+fn select_case(selection: CaseSelection, case: impl FnOnce() -> CaseRun) -> CaseRun {
+    let disposition = case();
+    if matches!(selection, CaseSelection::Required) {
+        assert_eq!(
+            disposition,
+            CaseRun::Executed,
+            "required native scenario backend unavailable"
+        );
+    }
+    disposition
+}
+
+#[test]
+fn optional_unavailable_is_explicit_and_required_unavailable_fails() {
+    assert_eq!(
+        select_case(CaseSelection::Optional, || CaseRun::Unavailable),
+        CaseRun::Unavailable
+    );
+    assert!(
+        std::panic::catch_unwind(|| select_case(CaseSelection::Required, || CaseRun::Unavailable))
+            .is_err()
+    );
+}
+
+#[test]
+fn immediate_success_failure_and_status_are_reaped_and_preserved() {
+    select_case(
+        CaseSelection::Optional,
+        run_immediate_success_failure_and_status_are_reaped_and_preserved,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_immediate_success_failure_and_status_are_reaped_and_preserved() {
+    select_case(
+        CaseSelection::Required,
+        run_immediate_success_failure_and_status_are_reaped_and_preserved,
+    );
+}
+
+#[test]
+fn confirmed_limit_has_dedicated_status() {
+    select_case(
+        CaseSelection::Optional,
+        run_confirmed_limit_has_dedicated_status,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_confirmed_limit_has_dedicated_status() {
+    select_case(
+        CaseSelection::Required,
+        run_confirmed_limit_has_dedicated_status,
+    );
+}
+
+#[test]
+fn default_command_lifetime_kills_background_descendant_before_return() {
+    select_case(
+        CaseSelection::Optional,
+        run_default_command_lifetime_kills_background_descendant_before_return,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_default_command_lifetime_kills_background_descendant_before_return() {
+    select_case(
+        CaseSelection::Required,
+        run_default_command_lifetime_kills_background_descendant_before_return,
+    );
+}
+
+#[test]
+fn command_exit_grace_allows_remaining_workload_to_drain_naturally() {
+    select_case(
+        CaseSelection::Optional,
+        run_command_exit_grace_allows_remaining_workload_to_drain_naturally,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_command_exit_grace_allows_remaining_workload_to_drain_naturally() {
+    select_case(
+        CaseSelection::Required,
+        run_command_exit_grace_allows_remaining_workload_to_drain_naturally,
+    );
+}
+
+#[test]
+fn command_exit_grace_force_cleans_survivors_after_expiry() {
+    select_case(
+        CaseSelection::Optional,
+        run_command_exit_grace_force_cleans_survivors_after_expiry,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_command_exit_grace_force_cleans_survivors_after_expiry() {
+    select_case(
+        CaseSelection::Required,
+        run_command_exit_grace_force_cleans_survivors_after_expiry,
+    );
+}
+
+#[test]
+fn deadline_remains_authoritative_during_command_exit_grace() {
+    select_case(
+        CaseSelection::Optional,
+        run_deadline_remains_authoritative_during_command_exit_grace,
+    );
+}
+
+#[test]
+#[ignore = "requires available native backend"]
+fn required_deadline_remains_authoritative_during_command_exit_grace() {
+    select_case(
+        CaseSelection::Required,
+        run_deadline_remains_authoritative_during_command_exit_grace,
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn workload_lifetime_deadline_cleans_background_descendant() {
+    select_case(
+        CaseSelection::Optional,
+        run_workload_lifetime_deadline_cleans_background_descendant,
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires available native backend"]
+fn required_workload_lifetime_deadline_cleans_background_descendant() {
+    select_case(
+        CaseSelection::Required,
+        run_workload_lifetime_deadline_cleans_background_descendant,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_interrupt_is_forwarded_cleaned_and_mapped() {
+    select_case(
+        CaseSelection::Optional,
+        run_wrapper_interrupt_is_forwarded_cleaned_and_mapped,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires available native backend"]
+fn required_wrapper_interrupt_is_forwarded_cleaned_and_mapped() {
+    select_case(
+        CaseSelection::Required,
+        run_wrapper_interrupt_is_forwarded_cleaned_and_mapped,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn guardian_kills_workload_after_wrapper_crash() {
+    select_case(
+        CaseSelection::Optional,
+        run_guardian_kills_workload_after_wrapper_crash,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires available native backend"]
+fn required_guardian_kills_workload_after_wrapper_crash() {
+    select_case(
+        CaseSelection::Required,
+        run_guardian_kills_workload_after_wrapper_crash,
+    );
+}
+
 fn fixture() -> &'static str {
     env!("CARGO_BIN_EXE_memcordon-test-fixture")
 }
@@ -124,8 +319,25 @@ fn assert_process_gone(identity: ProcessIdentity) {
 
 #[test]
 fn hard_unavailability_refuses_before_target_execution() {
-    if backend_available() {
-        return;
+    select_case(
+        CaseSelection::Optional,
+        run_hard_unavailability_refuses_before_target_execution,
+    );
+}
+
+#[test]
+#[ignore = "requires unavailable hard backend"]
+fn required_hard_unavailability_refuses_before_target_execution() {
+    select_case(
+        CaseSelection::Required,
+        run_hard_unavailability_refuses_before_target_execution,
+    );
+}
+
+fn run_hard_unavailability_refuses_before_target_execution() -> CaseRun {
+    // macOS's available watchdog is distinct from the unavailable hard backend.
+    if !cfg!(target_os = "macos") && backend_available() {
+        return CaseRun::Unavailable;
     }
     let marker = temporary_pid_file();
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
@@ -144,12 +356,12 @@ fn hard_unavailability_refuses_before_target_execution() {
     let output = completed(&mut invocation, Duration::from_secs(2));
     assert_eq!(output.status.code(), Some(125));
     assert!(!marker.exists(), "unavailable hard backend released target");
+    CaseRun::Executed
 }
 
-#[test]
-fn immediate_success_failure_and_status_are_reaped_and_preserved() {
+fn run_immediate_success_failure_and_status_are_reaped_and_preserved() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let iterations = configured_iterations("fast_short_child_iterations");
     for iteration in 0..iterations {
@@ -185,6 +397,7 @@ fn immediate_success_failure_and_status_are_reaped_and_preserved() {
         .expect("lifecycle report must remain valid");
         fs::remove_file(report_path).expect("successful lifecycle report should be removable");
     }
+    CaseRun::Executed
 }
 
 #[cfg(target_os = "macos")]
@@ -215,10 +428,9 @@ fn macos_system_success_and_failure_smoke_tests_are_bounded() {
     fs::remove_file(report_file).unwrap();
 }
 
-#[test]
-fn confirmed_limit_has_dedicated_status() {
+fn run_confirmed_limit_has_dedicated_status() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
@@ -244,12 +456,12 @@ fn confirmed_limit_has_dedicated_status() {
     let output = completed(&mut invocation, Duration::from_secs(5));
     assert_eq!(output.status.code(), Some(124));
     assert_stdout_empty(&output);
+    CaseRun::Executed
 }
 
-#[test]
-fn default_command_lifetime_kills_background_descendant_before_return() {
+fn run_default_command_lifetime_kills_background_descendant_before_return() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let report_file = pid_file.with_extension("json");
@@ -280,11 +492,15 @@ fn default_command_lifetime_kills_background_descendant_before_return() {
     // The outer guard covers native startup, prompt root-exit observation,
     // fixed retirement, report delivery, and harness margin. It must not
     // preempt legitimate cleanup or allow the descendant's 30 s natural exit.
-    let harness_budget = Duration::from_secs(5)
-        + Duration::from_secs(2)
-        + Duration::from_secs(3)
-        + Duration::from_secs(1)
-        + Duration::from_secs(1);
+    let harness_budget = memcordon_testkit::harness_budget::natural_root_guard(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_secs(3),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+    )
+    .expect("independent root-exit guard must precede natural descendant completion");
     let output = completed(&mut invocation, harness_budget);
     assert_eq!(output.status.code(), Some(0));
     assert_stdout_empty(&output);
@@ -365,12 +581,12 @@ fn default_command_lifetime_kills_background_descendant_before_return() {
     }
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
-#[test]
-fn command_exit_grace_allows_remaining_workload_to_drain_naturally() {
+fn run_command_exit_grace_allows_remaining_workload_to_drain_naturally() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let completion_marker = pid_file.with_extension("completed");
@@ -439,12 +655,12 @@ fn command_exit_grace_allows_remaining_workload_to_drain_naturally() {
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(completion_marker).expect("completion marker should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
-#[test]
-fn command_exit_grace_force_cleans_survivors_after_expiry() {
+fn run_command_exit_grace_force_cleans_survivors_after_expiry() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let completion_marker = pid_file.with_extension("completed");
@@ -496,12 +712,12 @@ fn command_exit_grace_force_cleans_survivors_after_expiry() {
     assert_eq!(cleanup["errors"], serde_json::json!([]));
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
-#[test]
-fn deadline_remains_authoritative_during_command_exit_grace() {
+fn run_deadline_remains_authoritative_during_command_exit_grace() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let completion_marker = pid_file.with_extension("completed");
@@ -631,24 +847,71 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
     }
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
-    assert_natural_workload_completion("100ms", Duration::from_secs(3));
+    select_case(CaseSelection::Optional, || {
+        assert_natural_workload_completion(
+            "100ms",
+            natural_workload_harness_guard(Duration::from_millis(100)),
+        )
+    });
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn natural_workload_completion_starts_retirement_reserve_at_completion() {
-    assert_natural_workload_completion("3500ms", Duration::from_secs(7));
+    select_case(CaseSelection::Optional, || {
+        assert_natural_workload_completion(
+            "3500ms",
+            natural_workload_harness_guard(Duration::from_millis(3500)),
+        )
+    });
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Duration) {
+#[test]
+#[ignore = "requires available native backend"]
+fn required_workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
+    select_case(CaseSelection::Required, || {
+        assert_natural_workload_completion(
+            "100ms",
+            natural_workload_harness_guard(Duration::from_millis(100)),
+        )
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires available native backend"]
+fn required_natural_workload_completion_starts_retirement_reserve_at_completion() {
+    select_case(CaseSelection::Required, || {
+        assert_natural_workload_completion(
+            "3500ms",
+            natural_workload_harness_guard(Duration::from_millis(3500)),
+        )
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn natural_workload_harness_guard(child_duration: Duration) -> Duration {
+    memcordon_testkit::harness_budget::sum(&[
+        Duration::from_secs(5),
+        child_duration,
+        Duration::from_secs(3),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    ])
+    .expect("natural workload guard must cover startup, workload, retirement and delivery")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Duration) -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let completion_marker = pid_file.with_extension("completed");
@@ -703,13 +966,13 @@ fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Dura
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(completion_marker).expect("completion marker should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn workload_lifetime_deadline_cleans_background_descendant() {
+fn run_workload_lifetime_deadline_cleans_background_descendant() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let report_file = pid_file.with_extension("json");
@@ -753,13 +1016,13 @@ fn workload_lifetime_deadline_cleans_background_descendant() {
     assert_eq!(cleanup["errors"], serde_json::json!([]), "{report:#}");
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
+    CaseRun::Executed
 }
 
 #[cfg(unix)]
-#[test]
-fn wrapper_interrupt_is_forwarded_cleaned_and_mapped() {
+fn run_wrapper_interrupt_is_forwarded_cleaned_and_mapped() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let mut invocation = wrapped(fixture(), &["hold", "--duration", "30s"]);
     let output = run_with_deadline_after(&mut invocation, Duration::from_secs(3), |wrapper_pid| {
@@ -775,6 +1038,7 @@ fn wrapper_interrupt_is_forwarded_cleaned_and_mapped() {
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(output.status.code(), Some(130));
     assert_stdout_empty(&output);
+    CaseRun::Executed
 }
 
 #[cfg(target_os = "macos")]
@@ -796,10 +1060,9 @@ fn virtual_metric_is_explicitly_supported() {
 }
 
 #[cfg(unix)]
-#[test]
-fn guardian_kills_workload_after_wrapper_crash() {
+fn run_guardian_kills_workload_after_wrapper_crash() -> CaseRun {
     if !backend_available() {
-        return;
+        return CaseRun::Unavailable;
     }
     let pid_file = temporary_pid_file();
     let callback_pid_file = pid_file.clone();
@@ -822,4 +1085,5 @@ fn guardian_kills_workload_after_wrapper_crash() {
     .unwrap_or_else(|error| panic!("{error}"));
     assert!(output.status.code().is_none());
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    CaseRun::Executed
 }

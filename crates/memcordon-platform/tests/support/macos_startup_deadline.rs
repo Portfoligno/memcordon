@@ -2,6 +2,8 @@ use super::*;
 
 #[derive(Debug)]
 pub struct StartupDeadlineObservations {
+    pub configuration_written: bool,
+    pub fault_phase_reached: bool,
     pub kind: io::ErrorKind,
     pub diagnostic: memcordon_core::NativeStartupDiagnosticV1,
     pub release: memcordon_core::ReleaseEvidence,
@@ -40,6 +42,8 @@ pub fn startup_deadline_observations(
             // Publication latency must not replace either native receipt.
             std::thread::sleep(Duration::from_millis(500));
             Ok(StartupDeadlineObservations {
+                configuration_written: error.configuration_written,
+                fault_phase_reached: error.fault_phase_reached,
                 kind: error.error.kind(),
                 diagnostic: error.diagnostic,
                 release: error.release,
@@ -109,6 +113,8 @@ pub fn startup_deadline_fault_observations(
         },
     ) {
         Err(error) => Ok(StartupDeadlineObservations {
+            configuration_written: error.configuration_written,
+            fault_phase_reached: error.fault_phase_reached,
             kind: error.error.kind(),
             diagnostic: error.diagnostic,
             release: error.release,

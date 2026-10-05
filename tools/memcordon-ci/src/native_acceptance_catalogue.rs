@@ -53,20 +53,20 @@ pub const LINUX_SEALED_TESTS: &[&str] = &[
     "sealed_package_uninstall_refuses_live_authenticated_attempt",
 ];
 pub const MACOS_LIFECYCLE_SCENARIOS: &[&str] = &[
-    "hard_unavailability_refuses_before_target_execution",
-    "confirmed_limit_has_dedicated_status",
+    "required_hard_unavailability_refuses_before_target_execution",
+    "required_confirmed_limit_has_dedicated_status",
     "macos_system_success_and_failure_smoke_tests_are_bounded",
     "virtual_metric_is_explicitly_supported",
-    "wrapper_interrupt_is_forwarded_cleaned_and_mapped",
-    "guardian_kills_workload_after_wrapper_crash",
-    "default_command_lifetime_kills_background_descendant_before_return",
-    "immediate_success_failure_and_status_are_reaped_and_preserved",
-    "command_exit_grace_allows_remaining_workload_to_drain_naturally",
-    "command_exit_grace_force_cleans_survivors_after_expiry",
-    "deadline_remains_authoritative_during_command_exit_grace",
-    "workload_lifetime_waits_for_background_descendant_to_finish_naturally",
-    "natural_workload_completion_starts_retirement_reserve_at_completion",
-    "workload_lifetime_deadline_cleans_background_descendant",
+    "required_wrapper_interrupt_is_forwarded_cleaned_and_mapped",
+    "required_guardian_kills_workload_after_wrapper_crash",
+    "required_default_command_lifetime_kills_background_descendant_before_return",
+    "required_immediate_success_failure_and_status_are_reaped_and_preserved",
+    "required_command_exit_grace_allows_remaining_workload_to_drain_naturally",
+    "required_command_exit_grace_force_cleans_survivors_after_expiry",
+    "required_deadline_remains_authoritative_during_command_exit_grace",
+    "required_workload_lifetime_waits_for_background_descendant_to_finish_naturally",
+    "required_natural_workload_completion_starts_retirement_reserve_at_completion",
+    "required_workload_lifetime_deadline_cleans_background_descendant",
 ];
 
 pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[

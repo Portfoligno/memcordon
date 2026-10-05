@@ -26,7 +26,10 @@ replace live admission or native resource checks.
 
 CI keeps pinned toolchains and action revisions, read-only contents permission,
 credential-free builds, and complete native matrix and Miri/fuzz shard coverage.
-Every workflow run step invokes one executable with arguments. Cargo source
+Every workflow run step invokes one executable with arguments.
+CI orchestration reads standard GitHub context and explicit command arguments;
+custom environment variables are confined to workflow files and never introduce
+a source, target, phase or timeout protocol in Rust or build scripts. Cargo source
 caches use the actual Cargo home and split restore/save steps. Compiled-cache
 reuse is disabled while the selected native inputs lack an ordinary safe cache
 identity; restoring a cache never proves that a test ran.
