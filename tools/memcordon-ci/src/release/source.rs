@@ -257,7 +257,11 @@ pub fn metadata(root: &Path) -> Result<Metadata> {
     )
     .output_quiet()?;
     if !bytes.status.success() {
-        return Err(CiError::Message("Cargo metadata failed".into()));
+        return Err(CiError::Message(format!(
+            "Cargo metadata failed with {} using toolchain {toolchain}: {}",
+            bytes.status,
+            String::from_utf8_lossy(&bytes.stderr).trim(),
+        )));
     }
     Ok(serde_json::from_slice(&bytes.stdout)?)
 }

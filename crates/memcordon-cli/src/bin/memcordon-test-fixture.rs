@@ -537,7 +537,20 @@ fn gate_wait(mut args: impl Iterator<Item = OsString>) {
     if args.next().is_some() {
         fail("gate-wait accepts ready and finish paths");
     }
-    fs::write(ready, b"authorized\n").unwrap();
+    let parent = ready
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::Builder::new()
+        .prefix(".gate-readiness-")
+        .tempdir_in(parent)
+        .unwrap();
+    let staged_ready = staging.path().join("ready");
+    // Publish complete bytes atomically, retaining ordinary file permissions so
+    // the coordinator can read a marker created by a delegated identity.
+    fs::write(&staged_ready, b"authorized\n").unwrap();
+    fs::rename(&staged_ready, &ready).unwrap();
+    drop(staging);
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     while !finish.exists() {
         if std::time::Instant::now() >= deadline {

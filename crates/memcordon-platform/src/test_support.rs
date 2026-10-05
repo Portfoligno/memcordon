@@ -373,6 +373,8 @@ impl MacosAdmission {
 }
 #[cfg(target_os = "macos")]
 pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mutation_probe;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::inspector_eof_retirement as macos_inspector_eof_retirement;
 
 #[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::inventory_reconciliation as macos_inventory_reconciliation;
@@ -417,8 +419,12 @@ pub use crate::macos_launch::submillisecond_deadline as macos_submillisecond_dea
 pub use crate::macos_launch::timer_mutation_detected as macos_timer_mutation_detected;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
-    LaunchFault as MacosLaunchFault, cancellation_fault as macos_cancellation_fault,
-    disarm_timeout as macos_disarm_timeout, rejects_protocol as macos_rejects_protocol,
+    LaunchFault as MacosLaunchFault, StartupDeadlineObservations,
+    cancellation_fault as macos_cancellation_fault, disarm_timeout as macos_disarm_timeout,
+    rejects_protocol as macos_rejects_protocol,
+    startup_deadline_fault as macos_startup_deadline_fault,
+    startup_deadline_fault_observations as macos_startup_deadline_fault_observations,
+    startup_deadline_observations as macos_startup_deadline_observations,
     startup_fault as macos_startup_fault,
 };
 #[cfg(target_os = "macos")]

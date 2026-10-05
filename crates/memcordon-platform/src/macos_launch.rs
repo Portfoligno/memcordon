@@ -20,12 +20,25 @@ use serde::{Deserialize, Serialize};
 
 const STARTUP: Duration = Duration::from_secs(5);
 const FRAME_LIMIT: usize = 4096;
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_inspector_retirement.rs"]
+mod inspector_retirement_support;
+#[cfg(feature = "test-support")]
+pub use inspector_retirement_support::inspector_eof_retirement;
 #[path = "macos_launch_runtime.rs"]
 mod runtime;
 pub use runtime::LaunchRuntime;
 #[cfg(feature = "test-support")]
 #[path = "../tests/support/macos_runtime_fixture.rs"]
 mod runtime_fixture;
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_startup_deadline.rs"]
+mod startup_deadline_fixture;
+#[cfg(feature = "test-support")]
+pub use startup_deadline_fixture::{
+    StartupDeadlineObservations, startup_deadline_fault, startup_deadline_fault_observations,
+    startup_deadline_observations,
+};
 #[cfg(feature = "test-support")]
 std::thread_local! {
     static RUNNING_GUARDIAN_LOSS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
@@ -304,6 +317,8 @@ enum Message {
         message: String,
     },
     #[cfg(feature = "test-support")]
+    StartupCleanupObservation(runtime::StartupCleanupObservation),
+    #[cfg(feature = "test-support")]
     HoldSpawn,
     #[cfg(feature = "test-support")]
     HoldSpawnReleaseAfterCancel,
@@ -333,6 +348,12 @@ enum Message {
     DelayObservedStatus,
     #[cfg(feature = "test-support")]
     DelayInventoryResponse,
+    #[cfg(feature = "test-support")]
+    ExpireGuardianReady,
+    #[cfg(feature = "test-support")]
+    ExpireGuardianReadyRetirementDelayed,
+    #[cfg(feature = "test-support")]
+    ExpireGuardianInspectors,
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -963,6 +984,8 @@ impl Message {
             Self::Retired => "Retired",
             Self::Failure { .. } => "Failure",
             Self::FailureDetail { .. } => "FailureDetail",
+            #[cfg(feature = "test-support")]
+            Self::StartupCleanupObservation(_) => "StartupCleanupObservation",
             Self::Configure { .. } => "Configure",
             Self::Prepared { .. } => "Prepared",
             Self::Released => "Released",
@@ -1004,6 +1027,12 @@ impl Message {
             Self::DelayObservedStatus => "DelayObservedStatus",
             #[cfg(feature = "test-support")]
             Self::DelayInventoryResponse => "DelayInventoryResponse",
+            #[cfg(feature = "test-support")]
+            Self::ExpireGuardianReady => "ExpireGuardianReady",
+            #[cfg(feature = "test-support")]
+            Self::ExpireGuardianReadyRetirementDelayed => "ExpireGuardianReadyRetirementDelayed",
+            #[cfg(feature = "test-support")]
+            Self::ExpireGuardianInspectors => "ExpireGuardianInspectors",
             #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
@@ -1057,6 +1086,7 @@ fn native_spawn(
         deadline,
         NativeSpawnContext {
             runtime,
+            cancellation_scope: runtime::CancellationScope::ChildlessInspector,
             context: None,
             auxiliary: None,
             admission: None,
@@ -1088,6 +1118,7 @@ impl NativeSpawnFailure {
 
 struct NativeSpawnContext<'a> {
     runtime: &'a LaunchRuntime,
+    cancellation_scope: runtime::CancellationScope,
     context: Option<crate::macos_envelope::Envelope>,
     auxiliary: Option<(RawFd, std::os::fd::OwnedFd)>,
     admission: Option<&'a crate::signal::LaunchAdmission>,
@@ -1103,6 +1134,7 @@ fn native_spawn_context(
 ) -> Result<Child, NativeSpawnFailure> {
     let NativeSpawnContext {
         runtime,
+        cancellation_scope,
         context,
         auxiliary,
         admission,
@@ -1110,7 +1142,7 @@ fn native_spawn_context(
     if let Some(admission) = admission {
         admission.check()?;
     }
-    let ticket = runtime.reserve()?;
+    let ticket = runtime.reserve_with_scope(cancellation_scope)?;
     let observation = ticket.observer();
     let expires = crate::macos_deadline::add(
         crate::macos_deadline::continuous_nanos()?,
@@ -1637,6 +1669,10 @@ pub(crate) struct Launch {
     pub(crate) release_tick: u64,
 }
 pub(crate) struct StartupError {
+    #[cfg(feature = "test-support")]
+    pub(crate) cleanup_observations: Vec<runtime::StartupCleanupObservation>,
+    pub(crate) terminal_observed: Option<u64>,
+    pub(crate) retirement_observed: Option<u64>,
     pub(crate) cancellation_observed: Option<u64>,
     pub(crate) cancellation_force: Option<u64>,
     pub(crate) phase: &'static str,
@@ -1676,6 +1712,12 @@ pub enum LaunchFault {
     DelayObservedStatus,
     #[cfg(feature = "test-support")]
     DelayInventoryResponse,
+    #[cfg(feature = "test-support")]
+    GuardianReadyExpired,
+    #[cfg(feature = "test-support")]
+    GuardianReadyExpiredRetirementDelayed,
+    #[cfg(feature = "test-support")]
+    GuardianInspectorsExpired,
 }
 
 pub(crate) fn launch(
@@ -1831,9 +1873,15 @@ fn launch_configured(
     let mut configured = false;
     let mut release = memcordon_core::ReleaseEvidence::NotIssued;
     let mut phase = "helper-spawn";
+    #[cfg(feature = "test-support")]
+    let mut cleanup_observations = Vec::new();
     if Instant::now() >= deadline {
         diagnostic.cleanup.state = CleanupState::Complete;
         return Err(Box::new(StartupError {
+            #[cfg(feature = "test-support")]
+            cleanup_observations,
+            terminal_observed: crate::macos_deadline::continuous_nanos().ok(),
+            retirement_observed: crate::macos_deadline::continuous_nanos().ok(),
             cancellation_observed: None,
             cancellation_force: None,
             phase,
@@ -1892,6 +1940,7 @@ fn launch_configured(
             deadline,
             NativeSpawnContext {
                 runtime: &runtime,
+                cancellation_scope: runtime::CancellationScope::ProcessGroup,
                 context: Some(envelope),
                 auxiliary: Some(auxiliary),
                 admission: signal.map(|signal| &signal.admission),
@@ -1943,6 +1992,18 @@ fn launch_configured(
         #[cfg(feature = "test-support")]
         if fault == Some(LaunchFault::DelayInventoryResponse) {
             control.send(Message::DelayInventoryResponse, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::GuardianReadyExpired) {
+            control.send(Message::ExpireGuardianReady, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::GuardianReadyExpiredRetirementDelayed) {
+            control.send(Message::ExpireGuardianReadyRetirementDelayed, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::GuardianInspectorsExpired) {
+            control.send(Message::ExpireGuardianInspectors, deadline)?;
         }
         // A failed partial Configure may still reach the guardian. Preserve its
         // custody from before the first write, rather than killing it on error.
@@ -2106,6 +2167,11 @@ fn launch_configured(
             },
         }),
         Err(error) => {
+            // Observe the failed admission before native retirement can consume
+            // the cleanup reserve. This receipt must never be sampled afterwards.
+            let terminal_observed = crate::macos_deadline::continuous_nanos().ok();
+            let mut retirement_observed = None;
+            let mut retirement_within_reserve = false;
             let cancellation_observed = signal
                 .filter(|signal| signal.take().is_some())
                 .and_then(|signal| signal.admission.observed_at().ok());
@@ -2176,8 +2242,57 @@ fn launch_configured(
                             // including an exec receipt already in flight. Its
                             // output must not fail merely because we cancelled.
                             let _ = channel.stream.shutdown(std::net::Shutdown::Write);
-                            while let Ok(Some(message)) = channel.receive(cleanup_deadline) {
+                            loop {
+                                let message = match channel.receive_available() {
+                                    Ok(Some(Some(message))) => message,
+                                    Ok(Some(None)) | Err(_) => break,
+                                    Ok(None) => {
+                                        // EOF is not the retirement receipt: the actual
+                                        // native parent may be reaped without a matching
+                                        // stream EOF. Preserve that exact observation.
+                                        if guardian
+                                            .child
+                                            .try_wait_until(cleanup_deadline)
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
+                                        {
+                                            retirement_observed =
+                                                crate::macos_deadline::continuous_nanos().ok();
+                                            retirement_within_reserve =
+                                                Instant::now() <= cleanup_deadline;
+                                            break;
+                                        }
+                                        if Instant::now() >= cleanup_deadline {
+                                            break;
+                                        }
+                                        std::thread::sleep(
+                                            Duration::from_millis(2).min(
+                                                cleanup_deadline
+                                                    .saturating_duration_since(Instant::now()),
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                };
                                 match message {
+                                    #[cfg(feature = "test-support")]
+                                    Message::StartupCleanupObservation(observation) => {
+                                        // Supplemental concurrent observations never prove
+                                        // retirement or change the cleanup classification.
+                                        if cleanup_observations.len() < 2 {
+                                            cleanup_observations.push(observation);
+                                        }
+                                    }
+                                    Message::Failure { errno }
+                                        if phase == "helper-ready"
+                                            && error.kind() == io::ErrorKind::TimedOut
+                                            && errno == libc::ETIMEDOUT =>
+                                    {
+                                        // Retain the guardian's explicit expiry receipt even
+                                        // when the frontend timer won the readiness race.
+                                        diagnostic.native_errno = Some(errno);
+                                    }
                                     Message::ReleaseIssued { at } => {
                                         release = memcordon_core::ReleaseEvidence::Issued {
                                             at,
@@ -2206,7 +2321,11 @@ fn launch_configured(
                         if !configured
                             || guardian.child.status.is_some_and(|status| status.success()) =>
                     {
-                        diagnostic.cleanup.state = CleanupState::Complete
+                        diagnostic.cleanup.state = CleanupState::Complete;
+                        if retirement_observed.is_none() {
+                            retirement_observed = crate::macos_deadline::continuous_nanos().ok();
+                            retirement_within_reserve = Instant::now() <= cleanup_deadline;
+                        }
                     }
                     Ok(()) => {}
                     Err(error) => diagnostic.cleanup.errors.push(NativeStartupCleanupErrorV1 {
@@ -2222,11 +2341,29 @@ fn launch_configured(
                 // No native operation was enqueued, or this exact creation's
                 // ticket proves no-child completion or actual native retirement.
                 diagnostic.cleanup.state = CleanupState::Complete;
+                retirement_observed = crate::macos_deadline::continuous_nanos().ok();
+                retirement_within_reserve = Instant::now() <= cleanup_deadline;
             }
             if !diagnostic.cleanup.errors.is_empty() {
                 diagnostic.cleanup.state = CleanupState::Incomplete;
             }
+            if diagnostic.cleanup.state == CleanupState::Complete
+                && (!retirement_within_reserve || retirement_observed.is_none())
+            {
+                diagnostic.cleanup.state = CleanupState::Incomplete;
+                diagnostic.cleanup.errors.push(NativeStartupCleanupErrorV1 {
+                    operation: Operation::ReapGuardian,
+                    native_errno: Some(libc::ETIMEDOUT),
+                    detail:
+                        "native startup retirement was not observed within its original reserve"
+                            .into(),
+                });
+            }
             Err(Box::new(StartupError {
+                #[cfg(feature = "test-support")]
+                cleanup_observations,
+                terminal_observed,
+                retirement_observed,
                 cancellation_observed,
                 cancellation_force,
                 phase,
@@ -2817,6 +2954,52 @@ pub fn inspector_helper(descriptor: RawFd, expected_run: u64) -> i32 {
     }
 }
 
+fn guardian_readiness_failure(
+    control: &mut Channel,
+    runtime: &LaunchRuntime,
+    error: io::Error,
+    retirement_deadline: Instant,
+    #[cfg(feature = "test-support")] normal_inspector_created: bool,
+) -> i32 {
+    // This path precedes target creation and release. Preserve the actual
+    // failure kind; elapsed time alone must never turn a broken helper into a
+    // deadline outcome. The read lease may already be in frontend cleanup.
+    let message = if error.kind() == io::ErrorKind::TimedOut {
+        Message::Failure {
+            errno: libc::ETIMEDOUT,
+        }
+    } else if let Some(errno) = error.raw_os_error() {
+        Message::Failure { errno }
+    } else {
+        Message::FailureDetail {
+            message: error.to_string(),
+        }
+    };
+    let _ = control.send(message, retirement_deadline);
+    #[cfg(feature = "test-support")]
+    let _ = control.send(
+        Message::StartupCleanupObservation(
+            runtime.startup_cleanup_observation(false, normal_inspector_created),
+        ),
+        retirement_deadline,
+    );
+    // Inventory owners have been dropped into this runtime's existing reaper.
+    // Successful guardian exit is the frontend's cleanup receipt, so emit it
+    // only after every native creation/retirement obligation actually settles.
+    if runtime.settled_until(retirement_deadline) {
+        0
+    } else {
+        #[cfg(feature = "test-support")]
+        let _ = control.send(
+            Message::StartupCleanupObservation(
+                runtime.startup_cleanup_observation(true, normal_inspector_created),
+            ),
+            retirement_deadline,
+        );
+        126
+    }
+}
+
 fn guardian_main(
     mut control: Channel,
     command: &[OsString],
@@ -2875,6 +3058,13 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let mut delay_inventory_response = configuration == Some(Message::DelayInventoryResponse);
     #[cfg(feature = "test-support")]
+    let expire_ready = configuration == Some(Message::ExpireGuardianReady);
+    #[cfg(feature = "test-support")]
+    let delay_ready_retirement =
+        configuration == Some(Message::ExpireGuardianReadyRetirementDelayed);
+    #[cfg(feature = "test-support")]
+    let expire_inspectors = configuration == Some(Message::ExpireGuardianInspectors);
+    #[cfg(feature = "test-support")]
     let mut delay_inventory_until = None;
     #[cfg(feature = "test-support")]
     let configuration = if hold_spawn
@@ -2883,6 +3073,9 @@ fn guardian_main(
         || delay_reaped_status
         || delay_observed_status
         || delay_inventory_response
+        || expire_ready
+        || delay_ready_retirement
+        || expire_inspectors
     {
         control.receive(initial)?
     } else {
@@ -2908,14 +3101,36 @@ fn guardian_main(
             ));
         }
     };
-    let now = crate::macos_deadline::continuous_nanos()?;
     if boot_identity != crate::macos_deadline::boot_identity()? {
         return Err(io::Error::other(
             "guardian continuous clock boot binding mismatch",
         ));
     }
+    #[cfg(feature = "test-support")]
+    if expire_ready || delay_ready_retirement {
+        while crate::macos_deadline::continuous_nanos()? < startup {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let now = crate::macos_deadline::continuous_nanos()?;
+    let retirement_expiry =
+        crate::macos_deadline::add(startup, crate::macos_watchdog::CLEANUP_DEADLINE)?;
+    let retirement_deadline = Instant::now()
+        .checked_add(Duration::from_nanos(retirement_expiry.saturating_sub(now)))
+        .ok_or_else(|| io::Error::other("guardian startup retirement deadline range"))?;
     if now >= startup || work.is_some_and(|expiry| now >= expiry) {
-        return Ok(126);
+        #[cfg(feature = "test-support")]
+        if delay_ready_retirement {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        return Ok(guardian_readiness_failure(
+            &mut control,
+            &runtime,
+            io::Error::new(io::ErrorKind::TimedOut, "guardian configuration expired"),
+            retirement_deadline,
+            #[cfg(feature = "test-support")]
+            false,
+        ));
     }
     // The dedicated guardian is the sole reaper; the launcher restores the caller's
     // inherited SIGCHLD disposition before executing target code.
@@ -2925,17 +3140,37 @@ fn guardian_main(
     let inspector_deadline = Instant::now()
         .checked_add(Duration::from_nanos(startup.saturating_sub(now)))
         .ok_or_else(|| io::Error::other("inspector startup deadline range"))?;
-    let mut normal = InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)?;
-    let emergency = match InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)
-    {
-        Ok(lane) => lane,
+    #[cfg(feature = "test-support")]
+    let mut normal_inspector_created = false;
+    let inspectors = (|| {
+        let normal = InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)?;
+        #[cfg(feature = "test-support")]
+        {
+            normal_inspector_created = true;
+        }
+        #[cfg(feature = "test-support")]
+        if expire_inspectors {
+            while crate::macos_deadline::continuous_nanos()? < startup {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let emergency = InventoryLane::start_in(&runtime, &image, control.run, inspector_deadline)?;
+        control.send(Message::Ready, inspector_deadline)?;
+        Ok([normal, emergency])
+    })();
+    let mut inventory_lanes = match inspectors {
+        Ok(lanes) => lanes,
         Err(error) => {
-            let _ = normal.cancel_owned();
-            return Err(error);
+            return Ok(guardian_readiness_failure(
+                &mut control,
+                &runtime,
+                error,
+                retirement_deadline,
+                #[cfg(feature = "test-support")]
+                normal_inspector_created,
+            ));
         }
     };
-    let mut inventory_lanes = [normal, emergency];
-    control.send(Message::Ready, inspector_deadline)?;
     // Validate every reserve before creation; no overflow may authorize an unbounded fallback.
     work.unwrap_or(startup)
         .checked_add(grace)

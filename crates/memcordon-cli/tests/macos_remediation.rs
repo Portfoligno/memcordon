@@ -343,13 +343,27 @@ fn native_accounting_backend_preserves_consistent_retirement() {
 #[test]
 fn large_poll_interval_cannot_postpone_a_short_deadline() {
     let _runtime = native_runtime();
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-short-deadline-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let report_path = directory.path().join("deadline.json");
     let mut command = Command::new(image());
     command
+        .arg("--report")
+        .arg(&report_path)
         .args(["+1GiB", "+100ms", "--poll-interval", "30s", "--"])
         .arg(fixture())
         .args(["hold", "--duration", "30s"]);
     let started = Instant::now();
-    let output = run_with_deadline(&mut command, Duration::from_secs(3)).unwrap();
+    // Work expiry is independent of the subsequent native retirement and report
+    // delivery reserves. The harness must allow those reserves to finish.
+    let harness_budget = Duration::from_millis(100)
+        + Duration::from_secs(2)
+        + Duration::from_secs(3)
+        + Duration::from_secs(1)
+        + Duration::from_secs(1);
+    let output = run_with_deadline(&mut command, harness_budget).unwrap();
     let elapsed = started.elapsed();
     let diagnostic = format!(
         "status={:?}; elapsed={elapsed:?}; stdout({} bytes)={:?}; stderr({} bytes)={:?}",
@@ -360,7 +374,400 @@ fn large_poll_interval_cannot_postpone_a_short_deadline() {
         String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(16 * 1024)]),
     );
     assert_eq!(output.status.code(), Some(123), "{diagnostic}");
-    assert!(elapsed < Duration::from_secs(2), "{diagnostic}");
+    let bytes = std::fs::read(&report_path).expect(&diagnostic);
+    let report: memcordon_core::MemcordonReport =
+        serde_json::from_slice(&bytes).expect(&diagnostic);
+    assert_eq!(report.attempts.len(), 1, "{diagnostic}");
+    let runtime = report.attempts[0].runtime.as_ref().expect(&diagnostic);
+    assert!(
+        short_deadline_runtime_is_valid(runtime),
+        "{diagnostic}; {runtime:#?}"
+    );
+    let report = serde_json::to_value(report).unwrap();
+    assert_eq!(
+        report["attempts"].as_array().unwrap().len(),
+        1,
+        "{diagnostic}"
+    );
+    let outcome = &report["attempts"][0]["outcome"];
+    assert_eq!(outcome["outcome"], "deadline-exceeded", "{diagnostic}");
+    assert_eq!(outcome["deadline"]["duration_ms"], 100, "{diagnostic}");
+    assert_eq!(
+        outcome["cleanup"]["direct_child_reaped"], true,
+        "{diagnostic}"
+    );
+    assert_eq!(outcome["cleanup"]["workload_empty"], true, "{diagnostic}");
+    assert!(
+        outcome["cleanup"]["errors"].as_array().unwrap().is_empty(),
+        "{diagnostic}"
+    );
+}
+
+fn short_deadline_runtime_is_valid(runtime: &memcordon_core::RuntimeEvidenceV1) -> bool {
+    use memcordon_core::{ClockDomain, ReleaseEvidence, RetirementEvidence};
+
+    let ClockDomain::DarwinContinuousTicksV1 {
+        ticks_per_second, ..
+    } = &runtime.clock;
+    let ticks = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap();
+    let Some(work) = runtime.work_expires else {
+        return false;
+    };
+    let Some(terminal) = runtime.terminal_observed else {
+        return false;
+    };
+    let Some(force) = runtime.force_expires else {
+        return false;
+    };
+    let Some(retire) = runtime.retirement_expires else {
+        return false;
+    };
+    let Some(deliver) = runtime.delivery_expires else {
+        return false;
+    };
+    let RetirementEvidence::Complete { at, .. } = runtime.retirement else {
+        return false;
+    };
+    *ticks_per_second == ticks(Duration::from_secs(1))
+        && runtime.is_consistent()
+        && work.checked_sub(runtime.run_origin) == Some(ticks(Duration::from_millis(100)))
+        && runtime.startup_expires <= work
+        && !matches!(runtime.release, ReleaseEvidence::Unknown)
+        && match runtime.release {
+            ReleaseEvidence::Issued { .. } => runtime.target_pid.is_some(),
+            ReleaseEvidence::NotIssued => true,
+            ReleaseEvidence::Unknown => false,
+        }
+        && terminal >= work
+        // Preserve the original responsiveness bound at the work observation,
+        // rather than incorrectly applying it to cleanup and report delivery.
+        && terminal.checked_sub(work).is_some_and(|delay| delay < ticks(Duration::from_secs(2)))
+        && force == work
+        && retire.checked_sub(force) == Some(ticks(Duration::from_secs(3)))
+        && deliver.checked_sub(retire) == Some(ticks(Duration::from_secs(1)))
+        && runtime.retirement.is_complete()
+        && at <= retire
+        && runtime.force_requested.is_none_or(|at| terminal <= at && at <= retire)
+}
+
+#[test]
+fn short_deadline_runtime_oracle_rejects_late_or_unsettled_evidence() {
+    use memcordon_core::{
+        ClockDomain, DeliveryEvidence, ReleaseEvidence, RetirementEvidence, RuntimeEvidenceV1,
+    };
+    let valid = RuntimeEvidenceV1 {
+        schema_version: 1,
+        clock: ClockDomain::DarwinContinuousTicksV1 {
+            boot_identity: "oracle-fixture".into(),
+            ticks_per_second: 1_000_000_000,
+        },
+        run_origin: 1_000_000_000,
+        attempt_origin: 1_010_000_000,
+        work_expires: Some(1_100_000_000),
+        startup_expires: 1_100_000_000,
+        release: ReleaseEvidence::NotIssued,
+        target_pid: None,
+        terminal_observed: Some(1_100_000_000),
+        force_requested: None,
+        force_expires: Some(1_100_000_000),
+        retirement_expires: Some(4_100_000_000),
+        delivery_expires: Some(5_100_000_000),
+        retirement: RetirementEvidence::Complete {
+            at: 4_000_000_000,
+            target_reaped_or_absent: true,
+            group_reconciled: true,
+            detached_identities_discharged: true,
+            native_obligations_settled: true,
+            policy_retired: true,
+        },
+        delivery: DeliveryEvidence::Prepared,
+    };
+    assert!(short_deadline_runtime_is_valid(&valid));
+    let mut released = valid.clone();
+    released.release = ReleaseEvidence::Issued {
+        at: 1_050_000_000,
+        exec_confirmed: true,
+    };
+    released.target_pid = std::num::NonZeroU32::new(42);
+    assert!(short_deadline_runtime_is_valid(&released));
+    released.release = ReleaseEvidence::Issued {
+        at: 1_050_000_000,
+        exec_confirmed: false,
+    };
+    assert!(short_deadline_runtime_is_valid(&released));
+    let mut bad = valid.clone();
+    bad.terminal_observed = Some(3_100_000_000);
+    assert!(bad.is_consistent());
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.work_expires = None;
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.retirement_expires = Some(5_100_000_000);
+    bad.delivery_expires = Some(6_100_000_000);
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.delivery_expires = Some(6_100_000_000);
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.release = ReleaseEvidence::Unknown;
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    if let RetirementEvidence::Complete {
+        native_obligations_settled,
+        ..
+    } = &mut bad.retirement
+    {
+        *native_obligations_settled = false;
+    }
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.work_expires = Some(31_000_000_000);
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.terminal_observed = Some(31_000_000_000);
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.release = ReleaseEvidence::Issued {
+        at: 1_100_000_000,
+        exec_confirmed: true,
+    };
+    bad.target_pid = std::num::NonZeroU32::new(42);
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid.clone();
+    bad.retirement = RetirementEvidence::Unconfirmed { last_owner: None };
+    assert!(!short_deadline_runtime_is_valid(&bad));
+    let mut bad = valid;
+    if let RetirementEvidence::Complete { at, .. } = &mut bad.retirement {
+        *at = 4_100_000_001;
+    }
+    assert!(!short_deadline_runtime_is_valid(&bad));
+}
+
+#[test]
+fn naturally_exited_inspector_drop_retires_without_suppressing_group_errors() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_inspector_eof_retirement(image()).unwrap();
+}
+
+#[test]
+fn guardian_readiness_expiry_reports_timeout_after_verified_cleanup() {
+    let _runtime = native_runtime();
+    for fault in [
+        MacosLaunchFault::GuardianReadyExpired,
+        MacosLaunchFault::GuardianInspectorsExpired,
+    ] {
+        let directory = tempfile::Builder::new()
+            .prefix("memcordon-startup-deadline-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let marker = directory.path().join("target marker");
+        let command = CommandSpec::new(fixture())
+            .args([OsString::from("gate-marker"), marker.as_os_str().to_owned()]);
+        let started = Instant::now();
+        let observation =
+            memcordon_platform::test_support::macos_startup_deadline_fault_observations(
+                &command,
+                image(),
+                fault,
+            )
+            .unwrap();
+        let kind = observation.kind;
+        let diagnostic = &observation.diagnostic;
+        let release = &observation.release;
+        assert_eq!(
+            kind,
+            std::io::ErrorKind::TimedOut,
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.native_errno,
+            Some(libc::ETIMEDOUT),
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(
+            diagnostic.guardian_pid.is_some(),
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.phase,
+            memcordon_core::NativeStartupPhaseV1::GuardianReadiness
+        );
+        assert_eq!(*release, memcordon_core::ReleaseEvidence::NotIssued);
+        assert!(!marker.exists(), "{fault:?}: {diagnostic:#?}");
+        assert!(!diagnostic.guardian_ready, "{fault:?}: {diagnostic:#?}");
+        assert!(
+            diagnostic.launcher_pid.is_none(),
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(!diagnostic.release_sent, "{fault:?}: {diagnostic:#?}");
+        assert!(!diagnostic.exec_confirmed, "{fault:?}: {diagnostic:#?}");
+        assert!(
+            !observation.cleanup_observations.is_empty(),
+            "readiness cleanup must retain its actual native handoff snapshot; {fault:?}: {observation:#?}"
+        );
+        assert!(
+            observation.cleanup_observations.len() <= 2,
+            "{observation:#?}"
+        );
+        let handoff = &observation.cleanup_observations[0];
+        assert_eq!(handoff["settlement_finished"], false, "{observation:#?}");
+        assert_eq!(
+            handoff["normal_inspector_created"],
+            fault == MacosLaunchFault::GuardianInspectorsExpired,
+            "the configured fault must reach its intended native ownership phase; {observation:#?}"
+        );
+        for snapshot in &observation.cleanup_observations {
+            let sampled = snapshot["observed_at"]
+                .as_u64()
+                .expect("native cleanup snapshot must retain its sampling time");
+            assert!(sampled >= observation.work_expires, "{observation:#?}");
+            assert!(sampled <= observation.published_at, "{observation:#?}");
+            let slots = snapshot["slots"]
+                .as_array()
+                .expect("native slot snapshot must be structured");
+            assert!(slots.len() <= 8, "{observation:#?}");
+        }
+        assert_eq!(
+            diagnostic.cleanup.state,
+            NativeStartupCleanupStateV1::Complete,
+            "{fault:?}: {observation:#?}"
+        );
+        assert!(
+            diagnostic.cleanup.errors.is_empty(),
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(diagnostic.is_consistent(), "{fault:?}: {diagnostic:#?}");
+        let terminal = observation
+            .terminal_observed
+            .expect("readiness expiry must retain its original timeout observation");
+        let retired = observation
+            .retirement_observed
+            .expect("complete readiness cleanup must retain its actual native receipt");
+        assert!(
+            terminal >= observation.work_expires,
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(terminal <= retired, "{fault:?}: {diagnostic:#?}");
+        assert!(
+            retired <= observation.work_expires + 3_000_000_000,
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(
+            retired <= observation.published_at,
+            "{fault:?}: {diagnostic:#?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{fault:?}: {diagnostic:#?}"
+        );
+    }
+}
+
+#[test]
+fn startup_deadline_observation_precedes_delayed_retirement_and_publication() {
+    let _runtime = native_runtime();
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-startup-receipts-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let marker = directory.path().join("target marker");
+    let command = CommandSpec::new(fixture())
+        .args([OsString::from("gate-marker"), marker.as_os_str().to_owned()]);
+    let observation =
+        memcordon_platform::test_support::macos_startup_deadline_observations(&command, image())
+            .unwrap();
+    let diagnostic = &observation.diagnostic;
+    assert_eq!(
+        observation.kind,
+        std::io::ErrorKind::TimedOut,
+        "{diagnostic:#?}"
+    );
+    assert_eq!(
+        diagnostic.native_errno,
+        Some(libc::ETIMEDOUT),
+        "{diagnostic:#?}"
+    );
+    assert!(diagnostic.guardian_pid.is_some(), "{diagnostic:#?}");
+    assert_eq!(
+        diagnostic.phase,
+        memcordon_core::NativeStartupPhaseV1::GuardianReadiness
+    );
+    assert_eq!(
+        observation.release,
+        memcordon_core::ReleaseEvidence::NotIssued
+    );
+    assert!(!marker.exists());
+    assert_eq!(
+        diagnostic.cleanup.state,
+        NativeStartupCleanupStateV1::Complete
+    );
+    assert!(diagnostic.cleanup.errors.is_empty(), "{diagnostic:#?}");
+    let terminal = observation
+        .terminal_observed
+        .expect("original timeout observation");
+    let retired = observation
+        .retirement_observed
+        .expect("actual successful native retirement receipt");
+    let cutoff = observation.work_expires;
+    assert!(
+        terminal >= cutoff,
+        "timeout must observe original work expiry"
+    );
+    assert!(
+        terminal - cutoff < 2_000_000_000,
+        "observation must precede cleanup reserve exhaustion"
+    );
+    assert!(
+        terminal < retired,
+        "timeout observation must precede actual native retirement"
+    );
+    assert!(
+        retired >= cutoff + 500_000_000,
+        "the configured guardian retirement delay must be exercised"
+    );
+    assert!(
+        retired <= cutoff + 3_000_000_000,
+        "retirement must settle within the original reserve"
+    );
+    assert!(
+        observation.published_at >= retired + 400_000_000,
+        "publication delay must not rewrite either native receipt"
+    );
+}
+
+#[test]
+fn guardian_loss_is_not_reported_as_clean_startup_deadline() {
+    let _runtime = native_runtime();
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-startup-loss-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let marker = directory.path().join("target marker");
+    let command = CommandSpec::new(fixture())
+        .args([OsString::from("gate-marker"), marker.as_os_str().to_owned()]);
+    let (kind, diagnostic, release) =
+        memcordon_platform::test_support::macos_startup_deadline_fault(
+            &command,
+            image(),
+            MacosLaunchFault::GuardianBeforeArm,
+        )
+        .unwrap();
+    assert_ne!(kind, std::io::ErrorKind::TimedOut, "{diagnostic:#?}");
+    assert_ne!(
+        diagnostic.native_errno,
+        Some(libc::ETIMEDOUT),
+        "{diagnostic:#?}"
+    );
+    assert_eq!(release, memcordon_core::ReleaseEvidence::NotIssued);
+    assert!(!marker.exists(), "{diagnostic:#?}");
+    assert!(!diagnostic.release_sent, "{diagnostic:#?}");
+    assert!(!diagnostic.exec_confirmed, "{diagnostic:#?}");
+    assert_ne!(
+        diagnostic.cleanup.state,
+        NativeStartupCleanupStateV1::Complete
+    );
+    assert!(diagnostic.is_consistent(), "{diagnostic:#?}");
 }
 
 #[test]

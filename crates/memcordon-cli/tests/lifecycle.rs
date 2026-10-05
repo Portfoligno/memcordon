@@ -252,14 +252,119 @@ fn default_command_lifetime_kills_background_descendant_before_return() {
         return;
     }
     let pid_file = temporary_pid_file();
-    let mut invocation = wrapped(fixture(), &["spawn-background", "--child-duration", "30s"]);
-    invocation.arg("--pid-file").arg(&pid_file);
-    let output = completed(&mut invocation, Duration::from_secs(3));
+    let report_file = pid_file.with_extension("json");
+    let completion_marker = pid_file.with_extension("completed");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--report",
+    ]);
+    invocation.arg(&report_file).args([
+        "+8GiB",
+        "--",
+        fixture(),
+        "spawn-background",
+        "--child-duration",
+        "30s",
+    ]);
+    invocation
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--completion-marker")
+        .arg(&completion_marker);
+    // The outer guard covers native startup, prompt root-exit observation,
+    // fixed retirement, report delivery, and harness margin. It must not
+    // preempt legitimate cleanup or allow the descendant's 30 s natural exit.
+    let harness_budget = Duration::from_secs(5)
+        + Duration::from_secs(2)
+        + Duration::from_secs(3)
+        + Duration::from_secs(1)
+        + Duration::from_secs(1);
+    let output = completed(&mut invocation, harness_budget);
     assert_eq!(output.status.code(), Some(0));
     assert_stdout_empty(&output);
+    let typed_report: memcordon_core::MemcordonReport = serde_json::from_str(
+        &fs::read_to_string(&report_file).expect("lifetime execution report must be readable"),
+    )
+    .expect("lifetime execution report must be valid");
+    let report = serde_json::to_value(&typed_report).unwrap();
+    assert_eq!(typed_report.attempts.len(), 1, "{report:#}");
+    assert!(
+        pid_file.exists(),
+        "descendant identity must be published; {report:#}"
+    );
+    assert!(
+        !completion_marker.exists(),
+        "descendant must be terminated before natural completion; {report:#}"
+    );
     let identity = read_identity(&pid_file);
     assert_process_gone(identity);
+    let outcome = &report["attempts"][0]["outcome"];
+    assert_eq!(outcome["outcome"], "exited", "{report:#}");
+    let cleanup = &outcome["cleanup"];
+    assert_eq!(cleanup["direct_child_reaped"], true, "{report:#}");
+    assert_eq!(cleanup["workload_empty"], true, "{report:#}");
+    assert_eq!(cleanup["force_attempted"], true, "{report:#}");
+    assert_eq!(cleanup["errors"], serde_json::json!([]), "{report:#}");
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = typed_report.attempts[0]
+            .runtime
+            .as_ref()
+            .expect("native runtime receipts are required");
+        assert!(runtime.is_consistent(), "{runtime:#?}");
+        assert!(
+            runtime.work_expires.is_none(),
+            "default lifetime has no work deadline; {runtime:#?}"
+        );
+        assert_eq!(
+            runtime.startup_expires.checked_sub(runtime.attempt_origin),
+            Some(5_000_000_000),
+            "{runtime:#?}"
+        );
+        assert!(
+            matches!(
+                runtime.release,
+                memcordon_core::ReleaseEvidence::Issued {
+                    exec_confirmed: true,
+                    ..
+                }
+            ),
+            "{runtime:#?}"
+        );
+        let terminal = runtime
+            .terminal_observed
+            .expect("root completion observation is required");
+        assert!(
+            terminal < runtime.startup_expires + 2_000_000_000,
+            "{runtime:#?}"
+        );
+        let force = runtime
+            .force_expires
+            .expect("original force boundary is required");
+        assert!(
+            force >= terminal && force < runtime.startup_expires + 2_000_000_000,
+            "{runtime:#?}"
+        );
+        assert_eq!(
+            runtime.retirement_expires,
+            Some(force + 3_000_000_000),
+            "{runtime:#?}"
+        );
+        assert_eq!(
+            runtime.delivery_expires,
+            Some(force + 4_000_000_000),
+            "{runtime:#?}"
+        );
+        assert!(runtime.retirement.is_complete(), "{runtime:#?}");
+    }
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
 }
 
 #[test]
@@ -410,13 +515,13 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
             "hard"
         },
         "--command-exit-grace",
-        "5s",
+        "20s",
         "--report",
     ]);
     invocation.arg(&report_file);
     invocation.args([
         "+8GiB",
-        "+2s",
+        "+8s",
         "--",
         fixture(),
         "spawn-background",
@@ -429,7 +534,10 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
         .arg("--completion-marker")
         .arg(&completion_marker);
 
-    let output = completed(&mut invocation, Duration::from_secs(6));
+    // Startup itself can consume five seconds. This fixture must actually reach
+    // root exit with a live descendant to exercise command-exit grace, while
+    // retaining one startup-inclusive work cutoff shorter than that grace.
+    let output = completed(&mut invocation, Duration::from_secs(15));
     let report_text = fs::read_to_string(&report_file);
     assert_eq!(
         output.status.code(),
@@ -442,11 +550,18 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
         !completion_marker.exists(),
         "descendant completed naturally"
     );
-    let identity = read_identity(&pid_file);
-    assert_process_gone(identity);
-    let report: serde_json::Value =
+    let typed_report: memcordon_core::MemcordonReport =
         serde_json::from_str(&report_text.expect("execution report should be readable"))
             .expect("execution report should be valid JSON");
+    let report = serde_json::to_value(&typed_report).unwrap();
+    assert_eq!(typed_report.attempts.len(), 1, "{report:#}");
+    assert!(
+        pid_file.exists(),
+        "descendant identity was not published; {report:#}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
     assert_eq!(report["supervision"]["terminal"]["kind"], "attempt-outcome");
     assert_eq!(
         report["attempts"][0]["outcome"]["outcome"],
@@ -454,8 +569,66 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
     );
     assert_eq!(
         report["policy"]["requested"]["command_exit_grace_ms"],
-        5_000
+        20_000
     );
+    let outcome = &report["attempts"][0]["outcome"];
+    assert_eq!(outcome["deadline"]["duration_ms"], 8_000, "{report:#}");
+    #[cfg(windows)]
+    let natural_root_exit = memcordon_core::ChildTermination::WindowsStatus { status: 0 };
+    #[cfg(not(windows))]
+    let natural_root_exit = memcordon_core::ChildTermination::ExitCode { code: 0 };
+    assert_eq!(
+        outcome["child_after_termination"],
+        serde_json::to_value(natural_root_exit).unwrap(),
+        "root must exit naturally before deadline cleanup; {report:#}"
+    );
+    let cleanup = &outcome["cleanup"];
+    assert_eq!(cleanup["direct_child_reaped"], true, "{report:#}");
+    assert_eq!(cleanup["workload_empty"], true, "{report:#}");
+    assert_eq!(cleanup["force_attempted"], true, "{report:#}");
+    assert_eq!(cleanup["errors"], serde_json::json!([]), "{report:#}");
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = typed_report.attempts[0]
+            .runtime
+            .as_ref()
+            .expect("native runtime receipts are required");
+        assert!(runtime.is_consistent(), "{runtime:#?}");
+        let work = runtime
+            .work_expires
+            .expect("original work cutoff is required");
+        assert_eq!(
+            work.checked_sub(runtime.run_origin),
+            Some(8_000_000_000),
+            "{runtime:#?}"
+        );
+        assert!(
+            matches!(
+                runtime.release,
+                memcordon_core::ReleaseEvidence::Issued { .. }
+            ),
+            "{runtime:#?}"
+        );
+        let terminal = runtime
+            .terminal_observed
+            .expect("terminal receipt is required");
+        assert!(
+            terminal >= work && terminal < work + 2_000_000_000,
+            "{runtime:#?}"
+        );
+        assert_eq!(runtime.force_expires, Some(work), "{runtime:#?}");
+        assert_eq!(
+            runtime.retirement_expires,
+            Some(work + 3_000_000_000),
+            "{runtime:#?}"
+        );
+        assert_eq!(
+            runtime.delivery_expires,
+            Some(work + 4_000_000_000),
+            "{runtime:#?}"
+        );
+        assert!(runtime.retirement.is_complete(), "{runtime:#?}");
+    }
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
 }

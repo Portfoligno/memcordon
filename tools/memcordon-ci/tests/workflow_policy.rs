@@ -194,8 +194,18 @@ fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
     )
     .expect("the bounded deep CI workflow should pass");
 
-    for timeout_minutes in [89, 91, 120] {
-        let invalid = workflow_with_job_timeout(fixture, "stress", timeout_minutes);
+    for (job, timeout_minutes) in [
+        ("stress", 90),
+        ("stress", 119),
+        ("stress", 121),
+        ("stress-packages", 89),
+        ("stress-packages", 91),
+        ("stress-packages", 120),
+        ("stress-lifecycle", 89),
+        ("stress-lifecycle", 91),
+        ("stress-lifecycle", 120),
+    ] {
+        let invalid = workflow_with_job_timeout(fixture, job, timeout_minutes);
         let error = policy::validate_workflow_bytes(
             &root,
             Path::new(".github/workflows/deep-ci.yml"),

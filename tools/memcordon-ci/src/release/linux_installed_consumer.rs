@@ -1256,10 +1256,13 @@ fn wait_ready(path: &Path, until: std::time::Instant) -> Result<()> {
     loop {
         match fs::read(path) {
             Ok(bytes) if bytes == b"authorized\n" => return Ok(()),
-            Ok(_) => {
-                return Err(CiError::Message(
-                    "native gate readiness bytes differ".into(),
-                ));
+            Ok(bytes) => {
+                return Err(CiError::Message(format!(
+                    "native gate readiness bytes differ at {}: expected {:?}, observed {:?}",
+                    path.display(),
+                    b"authorized\n",
+                    bytes
+                )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),

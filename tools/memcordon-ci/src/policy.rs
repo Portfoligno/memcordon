@@ -564,6 +564,7 @@ const NATIVE_MATRIX: [(&str, &str); 6] = [
 ];
 const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
 const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 90;
+const DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES: u64 = 120;
 fn check_runner_matrix(
     jobs: &Mapping,
     job_name: &str,
@@ -717,7 +718,11 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
                 != Some(format!("needs.performance-plan.outputs.{condition} == 'true'").as_str())
             || scalar(job, "runs-on") != Some("${{ matrix.runner }}")
             || job.get(key("timeout-minutes")).and_then(Value::as_u64)
-                != Some(DEEP_CI_STRESS_TIMEOUT_MINUTES)
+                != Some(if job_name == "stress" {
+                    DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES
+                } else {
+                    DEEP_CI_STRESS_TIMEOUT_MINUTES
+                })
         {
             return Err(failure(
                 "deep CI stress timeout does not cover the complete cold workload",
@@ -848,7 +853,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
         "deep CI stress",
     )?;
     if stress.get(key("timeout-minutes")).and_then(Value::as_u64)
-        != Some(DEEP_CI_STRESS_TIMEOUT_MINUTES)
+        != Some(DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES)
     {
         return Err(failure(
             "deep CI stress timeout does not cover the complete cold workload",

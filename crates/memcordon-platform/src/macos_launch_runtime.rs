@@ -21,6 +21,29 @@ enum State {
     OwnershipLost,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SlotObservation {
+    index: usize,
+    ownership_before: u64,
+    ownership_after: u64,
+    state_before: String,
+    state_after: String,
+    pid: i32,
+    cleanup_errno: i32,
+    cancellation: bool,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StartupCleanupObservation {
+    pub(crate) observed_at: Option<u64>,
+    pub(crate) settlement_finished: bool,
+    pub(crate) normal_inspector_created: bool,
+    outstanding: usize,
+    slots: Vec<SlotObservation>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SlotKey {
     index: usize,
@@ -34,11 +57,34 @@ fn state(value: u64) -> u64 {
     value & STATE_MASK
 }
 
+#[cfg(feature = "test-support")]
+fn state_name(value: u64) -> &'static str {
+    [
+        "Vacant",
+        "Reserved",
+        "Spawning",
+        "Owned",
+        "Abandoned",
+        "Reaping",
+        "Complete",
+        "OwnershipLost",
+    ]
+    .get(state(value) as usize)
+    .copied()
+    .unwrap_or("Invalid")
+}
+
+pub(crate) enum CancellationScope {
+    ProcessGroup,
+    ChildlessInspector,
+}
+
 struct Slot {
     state: AtomicU64,
     pid: AtomicI32,
     cancellation: AtomicBool,
     cleanup_errno: AtomicI32,
+    childless_inspector: AtomicBool,
 }
 
 type Operation = Box<dyn FnOnce() + Send>;
@@ -100,6 +146,52 @@ impl Drop for LaunchRuntime {
 }
 
 impl LaunchRuntime {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn startup_cleanup_observation(
+        &self,
+        settlement_finished: bool,
+        normal_inspector_created: bool,
+    ) -> StartupCleanupObservation {
+        // These are concurrent observations, not ownership or cleanup receipts.
+        // Retain both state/generation reads rather than pretending the fields
+        // constitute an atomic snapshot of the native workers.
+        let slots = self
+            .inner
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let ownership_before = slot.state.load(Ordering::Acquire);
+                let pid = slot.pid.load(Ordering::Acquire);
+                let cleanup_errno = slot.cleanup_errno.load(Ordering::Acquire);
+                let cancellation = slot.cancellation.load(Ordering::Acquire);
+                let ownership_after = slot.state.load(Ordering::Acquire);
+                (state(ownership_before) != State::Vacant as u64
+                    || state(ownership_after) != State::Vacant as u64)
+                    .then_some(SlotObservation {
+                        index,
+                        ownership_before,
+                        ownership_after,
+                        state_before: state_name(ownership_before).into(),
+                        state_after: state_name(ownership_after).into(),
+                        pid,
+                        cleanup_errno,
+                        cancellation,
+                    })
+            })
+            // Startup owns at most two inspector operations. Cap supplemental
+            // telemetry independently so it always fits the existing frame.
+            .take(8)
+            .collect();
+        StartupCleanupObservation {
+            observed_at: crate::macos_deadline::continuous_nanos().ok(),
+            settlement_finished,
+            normal_inspector_created,
+            outstanding: self.outstanding(),
+            slots,
+        }
+    }
+
     pub fn new(capacity: usize) -> io::Result<Self> {
         if capacity == 0 || capacity > 256 {
             return Err(io::Error::other(
@@ -115,6 +207,7 @@ impl LaunchRuntime {
                     pid: AtomicI32::new(0),
                     cancellation: AtomicBool::new(false),
                     cleanup_errno: AtomicI32::new(0),
+                    childless_inspector: AtomicBool::new(false),
                 })
                 .collect(),
             closing: AtomicBool::new(false),
@@ -160,7 +253,31 @@ impl LaunchRuntime {
         Ok(Self { inner })
     }
 
+    /// After creation admission has ended and all child owners have been dropped,
+    /// verify that the retained native reaper discharged every reserved operation.
+    pub(crate) fn settled_until(&self, deadline: std::time::Instant) -> bool {
+        loop {
+            if self
+                .inner
+                .slots
+                .iter()
+                .all(|slot| state(slot.state.load(Ordering::Acquire)) == State::Vacant as u64)
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+    }
+
     pub(crate) fn reserve(&self) -> io::Result<Ticket> {
+        self.reserve_with_scope(CancellationScope::ProcessGroup)
+    }
+
+    pub(crate) fn reserve_with_scope(&self, scope: CancellationScope) -> io::Result<Ticket> {
         if self.inner.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native runtime is closing"));
         }
@@ -190,6 +307,10 @@ impl LaunchRuntime {
                 slot.pid.store(0, Ordering::Relaxed);
                 slot.cancellation.store(false, Ordering::Relaxed);
                 slot.cleanup_errno.store(0, Ordering::Relaxed);
+                slot.childless_inspector.store(
+                    matches!(scope, CancellationScope::ChildlessInspector),
+                    Ordering::Relaxed,
+                );
                 let ticket = Ticket {
                     inner: self.inner.clone(),
                     key,
@@ -422,9 +543,15 @@ fn reap(inner: Arc<Inner>, events: mpsc::Receiver<()>) {
                         }
                         continue;
                     }
-                    // SAFETY: this exclusively owned unreaped group leader pins
-                    // the process-group identity through this final signal.
-                    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+                    // Childless inspectors require only the owned process to retire.
+                    // Darwin may reject group signalling for an exited group leader.
+                    let signal_target = if slot.childless_inspector.load(Ordering::Acquire) {
+                        pid
+                    } else {
+                        -pid
+                    };
+                    // SAFETY: exclusive unreaped ownership pins the declared signal target.
+                    if unsafe { libc::kill(signal_target, libc::SIGKILL) } != 0 {
                         let error = io::Error::last_os_error();
                         if error.raw_os_error() != Some(libc::ESRCH) {
                             slot.cleanup_errno.store(

@@ -15,6 +15,89 @@ fn check(document: &Value) -> memcordon_ci::Result<()> {
 }
 
 #[test]
+fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_source() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    let steps = workflow["jobs"]["assemble"]["steps"].as_sequence().unwrap();
+    let assembly = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble")
+        })
+        .unwrap();
+    let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
+    assert!(
+        steps[..assembly].iter().any(|step| {
+            step["run"].as_str().is_some_and(|run| {
+                run.split_whitespace().collect::<Vec<_>>()
+                    == [
+                        "rustup",
+                        "toolchain",
+                        "install",
+                        stable.as_str(),
+                        "--profile",
+                        "minimal",
+                    ]
+            }) && step["if"].is_null()
+                && step["continue-on-error"].is_null()
+        }),
+        "assembly must install the pinned Cargo toolchain before source metadata validation"
+    );
+}
+
+#[test]
+fn windows_release_jobs_configure_lf_before_checkout() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    for (name, job) in workflow["jobs"].as_mapping().unwrap() {
+        let name = name.as_str().unwrap();
+        if !name.starts_with("native-windows-") && !name.starts_with("installed-windows-") {
+            continue;
+        }
+        let steps = job["steps"].as_sequence().unwrap();
+        let checkout = steps
+            .iter()
+            .position(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("actions/checkout@"))
+            })
+            .unwrap();
+        assert!(
+            steps[..checkout].iter().any(|step| {
+                step["run"].as_str() == Some("git config --global core.autocrlf false")
+                    && step["if"].is_null()
+                    && step["continue-on-error"].is_null()
+            }),
+            "{name} must establish LF checkout before source materialization"
+        );
+    }
+}
+
+#[test]
+fn release_quality_installs_required_components_before_running_the_suite() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    let steps = workflow["jobs"]["source-checks"]["steps"]
+        .as_sequence()
+        .unwrap();
+    let quality = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str() == Some("./target/ci/release/memcordon-ci suite quality")
+        })
+        .unwrap();
+    assert!(steps[..quality].iter().any(|step| {
+        step["run"].as_str()
+            == Some(
+                "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+            )
+            && step["if"].is_null()
+            && step["continue-on-error"].is_null()
+    }));
+}
+
+#[test]
 fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
     let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();

@@ -209,6 +209,36 @@ fn delivery_evidence_uses_the_reviewed_process_boundary_without_new_authority() 
 }
 
 #[test]
+fn inspector_retirement_control_has_no_new_pre_exec_authority() {
+    let fixture =
+        Path::new("crates/memcordon-platform/tests/support/macos_inspector_retirement.rs");
+    validate_rust_policy_bytes(
+        fixture,
+        include_bytes!(
+            "../../../crates/memcordon-platform/tests/support/macos_inspector_retirement.rs"
+        ),
+    )
+    .expect("the real inspector retirement control must satisfy the process policy");
+    let previous_hook = br#"
+        fn configure(command: &mut std::process::Command) {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+    "#;
+    let error = validate_rust_policy_bytes(fixture, previous_hook)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pre_exec is allowed only"), "{error}");
+}
+
+#[test]
 fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     let pre_exec =
         b"fn run(command: &mut std::process::Command) { unsafe { command.pre_exec(|| Ok(())); } }";

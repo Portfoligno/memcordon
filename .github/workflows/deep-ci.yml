@@ -166,7 +166,8 @@ jobs:
         include: ${{ fromJSON(needs.performance-plan.outputs.combined) }}
     runs-on: ${{ matrix.runner }}
     # Includes a cold driver build, package checks, and the bounded lifecycle run.
-    timeout-minutes: 90
+    # Measured cold prefix ~72 min + admitted lifecycle 35 min + evidence margin.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

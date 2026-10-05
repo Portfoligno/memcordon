@@ -403,11 +403,14 @@ pub(crate) fn run_attempt_in(
                             target_pid,
                             terminal,
                             force,
-                            complete|
+                            complete,
+                            retirement_observed: Option<u64>|
      -> Result<memcordon_core::RuntimeEvidenceV1, Error> {
-        let retired = crate::macos_deadline::continuous_nanos().map_err(|error| {
-            Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
-        })?;
+        let retired = retirement_observed
+            .map_or_else(crate::macos_deadline::continuous_nanos, Ok)
+            .map_err(|error| {
+                Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+            })?;
         let retire = crate::macos_deadline::add(force, CLEANUP_DEADLINE).map_err(|error| {
             Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
         })?;
@@ -465,20 +468,26 @@ pub(crate) fn run_attempt_in(
     );
     if let Err(startup) = &launch_result {
         let interruption = signal_source.take();
+        let observed = startup
+            .cancellation_observed
+            .or(startup.terminal_observed)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCategory::Monitor,
+                    "MCMONITOR-CLOCK",
+                    "startup terminal observation unavailable",
+                )
+            })?;
         let expired = policy.deadline.is_some()
             && (startup.error.kind() == io::ErrorKind::TimedOut || interruption.is_some())
-            && work_expiry.is_some_and(|expiry| {
-                startup.cancellation_observed.map_or_else(
-                    || crate::macos_deadline::continuous_nanos().is_ok_and(|now| now >= expiry),
-                    |observed| observed >= expiry,
-                )
-            });
+            && work_expiry.is_some_and(|expiry| observed >= expiry);
         if interruption.is_some() || expired {
             let active = work_expiry.map_or(Duration::ZERO, |expiry| {
                 Duration::from_nanos(expiry.saturating_sub(attempt_origin))
             });
             let complete = startup.diagnostic.cleanup.state
                 == memcordon_core::NativeStartupCleanupStateV1::Complete
+                && startup.retirement_observed.is_some()
                 && !matches!(startup.release, memcordon_core::ReleaseEvidence::Unknown);
             let mut errors: Vec<CleanupErrorRecord> = startup
                 .diagnostic
@@ -551,17 +560,7 @@ pub(crate) fn run_attempt_in(
                             millis(context.supervision_offset + active),
                             millis(
                                 context.supervision_offset
-                                    + Duration::from_nanos(
-                                        crate::macos_deadline::continuous_nanos()
-                                            .map_err(|error| {
-                                                Error::new(
-                                                    ErrorCategory::Monitor,
-                                                    "MCMONITOR-CLOCK",
-                                                    error.to_string(),
-                                                )
-                                            })?
-                                            .saturating_sub(attempt_origin),
-                                    ),
+                                    + Duration::from_nanos(observed.saturating_sub(attempt_origin)),
                             ),
                             millis(policy.limit_grace),
                             0,
@@ -591,12 +590,7 @@ pub(crate) fn run_attempt_in(
                         .diagnostic
                         .launcher_pid
                         .and_then(std::num::NonZeroU32::new),
-                    startup
-                        .cancellation_observed
-                        .map_or_else(crate::macos_deadline::continuous_nanos, Ok)
-                        .map_err(|error| {
-                            Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
-                        })?,
+                    observed,
                     if expired {
                         work_expiry.unwrap_or(startup_expiry)
                     } else {
@@ -612,6 +606,7 @@ pub(crate) fn run_attempt_in(
                             })?
                     },
                     complete,
+                    startup.retirement_observed,
                 )?),
                 duration: started.elapsed(),
                 authorization_offset: match startup.release {
@@ -649,7 +644,7 @@ pub(crate) fn run_attempt_in(
             _ => None,
         };
         failure.cgroup_verified_before_release = startup.diagnostic.release_sent;
-        if let Ok(now) = crate::macos_deadline::continuous_nanos() {
+        if let Some(now) = startup.terminal_observed {
             failure.runtime = runtime_evidence(
                 startup.release.clone(),
                 startup
@@ -659,6 +654,7 @@ pub(crate) fn run_attempt_in(
                 now,
                 now,
                 !failure.workload_may_be_alive,
+                startup.retirement_observed,
             )
             .ok();
         }
@@ -1249,6 +1245,7 @@ pub(crate) fn run_attempt_in(
         terminal_tick.get().unwrap_or(attempt_origin),
         force_tick.get().unwrap_or(attempt_origin),
         restart_safety.is_safe(),
+        None,
     )?;
     let force_requested = force_receipt.load(std::sync::atomic::Ordering::Acquire);
     runtime.force_requested = (force_requested != 0).then_some(force_requested);
