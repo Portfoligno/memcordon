@@ -684,9 +684,15 @@ fn shared_assembler_validates_real_working_source_payloads_and_target_coverage()
         source::{self, BuildSourceIdentity},
         target::{self, TargetBundle},
     };
+    #[cfg(unix)]
     let workspace = tempfile::Builder::new()
         .prefix("memcordon-assembly-")
         .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let workspace = tempfile::Builder::new()
+        .prefix("memcordon-assembly-")
+        .tempdir()
         .unwrap();
     let root = workspace.path();
     std::fs::create_dir(root.join("ci")).unwrap();

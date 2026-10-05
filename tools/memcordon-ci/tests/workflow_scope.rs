@@ -52,7 +52,11 @@ fn literal_trigger_shape_preserves_uncovered_tags_and_nonpush_requests() {
 
 #[test]
 fn bounded_provider_adapter_requires_consistent_typed_push_context() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     let path = directory.path().join("event.json");
     std::fs::write(
         &path,

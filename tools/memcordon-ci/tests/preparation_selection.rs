@@ -8,9 +8,15 @@ use serde_json::json;
 use std::{fs, path::Path};
 
 fn fixture() -> tempfile::TempDir {
+    #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("memcordon-preparation-")
         .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-preparation-")
+        .tempdir()
         .unwrap();
     let root = directory.path();
     fs::create_dir(root.join("ci")).unwrap();

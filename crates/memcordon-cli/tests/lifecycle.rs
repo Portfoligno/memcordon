@@ -273,7 +273,10 @@ fn completed(command: &mut Command, deadline: Duration) -> ObservedOutput {
 }
 
 fn read_identity(path: &Path) -> ProcessIdentity {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    read_identity_until(path, Instant::now() + Duration::from_secs(1))
+}
+
+fn read_identity_until(path: &Path, deadline: Instant) -> ProcessIdentity {
     loop {
         match fs::read_to_string(path) {
             Ok(value) => {
@@ -1024,9 +1027,50 @@ fn run_wrapper_interrupt_is_forwarded_cleaned_and_mapped() -> CaseRun {
     if !backend_available() {
         return CaseRun::Unavailable;
     }
-    let mut invocation = wrapped(fixture(), &["hold", "--duration", "30s"]);
-    let output = run_with_deadline_after(&mut invocation, Duration::from_secs(3), |wrapper_pid| {
-        thread::sleep(Duration::from_millis(100));
+    let pid_file = temporary_pid_file();
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args([
+        "+8GiB",
+        "--",
+        fixture(),
+        "hold",
+        "--duration",
+        "30s",
+        "--pid-file",
+    ]);
+    invocation.arg(&pid_file);
+    // macos_launch admits 5 s startup. Allow 1 s for fixture publication,
+    // then the default signal grace, macos_watchdog's 3 s retirement cap,
+    // macos_result_delivery's 1 s delivery cap, and 1 s harness margin.
+    // This independent guard must expire before the fixture's natural exit.
+    let readiness_budget = Duration::from_secs(5) + Duration::from_secs(1);
+    let harness_budget = memcordon_testkit::harness_budget::natural_root_guard(
+        readiness_budget,
+        memcordon_core::Policy::default().signal_grace,
+        Duration::from_secs(3),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+    )
+    .expect("interrupt guard must precede natural fixture completion");
+    let ready_file = pid_file.clone();
+    let output = run_with_deadline_after(&mut invocation, harness_budget, move |wrapper_pid| {
+        let identity = read_identity_until(&ready_file, Instant::now() + readiness_budget);
+        assert!(
+            identity.still_exists()?,
+            "published workload identity must be live before interruption"
+        );
         let wrapper_pid = i32::try_from(wrapper_pid).map_err(io::Error::other)?;
         // SAFETY: this process id belongs to the wrapper just spawned by the test boundary.
         if unsafe { libc::kill(wrapper_pid, libc::SIGINT) } == -1 {
@@ -1038,6 +1082,24 @@ fn run_wrapper_interrupt_is_forwarded_cleaned_and_mapped() -> CaseRun {
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(output.status.code(), Some(130));
     assert_stdout_empty(&output);
+    assert_process_gone(read_identity(&pid_file));
+    let report: memcordon_core::MemcordonReport = serde_json::from_slice(
+        &fs::read(&report_file).expect("interruption execution report should be readable"),
+    )
+    .expect("interruption execution report should be valid");
+    assert_eq!(report.attempts.len(), 1, "{report:#?}");
+    let Some(memcordon_core::RunOutcome::Interrupted {
+        signal, cleanup, ..
+    }) = &report.attempts[0].outcome
+    else {
+        panic!("expected interrupted execution outcome: {report:#?}");
+    };
+    assert_eq!(signal.signal, libc::SIGINT, "{report:#?}");
+    assert!(cleanup.direct_child_reaped, "{report:#?}");
+    assert_eq!(cleanup.workload_empty, Some(true), "{report:#?}");
+    assert!(cleanup.errors.is_empty(), "{report:#?}");
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
     CaseRun::Executed
 }
 

@@ -79,7 +79,11 @@ fn write_phase(root: &std::path::Path, kind: &str, value: &MacosPhaseReport) {
 #[test]
 fn local_completion_rejects_missing_stale_malformed_or_incomplete_phase_reports() {
     use memcordon_ci::macos_performance::{clear_local_phases, validate_local_completed};
-    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let temporary = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     let root = temporary.path();
     let reports = root.join("target/ci/reports");
     std::fs::create_dir_all(&reports).unwrap();

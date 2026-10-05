@@ -14,9 +14,15 @@ fn repository() -> PathBuf {
 
 #[test]
 fn compilation_keys_cover_tracked_recipes_and_checkout_policy_without_runtime_state() {
+    #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("memcordon-cache-inputs-")
         .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-cache-inputs-")
+        .tempdir()
         .unwrap();
     let root = directory.path();
     fs::create_dir_all(root.join("ci")).unwrap();
@@ -135,9 +141,15 @@ fn compilation_keys_cover_tracked_recipes_and_checkout_policy_without_runtime_st
 
 #[test]
 fn actual_native_owner_cache_paths_do_not_capture_staging_or_report_sentinels() {
+    #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("memcordon-native-cache-paths-")
         .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-native-cache-paths-")
+        .tempdir()
         .unwrap();
     let sentinels = [
         ".release/prepared/sentinel",

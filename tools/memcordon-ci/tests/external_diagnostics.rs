@@ -1,8 +1,16 @@
 use memcordon_ci::external_consumer::retain_diagnostics;
 
+fn directory() -> tempfile::TempDir {
+    if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
+
 #[test]
 fn partial_raw_observations_are_retained_and_unexpected_or_oversized_entries_rejected() {
-    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let temporary = directory();
     let raw = temporary.path().join("raw");
     let retained = temporary.path().join("retained");
     std::fs::create_dir(&raw).unwrap();
@@ -56,7 +64,7 @@ fn partial_raw_observations_are_retained_and_unexpected_or_oversized_entries_rej
 #[cfg(unix)]
 #[test]
 fn raw_diagnostics_do_not_follow_symlinks() {
-    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let temporary = directory();
     let raw = temporary.path().join("raw");
     let retained = temporary.path().join("retained");
     std::fs::create_dir(&raw).unwrap();
