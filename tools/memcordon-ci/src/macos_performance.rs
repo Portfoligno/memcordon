@@ -115,6 +115,37 @@ fn read_phase(path: &Path) -> Result<MacosPhaseReport> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+const LOCAL_PHASES: [(&str, &str); 2] = [
+    ("release-macos-native.json", "native"),
+    ("release-macos-acceptance.json", "acceptance"),
+];
+
+/// Remove only known phase diagnostics before executing the complete local suite.
+pub fn clear_local_phases(root: &Path) -> Result<()> {
+    let reports = root.join("target/ci/reports");
+    for (file, _) in LOCAL_PHASES {
+        match fs::remove_file(reports.join(file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_local_completed(
+    root: &Path,
+    expected_commit: &str,
+    expected_architecture: &str,
+) -> Result<()> {
+    let reports = root.join("target/ci/reports");
+    for (file, phase) in LOCAL_PHASES {
+        let report = read_phase(&reports.join(file))?;
+        validate_phase(&report, expected_commit, expected_architecture, phase)?;
+    }
+    Ok(())
+}
+
 pub fn aggregate(root: &Path, input: &Path, destination: &Path) -> Result<()> {
     let selected = crate::performance_plan::PerformancePlan::read(root)?
         .macos_release

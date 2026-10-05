@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   policy:
+    if: github.event_name != 'push'
     name: policy
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -55,6 +56,7 @@ jobs:
           key: ${{ steps.policy-deps.outputs.cache-primary-key }}
 
   quality:
+    if: github.event_name != 'push'
     name: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -103,6 +105,7 @@ jobs:
           key: ${{ steps.quality-deps.outputs.cache-primary-key }}
 
   msrv:
+    if: github.event_name != 'push'
     name: MSRV 1.85.0
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -153,6 +156,7 @@ jobs:
           key: ${{ steps.msrv-deps.outputs.cache-primary-key }}
 
   supply-chain:
+    if: github.event_name != 'push'
     name: supply chain
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -205,6 +209,7 @@ jobs:
           key: ${{ steps.supply-deps.outputs.cache-primary-key }}
 
   native:
+    if: github.event.deleted != true
     name: native / ${{ matrix.id }}
     strategy:
       fail-fast: false
@@ -244,7 +249,7 @@ jobs:
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - id: compiled-context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete
       - id: compiled
         if: steps.compiled-context.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -276,6 +281,7 @@ jobs:
           key: ${{ steps.native-deps.outputs.cache-primary-key }}
 
   macos-deadline:
+    if: github.event_name != 'push'
     name: macOS deadline / ${{ matrix.id }}
     strategy:
       fail-fast: false

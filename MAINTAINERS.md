@@ -26,6 +26,14 @@ replace live admission or native resource checks.
 
 CI keeps pinned toolchains and action revisions, read-only contents permission,
 credential-free builds, and complete native matrix and Miri/fuzz shard coverage.
+On covered branch/version-filter tag pushes, Release owns common preparation;
+ordinary CI retains six debug-native cells, Deep CI retains stress, and Native
+backend tests retains optional Windows sealed and Linux private installed work.
+Release's CLI-only public selection does not cover those optional runtimes.
+PR and merge-group CI, explicit standalone dispatches and uncovered-tag common
+checks retain their existing work. The event classifier only schedules jobs; it
+does not establish Release success or publication permission. Ref deletions do
+not schedule work for the deleted ref.
 Every workflow run step invokes one executable with arguments.
 CI orchestration reads standard GitHub context and explicit command arguments;
 custom environment variables are confined to workflow files and never introduce
@@ -33,6 +41,10 @@ a source, target, phase or timeout protocol in Rust or build scripts. Cargo sour
 caches use the actual Cargo home and split restore/save steps. Compiled-cache
 reuse is disabled while the selected native inputs lack an ordinary safe cache
 identity; restoring a cache never proves that a test ran.
+Debug-native and optimized-native owners use separate cache purposes and actual
+test recipes. Release additionally identifies selected product features and
+binaries. Preserve split restore/save, valid-context and quiescence conditions;
+do not cache reports, installed state or prepared release bytes.
 
 Native CI executes the selected test binaries on matching hosts. Installed
 consumers exercise the selected package and archive bytes and report execution,
@@ -43,3 +55,8 @@ Release tooling prepares selected source and artifact bytes, exercises native an
 installed consumers, and reconciles publication state. See RELEASING.md for the
 operating procedure. A portable test or an unavailable native host does not
 establish completed native release validation.
+Required checks and dashboards must distinguish actual branch preparation from
+PR/merge-group checks and skipped duplicate jobs. Their settings are a maintainer
+operation and are not changed by workflow edits. Confirm the enabled Release
+candidate path and representative event outcomes before relying on suppression;
+see RELEASING.md for migration, measurement and rollback guidance.

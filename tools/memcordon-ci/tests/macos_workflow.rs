@@ -9,19 +9,19 @@ fn selected_macos_forms_require_both_architectures_and_actual_phase_collection()
     for (job, condition, suite, phase) in [
         (
             "macos-combined",
-            "needs.macos-performance-plan.outputs.split == 'false'",
+            "needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'false'",
             "backend-macos-watchdog",
             "combined",
         ),
         (
             "macos-native",
-            "needs.macos-performance-plan.outputs.split == 'true'",
+            "needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'true'",
             "release-macos-native",
             "native",
         ),
         (
             "macos-acceptance",
-            "needs.macos-performance-plan.outputs.split == 'true'",
+            "needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'true'",
             "release-macos-acceptance",
             "acceptance",
         ),
@@ -73,7 +73,10 @@ fn selected_macos_forms_require_both_architectures_and_actual_phase_collection()
         );
     }
     let assessment = &workflow["jobs"]["macos-assessment"];
-    assert_eq!(assessment["if"], "always()");
+    assert_eq!(
+        assessment["if"],
+        "always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'"
+    );
     assert_eq!(assessment["needs"].as_sequence().unwrap().len(), 4);
     assert!(
         assessment["steps"]

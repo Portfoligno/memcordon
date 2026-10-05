@@ -677,6 +677,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
         "stress planner",
     )?;
     let plan_steps = ordinary_steps(planner, "stress planner")?;
+    check_scope_planner(planner, false)?;
     let plan_index = plan_steps
         .iter()
         .position(|step| {
@@ -833,7 +834,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
         .collect(),
     );
     if assessment.get(key("needs")) != Some(&required_needs)
-        || scalar(assessment, "if") != Some("always()")
+        || scalar(assessment, "if") != Some("always() && github.event.deleted != true")
     {
         return Err(failure(
             "stress aggregation must collect all phase outcomes",
@@ -906,6 +907,74 @@ const ORDINARY_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --re
 const ORDINARY_SOURCE_PATHS: &str =
     "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
 
+fn check_scope_planner(planner: &Mapping, conditional_plan: bool) -> Result<()> {
+    if scalar(planner, "if") != Some("github.event.deleted != true") {
+        return Err(failure("workflow scope planner must guard ref deletion"));
+    }
+    let outputs = mapping(
+        planner
+            .get(key("outputs"))
+            .ok_or_else(|| failure("scope outputs absent"))?,
+        "scope outputs",
+    )?;
+    if scalar(outputs, "standalone-common") != Some("${{ steps.scope.outputs.standalone-common }}")
+    {
+        return Err(failure("workflow scope output binding differs"));
+    }
+    let steps = ordinary_steps(planner, "scope planner")?;
+    let scope = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.get(key("run")).and_then(Value::as_str)
+                == Some("./target/ci/release/memcordon-ci ci workflow-scope")
+        })
+        .collect::<Vec<_>>();
+    if scope.len() != 1
+        || scope[0].1.get(key("id")).and_then(Value::as_str) != Some("scope")
+        || scope[0].1.get(key("if")).is_some()
+    {
+        return Err(failure(
+            "actual unconditional workflow scope command absent",
+        ));
+    }
+    ordinary_driver_before_suite(steps, scope[0].0)?;
+    let plan = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.get(key("run")).and_then(Value::as_str)
+                == Some("./target/ci/release/memcordon-ci ci performance-plan")
+        })
+        .collect::<Vec<_>>();
+    let condition = conditional_plan.then_some("steps.scope.outputs.standalone-common == 'true'");
+    if plan.len() != 1
+        || plan[0].0 <= scope[0].0
+        || plan[0].1.get(key("if")).and_then(Value::as_str) != condition
+    {
+        return Err(failure(
+            "performance plan must follow the actual workflow scope",
+        ));
+    }
+    Ok(())
+}
+
+fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
+    let steps = ordinary_steps(job, "native cache")?;
+    let expected = format!(
+        "./target/ci/release/memcordon-ci ci cache-context --purpose {purpose} --shard complete"
+    );
+    let contexts = steps
+        .iter()
+        .filter_map(|step| step.get(key("run")).and_then(Value::as_str))
+        .filter(|run| run.split_whitespace().any(|part| part == "cache-context"))
+        .collect::<Vec<_>>();
+    if contexts != [expected.as_str()] {
+        return Err(failure("native debug/release cache role differs"));
+    }
+    Ok(())
+}
+
 fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
     let steps = job
         .get(key("steps"))
@@ -952,9 +1021,22 @@ fn ordinary_driver_before_suite(steps: &[Value], suite_index: usize) -> Result<(
 fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64) -> Result<()> {
     exact_mapping_keys(
         job,
-        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        &[
+            "name",
+            "needs",
+            "if",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "steps",
+        ],
         "deep shard job",
     )?;
+    if scalar(job, "needs") != Some("performance-plan")
+        || scalar(job, "if") != Some("needs.performance-plan.outputs.standalone-common == 'true'")
+    {
+        return Err(failure("Deep common shard event selection differs"));
+    }
     let strategy = mapping(
         job.get(key("strategy"))
             .ok_or_else(|| failure("shard strategy absent"))?,
@@ -1172,6 +1254,7 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
         "Mac selector",
     )?;
     let steps = ordinary_steps(planner, "Mac selector")?;
+    check_scope_planner(planner, true)?;
     let selected = steps
         .iter()
         .enumerate()
@@ -1181,7 +1264,8 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if selected.len() != 1
-        || selected[0].1.get(key("if")).is_some()
+        || selected[0].1.get(key("if")).and_then(Value::as_str)
+            != Some("steps.scope.outputs.standalone-common == 'true'")
         || selected[0].1.get(key("id")).and_then(Value::as_str) != Some("plan")
     {
         return Err(failure("Mac selector must run exactly once"));
@@ -1216,7 +1300,9 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
                 .ok_or_else(|| failure("selected Mac phase absent"))?,
             name,
         )?;
-        let condition = format!("needs.macos-performance-plan.outputs.split == '{split}'");
+        let condition = format!(
+            "needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == '{split}'"
+        );
         if scalar(job, "needs") != Some("macos-performance-plan")
             || scalar(job, "if") != Some(condition.as_str())
         {
@@ -1268,7 +1354,11 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
             .ok_or_else(|| failure("Mac selected assessment absent"))?,
         "Mac assessment",
     )?;
-    if scalar(assessment, "if") != Some("always()") {
+    if scalar(assessment, "if")
+        != Some(
+            "always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'",
+        )
+    {
         return Err(failure("Mac selected assessment must run after failure"));
     }
     exact_string_sequence(
@@ -1302,7 +1392,10 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
                     .ok_or_else(|| failure("selected Windows installed graph absent"))?,
                 &name,
             )?;
-            if scalar(job, "runs-on") != Some(runner) || job.get(key("if")).is_some() {
+            if scalar(job, "runs-on") != Some(runner)
+                || scalar(job, "if") != Some("github.event.deleted != true")
+                || (!consumer && job.get(key("needs")).is_some())
+            {
                 return Err(failure(
                     "selected Windows runner or unconditional graph differs",
                 ));
@@ -1472,6 +1565,9 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
         )?;
         if scalar(job, "runs-on") != Some(runner)
             || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+            || scalar(job, "needs") != Some("macos-performance-plan")
+            || scalar(job, "if")
+                != Some("needs.macos-performance-plan.outputs.standalone-common == 'true'")
         {
             return Err(failure("ordinary native runner or deadline differs"));
         }
@@ -1497,6 +1593,18 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
         ordinary_driver_before_suite(steps, suites[0].0)?;
     }
     check_selected_native_forms(jobs)?;
+    let private = mapping(
+        jobs.get(key("private-linux"))
+            .ok_or_else(|| failure("private Linux job absent"))?,
+        "private Linux",
+    )?;
+    if scalar(private, "if") != Some("github.event.deleted != true")
+        || private.get(key("needs")).is_some()
+    {
+        return Err(failure(
+            "optional private Linux work must remain independent",
+        ));
+    }
     Ok(())
 }
 pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
@@ -1577,6 +1685,76 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
         return Err(failure("CI concurrency policy differs"));
     }
     check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "CI native")?;
+    for name in [
+        "policy",
+        "quality",
+        "msrv",
+        "supply-chain",
+        "macos-deadline",
+    ] {
+        let job = mapping(
+            jobs.get(key(name))
+                .ok_or_else(|| failure("CI common job absent"))?,
+            name,
+        )?;
+        if scalar(job, "if") != Some("github.event_name != 'push'")
+            || job.get(key("needs")).is_some()
+        {
+            return Err(failure(
+                "CI common work must retain PR, merge-group and manual execution",
+            ));
+        }
+    }
+    let native = mapping(
+        jobs.get(key("native")).expect("validated CI native"),
+        "CI native",
+    )?;
+    if scalar(native, "if") != Some("github.event.deleted != true") {
+        return Err(failure(
+            "CI debug native must remain active on nondeleted events",
+        ));
+    }
+    check_native_cache_role(native, "native-debug")?;
+    for (name, suite) in [
+        ("policy", "policy"),
+        ("quality", "quality"),
+        ("msrv", "msrv"),
+        ("supply-chain", "supply-chain"),
+        ("native", "native"),
+        ("macos-deadline", "macos-deadline"),
+    ] {
+        let job = mapping(jobs.get(key(name)).expect("validated CI job"), name)?;
+        let steps = ordinary_steps(job, name)?;
+        let invocation = format!("./target/ci/release/memcordon-ci suite {suite}");
+        let suites = steps
+            .iter()
+            .filter(|step| {
+                step.get(key("run"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|run| run.split_whitespace().any(|part| part == "suite"))
+            })
+            .collect::<Vec<_>>();
+        if suites.len() != 1
+            || suites[0].get(key("run")).and_then(Value::as_str) != Some(invocation.as_str())
+            || suites[0].get(key("if")).is_some()
+        {
+            return Err(failure("CI must execute its actual selected suite"));
+        }
+        for step in steps.iter().filter(|step| {
+            step.get(key("uses"))
+                .and_then(Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        }) {
+            if step
+                .get(key("with"))
+                .is_some_and(|with| with.get(key("ref")).is_some())
+            {
+                return Err(failure(
+                    "CI must preserve the event's PR/merge-group checkout source",
+                ));
+            }
+        }
+    }
     check_macos_deadline_job(jobs, "macos-deadline")?;
     let configured_matrix: Vec<&str> = policy
         .workflow
@@ -1736,6 +1914,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             ));
         }
         check_release_row(native, target, runner, None)?;
+        check_native_cache_role(native, "native-release")?;
         let steps = ordinary_steps(native, "release native")?;
         let build = steps
             .iter()
@@ -2280,6 +2459,8 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
     let events = workflow
         .get(key("on"))
         .ok_or_else(|| failure("preparation events absent"))?;
+    let push = mapping(&events["push"], "preparation push")?;
+    exact_mapping_keys(push, &["branches", "tags"], "preparation push")?;
     exact_string_sequence(
         &events["push"]["branches"],
         &["**"],
@@ -2287,7 +2468,7 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
     )?;
     exact_string_sequence(
         &events["push"]["tags"],
-        &["[0-9]+.[0-9]+.[0-9]+*"],
+        &[crate::workflow_scope::RELEASE_TAG_FILTER],
         "release tag coverage",
     )?;
     exact_string_sequence(
@@ -2506,6 +2687,32 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             return Err(failure(
                 "each preparation job must retain bounded diagnostics",
             ));
+        }
+        if name.starts_with("native-") {
+            let diagnostics = steps
+                .iter()
+                .find(|step| {
+                    step.get(key("name")).and_then(Value::as_str)
+                        == Some("Retain bounded preparation diagnostics")
+                })
+                .ok_or_else(|| failure("native diagnostics absent"))?;
+            let paths = diagnostics
+                .get(key("with"))
+                .and_then(|with| with.get(key("path")))
+                .and_then(Value::as_str)
+                .ok_or_else(|| failure("native diagnostic paths absent"))?;
+            for required in [
+                "target/ci/reports/release-macos-native.json",
+                "target/ci/reports/release-macos-acceptance.json",
+                "target/ci/reports/backend-macos-watchdog.json",
+                "target/ci/reports/memcordon-macos-acceptance-*",
+            ] {
+                if !paths.lines().any(|path| path == required) {
+                    return Err(failure(
+                        "Release must preserve the actual macOS phase diagnostics",
+                    ));
+                }
+            }
         }
         if name.starts_with("native-")
             && job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)

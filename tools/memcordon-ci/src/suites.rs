@@ -960,15 +960,7 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
     // Preserve every actual raw file, including partial observations on error.
     // The retained /tmp operation also survives an artifact collection error.
     if raw.try_exists()? {
-        for entry in fs::read_dir(&raw)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                return Err(CiError::Message(
-                    "external native diagnostics contains a non-file".into(),
-                ));
-            }
-            fs::copy(entry.path(), retained.join(entry.file_name()))?;
-        }
+        memcordon_ci::external_consumer::retain_diagnostics(&raw, &retained)?;
     }
     let assessment = assessment?;
     if !assessment.passed() {
@@ -1031,8 +1023,19 @@ fn write_macos_report(root: &Path, filename: &str, scenarios: Vec<&str>) -> Resu
 /// Complete sequential compatibility form. Optional job splitting changes
 /// scheduling only; each selected phase remains required by the workflow.
 pub fn release_macos(root: &Path, stable: &str) -> Result<()> {
+    memcordon_ci::macos_performance::require_native_host(root, stable)?;
+    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(error.to_string()))?
+        .trim()
+        .to_owned();
+    memcordon_ci::macos_performance::clear_local_phases(root)?;
     release_macos_native(root, stable)?;
     release_macos_acceptance(root, stable)?;
+    memcordon_ci::macos_performance::validate_local_completed(
+        root,
+        &commit,
+        std::env::consts::ARCH,
+    )?;
     write_macos_report(
         root,
         "backend-macos-watchdog.json",

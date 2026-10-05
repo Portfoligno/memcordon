@@ -594,6 +594,27 @@ pub fn assess_result(
     Ok((execution, retirement))
 }
 
+/// Retain partial observations using the consumer's finite output inventory.
+pub fn retain_diagnostics(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let maximum = match name.to_str() {
+            Some("stdout.bin" | "stderr.bin") => MAX_STREAM_BYTES as u64,
+            Some("result.json") => memcordon_core::result_v1::RESULT_MAX_BYTES as u64,
+            Some("requested-contract.json" | "assessment.json") => MAX_INPUT_BYTES,
+            _ => {
+                return Err(failure(
+                    "external diagnostic filename is outside the finite inventory",
+                ));
+            }
+        };
+        let bytes = bounded_regular(&entry.path(), maximum)?;
+        fs::write(destination.join(name), bytes)?;
+    }
+    Ok(())
+}
+
 pub fn run_file(input: &Path, destination: &Path) -> Result<ExternalConsumerAssessment> {
     let spec = ExternalConsumerSpec::parse(&bounded_regular(input, MAX_INPUT_BYTES)?)?;
     run(&spec, destination)

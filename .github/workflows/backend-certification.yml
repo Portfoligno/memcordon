@@ -13,22 +13,27 @@ concurrency:
 
 jobs:
   macos-performance-plan:
+    if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       split: ${{ steps.plan.outputs.macos-split }}
+      standalone-common: ${{ steps.scope.outputs.standalone-common }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: scope
+        run: ./target/ci/release/memcordon-ci ci workflow-scope
       - id: plan
+        if: steps.scope.outputs.standalone-common == 'true'
         run: ./target/ci/release/memcordon-ci ci performance-plan
 
   macos-combined:
     needs: macos-performance-plan
-    if: needs.macos-performance-plan.outputs.split == 'false'
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +91,7 @@ jobs:
 
   macos-native:
     needs: macos-performance-plan
-    if: needs.macos-performance-plan.outputs.split == 'true'
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -144,7 +149,7 @@ jobs:
 
   macos-acceptance:
     needs: macos-performance-plan
-    if: needs.macos-performance-plan.outputs.split == 'true'
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true' && needs.macos-performance-plan.outputs.split == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -201,7 +206,7 @@ jobs:
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
   macos-assessment:
-    if: always()
+    if: always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'
     needs: [macos-performance-plan, macos-combined, macos-native, macos-acceptance]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -226,6 +231,7 @@ jobs:
           include-hidden-files: true
 
   windows-payload-x64:
+    if: github.event.deleted != true
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
@@ -277,6 +283,7 @@ jobs:
           key: ${{ steps.sources.outputs.cache-primary-key }}
 
   windows-payload-arm64:
+    if: github.event.deleted != true
     runs-on: windows-11-arm
     timeout-minutes: 90
     strategy:
@@ -286,6 +293,7 @@ jobs:
     steps: *windows-working-producer
 
   windows-installed-x64:
+    if: github.event.deleted != true
     needs: windows-payload-x64
     runs-on: windows-2025
     timeout-minutes: 90
@@ -345,6 +353,7 @@ jobs:
           key: ${{ steps.sources.outputs.cache-primary-key }}
 
   windows-installed-arm64:
+    if: github.event.deleted != true
     needs: windows-payload-arm64
     runs-on: windows-11-arm
     timeout-minutes: 90
@@ -355,6 +364,7 @@ jobs:
     steps: *windows-working-consumer
 
   private-linux:
+    if: github.event.deleted != true
     name: Linux private TCP / ${{ matrix.id }}
     strategy:
       fail-fast: false
@@ -419,6 +429,8 @@ jobs:
           key: ${{ steps.private-deps.outputs.cache-primary-key }}
 
   standard-linux:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true'
     name: Linux standard cgroup v2 / x64
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -463,6 +475,8 @@ jobs:
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
   standard-windows:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true'
     name: Windows standard Job Object / x64
     runs-on: windows-2025
     timeout-minutes: 75
@@ -507,6 +521,8 @@ jobs:
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
   standard-windows-arm64:
+    needs: macos-performance-plan
+    if: needs.macos-performance-plan.outputs.standalone-common == 'true'
     name: Windows standard Job Object / arm64
     runs-on: windows-11-arm
     timeout-minutes: 75

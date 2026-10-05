@@ -34,6 +34,7 @@ pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
 pub mod workflow_output;
+pub mod workflow_scope;
 
 use thiserror::Error;
 

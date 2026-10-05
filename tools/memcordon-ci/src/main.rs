@@ -60,6 +60,7 @@ enum CiCommand {
     },
     CheckWorkflows,
     PerformancePlan,
+    WorkflowScope,
     AggregateStress {
         #[arg(long, default_value = "target/ci/stress-artifacts")]
         input: PathBuf,
@@ -139,6 +140,7 @@ fn run() -> Result<()> {
                 external,
             } => memcordon_ci::cache::emit(&root, &purpose, &shard, &external),
             CiCommand::CheckWorkflows => policy::run(&root),
+            CiCommand::WorkflowScope => memcordon_ci::workflow_scope::emit_from_github(),
             CiCommand::PerformancePlan => {
                 memcordon_ci::performance_plan::PerformancePlan::read(&root)?.emit()
             }

@@ -111,6 +111,10 @@ jobs:
           path: &diagnostic-paths |
             target/ci/reports/execution
             target/ci/deadline-evidence
+            target/ci/reports/release-macos-native.json
+            target/ci/reports/release-macos-acceptance.json
+            target/ci/reports/backend-macos-watchdog.json
+            target/ci/reports/memcordon-macos-acceptance-*
             .release/installed-results
           if-no-files-found: warn
           include-hidden-files: true
@@ -438,7 +442,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - id: cache
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-release --shard complete
       - id: products
         if: steps.cache.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9

@@ -1,8 +1,9 @@
 # Releasing MemCordon
 
-The Rust release workflow selects an existing unsigned annotated tag and prepares
-the exact public crate and native archive bytes for that commit. Source, package,
-native-test and installed-consumer checks gate preparation and publication.
+The Rust release workflow prepares exact public crate and native archive bytes
+from branch candidates or an existing unsigned annotated release tag. Only tagged
+preparation can be published. Source, package, native-test and installed-consumer
+checks gate preparation and publication.
 Installed workload permission is checked separately through live authentication
 and native resource checks, with local administrator grants for contract-bound
 launches.
@@ -107,18 +108,54 @@ and deadline cases with native status and complete-retirement checks.
 
 ## Required status migration
 
-Branch protection should require the ordinary CI jobs and the selected stress/Mac
-assessment jobs. Those assessments fail when a selected phase is missing, failed,
-duplicated or reports another source or architecture. Keep branch-protection
-requirements aligned with the current workflow job names. Repository status
-administration is a maintainer operation; editing workflow files does not update
-branch protection automatically.
+On nondeleted branch pushes and tags matching Release's literal
+`[0-9]+.[0-9]+.[0-9]+*` trigger, Release owns common source checks, optimized native
+tests, Miri/fuzz smoke, standard backends and selected distributable preparation.
+Ordinary CI retains all six debug-native cells; Deep CI retains complete stress
+and assessment; Native backend tests retains both private Linux architectures and
+the explicit Windows sealed payloads and native/Cargo installed channels. The
+public distribution currently selects only the CLI with no runtime features, so
+its installed consumers do not replace these optional runtime checks. Branch and
+matching-tag preparation remain separate real executions.
+
+PR and merge-group checks retain ordinary CI's full existing selection on their
+actual merge source. Explicit CI, Deep and Native backend dispatches retain their
+full standalone work; tags outside Release's trigger keep Deep and Native backend
+common checks. Ref deletion schedules no work for the deleted ref. Do not disable
+those workflows or combine their concurrency groups. A failing owner should be
+rerun directly; an explicit standalone dispatch remains available for diagnostics.
+
+Before suppression reaches a protected branch, confirm that Release is enabled
+and its branch candidate path really executes, then inventory required checks and
+dashboards through maintainer settings. Branch readiness must use actual Release
+preparation completion plus retained debug, stress and optional checks required by
+development policy. Keep ordinary CI checks required for PR/merge-group events;
+do not require a Release-only check absent on fork PRs. A skipped job's successful
+display is not executed coverage and cannot hide a failed or canceled owner.
+Editing workflow files does not update branch protection automatically; no live
+settings migration or successful representative event run is implied here.
+
+The complete macOS suite validates current native and acceptance phase reports
+locally before reporting completion. Standalone macOS assessment remains for
+manual and uncovered-tag runs, including failed selected phases. Both validators
+reject missing, failed, skipped or wrong-source/architecture results. Release
+retains the actual phase diagnostics without treating them as publication grants.
+
+At the serial macOS layout, the job conditions suppress 18 duplicate runner
+executions on covered branch pushes and 12 on matching tags. These are structural
+counts, not measured time or cost savings. Measure actual started jobs, queues,
+phase timings and failed/unavailable coverage on representative events before
+claiming an observed reduction. Rollback restores affected standalone conditions
+and policy expectations while retaining local macOS assertions and cache role
+separation.
 
 Performance forms remain serial or combined by default. `ci/performance.toml` can
 select a bounded stress split as an explicit scheduling choice. Both selected
 phases retain their full coverage and budgets; optional comparative measurements
 must be honest when supplied. Other performance forms retain their existing
-measurement requirements. Unknown cache inputs
+measurement requirements. CI debug-native and Release optimized-native caches use
+separate `native-debug` and `native-release` purposes, with actual native argument
+recipes and selected product inputs in their identities. Unknown cache inputs
 disable compiled reuse and allow an ordinary build; the first CI driver build may
 be cold. Reports, installed state and prepared package bytes are not build caches.
 

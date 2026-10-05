@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   performance-plan:
+    if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -20,15 +21,20 @@ jobs:
       split: ${{ steps.plan.outputs.stress-split }}
       has-combined: ${{ steps.plan.outputs.stress-has-combined }}
       has-split: ${{ steps.plan.outputs.stress-has-split }}
+      standalone-common: ${{ steps.scope.outputs.standalone-common }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: scope
+        run: ./target/ci/release/memcordon-ci ci workflow-scope
       - id: plan
         run: ./target/ci/release/memcordon-ci ci performance-plan
   miri:
+    needs: performance-plan
+    if: needs.performance-plan.outputs.standalone-common == 'true'
     name: Miri / ${{ matrix.shard }}
     strategy:
       fail-fast: false
@@ -87,6 +93,8 @@ jobs:
           key: ${{ steps.miri-deps.outputs.cache-primary-key }}
 
   fuzz:
+    needs: performance-plan
+    if: needs.performance-plan.outputs.standalone-common == 'true'
     name: fuzz smoke / ${{ matrix.shard }}
     strategy:
       fail-fast: false
@@ -334,7 +342,7 @@ jobs:
           key: ${{ steps.sources.outputs.cache-primary-key }}
 
   stress-assessment:
-    if: always()
+    if: always() && github.event.deleted != true
     needs: [performance-plan, stress, stress-packages, stress-lifecycle]
     runs-on: ubuntu-24.04
     timeout-minutes: 20

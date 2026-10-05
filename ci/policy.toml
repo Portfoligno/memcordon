@@ -28,6 +28,7 @@ environment_allowlist = [
 allowed_run_commands = [
   "git config --global core.autocrlf false",
   "./target/ci/release/memcordon-ci ci performance-plan",
+  "./target/ci/release/memcordon-ci ci workflow-scope",
   "./target/ci/release/memcordon-ci release verify-source",
   "./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json",
   "./target/ci/release/memcordon-ci release select-preparation",
@@ -57,6 +58,8 @@ allowed_run_commands = [
   "./target/ci/release/memcordon-ci release build-target",
   "./target/ci/release/memcordon-ci release installed-consumers",
   "./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose native-release --shard complete",
   "./target/ci/release/memcordon-ci release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload",
   "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined",
   "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native",

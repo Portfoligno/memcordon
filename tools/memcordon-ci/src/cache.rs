@@ -36,6 +36,20 @@ fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> 
     Ok(text)
 }
 
+fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
+    let release = match purpose {
+        "native-debug" => false,
+        "native-release" => true,
+        _ => return None,
+    };
+    Some(
+        crate::native_test_plan::commands(release)
+            .into_iter()
+            .map(|command| command.arguments)
+            .collect(),
+    )
+}
+
 pub fn context(
     root: &Path,
     purpose: &str,
@@ -146,10 +160,46 @@ pub fn context(
     inputs.insert("purpose".into(), purpose.into());
     inputs.insert("toolchain".into(), selected_toolchain.clone());
     inputs.insert("shard".into(), shard.into());
-    inputs.insert(
-        "profile".into(),
-        "source-tests:dev+release;product:release;consumer:dev+release;driver:dev".into(),
-    );
+    let revision = if let Some(recipe) = native_recipe(purpose) {
+        inputs.insert(
+            "native-test-arguments".into(),
+            serde_json::to_string(&recipe)?,
+        );
+        inputs.insert(
+            "profile".into(),
+            if purpose == "native-debug" {
+                "source-tests:dev"
+            } else {
+                "source-tests:release;product:release"
+            }
+            .into(),
+        );
+        if purpose == "native-release" {
+            inputs.insert("product-package".into(), "memcordon".into());
+            inputs.insert("product-profile".into(), "release".into());
+            match distribution::Distribution::read(root)
+                .and_then(|selected| Ok(selected.native()?.clone()))
+            {
+                Ok(selected) => {
+                    inputs.insert(
+                        "product-distribution".into(),
+                        serde_json::to_string(&selected)?,
+                    );
+                }
+                Err(_) => {
+                    usable = false;
+                    inputs.insert("product-distribution".into(), "unknown-selection".into());
+                }
+            }
+        }
+        2_u32
+    } else {
+        inputs.insert(
+            "profile".into(),
+            "source-tests:dev+release;product:release;consumer:dev+release;driver:dev".into(),
+        );
+        1_u32
+    };
     inputs.insert(
         "distribution".into(),
         artifacts::checksum(&artifacts::read_file(&root.join("ci/distribution.toml"))?),
@@ -298,11 +348,11 @@ pub fn context(
         selected.insert("partition".into(), partition.into());
         partitions.insert(
             partition.into(),
-            artifacts::checksum(&serde_json::to_vec(&(1_u32, selected))?),
+            artifacts::checksum(&serde_json::to_vec(&(revision, selected))?),
         );
     }
     Ok(CacheContext {
-        revision: 1,
+        revision,
         usable,
         inputs,
         partitions,
