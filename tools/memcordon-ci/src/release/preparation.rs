@@ -39,14 +39,33 @@ pub fn select_event(
     source::validate_repository(repository)?;
     source::validate_oid(sha)?;
     if event_name == "push"
-        && (event.get("ref").and_then(serde_json::Value::as_str) != Some(reference)
-            || event.get("after").and_then(serde_json::Value::as_str) != Some(sha))
+        && event.get("ref").and_then(serde_json::Value::as_str) != Some(reference)
     {
         return Err(CiError::Message(
             "push payload differs from standard selected context".into(),
         ));
     }
     let git = Git::new(root)?;
+    if event_name == "push" {
+        let after = event
+            .get("after")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CiError::Message("push payload lacks its after object".into()))?;
+        source::validate_oid(after)?;
+        let matches = if reference.starts_with("refs/tags/") {
+            let tag = git.tag(reference)?;
+            // Annotated tag pushes can identify the tag object, while the Actions
+            // checkout context identifies its commit. Bind both to this exact ref.
+            tag.commit == sha && after == tag.object
+        } else {
+            after == sha
+        };
+        if !matches {
+            return Err(CiError::Message(
+                "push after object differs from selected ref and commit".into(),
+            ));
+        }
+    }
     let head = git.text(["rev-parse", "--verify", "HEAD"])?;
     let resolved = git.text(["rev-parse", "--verify", sha])?;
     if sha != resolved

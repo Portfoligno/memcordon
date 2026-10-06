@@ -177,6 +177,8 @@ fn branch_and_tag_events_recheck_real_git_objects_and_conflicting_inputs() {
         "Annotated fixture",
     ])
     .unwrap();
+    let tagged =
+        json!({"ref":"refs/tags/1.2.3", "after":git.tag("refs/tags/1.2.3").unwrap().object});
     assert!(
         select_event(
             root,
@@ -194,6 +196,86 @@ fn branch_and_tag_events_recheck_real_git_objects_and_conflicting_inputs() {
     )
     .unwrap();
     assert!(select_event(root, "example/repository", "push", branch, &sha, &event).is_err());
+}
+
+#[test]
+fn annotated_tag_push_binds_payload_object_to_exact_ref_and_checkout_commit() {
+    let directory = fixture();
+    let root = directory.path();
+    let git = Git::new(root).unwrap();
+    let sha = git.text(["rev-parse", "HEAD"]).unwrap();
+    git.text([
+        "tag",
+        "--annotate",
+        "--no-sign",
+        "--message",
+        "Release",
+        "--",
+        "1.2.3",
+        &sha,
+    ])
+    .unwrap();
+    let reference = "refs/tags/1.2.3";
+    let tag = git.tag(reference).unwrap();
+    assert_ne!(tag.object, sha);
+    let event = json!({
+        "ref": reference,
+        "before": "0000000000000000000000000000000000000000",
+        "after": tag.object,
+        "created": true,
+        "deleted": false,
+        "forced": false,
+        "head_commit": {"id": sha},
+    });
+    let selected =
+        select_event(root, "example/repository", "push", reference, &sha, &event).unwrap();
+    assert_eq!(selected.mode, PreparationMode::TaggedReprepare);
+    assert_eq!(selected.build.commit(), sha);
+
+    git.text([
+        "tag",
+        "--annotate",
+        "--no-sign",
+        "--message",
+        "Other tag",
+        "--",
+        "other",
+        &sha,
+    ])
+    .unwrap();
+    let other = git.tag("refs/tags/other").unwrap();
+    let mut wrong = event.clone();
+    wrong["after"] = json!(sha);
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong["after"] = json!(other.object);
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong["after"] = json!(git.text(["rev-parse", "HEAD^{tree}"]).unwrap());
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong["after"] = json!("HEAD");
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong["after"] = serde_json::Value::Null;
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong = event.clone();
+    wrong["ref"] = json!("refs/tags/other");
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    wrong = event.clone();
+    wrong["deleted"] = json!(true);
+    assert!(select_event(root, "example/repository", "push", reference, &sha, &wrong).is_err());
+    let branch = "refs/heads/1.2.3";
+    wrong = event.clone();
+    wrong["ref"] = json!(branch);
+    assert!(select_event(root, "example/repository", "push", branch, &sha, &wrong).is_err());
+    assert!(
+        select_event(
+            root,
+            "example/repository",
+            "push",
+            reference,
+            &tag.object,
+            &event
+        )
+        .is_err()
+    );
 }
 
 #[test]
