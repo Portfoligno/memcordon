@@ -830,6 +830,10 @@ async fn github(
             };
             json_response(200, &json!(rows))?
         }
+        ("GET", ["releases", "1"]) => match snapshot.release.as_ref() {
+            Some(release) => json_response(200, &release_json(release, &selection.version))?,
+            None => simple(404, b"release absent"),
+        },
         ("POST", ["releases"]) => {
             if snapshot.release.is_some() {
                 return Ok(Routed::Reply(simple(422, b"duplicate release")));

@@ -287,6 +287,274 @@ impl Transport for PublicationRemote<'_> {
     }
 }
 
+struct CreationRemote<'a> {
+    existing: PublicationRemote<'a>,
+    created: Mutex<bool>,
+    uploaded: Mutex<BTreeSet<String>>,
+    creations: Mutex<usize>,
+    deadline: Instant,
+    receipt_change: Option<(&'static str, Value)>,
+    readback_change: Option<(&'static str, Value)>,
+    readback_status: u16,
+    lost_creation_reply: bool,
+    conflicting_listing: bool,
+}
+
+impl CreationRemote<'_> {
+    fn release(&self) -> Value {
+        json!({"id":7,"name":"1.2.3","tag_name":"1.2.3",
+            "body":self.existing.bundle.metadata.notes,"prerelease":false,
+            "draft":!*self.existing.public.lock().unwrap()})
+    }
+}
+
+impl Transport for CreationRemote<'_> {
+    fn request(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &[(String, String)],
+        body: &[u8],
+        deadline: Instant,
+        maximum: u64,
+    ) -> Result<Response> {
+        assert_eq!(
+            deadline, self.deadline,
+            "every request retains the shared deadline"
+        );
+        let path = url.path();
+        if path == "/repos/example/repository/releases" {
+            assert!(
+                headers.iter().any(|(name, value)| name == "Authorization"
+                    && value == "Bearer private fixture token")
+            );
+            if method == "GET" {
+                let rows = if self.conflicting_listing && *self.created.lock().unwrap() {
+                    let mut other = self.release();
+                    other["id"] = json!(8);
+                    vec![other]
+                } else {
+                    Vec::new()
+                };
+                return Ok(json_response(json!(rows)));
+            }
+            assert_eq!(method, "POST");
+            let value: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                value["target_commitish"],
+                self.existing.bundle.metadata.source.commit
+            );
+            assert_eq!(value["draft"], true);
+            assert!(
+                !*self.created.lock().unwrap(),
+                "never repeat an accepted creation"
+            );
+            *self.created.lock().unwrap() = true;
+            *self.creations.lock().unwrap() += 1;
+            if self.lost_creation_reply {
+                return Err(CiError::Message("creation reply lost".into()));
+            }
+            let mut value = self.release();
+            if let Some((key, changed)) = &self.receipt_change {
+                value[*key] = changed.clone();
+            }
+            return Ok(response(201, serde_json::to_vec(&value).unwrap()));
+        }
+        if method == "GET"
+            && path
+                .strip_prefix("/repos/example/repository/releases/")
+                .is_some_and(|tail| tail.parse::<u64>().is_ok() && tail != "7")
+        {
+            return Ok(response(404, Vec::new()));
+        }
+        if path == "/repos/example/repository/releases/7" && method == "GET" {
+            assert!(headers.iter().any(|(name, _)| name == "Authorization"));
+            assert_eq!(url.host_str(), Some("api.github.com"));
+            assert!(*self.created.lock().unwrap());
+            let mut value = self.release();
+            if let Some((key, changed)) = &self.readback_change {
+                value[*key] = changed.clone();
+            }
+            return Ok(response(
+                self.readback_status,
+                serde_json::to_vec(&value).unwrap(),
+            ));
+        }
+        if path == "/repos/example/repository/releases/7/assets" {
+            let uploaded = self.uploaded.lock().unwrap();
+            if method == "GET" {
+                let rows: Vec<_> = self.existing.bundle.metadata.files.iter().enumerate()
+                    .filter(|(_, row)| uploaded.contains(&row.name))
+                    .map(|(index,row)| json!({"id":100+index,"name":row.name,"size":row.byte_len,"state":"uploaded","digest":format!("sha256:{}",row.sha256)})).collect();
+                return Ok(json_response(json!(rows)));
+            }
+            drop(uploaded);
+            assert_eq!(method, "POST");
+            assert_eq!(url.host_str(), Some("uploads.github.com"));
+            let name = url
+                .query_pairs()
+                .find(|(key, _)| key == "name")
+                .unwrap()
+                .1
+                .into_owned();
+            let index = self
+                .existing
+                .bundle
+                .metadata
+                .files
+                .iter()
+                .position(|row| row.name == name)
+                .unwrap();
+            assert_eq!(body, self.existing.bundle.payloads[index]);
+            assert!(self.uploaded.lock().unwrap().insert(name));
+            return Ok(json_response(json!({})));
+        }
+        self.existing
+            .request(method, url, headers, body, deadline, maximum)
+    }
+}
+
+fn creation_remote(bundle: &LoadedBundle, deadline: Instant) -> CreationRemote<'_> {
+    CreationRemote {
+        existing: PublicationRemote {
+            bundle,
+            public: Mutex::new(false),
+            mutations: Mutex::new(0),
+            anonymous_reads: Mutex::new(0),
+            content_status: 200,
+            corrupt_content: false,
+        },
+        created: Mutex::new(false),
+        uploaded: Mutex::new(BTreeSet::new()),
+        creations: Mutex::new(0),
+        deadline,
+        receipt_change: None,
+        readback_change: None,
+        readback_status: 200,
+        lost_creation_reply: false,
+        conflicting_listing: false,
+    }
+}
+
+#[test]
+fn accepted_creation_uses_validated_direct_readback_when_collection_stays_absent() {
+    let bundle = bundle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let remote = creation_remote(&bundle, deadline);
+    let credentials = Credentials::for_transport("private fixture token".into(), None).unwrap();
+    let summary = Publisher::new(&remote, &credentials, &bundle, deadline)
+        .publish()
+        .unwrap();
+    assert!(summary.complete);
+    assert_eq!(*remote.creations.lock().unwrap(), 1);
+    assert_eq!(
+        remote.uploaded.lock().unwrap().len(),
+        bundle.metadata.files.len()
+    );
+    assert_eq!(
+        *remote.existing.anonymous_reads.lock().unwrap(),
+        bundle.metadata.files.len()
+    );
+    assert_eq!(
+        summary.writes[0].endpoint,
+        "/repos/example/repository/releases"
+    );
+    assert_eq!(summary.writes[0].release_id, Some(7));
+}
+
+#[test]
+fn accepted_creation_rejects_conflicting_or_uncertain_identity_before_asset_writes() {
+    let bundle = bundle();
+    let credentials = Credentials::for_transport("private fixture token".into(), None).unwrap();
+    for direct in [false, true] {
+        for (key, value) in [
+            ("id", json!(0)),
+            ("id", json!(8)),
+            ("tag_name", json!("other")),
+            ("name", json!("other")),
+            ("body", json!("changed")),
+            ("prerelease", json!(true)),
+            ("draft", Value::Null),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut remote = creation_remote(&bundle, deadline);
+            if direct {
+                remote.readback_change = Some((key, value));
+            } else {
+                remote.receipt_change = Some((key, value));
+            }
+            assert!(
+                Publisher::new(&remote, &credentials, &bundle, deadline)
+                    .publish()
+                    .is_err()
+            );
+            assert_eq!(*remote.creations.lock().unwrap(), 1);
+            assert!(remote.uploaded.lock().unwrap().is_empty());
+        }
+    }
+    for status in [404, 403, 500] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut remote = creation_remote(&bundle, deadline);
+        remote.readback_status = status;
+        assert!(
+            Publisher::new(&remote, &credentials, &bundle, deadline)
+                .publish()
+                .is_err()
+        );
+        assert!(remote.uploaded.lock().unwrap().is_empty());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remote = creation_remote(&bundle, deadline);
+    remote.conflicting_listing = true;
+    assert!(
+        Publisher::new(&remote, &credentials, &bundle, deadline)
+            .publish()
+            .is_err()
+    );
+    assert!(remote.uploaded.lock().unwrap().is_empty());
+}
+
+#[test]
+fn lost_creation_reply_with_absent_collection_never_repeats_the_post() {
+    let bundle = bundle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remote = creation_remote(&bundle, deadline);
+    remote.lost_creation_reply = true;
+    let credentials = Credentials::for_transport("private fixture token".into(), None).unwrap();
+    let summary = Publisher::new(&remote, &credentials, &bundle, deadline)
+        .publish()
+        .unwrap();
+    assert!(!summary.complete);
+    assert_eq!(*remote.creations.lock().unwrap(), 1);
+    assert!(remote.uploaded.lock().unwrap().is_empty());
+    assert!(summary.writes[0].transport_failed);
+}
+
+#[test]
+fn direct_release_readback_still_requires_anonymous_matching_asset_bytes() {
+    let bundle = bundle();
+    let credentials = Credentials::for_transport("private fixture token".into(), None).unwrap();
+    for (status, corrupt) in [(403, false), (200, true)] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut remote = creation_remote(&bundle, deadline);
+        remote.existing.content_status = status;
+        remote.existing.corrupt_content = corrupt;
+        let summary = Publisher::new(&remote, &credentials, &bundle, deadline)
+            .publish()
+            .unwrap();
+        assert!(!summary.complete);
+        assert!(summary.objects.iter().any(|object| {
+            object.destination == "github"
+                && if corrupt {
+                    matches!(object.observation, RemoteState::Conflicting { .. })
+                } else {
+                    matches!(object.observation, RemoteState::Unknown { .. })
+                }
+        }));
+        assert_eq!(*remote.creations.lock().unwrap(), 1);
+    }
+}
+
 #[test]
 fn lost_mutation_reply_is_resolved_by_actual_readback_and_anonymous_content() {
     let bundle = bundle();

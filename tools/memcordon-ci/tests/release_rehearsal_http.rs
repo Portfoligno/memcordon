@@ -273,6 +273,19 @@ fn actual_http_fixture_commits_received_bytes_and_rejects_duplicate_effect() {
         .status,
         201
     );
+    let observed = request(
+        &transport,
+        "GET",
+        "https://api.github.com/repos/fixture/repository/releases/1",
+        &github_headers(),
+        &[],
+    );
+    assert_eq!(observed.status, 200);
+    let observed: serde_json::Value = serde_json::from_slice(&observed.body).unwrap();
+    assert_eq!(observed["id"], 1);
+    assert_eq!(observed["tag_name"], "1.2.3");
+    assert_eq!(observed["body"], "actual notes");
+    assert_eq!(observed["draft"], true);
     let url =
         "https://uploads.github.com/repos/fixture/repository/releases/1/assets?name=asset.bin";
     assert_eq!(

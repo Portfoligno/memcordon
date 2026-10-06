@@ -41,8 +41,12 @@ pub struct PublicationSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WriteObservation {
     pub method: String,
+    #[serde(default)]
+    pub endpoint: String,
     pub status: Option<u16>,
     pub transport_failed: bool,
+    #[serde(default)]
+    pub release_id: Option<u64>,
 }
 
 /// Borrowed transaction input. Candidate fixture selections never become a tagged envelope.
@@ -109,6 +113,7 @@ pub struct Publisher<'a, T: Transport> {
     view: PublicationView<'a>,
     verified_registry_bytes: std::sync::Mutex<BTreeSet<String>>,
     writes: std::sync::Mutex<Vec<WriteObservation>>,
+    created_release: std::sync::Mutex<Option<u64>>,
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -165,6 +170,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             budget: ReadBudget::new(deadline),
             verified_registry_bytes: std::sync::Mutex::new(BTreeSet::new()),
             writes: std::sync::Mutex::new(Vec::new()),
+            created_release: std::sync::Mutex::new(None),
         }
     }
     fn get(&self, url: &Url) -> Result<http::Response> {
@@ -195,10 +201,10 @@ impl<'a, T: Transport> Publisher<'a, T> {
             self.budget.deadline,
             4 * 1024 * 1024,
         );
-        self.observe_write(method, &reply)?;
+        self.observe_write(method, url, &reply)?;
         reply
     }
-    fn observe_write(&self, method: &str, reply: &Result<http::Response>) -> Result<()> {
+    fn observe_write(&self, method: &str, url: &Url, reply: &Result<http::Response>) -> Result<()> {
         let mut observations = self
             .writes
             .lock()
@@ -208,9 +214,23 @@ impl<'a, T: Transport> Publisher<'a, T> {
         }
         observations.push(WriteObservation {
             method: method.to_owned(),
+            endpoint: url.path().to_owned(),
             status: reply.as_ref().ok().map(|response| response.status),
             transport_failed: reply.is_err(),
+            release_id: if method == "POST" && url.path().ends_with("/releases") {
+                reply.as_ref().ok().and_then(|response| {
+                    serde_json::from_slice::<Value>(&response.body)
+                        .ok()
+                        .and_then(|value| id(&value).ok())
+                })
+            } else {
+                None
+            },
         });
+        eprintln!(
+            "publication write {}",
+            serde_json::to_string(observations.last().expect("recorded write observation"))?
+        );
         Ok(())
     }
 
@@ -281,6 +301,23 @@ impl<'a, T: Transport> Publisher<'a, T> {
         Err(CiError::Message("destination tag depth exceeded".into()))
     }
 
+    fn validate_created_release(&self, release: &Value, expected_id: u64) -> Result<()> {
+        let version = self.view.version.to_string();
+        if id(release)? != expected_id
+            || field(release, "tag_name")? != version
+            || field(release, "name")? != version
+            || field(release, "body")? != self.view.notes
+            || release.get("prerelease").and_then(Value::as_bool)
+                != Some(!self.view.version.pre.is_empty())
+            || release.get("draft").and_then(Value::as_bool).is_none()
+        {
+            return Err(CiError::Message(
+                "created release identity or metadata differs".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn release(&self) -> Result<Option<Value>> {
         let tag = self.view.version.to_string();
         // List drafts as well as public releases; a by-tag 404 alone cannot establish
@@ -332,6 +369,30 @@ impl<'a, T: Transport> Publisher<'a, T> {
                             != Some(!self.view.version.pre.is_empty()))
                 {
                     return Err(CiError::Message("managed release metadata differs".into()));
+                }
+                let created = *self.created_release.lock().map_err(|_| {
+                    CiError::Message("created release observation owner failed".into())
+                })?;
+                if let Some(created) = created {
+                    if selected
+                        .as_ref()
+                        .is_some_and(|release| id(release).ok() != Some(created))
+                    {
+                        return Err(CiError::Message(
+                            "created release ID conflicts with listing".into(),
+                        ));
+                    }
+                    // The collection can lag an accepted creation. Read the fixed API
+                    // path for its validated ID; never follow a provider-supplied URL.
+                    let response = self.get(&self.api(&["releases", &created.to_string()])?)?;
+                    if response.status != 200 {
+                        return Err(CiError::Message(
+                            "created release readback is uncertain".into(),
+                        ));
+                    }
+                    let release = http::json(&response)?;
+                    self.validate_created_release(&release, created)?;
+                    return Ok(Some(release));
                 }
                 return Ok(selected);
             }
@@ -598,8 +659,23 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 let body = serde_json::to_vec(
                     &json!({"tag_name":self.view.version,"target_commitish":self.view.commit,"name":self.view.version,"body":self.view.notes,"draft":true,"prerelease":!self.view.version.pre.is_empty()}),
                 )?;
-                let _reply =
+                let reply =
                     self.write("POST", &self.api(&["releases"])?, &body, "application/json");
+                if let Ok(reply) = &reply
+                    && reply.status == 201
+                {
+                    let release = http::json(reply)?;
+                    let created = id(&release)?;
+                    self.validate_created_release(&release, created)?;
+                    if release.get("draft").and_then(Value::as_bool) != Some(true) {
+                        return Err(CiError::Message(
+                            "created release receipt is not a draft".into(),
+                        ));
+                    }
+                    *self.created_release.lock().map_err(|_| {
+                        CiError::Message("created release observation owner failed".into())
+                    })? = Some(created);
+                }
                 let Some(release) = self.release()? else {
                     return self.inspect();
                 };
@@ -663,7 +739,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 self.budget.deadline,
                 1024 * 1024,
             );
-            self.observe_write("PUT", &reply)?;
+            self.observe_write("PUT", &url, &reply)?;
             let slot_deadline =
                 (Instant::now() + Duration::from_secs(300)).min(self.budget.deadline);
             let mut delay = Duration::from_millis(500);
