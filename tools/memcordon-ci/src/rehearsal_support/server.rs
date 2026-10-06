@@ -155,11 +155,7 @@ async fn run(setup: Setup, state: &Path, ready: &Path, maximum: u64, quota: u64)
         quota,
     });
     save(&shared, &*shared.snapshot.lock().await)?;
-    let mut ready_file = File::options().write(true).create_new(true).open(ready)?;
-    serde_json::to_writer(&mut ready_file, &record)?;
-    ready_file.write_all(b"\n")?;
-    ready_file.flush()?;
-    ready_file.sync_all()?;
+    publish_readiness(ready, &record)?;
     let control = shared.clone();
     std::thread::spawn(move || {
         let input = io::stdin();
@@ -246,6 +242,24 @@ fn control_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
             return Ok(Some(line));
         }
     }
+}
+
+/// Make a new readiness record visible only after its complete, synced JSON exists.
+/// The final name must not overwrite another fixture's readiness record.
+pub fn publish_readiness(ready: &Path, record: &impl serde::Serialize) -> Result<()> {
+    let parent = ready
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(staged.as_file_mut(), record)?;
+    staged.write_all(b"\n")?;
+    staged.flush()?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist_noclobber(ready)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub fn read_snapshot(root: &Path) -> Result<Snapshot> {
