@@ -1,5 +1,60 @@
 use super::*;
 
+#[test]
+fn rehearsal_legacy_credentials_are_allowed_only_as_reviewed_removals() {
+    let coordinator = Path::new("tools/memcordon-ci/src/rehearsal_support/coordinator.rs");
+    let removal = r#"fn sanitize_child(command: &mut Command) {
+        for name in ["GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN"] {
+            command.env_remove(name);
+        }
+    }"#;
+    let secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
+    validate_legacy_registry_token_source(coordinator, removal).unwrap();
+    validate_legacy_registry_token_source(
+        coordinator,
+        include_str!("../../src/rehearsal_support/coordinator.rs"),
+    )
+    .unwrap();
+    validate_legacy_registry_token_source(
+        Path::new("tools/memcordon-ci/tests/release_rehearsal_http.rs"),
+        include_str!("../release_rehearsal_http.rs"),
+    )
+    .unwrap();
+    for source in [
+        removal.replace("env_remove", "env"),
+        removal.replace("command.env_remove(name)", "other.env_remove(name)"),
+        removal.replace("sanitize_child", "configure_child"),
+        removal.replace("&mut Command", "&mut Other"),
+        removal.replace("\"GITHUB_TOKEN\"", "acquire()"),
+        removal.replace("command.env_remove(name);", "command.env_remove(name); acquire();"),
+        [removal, "fn acquire() { std::env::var(\"CARGO_REGISTRY_TOKEN\"); }"].join("\n"),
+        "fn sanitize_child(command: &mut Command) { command.env(\"CARGO_REGISTRY_TOKEN\", \"secret\"); }".into(),
+        secret_source.clone(),
+    ] {
+        assert!(validate_legacy_registry_token_source(coordinator, &source).is_err(), "accepted credential configuration: {source}");
+    }
+    assert!(
+        validate_legacy_registry_token_source(
+            Path::new("tools/memcordon-ci/src/release/other.rs"),
+            removal,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_legacy_registry_token_source(Path::new("RELEASING.md"), &secret_source,).is_err()
+    );
+    assert!(
+        validate_rust_policy_bytes(
+            Path::new("tools/memcordon-ci/tests/release_rehearsal_transport.rs"),
+            br#"fn proxy(command: &mut Command) {
+            command.env("HTTP_PROXY", "http://127.0.0.1:1");
+            command.env("CUSTOM_PROXY", "unexpected");
+        }"#,
+        )
+        .is_err()
+    );
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }

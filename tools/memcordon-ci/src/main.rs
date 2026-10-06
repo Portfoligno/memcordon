@@ -127,7 +127,8 @@ fn run() -> Result<()> {
             command:
                 memcordon_ci::release::ReleaseCommand::Publish { .. }
                 | memcordon_ci::release::ReleaseCommand::Inspect { .. }
-                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. },
+                | memcordon_ci::release::ReleaseCommand::PublicConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::RehearsalTransaction { .. },
         }) => current,
         _ => workspace_root(&current)?,
     };

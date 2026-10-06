@@ -4,6 +4,141 @@ use std::process::Command;
 use std::time::Duration;
 
 #[test]
+fn command_excerpts_preserve_first_middle_libtest_failure_for_lf_and_crlf() {
+    let limit = 64 * 1024;
+    let failure = "failures:\n\n---- actual_asset_loss stdout ----\nthread 'actual_asset_loss' panicked at release_rehearsal_loss.rs:387:\nactual first failure observation\n\nfailures:\n    actual_asset_loss\n\ntest result: FAILED. 0 passed; 1 failed\n";
+    let later = b"failures:\n\n---- another_case stdout ----\nsecond failure observation\n\nfailures:\n    another_case\n\ntest result: FAILED. 0 passed; 1 failed\n";
+    for failure in [failure.to_owned(), failure.replace('\n', "\r\n")] {
+        assert_eq!(
+            memcordon_ci::command::bounded_excerpt(failure.as_bytes()),
+            failure
+        );
+        let beginning = b"first successful target\n";
+        let terminal = b"last successful target: test result: ok. 2 passed\n";
+        let mut bytes = beginning.to_vec();
+        bytes.extend(vec![b'x'; limit]);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(failure.as_bytes());
+        bytes.extend(vec![b'y'; limit]);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(later);
+        bytes.extend(vec![b'z'; limit]);
+        bytes.extend_from_slice(terminal);
+        let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+        assert!(excerpt.len() <= limit);
+        assert!(excerpt.starts_with(std::str::from_utf8(beginning).unwrap()));
+        assert!(excerpt.ends_with(std::str::from_utf8(terminal).unwrap()));
+        assert!(excerpt.contains(&failure));
+        assert!(!excerpt.contains("second failure observation"));
+        assert!(excerpt.contains("first libtest failure section"));
+    }
+}
+
+#[test]
+fn command_excerpts_bound_large_failure_sections_and_lossy_decoding() {
+    let limit = 64 * 1024;
+    let beginning = b"first successful target\n";
+    let terminal = "last successful target: 終了🙂\n";
+    for padding in ["🙂".repeat(limit).into_bytes(), vec![0xff; limit * 2]] {
+        let mut bytes = beginning.to_vec();
+        bytes.extend(vec![b'x'; limit]);
+        bytes.extend_from_slice(b"\nfailures:\n\n---- large_case stdout ----\nthread panicked at actual_source.rs:42:\n");
+        bytes.extend(padding);
+        bytes.extend_from_slice(
+            b"\nfailures:\n    large_case\n\ntest result: FAILED. 0 passed; 1 failed\n",
+        );
+        bytes.extend(vec![b'y'; limit]);
+        bytes.extend_from_slice(terminal.as_bytes());
+        let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+        assert!(excerpt.len() <= limit);
+        assert!(excerpt.starts_with(std::str::from_utf8(beginning).unwrap()));
+        assert!(excerpt.ends_with(terminal));
+        assert!(excerpt.contains("thread panicked at actual_source.rs:42"));
+        assert!(excerpt.contains("test result: FAILED. 0 passed; 1 failed"));
+        assert!(excerpt.contains(" [excerpt truncated] "));
+    }
+}
+
+#[test]
+fn command_excerpts_ignore_incidental_failure_headings_and_reset_after_success() {
+    let limit = 64 * 1024;
+    for incidental in [
+        "failures:\nincidental output\ntest result: ok. 1 passed\n",
+        "failures:\nunterminated output\n",
+        "failures: incidental inline heading\ntest result: FAILED. 1 failed\n",
+        "failures:\nincidental output\ntest result: FAILEDNESS.\n",
+    ] {
+        let mut bytes = vec![b'x'; limit];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(incidental.as_bytes());
+        bytes.extend(vec![b'y'; limit]);
+        let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+        assert!(excerpt.len() <= limit);
+        assert!(!excerpt.contains("first libtest failure section"));
+    }
+
+    let mut bytes = vec![b'x'; limit];
+    bytes.extend_from_slice(
+        b"\nfailures:\nincidental successful output\ntest result: ok. 1 passed\n",
+    );
+    bytes.extend(vec![b'y'; limit]);
+    bytes.extend_from_slice(b"\nfailures:\nactual later failure\ntest result: FAILED. 1 failed\n");
+    bytes.extend(vec![b'z'; limit]);
+    let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+    assert!(excerpt.len() <= limit);
+    assert!(excerpt.contains("actual later failure"));
+    assert!(!excerpt.contains("incidental successful output"));
+}
+
+#[test]
+fn command_excerpts_preserve_terminal_failures_within_the_existing_bound() {
+    let limit = 64 * 1024;
+    let beginning = b"beginning of subprocess output\n";
+    let terminal = b"\nerror: test failed, to rerun pass --test actual_terminal_failure";
+    let mut bytes = beginning.to_vec();
+    bytes.extend(vec![b'x'; limit * 2]);
+    bytes.extend_from_slice(terminal);
+    let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+    assert_eq!(excerpt.len(), limit);
+    assert!(excerpt.starts_with(std::str::from_utf8(beginning).unwrap()));
+    assert!(excerpt.ends_with(std::str::from_utf8(terminal).unwrap()));
+    assert!(excerpt.contains(" [excerpt truncated] "));
+
+    for length in [0, limit / 2, limit] {
+        let complete = vec![b'x'; length];
+        assert_eq!(
+            memcordon_ci::command::bounded_excerpt(&complete).as_bytes(),
+            complete
+        );
+    }
+    let overflowing = vec![b'x'; limit + 1];
+    assert!(memcordon_ci::command::bounded_excerpt(&overflowing).len() <= limit);
+    assert!(memcordon_ci::command::bounded_excerpt(&overflowing).contains("[excerpt truncated]"));
+}
+
+#[test]
+fn command_excerpts_bound_unicode_and_lossy_utf8_without_losing_the_tail() {
+    let limit = 64 * 1024;
+    let terminal = "\nactual terminal failure: 終了🙂";
+    for mut bytes in [
+        "🙂".repeat(limit).into_bytes(),
+        vec![0xff; limit * 2],
+        vec![0xff; limit / 2],
+    ] {
+        bytes.extend_from_slice(terminal.as_bytes());
+        let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
+        assert!(excerpt.len() <= limit);
+        assert!(excerpt.ends_with(terminal));
+        assert!(excerpt.contains("[excerpt truncated]"));
+    }
+    let short = "short output: 終了🙂";
+    assert_eq!(
+        memcordon_ci::command::bounded_excerpt(short.as_bytes()),
+        short
+    );
+}
+
+#[test]
 fn private_native_command_explicitly_removes_actions_token() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let command = CommandSpec::new(

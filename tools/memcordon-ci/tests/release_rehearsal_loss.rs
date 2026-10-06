@@ -1,5 +1,8 @@
 //! Real publisher and HTTP response-loss controls with small, validated archive fixtures.
 //! Structural executable headers are never executed or described as compiled native artifacts.
+#[path = "support/release_loss_budget.rs"]
+mod release_loss_budget;
+
 use memcordon_ci::{
     rehearsal_support::{coordinator, protocol::*, server},
     release::{
@@ -14,6 +17,7 @@ use memcordon_ci::{
         target,
     },
 };
+use release_loss_budget::{RETIREMENT_ALLOWANCE, ScenarioClock};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -245,7 +249,7 @@ impl Drop for RetiringChild {
             return;
         }
         let kill = self.0.kill();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + RETIREMENT_ALLOWANCE;
         loop {
             match self.0.try_wait() {
                 Ok(Some(_)) => return,
@@ -265,10 +269,13 @@ impl Drop for RetiringChild {
 struct Fixture {
     child: RetiringChild,
     transport: LoopbackTransport,
+    clock: ScenarioClock,
 }
 impl Fixture {
     fn start(state: &Path, bundle: &LoadedBundle, ordinal: usize) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let started = Instant::now();
+        let started_unix_ms = memcordon_ci::release::rehearsal::unix_ms().unwrap();
+        let clock = ScenarioClock::from_start(started, started_unix_ms);
         let setup = Setup {
             revision: REVISION,
             case_id: "asset-loss".into(),
@@ -294,7 +301,7 @@ impl Fixture {
                 boundary: Boundary::Asset(u32::try_from(ordinal).unwrap()),
             },
             budget: BudgetPreset::Normal20min,
-            work_unix_ms: memcordon_ci::release::rehearsal::unix_ms().unwrap() + 15_000,
+            work_unix_ms: clock.work_unix_ms,
         };
         fs::write(
             state.join("setup.json"),
@@ -315,19 +322,32 @@ impl Fixture {
         // Own the child before readiness parsing or assertions can fail.
         let mut child = RetiringChild(command.spawn().unwrap());
         let transport = loop {
-            if let Ok(bytes) = fs::read(&ready) {
-                if let Ok(record) = serde_json::from_slice(&bytes) {
-                    break LoopbackTransport::new(record).unwrap();
-                }
+            assert!(
+                clock.admits_readiness(Instant::now()),
+                "asset position {ordinal}: readiness expired after {:?}",
+                clock.started.elapsed()
+            );
+            if let Ok(bytes) = fs::read(&ready)
+                && let Ok(record) = serde_json::from_slice(&bytes)
+            {
+                assert!(
+                    clock.admits_readiness(Instant::now()),
+                    "asset position {ordinal}: readiness acceptance expired after {:?}",
+                    clock.started.elapsed()
+                );
+                break LoopbackTransport::new(record).unwrap();
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
                 "fixture exited before readiness"
             );
-            assert!(Instant::now() < deadline, "fixture readiness expired");
             std::thread::sleep(Duration::from_millis(5));
         };
-        Self { child, transport }
+        Self {
+            child,
+            transport,
+            clock,
+        }
     }
     fn stop(&mut self) {
         self.child
@@ -336,7 +356,7 @@ impl Fixture {
             .unwrap()
             .write_all(b"stop\n")
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + RETIREMENT_ALLOWANCE;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success());
@@ -378,12 +398,22 @@ fn every_managed_asset_lost_reply_is_resolved_by_real_http_without_duplicate_eff
     for ordinal in 0..bundle.metadata.files.len() {
         let state = scratch();
         let mut fixture = Fixture::start(state.path(), &bundle, ordinal);
-        let deadline = fixture.transport.deadline().unwrap();
+        // The fixture and all HTTP phases share the original composed work
+        // cutoff. Readiness keeps its original shorter subguard.
+        let deadline = fixture
+            .clock
+            .work
+            .min(fixture.transport.deadline().unwrap());
         let credentials =
             Credentials::for_transport(GITHUB_TOKEN.into(), Some(REGISTRY_TOKEN.into())).unwrap();
         let summary = Publisher::new(&fixture.transport, &credentials, &bundle, deadline)
             .publish()
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "asset position {ordinal}: initial-publication failed after {:?}: {error}",
+                    fixture.clock.started.elapsed()
+                )
+            });
         assert!(summary.complete, "asset position {ordinal}: {summary:?}");
         assert!(
             summary
@@ -427,11 +457,21 @@ fn every_managed_asset_lost_reply_is_resolved_by_real_http_without_duplicate_eff
             &summary,
             deadline,
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "asset position {ordinal}: independent-readback failed after {:?}: {error}",
+                fixture.clock.started.elapsed()
+            )
+        });
         let before = server::read_snapshot(state.path()).unwrap();
         let retried = Publisher::new(&fixture.transport, &credentials, &bundle, deadline)
             .publish()
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "asset position {ordinal}: idempotent-publication failed after {:?}: {error}",
+                    fixture.clock.started.elapsed()
+                )
+            });
         assert!(retried.complete);
         let after = server::read_snapshot(state.path()).unwrap();
         assert_eq!(

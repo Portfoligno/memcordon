@@ -276,6 +276,13 @@ fn wait_ready(
     }
 }
 
+struct PublisherPaths<'a> {
+    executable: &'a Path,
+    input: &'a Path,
+    record: &'a Path,
+    result: &'a Path,
+}
+
 fn publisher(
     publisher: &Path,
     input: &Path,
@@ -286,19 +293,31 @@ fn publisher(
     cancelled: Arc<AtomicBool>,
 ) -> Result<(bool, bool)> {
     publisher_observed(
-        publisher, input, record, result, deadline, events, cancelled, None,
+        PublisherPaths {
+            executable: publisher,
+            input,
+            record,
+            result,
+        },
+        deadline,
+        events,
+        cancelled,
+        None,
     )
 }
 fn publisher_observed(
-    publisher: &Path,
-    input: &Path,
-    record: &Path,
-    result: &Path,
+    paths: PublisherPaths<'_>,
     deadline: Instant,
     events: Option<Arc<Mutex<mpsc::Receiver<ControlEvent>>>>,
     cancelled: Arc<AtomicBool>,
     identity_file: Option<PathBuf>,
 ) -> Result<(bool, bool)> {
+    let PublisherPaths {
+        executable: publisher,
+        input,
+        record,
+        result,
+    } = paths;
     let mut command = Command::new(publisher);
     command
         .args(["release", "rehearsal-transaction", "--input"])
@@ -405,10 +424,12 @@ pub fn cancellation_control(
     let cancelled = Arc::new(AtomicBool::new(false));
     cancellation_listener(cancelled.clone())?;
     publisher_observed(
-        publisher,
-        input,
-        record,
-        result,
+        PublisherPaths {
+            executable: publisher,
+            input,
+            record,
+            result,
+        },
         transport.deadline()?,
         None,
         cancelled,
@@ -420,14 +441,17 @@ pub fn cancellation_control(
 }
 fn cancel_case(
     helper: &Path,
-    publisher_path: &Path,
-    input: &Path,
-    ready: &Path,
-    result: &Path,
+    paths: PublisherPaths<'_>,
     state: &Path,
     server: &Server,
     deadline: Instant,
 ) -> Result<()> {
+    let PublisherPaths {
+        executable: publisher_path,
+        input,
+        record: ready,
+        result,
+    } = paths;
     let identity = state.join("cancelled-publisher.json");
     let mut command = Command::new(helper);
     command
@@ -725,16 +749,18 @@ pub fn run(helper: &Path, publisher_path: &Path, input: &Path, report_dir: &Path
         let state = temporary.path().join(ordinal.to_string());
         fs::create_dir(&state)?;
         let result = run_case(
-            helper,
-            publisher_path,
-            input,
+            &CaseContext {
+                helper,
+                publisher_path,
+                input,
+                selection: &selection,
+                work_unix_ms,
+                work,
+                retirement,
+                cancelled: cancelled.clone(),
+            },
             &state,
             case,
-            &selection,
-            work_unix_ms,
-            work,
-            retirement,
-            cancelled.clone(),
         );
         let diagnostic = retain_case(report_dir, &state, ordinal);
         report.unexecuted -= 1;
@@ -995,18 +1021,31 @@ fn cancellation_listener(cancelled: Arc<AtomicBool>) -> Result<()> {
         .map_err(|_| failure("coordinator cancellation listener was not ready"))
 }
 
-fn run_case(
-    helper: &Path,
-    publisher_path: &Path,
-    input: &Path,
-    state: &Path,
-    case: &Case,
-    selection: &FixtureSelection,
+struct CaseContext<'a> {
+    helper: &'a Path,
+    publisher_path: &'a Path,
+    input: &'a Path,
+    selection: &'a FixtureSelection,
     work_unix_ms: u64,
     work: Instant,
     retirement: Instant,
     cancelled: Arc<AtomicBool>,
-) -> Result<CaseResult> {
+}
+
+fn run_case(context: &CaseContext<'_>, state: &Path, case: &Case) -> Result<CaseResult> {
+    let CaseContext {
+        helper,
+        publisher_path,
+        input,
+        selection,
+        work_unix_ms,
+        work,
+        retirement,
+        cancelled,
+    } = context;
+    let (helper, publisher_path, input, selection) = (*helper, *publisher_path, *input, *selection);
+    let (work_unix_ms, work, retirement) = (*work_unix_ms, *work, *retirement);
+    let cancelled = cancelled.clone();
     let budget = if matches!(
         case.fault,
         Fault::Stall
@@ -1083,10 +1122,12 @@ fn run_case(
         if case.group == "R13" && case.variant == "cancellation" {
             cancel_case(
                 helper,
-                publisher_path,
-                input,
-                &ready,
-                &result,
+                PublisherPaths {
+                    executable: publisher_path,
+                    input,
+                    record: &ready,
+                    result: &result,
+                },
                 state,
                 &server,
                 work,
@@ -1514,20 +1555,17 @@ fn preserve_identities(before: &Snapshot, after: &Snapshot) -> Result<()> {
     Ok(())
 }
 pub fn expected_boundary(case: &Case, observed: &Snapshot) -> Result<()> {
-    if let Fault::Loss { boundary }
-    | Fault::Barrier { boundary }
-    | Fault::FixtureLoss { boundary } = &case.fault
-    {
-        if observed.fault_boundary.as_ref() != Some(boundary)
+    if let Fault::Loss { boundary } | Fault::Barrier { boundary } | Fault::FixtureLoss { boundary } =
+        &case.fault
+        && (observed.fault_boundary.as_ref() != Some(boundary)
             || !observed
                 .effects
                 .iter()
-                .any(|effect| &effect.boundary == boundary)
-        {
-            return Err(failure(
-                "configured interruption boundary did not actually commit",
-            ));
-        }
+                .any(|effect| &effect.boundary == boundary))
+    {
+        return Err(failure(
+            "configured interruption boundary did not actually commit",
+        ));
     }
     Ok(())
 }

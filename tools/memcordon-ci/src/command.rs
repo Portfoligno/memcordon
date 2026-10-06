@@ -326,16 +326,94 @@ impl CommandSpec {
 }
 
 pub fn bounded_excerpt(bytes: &[u8]) -> String {
-    let shown = &bytes[..bytes.len().min(64 * 1024)];
-    let mut text = String::from_utf8_lossy(shown).into_owned();
-    if shown.len() != bytes.len() {
-        text.push_str(" [excerpt truncated]");
+    excerpt(bytes).0
+}
+
+fn excerpt(bytes: &[u8]) -> (String, bool) {
+    let limit = 64 * 1024;
+    let first = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
+    if bytes.len() <= limit && first.len() <= limit {
+        return (first.into_owned(), false);
     }
-    text
+    if let Some(failure) = libtest_failure_section(bytes) {
+        let before = " [excerpt truncated; first libtest failure section] ";
+        let after = " [excerpt truncated; remaining output] ";
+        let content_budget = limit - before.len() - after.len();
+        let failure_budget = content_budget / 2;
+        let head_budget = (content_budget - failure_budget) / 2;
+        let tail_budget = content_budget - failure_budget - head_budget;
+        let mut text = String::with_capacity(limit);
+        append_excerpt_head(&mut text, bytes, head_budget);
+        text.push_str(before);
+        text.push_str(&head_tail_excerpt(failure, failure_budget).0);
+        text.push_str(after);
+        append_excerpt_tail(&mut text, bytes, tail_budget);
+        return (text, true);
+    }
+    head_tail_excerpt(bytes, limit)
+}
+
+fn libtest_failure_section(bytes: &[u8]) -> Option<&[u8]> {
+    let mut offset = 0;
+    let mut start = None;
+    for raw_line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line == b"failures:" && start.is_none() {
+            start = Some(offset);
+        }
+        offset += raw_line.len();
+        if line.starts_with(b"test result: FAILED.")
+            && let Some(start) = start
+        {
+            return Some(&bytes[start..offset]);
+        }
+        if line.starts_with(b"test result: ") {
+            start = None;
+        }
+    }
+    None
+}
+
+fn head_tail_excerpt(bytes: &[u8], limit: usize) -> (String, bool) {
+    let first = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
+    if bytes.len() <= limit && first.len() <= limit {
+        return (first.into_owned(), false);
+    }
+    let marker = " [excerpt truncated] ";
+    let content_budget = limit - marker.len();
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+    let mut text = String::with_capacity(limit);
+    append_excerpt_head(&mut text, bytes, head_budget);
+    text.push_str(marker);
+    append_excerpt_tail(&mut text, bytes, tail_budget);
+    (text, true)
+}
+
+fn append_excerpt_head(text: &mut String, bytes: &[u8], head_budget: usize) {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(head_budget)]);
+    let head_end = head
+        .char_indices()
+        .map(|(offset, character)| offset + character.len_utf8())
+        .take_while(|&end| end <= head_budget)
+        .last()
+        .unwrap_or(0);
+    text.push_str(&head[..head_end]);
+}
+
+fn append_excerpt_tail(text: &mut String, bytes: &[u8], tail_budget: usize) {
+    let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(tail_budget)..]);
+    let tail_start = tail
+        .char_indices()
+        .find(|&(offset, _)| offset >= tail.len().saturating_sub(tail_budget))
+        .map_or(tail.len(), |(offset, _)| offset);
+    text.push_str(&tail[tail_start..]);
 }
 
 fn excerpt_json(bytes: &[u8]) -> serde_json::Value {
-    serde_json::json!({"text": bounded_excerpt(bytes), "byte-count": bytes.len(), "truncated": bytes.len() > 64 * 1024})
+    let (text, truncated) = excerpt(bytes);
+    serde_json::json!({"text": text, "byte-count": bytes.len(), "truncated": truncated})
 }
 
 fn status_json(status: std::process::ExitStatus) -> serde_json::Value {

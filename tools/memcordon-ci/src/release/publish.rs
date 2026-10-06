@@ -326,13 +326,12 @@ impl<'a, T: Transport> Publisher<'a, T> {
                     .get("link")
                     .is_some_and(|link| link.contains("rel=\"next\""))
             {
-                if let Some(release) = &selected {
-                    if field(release, "body")? != self.view.notes
+                if let Some(release) = &selected
+                    && (field(release, "body")? != self.view.notes
                         || release.get("prerelease").and_then(Value::as_bool)
-                            != Some(!self.view.version.pre.is_empty())
-                    {
-                        return Err(CiError::Message("managed release metadata differs".into()));
-                    }
+                            != Some(!self.view.version.pre.is_empty()))
+                {
+                    return Err(CiError::Message("managed release metadata differs".into()));
                 }
                 return Ok(selected);
             }

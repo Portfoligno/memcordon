@@ -2135,7 +2135,10 @@ fn check_rehearsal_tool(jobs: &Mapping) -> Result<()> {
             "helper must be a separate immutable single-executable archive",
         ));
     }
-    if jobs[&key("assemble")]["outputs"]["candidate-artifact-id"].as_str()
+    let assemble = jobs
+        .get(key("assemble"))
+        .ok_or_else(|| failure("assembly absent"))?;
+    if assemble["outputs"]["candidate-artifact-id"].as_str()
         != Some("${{ steps.candidate.outputs.artifact-id }}")
     {
         return Err(failure(
@@ -3356,6 +3359,11 @@ fn reviewed_git_environment(relative: &Path) -> bool {
     .contains(&relative)
 }
 
+fn reviewed_proxy_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    relative == Path::new("tools/memcordon-ci/tests/release_rehearsal_transport.rs")
+        && visitor.subprocess_env_mutations == visitor.standard_proxy_mutations
+}
+
 fn reviewed_macos_writer_image(relative: &Path) -> bool {
     [
         Path::new("crates/memcordon-platform/src/macos_watchdog.rs"),
@@ -3384,13 +3392,10 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     ]
     .contains(&relative)
         && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
-    let proxy_fixture = relative
-        == Path::new("tools/memcordon-ci/tests/release_rehearsal_transport.rs")
-        && visitor.subprocess_env_mutations == visitor.standard_proxy_mutations;
     if visitor.subprocess_env_mutations != 0
         && relative != sealed_launch
         && !native_path_fixture
-        && !proxy_fixture
+        && !reviewed_proxy_environment(relative, &visitor)
         && !reviewed_git_environment(relative)
     {
         visitor
@@ -3484,6 +3489,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
             && !native_path_fixture
+            && !reviewed_proxy_environment(relative, &visitor)
             && !reviewed_git_environment(relative)
         {
             visitor
@@ -3834,6 +3840,122 @@ fn check_cargo_configuration(root: &Path, files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn removal_only_legacy_token(source: &str) -> bool {
+    let Ok(syntax) = syn::parse_file(source) else {
+        return false;
+    };
+    let mut reviewed = 0;
+    for item in syntax.items {
+        let syn::Item::Fn(function) = item else {
+            continue;
+        };
+        if function.sig.ident != "sanitize_child" || function.sig.inputs.len() != 1 {
+            continue;
+        }
+        let Some(syn::FnArg::Typed(argument)) = function.sig.inputs.first() else {
+            continue;
+        };
+        let syn::Pat::Ident(parameter) = argument.pat.as_ref() else {
+            continue;
+        };
+        let syn::Type::Reference(reference) = argument.ty.as_ref() else {
+            continue;
+        };
+        let syn::Type::Path(argument_type) = reference.elem.as_ref() else {
+            continue;
+        };
+        if reference.mutability.is_none() || !argument_type.path.is_ident("Command") {
+            continue;
+        }
+        for statement in &function.block.stmts {
+            let syn::Stmt::Expr(syn::Expr::ForLoop(loop_expression), _) = statement else {
+                continue;
+            };
+            let syn::Pat::Ident(binding) = loop_expression.pat.as_ref() else {
+                continue;
+            };
+            let syn::Expr::Array(names) = loop_expression.expr.as_ref() else {
+                continue;
+            };
+            if !names.elems.iter().all(|name| {
+                matches!(
+                    name,
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(_),
+                        ..
+                    })
+                )
+            }) {
+                continue;
+            }
+            let [syn::Stmt::Expr(syn::Expr::MethodCall(removal), _)] =
+                loop_expression.body.stmts.as_slice()
+            else {
+                continue;
+            };
+            let syn::Expr::Path(receiver) = removal.receiver.as_ref() else {
+                continue;
+            };
+            let Some(syn::Expr::Path(name)) = removal.args.first() else {
+                continue;
+            };
+            if removal.method != "env_remove"
+                || removal.args.len() != 1
+                || !receiver.path.is_ident(&parameter.ident)
+                || !name.path.is_ident(&binding.ident)
+            {
+                continue;
+            }
+            for name in &names.elems {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(name),
+                    ..
+                }) = name
+                    && name.value() == "CARGO_REGISTRY_TOKEN"
+                {
+                    reviewed += 1;
+                }
+            }
+        }
+    }
+    reviewed != 0 && reviewed == source.matches("CARGO_REGISTRY_TOKEN").count()
+}
+
+pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> Result<()> {
+    let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
+    if source.contains(legacy_secret_source.as_str()) {
+        return Err(failure(format!(
+            "legacy broad crates.io token source remains: {relative:?}"
+        )));
+    }
+    if !source.contains("CARGO_REGISTRY_TOKEN") {
+        return Ok(());
+    }
+    let established = [
+        "tools/memcordon-ci/src/command.rs",
+        "tools/memcordon-ci/src/policy.rs",
+        "tools/memcordon-ci/tests/command.rs",
+        "tools/memcordon-ci/tests/unit/policy.rs",
+        "RELEASING.md",
+        "MAINTAINERS.md",
+        "ci/policy.toml",
+        ".github/workflows/release.yml",
+        "tools/memcordon-ci/src/release/publish.rs",
+        "tools/memcordon-ci/src/release/git.rs",
+    ]
+    .iter()
+    .any(|path| relative == Path::new(path));
+    if established
+        || relative == Path::new("tools/memcordon-ci/src/rehearsal_support/coordinator.rs")
+            && removal_only_legacy_token(source)
+    {
+        return Ok(());
+    }
+    Err(failure(format!(
+        "legacy crates.io token interface remains outside negative policy assertions: {relative:?}"
+    )))
+}
+
 pub fn run(root: &Path) -> Result<()> {
     let policy = config::policy(root)?;
     for command in &policy.workflow.allowed_run_commands {
@@ -3858,31 +3980,10 @@ pub fn run(root: &Path) -> Result<()> {
             "temporary release bootstrap workflow must be removed in steady state",
         ));
     }
-    let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
     for relative in &files {
         let bytes = fs::read(root.join(relative))?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
-            if text.contains(legacy_secret_source.as_str()) {
-                return Err(failure(format!(
-                    "legacy broad crates.io token source remains: {relative:?}"
-                )));
-            }
-            if text.contains("CARGO_REGISTRY_TOKEN")
-                && relative != Path::new("tools/memcordon-ci/src/command.rs")
-                && relative != Path::new("tools/memcordon-ci/src/policy.rs")
-                && relative != Path::new("tools/memcordon-ci/tests/command.rs")
-                && relative != Path::new("tools/memcordon-ci/tests/unit/policy.rs")
-                && relative != Path::new("RELEASING.md")
-                && relative != Path::new("MAINTAINERS.md")
-                && relative != Path::new("ci/policy.toml")
-                && relative != Path::new(".github/workflows/release.yml")
-                && relative != Path::new("tools/memcordon-ci/src/release/publish.rs")
-                && relative != Path::new("tools/memcordon-ci/src/release/git.rs")
-            {
-                return Err(failure(format!(
-                    "legacy crates.io token interface remains outside negative policy assertions: {relative:?}"
-                )));
-            }
+            validate_legacy_registry_token_source(relative, text)?;
         }
     }
     let mut environment_definitions = BTreeSet::new();

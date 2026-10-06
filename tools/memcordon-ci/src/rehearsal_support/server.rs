@@ -441,10 +441,8 @@ async fn handle_inner(
     if !valid_role {
         return Ok(simple(403, b"credential role rejected"));
     }
-    if !write {
-        if let Some(reply) = read_fault(&shared, service, &path, &query).await? {
-            return Ok(reply);
-        }
+    if !write && let Some(reply) = read_fault(&shared, service, &path, &query).await? {
+        return Ok(reply);
     }
     let content_length = request
         .headers()
@@ -506,7 +504,16 @@ async fn handle_inner(
         save(&shared, &snapshot)?;
     }
     let result = route(
-        &shared, service, &method, &path, &query, &accept, &incoming, body_len,
+        &shared,
+        service,
+        RoutedRequest {
+            method: &method,
+            path: &path,
+            query: &query,
+            accept: &accept,
+            incoming: &incoming,
+            body_len,
+        },
     )
     .await;
     if incoming.exists() {
@@ -720,16 +727,28 @@ async fn read_fault(
     Ok(None)
 }
 
+struct RoutedRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    accept: &'a str,
+    incoming: &'a Path,
+    body_len: u64,
+}
+
 async fn route(
     shared: &Shared,
     service: FixtureService,
-    method: &str,
-    path: &str,
-    query: &str,
-    accept: &str,
-    incoming: &Path,
-    body_len: u64,
+    request: RoutedRequest<'_>,
 ) -> Result<Routed> {
+    let RoutedRequest {
+        method,
+        path,
+        query,
+        accept,
+        incoming,
+        body_len,
+    } = request;
     match service {
         FixtureService::GithubApi => github(shared, method, path, query, accept, incoming).await,
         FixtureService::GithubUpload => {
@@ -1128,31 +1147,30 @@ async fn registry_index(shared: &Shared, method: &str, path: &str) -> Result<Rou
     else {
         return Ok(Routed::Reply(simple(404, b"absent version")));
     };
-    if let Fault::VisibilityDelay { polls, expire } = &shared.setup.fault {
-        if !snapshot.crates[position].visible {
-            snapshot.fault_reached = true;
-            let last_upload = snapshot
-                .requests
-                .iter()
-                .rposition(|request| request.service == FixtureService::RegistryUpload)
-                .ok_or_else(|| invalid("visibility check missing actual upload"))?;
-            let observations = snapshot
-                .requests
-                .iter()
-                .skip(last_upload + 1)
-                .filter(|request| {
-                    request.service == FixtureService::RegistryIndex && request.path == path
-                })
-                .count();
-            if !*expire
-                && observations
-                    > usize::try_from(*polls)
-                        .map_err(|_| invalid("visibility poll count overflow"))?
-            {
-                snapshot.crates[position].visible = true;
-            }
-            save(shared, &snapshot)?;
+    if let Fault::VisibilityDelay { polls, expire } = &shared.setup.fault
+        && !snapshot.crates[position].visible
+    {
+        snapshot.fault_reached = true;
+        let last_upload = snapshot
+            .requests
+            .iter()
+            .rposition(|request| request.service == FixtureService::RegistryUpload)
+            .ok_or_else(|| invalid("visibility check missing actual upload"))?;
+        let observations = snapshot
+            .requests
+            .iter()
+            .skip(last_upload + 1)
+            .filter(|request| {
+                request.service == FixtureService::RegistryIndex && request.path == path
+            })
+            .count();
+        if !*expire
+            && observations
+                > usize::try_from(*polls).map_err(|_| invalid("visibility poll count overflow"))?
+        {
+            snapshot.crates[position].visible = true;
         }
+        save(shared, &snapshot)?;
     }
     if !snapshot.crates[position].visible {
         return Ok(Routed::Reply(simple(404, b"pending visibility")));

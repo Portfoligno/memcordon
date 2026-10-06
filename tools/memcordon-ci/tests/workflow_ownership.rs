@@ -33,6 +33,30 @@ fn set_condition(document: &mut Value, job: &str, condition: &str) {
 }
 
 #[test]
+fn rehearsal_helper_rejects_missing_assembly_and_candidate_output() {
+    let mut missing_job = fixture(RELEASE);
+    missing_job["jobs"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(Value::String("assemble".into()));
+    let error = validate(RELEASE, &missing_job).unwrap_err();
+    assert!(error.to_string().contains("assembly absent"), "{error}");
+
+    let mut missing_output = fixture(RELEASE);
+    missing_output["jobs"]["assemble"]["outputs"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(Value::String("candidate-artifact-id".into()));
+    let error = validate(RELEASE, &missing_output).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("assembly must expose the existing candidate artifact ID"),
+        "{error}"
+    );
+}
+
+#[test]
 fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
     let exact = fixture(RELEASE);
     assert_eq!(

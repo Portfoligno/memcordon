@@ -190,23 +190,14 @@ impl Fixture {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        for name in [
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "CARGO_REGISTRY_TOKEN",
-            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-            "ACTIONS_RUNTIME_TOKEN",
-            "ACTIONS_CACHE_URL",
-        ] {
-            command.env_remove(name);
-        }
+        memcordon_ci::rehearsal_support::coordinator::sanitize_child(&mut command);
         let mut child = RetiringChild(command.spawn().unwrap());
         let deadline = Instant::now() + Duration::from_secs(10);
         let record = loop {
-            if let Ok(bytes) = fs::read(&ready) {
-                if let Ok(record) = serde_json::from_slice(&bytes) {
-                    break record;
-                }
+            if let Ok(bytes) = fs::read(&ready)
+                && let Ok(record) = serde_json::from_slice(&bytes)
+            {
+                break record;
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
