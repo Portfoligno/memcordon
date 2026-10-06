@@ -5,7 +5,7 @@ use super::{
     http::{self, ReadBudget, Transport},
 };
 use crate::{CiError, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +14,7 @@ use std::{
 };
 use url::Url;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum RemoteState {
     Absent,
@@ -22,18 +22,38 @@ pub enum RemoteState {
     Conflicting { detail: String },
     Unknown { detail: String },
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectObservation {
     pub name: String,
     pub destination: String,
     pub observation: RemoteState,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicationSummary {
     pub source_commit: String,
     pub objects: Vec<ObjectObservation>,
     pub complete: bool,
     pub public: Option<bool>,
+    #[serde(default)]
+    pub writes: Vec<WriteObservation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriteObservation {
+    pub method: String,
+    pub status: Option<u16>,
+    pub transport_failed: bool,
+}
+
+/// Borrowed transaction input. Candidate fixture selections never become a tagged envelope.
+pub(crate) struct PublicationView<'a> {
+    pub version: &'a semver::Version,
+    pub commit: &'a str,
+    pub repository: &'a str,
+    pub tag_ref: &'a str,
+    pub notes: &'a str,
+    pub files: &'a [artifacts::FileRecord],
+    pub payloads: &'a [Vec<u8>],
 }
 
 #[derive(Clone)]
@@ -86,8 +106,9 @@ pub struct Publisher<'a, T: Transport> {
     transport: &'a T,
     credentials: &'a Credentials,
     budget: ReadBudget,
-    bundle: &'a LoadedBundle,
+    view: PublicationView<'a>,
     verified_registry_bytes: std::sync::Mutex<BTreeSet<String>>,
+    writes: std::sync::Mutex<Vec<WriteObservation>>,
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -116,12 +137,34 @@ impl<'a, T: Transport> Publisher<'a, T> {
         bundle: &'a LoadedBundle,
         deadline: Instant,
     ) -> Self {
+        Self::from_view(
+            transport,
+            credentials,
+            PublicationView {
+                version: &bundle.metadata.source.version,
+                commit: &bundle.metadata.source.commit,
+                repository: &bundle.metadata.source.repository,
+                tag_ref: &bundle.metadata.source.tag_ref,
+                notes: &bundle.metadata.notes,
+                files: &bundle.metadata.files,
+                payloads: &bundle.payloads,
+            },
+            deadline,
+        )
+    }
+    pub(crate) fn from_view(
+        transport: &'a T,
+        credentials: &'a Credentials,
+        view: PublicationView<'a>,
+        deadline: Instant,
+    ) -> Self {
         Self {
             transport,
             credentials,
-            bundle,
+            view,
             budget: ReadBudget::new(deadline),
             verified_registry_bytes: std::sync::Mutex::new(BTreeSet::new()),
+            writes: std::sync::Mutex::new(Vec::new()),
         }
     }
     fn get(&self, url: &Url) -> Result<http::Response> {
@@ -133,7 +176,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
         )
     }
     fn api(&self, parts: &[&str]) -> Result<Url> {
-        http::github_url(&self.bundle.metadata.source.repository, parts)
+        http::github_url(self.view.repository, parts)
     }
     fn write(
         &self,
@@ -144,14 +187,31 @@ impl<'a, T: Transport> Publisher<'a, T> {
     ) -> Result<http::Response> {
         let mut headers = self.credentials.github_headers();
         headers.push(("Content-Type".into(), content_type.into()));
-        self.transport.request(
+        let reply = self.transport.request(
             method,
             url,
             &headers,
             body,
             self.budget.deadline,
             4 * 1024 * 1024,
-        )
+        );
+        self.observe_write(method, &reply)?;
+        reply
+    }
+    fn observe_write(&self, method: &str, reply: &Result<http::Response>) -> Result<()> {
+        let mut observations = self
+            .writes
+            .lock()
+            .map_err(|_| CiError::Message("write observation owner failed".into()))?;
+        if observations.len() >= 4096 {
+            return Err(CiError::Message("write observation bound exceeded".into()));
+        }
+        observations.push(WriteObservation {
+            method: method.to_owned(),
+            status: reply.as_ref().ok().map(|response| response.status),
+            transport_failed: reply.is_err(),
+        });
+        Ok(())
     }
 
     /// Bind destination access and its current tag once, before any mutation.
@@ -163,7 +223,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             ));
         }
         let repository = http::json(&repository)?;
-        if field(&repository, "full_name")? != self.bundle.metadata.source.repository {
+        if field(&repository, "full_name")? != self.view.repository {
             return Err(CiError::Message("destination repository differs".into()));
         }
         let private = repository
@@ -171,9 +231,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             .and_then(Value::as_bool)
             .ok_or_else(|| CiError::Message("repository visibility unknown".into()))?;
         let tag = self
-            .bundle
-            .metadata
-            .source
+            .view
             .tag_ref
             .strip_prefix("refs/tags/")
             .ok_or_else(|| CiError::Message("selected full tag missing".into()))?;
@@ -195,7 +253,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 return Err(CiError::Message("cyclic destination tag".into()));
             }
             match field(&object, "type")? {
-                "commit" if sha == self.bundle.metadata.source.commit => return Ok(!private),
+                "commit" if sha == self.view.commit => return Ok(!private),
                 "commit" => {
                     return Err(CiError::Message(
                         "destination tag selects a different commit".into(),
@@ -224,7 +282,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
     }
 
     fn release(&self) -> Result<Option<Value>> {
-        let tag = self.bundle.metadata.source.version.to_string();
+        let tag = self.view.version.to_string();
         // List drafts as well as public releases; a by-tag 404 alone cannot establish
         // that an interrupted draft creation had no effect.
         let mut selected = None;
@@ -246,6 +304,13 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 if !ids.insert(id(value)?) {
                     return Err(CiError::Message("duplicate release object ID".into()));
                 }
+                if value.get("name").and_then(Value::as_str) == Some(tag.as_str())
+                    && field(value, "tag_name")? != tag
+                {
+                    return Err(CiError::Message(
+                        "managed release name/tag identity is ambiguous".into(),
+                    ));
+                }
                 if field(value, "tag_name")? == tag
                     && (value.get("draft").and_then(Value::as_bool).is_none()
                         || selected.replace(value.clone()).is_some())
@@ -261,6 +326,14 @@ impl<'a, T: Transport> Publisher<'a, T> {
                     .get("link")
                     .is_some_and(|link| link.contains("rel=\"next\""))
             {
+                if let Some(release) = &selected {
+                    if field(release, "body")? != self.view.notes
+                        || release.get("prerelease").and_then(Value::as_bool)
+                            != Some(!self.view.version.pre.is_empty())
+                    {
+                        return Err(CiError::Message("managed release metadata differs".into()));
+                    }
+                }
                 return Ok(selected);
             }
         }
@@ -409,7 +482,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 if field(&value, "name")? != package {
                     return Err(CiError::Message("registry index package differs".into()));
                 }
-                if field(&value, "vers")? == self.bundle.metadata.source.version.to_string()
+                if field(&value, "vers")? == self.view.version.to_string()
                     && row.replace(value).is_some()
                 {
                     return Err(CiError::Message("duplicate registry version row".into()));
@@ -437,7 +510,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             url.path_segments_mut().expect("HTTPS base").extend([
                 "crates",
                 package,
-                &format!("{}-{}.crate", package, self.bundle.metadata.source.version),
+                &format!("{}-{}.crate", package, self.view.version),
             ]);
             let bytes = http::download(self.transport, &self.budget, &url, &[], record.byte_len)?;
             Ok(if artifacts::check_bytes(record, &bytes).is_ok() {
@@ -464,8 +537,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             .transpose()?
             .unwrap_or_default();
         let reads: Vec<_> = self
-            .bundle
-            .metadata
+            .view
             .files
             .iter()
             .flat_map(|record| {
@@ -499,10 +571,15 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 release.get("draft").and_then(Value::as_bool) == Some(false)
             });
         Ok(PublicationSummary {
-            source_commit: self.bundle.metadata.source.commit.clone(),
+            source_commit: self.view.commit.to_owned(),
             objects,
             complete,
             public: Some(public),
+            writes: self
+                .writes
+                .lock()
+                .map_err(|_| CiError::Message("write observation owner failed".into()))?
+                .clone(),
         })
     }
 
@@ -520,7 +597,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
             Some(release) => release,
             None => {
                 let body = serde_json::to_vec(
-                    &json!({"tag_name":self.bundle.metadata.source.version,"target_commitish":self.bundle.metadata.source.commit,"name":self.bundle.metadata.source.version,"body":self.bundle.metadata.notes,"draft":true,"prerelease":!self.bundle.metadata.source.version.pre.is_empty()}),
+                    &json!({"tag_name":self.view.version,"target_commitish":self.view.commit,"name":self.view.version,"body":self.view.notes,"draft":true,"prerelease":!self.view.version.pre.is_empty()}),
                 )?;
                 let _reply =
                     self.write("POST", &self.api(&["releases"])?, &body, "application/json");
@@ -530,7 +607,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 release
             }
         };
-        for (record, bytes) in self.bundle.metadata.files.iter().zip(&self.bundle.payloads) {
+        for (record, bytes) in self.view.files.iter().zip(self.view.payloads) {
             let assets = self.assets(&release)?;
             match self.asset_state(record, assets.get(&record.name), false) {
                 RemoteState::Matching => continue,
@@ -542,7 +619,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 .path_segments_mut()
                 .expect("HTTPS base")
                 .push("repos")
-                .extend(self.bundle.metadata.source.repository.split('/'))
+                .extend(self.view.repository.split('/'))
                 .extend(["releases", &id(&release)?.to_string(), "assets"]);
             upload.query_pairs_mut().append_pair("name", &record.name);
             let _reply = self.write("POST", &upload, bytes, "application/octet-stream");
@@ -552,11 +629,10 @@ impl<'a, T: Transport> Publisher<'a, T> {
             }
         }
         for (record, bytes) in self
-            .bundle
-            .metadata
+            .view
             .files
             .iter()
-            .zip(&self.bundle.payloads)
+            .zip(self.view.payloads)
             .filter(|(record, _)| record.kind == "crate")
         {
             match self.registry_state(record) {
@@ -571,12 +647,12 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 .ok_or_else(|| CiError::Message("registry write credential absent".into()))?;
             let wire = super::registry::render_upload(
                 record.package.as_deref().expect("validated package"),
-                &self.bundle.metadata.source.version.to_string(),
+                &self.view.version.to_string(),
                 bytes,
                 &record.sha256,
             )?;
             let url = Url::parse("https://crates.io/api/v1/crates/new").expect("constant URL");
-            let _reply = self.transport.request(
+            let reply = self.transport.request(
                 "PUT",
                 &url,
                 &[
@@ -588,6 +664,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 self.budget.deadline,
                 1024 * 1024,
             );
+            self.observe_write("PUT", &reply)?;
             let slot_deadline =
                 (Instant::now() + Duration::from_secs(300)).min(self.budget.deadline);
             let mut delay = Duration::from_millis(500);
@@ -609,11 +686,12 @@ impl<'a, T: Transport> Publisher<'a, T> {
         }
         if release.get("draft").and_then(Value::as_bool) == Some(true) {
             let assets = self.assets(&release)?;
-            if !self.bundle.metadata.files.iter().all(|file| {
+            if !self.view.files.iter().all(|file| {
                 self.asset_state(file, assets.get(&file.name), false) == RemoteState::Matching
             }) {
                 return self.inspect();
             }
+            self.destination()?;
             let _reply = self.write(
                 "PATCH",
                 &self.api(&["releases", &id(&release)?.to_string()])?,
@@ -625,9 +703,9 @@ impl<'a, T: Transport> Publisher<'a, T> {
                 .ok_or_else(|| CiError::Message("release disappeared during publication".into()))?;
         }
         let mut result = self.inspect()?;
-        if result.complete && result.public == Some(true) {
+        if result.complete {
             let assets = self.assets(&release)?;
-            let records: Vec<_> = self.bundle.metadata.files.iter().collect();
+            let records: Vec<_> = self.view.files.iter().collect();
             let observations = crate::public_reads::map_public_reads_ordered(
                 &records,
                 std::num::NonZeroUsize::new(4).expect("positive fixed worker ceiling"),
@@ -641,7 +719,7 @@ impl<'a, T: Transport> Publisher<'a, T> {
                     if let Some(asset) = asset.as_object_mut() {
                         asset.remove("digest");
                     }
-                    Ok(self.asset_state(record, Some(&asset), true))
+                    Ok(self.asset_state(record, Some(&asset), result.public == Some(true)))
                 },
             )?;
             for (record, observation) in records.into_iter().zip(observations) {
@@ -670,7 +748,7 @@ pub fn run(directory: &Path, write: bool) -> Result<()> {
         &transport,
         &credentials,
         &bundle,
-        Instant::now() + Duration::from_secs(3700),
+        Instant::now() + Duration::from_secs(20 * 60),
     );
     let result = if write {
         publisher.publish()?

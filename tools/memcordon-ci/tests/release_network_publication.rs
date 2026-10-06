@@ -272,7 +272,7 @@ impl Transport for PublicationRemote<'_> {
         match path {
             "/repos/example/repository"=>Ok(json_response(json!({"full_name":"example/repository","private":false}))),
             "/repos/example/repository/git/ref/tags/1.2.3"=>Ok(json_response(json!({"object":{"type":"commit","sha":self.bundle.metadata.source.commit}}))),
-            "/repos/example/repository/releases"=>Ok(json_response(json!([{"id":7,"tag_name":"1.2.3","draft":!*self.public.lock().unwrap()}]))),
+            "/repos/example/repository/releases"=>Ok(json_response(json!([{"id":7,"tag_name":"1.2.3","body":self.bundle.metadata.notes,"prerelease":false,"draft":!*self.public.lock().unwrap()}]))),
             "/repos/example/repository/releases/7/assets"=>Ok(json_response(Value::Array(self.bundle.metadata.files.iter().enumerate().map(|(index,row)| json!({"id":100+index,"name":row.name,"size":row.byte_len,"state":"uploaded","digest":format!("sha256:{}",row.sha256)})).collect()))),
             _=>{
                 let index=path.strip_prefix("/repos/example/repository/releases/assets/").expect("unexpected publication URL").parse::<usize>().unwrap()-100;

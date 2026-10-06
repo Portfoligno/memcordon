@@ -1866,7 +1866,289 @@ fn check_release_row(
     Ok(())
 }
 
+const REHEARSAL_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin memcordon-release-rehearsal";
+const REHEARSAL_RUN: &str = "./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results";
+const RECOVERY_REHEARSAL_CONDITION: &str = "needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')";
+
+fn check_rehearsal_download(
+    value: &Value,
+    artifact: &str,
+    path: &str,
+    condition: Option<&str>,
+    original: bool,
+) -> Result<()> {
+    let step = mapping(value, "rehearsal download")?;
+    exact_mapping_keys(
+        step,
+        if condition.is_some() {
+            &["if", "uses", "with"]
+        } else {
+            &["uses", "with"]
+        },
+        "rehearsal download",
+    )?;
+    if scalar(step, "uses")
+        != Some("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+        || scalar(step, "if") != condition
+    {
+        return Err(failure("rehearsal download action/selection differs"));
+    }
+    let inputs = mapping(&value["with"], "rehearsal download inputs")?;
+    exact_mapping_keys(
+        inputs,
+        if original {
+            &[
+                "artifact-ids",
+                "path",
+                "merge-multiple",
+                "digest-mismatch",
+                "run-id",
+                "repository",
+                "github-token",
+            ]
+        } else {
+            &["artifact-ids", "path", "merge-multiple", "digest-mismatch"]
+        },
+        "rehearsal download inputs",
+    )?;
+    if scalar(inputs, "artifact-ids") != Some(artifact)
+        || scalar(inputs, "path") != Some(path)
+        || scalar(inputs, "digest-mismatch") != Some("error")
+        || inputs.get(key("merge-multiple")).and_then(Value::as_bool) != Some(true)
+        || original
+            && (scalar(inputs, "run-id")
+                != Some("${{ needs.recovery-inputs.outputs.original-run-id }}")
+                || scalar(inputs, "repository") != Some("${{ github.repository }}")
+                || scalar(inputs, "github-token") != Some("${{ github.token }}"))
+    {
+        return Err(failure(
+            "rehearsal must download the exact current or original pair",
+        ));
+    }
+    Ok(())
+}
+
+fn check_rehearsal_job(jobs: &Mapping, recovery: bool) -> Result<()> {
+    let name = if recovery {
+        "recovery-rehearse"
+    } else {
+        "rehearse"
+    };
+    let value = jobs
+        .get(key(name))
+        .ok_or_else(|| failure("required rehearsal absent"))?;
+    let job = mapping(value, "rehearsal job")?;
+    exact_mapping_keys(
+        job,
+        &[
+            "name",
+            "needs",
+            "if",
+            "runs-on",
+            "timeout-minutes",
+            "permissions",
+            "steps",
+        ],
+        "rehearsal job",
+    )?;
+    if scalar(job, "name")
+        != Some(if recovery {
+            "Release recovery rehearsal"
+        } else {
+            "Release rehearsal"
+        })
+        || scalar(job, "if")
+            != Some(if recovery {
+                RECOVERY_REHEARSAL_CONDITION
+            } else {
+                "needs.select.outputs.recovery-mode == 'reprepare'"
+            })
+        || scalar(job, "runs-on") != Some("ubuntu-24.04")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(60)
+    {
+        return Err(failure("rehearsal name, mode, host or budget differs"));
+    }
+    exact_string_sequence(
+        &value["needs"],
+        if recovery {
+            &["select", "recovery-inputs"]
+        } else {
+            &["select", "assemble"]
+        },
+        "rehearsal successful prerequisites",
+    )?;
+    let permissions = mapping(&value["permissions"], "rehearsal permissions")?;
+    exact_mapping_keys(
+        permissions,
+        if recovery {
+            &["contents", "actions"]
+        } else {
+            &["contents"]
+        },
+        "rehearsal permissions",
+    )?;
+    if permissions
+        .values()
+        .any(|value| value.as_str() != Some("read"))
+    {
+        return Err(failure(
+            "rehearsal may only read source and original artifacts",
+        ));
+    }
+    let steps = ordinary_steps(job, "rehearsal steps")?;
+    let download_count = if recovery { 3 } else { 5 };
+    if steps.len() != download_count + 4 {
+        return Err(failure(
+            "rehearsal cannot compile, authenticate, cache or omit work",
+        ));
+    }
+    check_rehearsal_download(
+        &steps[0],
+        "${{ needs.select.outputs.rehearsal-tool-artifact-id }}",
+        ".release/rehearsal-tool",
+        None,
+        false,
+    )?;
+    if recovery {
+        check_rehearsal_download(
+            &steps[1],
+            "${{ needs.recovery-inputs.outputs.tool-artifact-id }}",
+            ".release/tool",
+            None,
+            true,
+        )?;
+        check_rehearsal_download(
+            &steps[2],
+            "${{ needs.recovery-inputs.outputs.prepared-artifact-id }}",
+            ".release/rehearsal-input",
+            None,
+            true,
+        )?;
+    } else {
+        for (index, artifact, path, condition) in [
+            (
+                1,
+                "${{ needs.select.outputs.preparation-tool-artifact-id }}",
+                ".release/tool",
+                "needs.select.outputs.preparation-kind == 'candidate'",
+            ),
+            (
+                2,
+                "${{ needs.assemble.outputs.publication-tool-artifact-id }}",
+                ".release/tool",
+                "needs.select.outputs.preparation-kind == 'tagged'",
+            ),
+            (
+                3,
+                "${{ needs.assemble.outputs.candidate-artifact-id }}",
+                ".release/rehearsal-input",
+                "needs.select.outputs.preparation-kind == 'candidate'",
+            ),
+            (
+                4,
+                "${{ needs.assemble.outputs.prepared-artifact-id }}",
+                ".release/rehearsal-input",
+                "needs.select.outputs.preparation-kind == 'tagged'",
+            ),
+        ] {
+            check_rehearsal_download(&steps[index], artifact, path, Some(condition), false)?;
+        }
+    }
+    for (offset, run) in [
+        "tar -xzf .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz -C .release/rehearsal-tool",
+        "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool",
+        REHEARSAL_RUN,
+    ].into_iter().enumerate() {
+        let step = mapping(&steps[download_count + offset], "rehearsal invocation")?;
+        exact_mapping_keys(step, if offset == 2 { &["id", "run"] } else { &["run"] }, "required rehearsal invocation")?;
+        if scalar(step, "run") != Some(run) || offset == 2 && scalar(step, "id") != Some("rehearsal") {
+            return Err(failure("rehearsal must execute downloaded helper and publisher unconditionally"));
+        }
+    }
+    let diagnostic = &steps[download_count + 3];
+    let expected: Value = serde_yaml::from_str(if recovery {
+        "name: Retain recovery rehearsal diagnostics\nif: always()\ncontinue-on-error: true\nuses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\nwith:\n  name: recovery-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}\n  path: .release/rehearsal-results\n  if-no-files-found: warn\n  retention-days: 7\n  include-hidden-files: true\n  overwrite: false\n"
+    } else {
+        "name: Retain rehearsal diagnostics\nif: always()\ncontinue-on-error: true\nuses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\nwith:\n  name: rehearsal-${{ github.run_id }}-${{ github.run_attempt }}\n  path: .release/rehearsal-results\n  if-no-files-found: warn\n  retention-days: 7\n  include-hidden-files: true\n  overwrite: false\n"
+    }).map_err(|error| failure(format!("invalid rehearsal diagnostic contract: {error}")))?;
+    if diagnostic != &expected {
+        return Err(failure(
+            "rehearsal diagnostics must be bounded, optional and nonauthoritative",
+        ));
+    }
+    Ok(())
+}
+
+fn check_rehearsal_tool(jobs: &Mapping) -> Result<()> {
+    let select = jobs
+        .get(key("select"))
+        .ok_or_else(|| failure("selection absent"))?;
+    if select["outputs"]["rehearsal-tool-artifact-id"].as_str()
+        != Some("${{ steps.rehearsal-tool.outputs.artifact-id }}")
+    {
+        return Err(failure(
+            "selection must expose actual rehearsal helper artifact ID",
+        ));
+    }
+    let steps = select["steps"]
+        .as_sequence()
+        .ok_or_else(|| failure("selection steps absent"))?;
+    let build = steps
+        .iter()
+        .position(|step| step["run"].as_str() == Some(REHEARSAL_DRIVER_BUILD))
+        .ok_or_else(|| failure("selection must build both CI binaries once"))?;
+    let selection = steps
+        .iter()
+        .position(|step| step["id"].as_str() == Some("source"))
+        .ok_or_else(|| failure("source selection absent"))?;
+    let pack = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str() == Some("./target/ci/release/memcordon-ci release rehearsal-tool")
+        })
+        .ok_or_else(|| failure("rehearsal helper packaging absent"))?;
+    let upload = steps
+        .iter()
+        .position(|step| step["id"].as_str() == Some("rehearsal-tool"))
+        .ok_or_else(|| failure("rehearsal helper upload absent"))?;
+    if !(build < selection && selection < pack && pack < upload)
+        || steps
+            .iter()
+            .filter(|step| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.contains("cargo build"))
+            })
+            .count()
+            != 1
+        || [build, pack, upload].into_iter().any(|index| {
+            !steps[index]["if"].is_null() || !steps[index]["continue-on-error"].is_null()
+        })
+    {
+        return Err(failure(
+            "helper build/pack/upload must succeed in both recovery modes",
+        ));
+    }
+    let expected: Value = serde_yaml::from_str("id: rehearsal-tool\nuses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\nwith:\n  name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}\n  path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz\n  if-no-files-found: error\n  include-hidden-files: true\n  overwrite: false\n").map_err(|error| failure(format!("invalid helper upload contract: {error}")))?;
+    if steps[upload] != expected {
+        return Err(failure(
+            "helper must be a separate immutable single-executable archive",
+        ));
+    }
+    if jobs[&key("assemble")]["outputs"]["candidate-artifact-id"].as_str()
+        != Some("${{ steps.candidate.outputs.artifact-id }}")
+    {
+        return Err(failure(
+            "assembly must expose the existing candidate artifact ID",
+        ));
+    }
+    Ok(())
+}
+
 fn check_release_structure(jobs: &Mapping) -> Result<()> {
+    check_rehearsal_tool(jobs)?;
+    check_rehearsal_job(jobs, false)?;
+    check_rehearsal_job(jobs, true)?;
     for (name, value) in jobs {
         let name = name
             .as_str()
@@ -2097,10 +2379,87 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             return Err(failure("publication must serialize without cancellation"));
         }
         let publisher_steps = ordinary_steps(publish, "publisher")?;
+        if publish.contains_key(key("continue-on-error")) || publisher_steps.len() != 5 {
+            return Err(failure(
+                "publisher cannot hide failure or add substitute execution",
+            ));
+        }
+        for (index, path, current_id, original_id) in [
+            (
+                0,
+                ".release/tool",
+                "${{ needs.assemble.outputs.publication-tool-artifact-id }}",
+                "${{ needs.recovery-inputs.outputs.tool-artifact-id }}",
+            ),
+            (
+                1,
+                ".release/prepared",
+                "${{ needs.assemble.outputs.prepared-artifact-id }}",
+                "${{ needs.recovery-inputs.outputs.prepared-artifact-id }}",
+            ),
+        ] {
+            let value = &publisher_steps[index];
+            let step = mapping(value, "publisher original-byte download")?;
+            exact_mapping_keys(step, &["uses", "with"], "publisher download")?;
+            let inputs = mapping(&value["with"], "publisher download inputs")?;
+            exact_mapping_keys(
+                inputs,
+                if writer == "publish" {
+                    &[
+                        "artifact-ids",
+                        "run-id",
+                        "github-token",
+                        "path",
+                        "merge-multiple",
+                        "digest-mismatch",
+                    ]
+                } else {
+                    &[
+                        "artifact-ids",
+                        "run-id",
+                        "repository",
+                        "github-token",
+                        "path",
+                        "merge-multiple",
+                        "digest-mismatch",
+                    ]
+                },
+                "publisher download inputs",
+            )?;
+            if scalar(step, "uses")
+                != Some("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+                || scalar(inputs, "artifact-ids")
+                    != Some(if writer == "publish" {
+                        current_id
+                    } else {
+                        original_id
+                    })
+                || scalar(inputs, "run-id")
+                    != Some(if writer == "publish" {
+                        "${{ github.run_id }}"
+                    } else {
+                        "${{ needs.recovery-inputs.outputs.original-run-id }}"
+                    })
+                || scalar(inputs, "path") != Some(path)
+                || scalar(inputs, "github-token") != Some("${{ github.token }}")
+                || scalar(inputs, "digest-mismatch") != Some("error")
+                || inputs.get(key("merge-multiple")).and_then(Value::as_bool) != Some(true)
+                || writer == "recovery-publish"
+                    && scalar(inputs, "repository") != Some("${{ github.repository }}")
+            {
+                return Err(failure(
+                    "publisher must use the same exact pair as its rehearsal",
+                ));
+            }
+        }
         let mut writes = 0;
         for step in publisher_steps {
             if let Some(run) = step.get(key("run")).and_then(Value::as_str) {
                 if run == "./.release/tool/memcordon-ci release publish" {
+                    if step.get(key("if")).is_some() || step.get(key("continue-on-error")).is_some()
+                    {
+                        return Err(failure("actual publication cannot skip or ignore failure"));
+                    }
                     writes += 1;
                 } else if run
                     != "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool"
@@ -2137,9 +2496,9 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 .get(key("needs"))
                 .ok_or_else(|| failure("writer dependencies absent"))?,
             if writer == "publish" {
-                &["select", "assemble"]
+                &["select", "assemble", "rehearse"]
             } else {
-                &["select", "recovery-inputs"]
+                &["select", "recovery-inputs", "recovery-rehearse"]
             },
             "writer preparation dependencies",
         )?;
@@ -2509,23 +2868,29 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
         let job = mapping(job, "preparation job")?;
         let writer = matches!(name, "publish" | "recovery-publish");
         let preparation = !writer && name != "published-consumer";
-        if name == "recovery-inputs" && !job.contains_key(key("permissions")) {
+        if matches!(name, "recovery-inputs" | "rehearse" | "recovery-rehearse")
+            && !job.contains_key(key("permissions"))
+        {
             return Err(failure(
                 "recovery validation requires explicit read-only artifact access",
             ));
         }
         if preparation && let Some(permissions) = job.get(key("permissions")) {
             let permissions = mapping(permissions, "preparation permissions")?;
-            if name != "recovery-inputs" {
+            if !matches!(name, "recovery-inputs" | "rehearse" | "recovery-rehearse") {
                 return Err(failure("preparation must inherit read-only permissions"));
             }
             exact_mapping_keys(
                 permissions,
-                &["contents", "actions"],
+                if name == "rehearse" {
+                    &["contents"]
+                } else {
+                    &["contents", "actions"]
+                },
                 "recovery read permissions",
             )?;
             if scalar(permissions, "contents") != Some("read")
-                || scalar(permissions, "actions") != Some("read")
+                || name != "rehearse" && scalar(permissions, "actions") != Some("read")
             {
                 return Err(failure(
                     "recovery validation requires only source and artifact read permissions",
@@ -2620,8 +2985,14 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
                     ));
                 }
                 if scalar(with, "if-no-files-found") == Some("warn") {
-                    diagnostic |=
-                        scalar(step, "name") == Some("Retain bounded preparation diagnostics");
+                    diagnostic |= matches!(
+                        scalar(step, "name"),
+                        Some(
+                            "Retain bounded preparation diagnostics"
+                                | "Retain rehearsal diagnostics"
+                                | "Retain recovery rehearsal diagnostics"
+                        )
+                    );
                     if scalar(step, "if") != Some("always()")
                         || step.get(key("continue-on-error")).and_then(Value::as_bool) != Some(true)
                     {
@@ -2864,6 +3235,7 @@ struct RustPolicy {
     calls_env_remove: bool,
     subprocess_env_mutations: usize,
     standard_path_mutations: usize,
+    standard_proxy_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -2939,6 +3311,11 @@ impl<'ast> Visit<'ast> for RustPolicy {
             {
                 self.standard_path_mutations += 1;
             }
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "http_proxy" | "https_proxy" | "all_proxy" | "NO_PROXY" | "no_proxy"))
+            {
+                self.standard_proxy_mutations += 1;
+            }
         }
         syn::visit::visit_expr_method_call(self, expression);
     }
@@ -2965,6 +3342,8 @@ fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
         || [
             Path::new("tools/memcordon-ci/src/command.rs"),
             Path::new("tools/memcordon-ci/src/release/git.rs"),
+            Path::new("tools/memcordon-ci/src/rehearsal_support/coordinator.rs"),
+            Path::new("tools/memcordon-ci/tests/release_rehearsal_http.rs"),
         ]
         .contains(&relative)
 }
@@ -3005,9 +3384,13 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     ]
     .contains(&relative)
         && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
+    let proxy_fixture = relative
+        == Path::new("tools/memcordon-ci/tests/release_rehearsal_transport.rs")
+        && visitor.subprocess_env_mutations == visitor.standard_proxy_mutations;
     if visitor.subprocess_env_mutations != 0
         && relative != sealed_launch
         && !native_path_fixture
+        && !proxy_fixture
         && !reviewed_git_environment(relative)
     {
         visitor

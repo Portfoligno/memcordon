@@ -3,7 +3,8 @@
 The Rust release workflow prepares exact public crate and native archive bytes
 from branch candidates or an existing unsigned annotated release tag. Only tagged
 preparation can be published. Source, package, native-test and installed-consumer
-checks gate preparation and publication.
+checks gate preparation. Mandatory runner-local HTTP rehearsal follows assembly
+and gates publication.
 Installed workload permission is checked separately through live authentication
 and native resource checks, with local administrator grants for contract-bound
 launches.
@@ -81,6 +82,40 @@ before the next channel starts. Assembly waits for every required successful lea
 The credentialed publisher consumes the prepared bytes and publication executable
 without a checkout, Cargo build or compilation cache.
 
+Assembly is followed by `Release rehearsal` for both candidates and tagged
+preparation. Selection builds the separate unpublished
+`memcordon-release-rehearsal` helper beside the driver; its single-executable
+archive does not change the original publication-tool archive or product packages.
+The job downloads exact input and publisher IDs, then runs the original publisher
+process against disposable file-backed loopback HTTP fixtures. It compiles and
+installs nothing. Candidates retain `candidate.json` and their selected notes
+disposition; unavailable notes use an explicitly labeled fixture placeholder.
+Candidate bytes never become a tagged envelope or a production publication input.
+
+Rehearsal checks actual requests, committed bodies, exposed-byte readback,
+interruption, fresh-process retry and observed child retirement. Its reports are
+bounded diagnostics under `.release/rehearsal-results`, uploaded best-effort for
+seven days; they are never consumed by the publisher or installed with MemCordon.
+No certificate, staging controller, enrollment or new publication authority is
+required. Rehearsal has no production credentials and addresses only owned
+numeric-loopback fixtures. It does not establish live account access, OIDC, TLS or
+provider availability; real publication still authenticates and reconciles its
+actual destinations.
+
+For an already assembled local input, run the built helper with the publisher
+which belongs to that input:
+
+```console
+./target/ci/release/memcordon-release-rehearsal run --publisher target/ci/release/memcordon-ci --input .release/prepared-candidate --report-dir .release/rehearsal-results
+```
+
+Use the exact prepared or original recovery pair for tagged input. The input and
+publisher remain immutable; reports and fixture state occupy separate directories.
+The helper reserves minute 49 for ending case work and minute 50 for settlement,
+inside each job's 60-minute envelope. These are planning bounds, not measured
+performance. A failed or canceled rehearsal blocks its publisher even if optional
+diagnostics cannot be retained.
+
 Prepared output includes `manifest.json`, checksums, release notes and
 `compatibility.json`; each native archive includes `package.json` and its actual
 runtime manifest. These describe measured members, selected features, protocol
@@ -100,6 +135,22 @@ same tag. `--mode publication-only` additionally requires the exact original run
 prepared-artifact and publication-tool artifact IDs. Recovery verifies their source,
 names, bytes and producer association before using them. Expired or unverifiable
 artifacts require repreparation.
+
+Publication-only recovery also requires this invocation's fresh `Release recovery
+rehearsal`. Both it and `recovery-publish` download the validated original
+prepared/tool IDs from the original run. The current helper coordinates the test
+but runs the original publication executable; it never substitutes a newly built
+publisher. An old executable without the hidden rehearsal interface fails
+compatibility explicitly. Reprepare at the same supported tag when necessary;
+do not move historical tags or treat their older workflow as retroactively tested.
+Matching destination bytes can be adopted without a local progress receipt;
+uncertain/conflicting state stops without automatic deletion, overwrite or yanking.
+
+The live writer has a single 20-minute operation allowance inside its existing
+30-minute job. Each registry-visibility slot remains capped at 300 seconds and the
+remaining shared allowance. Exhaustion may leave actual partial publication;
+recover from the same original bytes instead of extending the deadline or claiming
+rollback. Local fixture cleanup is separate from remote publication effects.
 
 The source-controlled `public_consumer` distribution option selects a final registry
 consumer. It checks all four exposed crate archives, compiles a downstream program
@@ -134,6 +185,14 @@ do not require a Release-only check absent on fork PRs. A skipped job's successf
 display is not executed coverage and cannot hide a failed or canceled owner.
 Editing workflow files does not update branch protection automatically; no live
 settings migration or successful representative event run is implied here.
+
+Keep `Release rehearsal` and `Release recovery rehearsal` names stable. Inventory
+required-check settings administratively before relying on them: candidates use
+the normal gate, while publication-only recovery uses the separate original-pair
+gate. A skipped sibling is not executed rehearsal. If the new test infrastructure
+fails, pause publication and fix it; removing its success dependency is a separate
+maintainer policy decision, never an automatic fallback. No required-check setting
+change or hosted rehearsal outcome is implied by the source change.
 
 The complete macOS suite validates current native and acceptance phase reports
 locally before reporting completion. Standalone macOS assessment remains for

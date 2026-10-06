@@ -13,6 +13,9 @@ pub mod public_consumer;
 pub mod publish;
 pub mod recovery;
 pub mod registry;
+pub mod rehearsal;
+pub mod rehearsal_input;
+pub mod rehearsal_tool;
 pub mod source;
 pub mod tag;
 pub mod target;
@@ -66,6 +69,16 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     RecoveryInputs,
+    RehearsalTool,
+    #[command(hide = true)]
+    RehearsalTransaction {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+    },
     Publish {
         #[arg(long, default_value = ".release/prepared")]
         prepared: PathBuf,
@@ -264,6 +277,12 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             }
         },
         ReleaseCommand::RecoveryInputs => recovery::recovery_inputs(root),
+        ReleaseCommand::RehearsalTool => rehearsal_tool::package(root),
+        ReleaseCommand::RehearsalTransaction {
+            input,
+            fixture,
+            result,
+        } => rehearsal::transaction(&input, &fixture, &result),
         ReleaseCommand::Publish { prepared } => publish::run(&prepared, true),
         ReleaseCommand::Inspect { prepared } => publish::run(&prepared, false),
         ReleaseCommand::BuildTarget {

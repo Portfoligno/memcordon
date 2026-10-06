@@ -52,7 +52,17 @@ collection and cleanup failures separately. Special loader experiments remain
 optional and do not enter distribution inputs.
 
 Release tooling prepares selected source and artifact bytes, exercises native and
-installed consumers, and reconciles publication state. See RELEASING.md for the
+installed consumers, rehearses the actual downloaded publisher over file-backed
+loopback HTTP, and reconciles publication state. Normal preparation and original
+publication-only recovery have separate mandatory rehearsal gates in Release;
+other workflows do not repeat them. The helper archive is separate from the
+unchanged single-publisher archive and all product inventories. Candidate identity
+is preserved and production Publish accepts only tagged prepared inputs.
+Rehearsal diagnostics are bounded observations, not publisher-consumed permissions.
+No live credential, enrolled fixture, certificate or staging authority is added.
+Actual process/effect/readback/retirement assertions are required; an arbitrary
+error or a complete summary alone cannot satisfy a case. Live provider access and
+TLS remain outside local rehearsal coverage. See RELEASING.md for the
 operating procedure. A portable test or an unavailable native host does not
 establish completed native release validation.
 Required checks and dashboards must distinguish actual branch preparation from

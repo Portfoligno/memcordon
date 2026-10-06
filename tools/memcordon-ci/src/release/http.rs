@@ -39,64 +39,98 @@ impl Transport for HttpsTransport {
         maximum: u64,
     ) -> Result<Response> {
         validate_https(url)?;
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|time| !time.is_zero())
-            .ok_or_else(|| CiError::Message("HTTPS operation deadline expired".into()))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .timeout_global(Some(remaining))
-            .timeout_connect(Some(remaining.min(Duration::from_secs(30))))
-            .build()
-            .into();
-        let mut request = ureq::http::Request::builder()
-            .method(method)
-            .uri(url.as_str());
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        let request = request
-            .body(body)
-            .map_err(|_| CiError::Message("invalid HTTPS request fields".into()))?;
-        // Never include underlying HTTP errors: those may contain a URL or authorization data.
-        let mut response = agent
-            .run(request)
-            .map_err(|_| CiError::Message("HTTPS transport failed or timed out".into()))?;
-        let status = response.status().as_u16();
-        let mut observed = BTreeMap::new();
-        for name in [
-            "location",
-            "retry-after",
-            "x-ratelimit-remaining",
-            "x-ratelimit-reset",
-            "link",
-        ] {
-            if let Some(value) = response.headers().get(name) {
-                observed.insert(
-                    name.into(),
-                    value
-                        .to_str()
-                        .map_err(|_| CiError::Message("invalid HTTP response header".into()))?
-                        .into(),
-                );
-            }
-        }
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(maximum)
-            .read_to_vec()
-            .map_err(|_| {
-                CiError::Message("HTTPS body exceeds bound or could not be read".into())
-            })?;
-        Ok(Response {
-            status,
-            headers: observed,
-            body: bytes,
-        })
+        wire_request(method, url, headers, body, deadline, maximum, false)
     }
+}
+
+/// The fixture caller validates numeric loopback before reaching this shared wire boundary.
+pub(crate) fn wire_request(
+    method: &str,
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+    maximum: u64,
+    disable_proxy: bool,
+) -> Result<Response> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|time| !time.is_zero())
+        .ok_or_else(|| CiError::Message("HTTPS operation deadline expired".into()))?;
+    let configuration = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .timeout_global(Some(remaining))
+        .timeout_connect(Some(remaining.min(Duration::from_secs(30))));
+    let configuration = if disable_proxy {
+        configuration.proxy(None)
+    } else {
+        configuration
+    };
+    let agent: ureq::Agent = configuration.build().into();
+    let mut request = ureq::http::Request::builder()
+        .method(method)
+        .uri(url.as_str());
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let request = request
+        .body(body)
+        .map_err(|_| CiError::Message("invalid HTTPS request fields".into()))?;
+    // Never include underlying HTTP errors: those may contain a URL or authorization data.
+    let mut response = agent
+        .run(request)
+        .map_err(|_| CiError::Message("HTTPS transport failed or timed out".into()))?;
+    let status = response.status().as_u16();
+    let mut observed = BTreeMap::new();
+    for name in [
+        "location",
+        "retry-after",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "link",
+    ] {
+        if let Some(value) = response.headers().get(name) {
+            observed.insert(
+                name.into(),
+                value
+                    .to_str()
+                    .map_err(|_| CiError::Message("invalid HTTP response header".into()))?
+                    .into(),
+            );
+        }
+    }
+    // The wire bound is inclusive. ureq's LimitReader rejects its next EOF
+    // probe once exactly the configured length was read. Probe at most one
+    // extra byte ourselves, rejecting overflow before retaining that byte.
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    let mut reader = response.body_mut().as_reader();
+    loop {
+        let remaining = maximum.saturating_sub(bytes.len() as u64);
+        let admission = usize::try_from(remaining.saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
+        let count = reader.read(&mut chunk[..admission]).map_err(|_| {
+            CiError::Message("HTTPS body exceeds bound or could not be read".into())
+        })?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > remaining {
+            return Err(CiError::Message(
+                "HTTPS body exceeds bound or could not be read".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(Response {
+        status,
+        headers: observed,
+        body: bytes,
+    })
 }
 
 pub fn validate_https(url: &Url) -> Result<()> {

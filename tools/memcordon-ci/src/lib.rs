@@ -16,6 +16,7 @@ pub mod native_test_plan;
 pub mod policy;
 pub mod preparation;
 pub mod public_reads;
+pub mod rehearsal_support;
 pub mod release;
 pub mod reparse_diagnostic;
 pub mod runtime_manifest;
