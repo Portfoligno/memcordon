@@ -122,15 +122,24 @@ pub fn candidate_notes(
         (exact.as_str(), NotesSelection::ExactVersion),
         ("Unreleased", NotesSelection::Unreleased),
     ] {
-        let notes = section_notes(&text, token)?;
-        if let Some(notes) = notes {
-            return Ok((selection, Some(notes)));
+        let Some(notes) = section_notes(&text, token) else {
+            continue;
+        };
+        if notes.trim().is_empty() {
+            if selection == NotesSelection::ExactVersion {
+                return Err(CiError::Message(
+                    "selected candidate changelog section is empty".into(),
+                ));
+            }
+            // A new development cycle may have no Unreleased notes yet.
+            continue;
         }
+        return Ok((selection, Some(notes)));
     }
     Ok((NotesSelection::Unavailable, None))
 }
 
-fn section_notes(text: &str, token: &str) -> Result<Option<String>> {
+fn section_notes(text: &str, token: &str) -> Option<String> {
     let mut selected = false;
     let mut present = false;
     let mut notes = String::new();
@@ -151,12 +160,7 @@ fn section_notes(text: &str, token: &str) -> Result<Option<String>> {
             notes.push('\n');
         }
     }
-    if present && notes.trim().is_empty() {
-        return Err(CiError::Message(
-            "selected candidate changelog section is empty".into(),
-        ));
-    }
-    Ok(present.then_some(notes))
+    present.then_some(notes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

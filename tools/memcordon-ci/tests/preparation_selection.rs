@@ -313,26 +313,68 @@ fn candidate_notes_dispositions_do_not_relax_tagged_exact_notes() {
     let directory = tempfile::tempdir().unwrap();
     let version = "1.2.3".parse().unwrap();
     let path = directory.path().join("CHANGELOG.md");
-    for (text, expected) in [
+    for (text, expected, expected_notes) in [
         (
             "## [1.2.3]\nExact notes\n## Unreleased\nLater\n",
             NotesSelection::ExactVersion,
+            Some("Exact notes\n"),
         ),
         (
             "## Unreleased\nDevelopment notes\n",
             NotesSelection::Unreleased,
+            Some("Development notes\n"),
         ),
-        ("# Changelog\n", NotesSelection::Unavailable),
+        ("# Changelog\n", NotesSelection::Unavailable, None),
+        (
+            "## Unreleased\nLater\n## [1.2.3] - 2026-10-07\nExact notes\n## 1.2.2\nHistorical\n",
+            NotesSelection::ExactVersion,
+            Some("Exact notes\n"),
+        ),
+        (
+            "## Unreleased\nDevelopment notes\n## 1.2.2\nHistorical\n",
+            NotesSelection::Unreleased,
+            Some("Development notes\n"),
+        ),
     ] {
         fs::write(&path, text).unwrap();
         let (selection, notes) = candidate_notes(directory.path(), &version).unwrap();
         assert_eq!(selection, expected);
-        assert_eq!(notes.is_none(), expected == NotesSelection::Unavailable);
+        assert_eq!(notes.as_deref(), expected_notes);
         assert_eq!(
             changelog_notes(directory.path(), &version).is_ok(),
             expected == NotesSelection::ExactVersion
         );
     }
-    fs::write(path, "## [1.2.3]\n## Unreleased\nFallback forbidden\n").unwrap();
-    assert!(candidate_notes(directory.path(), &version).is_err());
+    for text in [
+        "## [1.2.3]\n## Unreleased\nFallback forbidden\n",
+        "## Unreleased\nFallback forbidden\n## [1.2.3]\n \t\r\n",
+    ] {
+        fs::write(&path, text).unwrap();
+        let error = candidate_notes(directory.path(), &version).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "selected candidate changelog section is empty"
+        );
+        assert!(changelog_notes(directory.path(), &version).is_err());
+    }
+
+    let development_version = "0.5.8-dev".parse().unwrap();
+    for text in [
+        "# Changelog\n\n## Unreleased\n\n## 0.5.7-rc.19 - 2026-10-07\nPrior release notes must not leak.\n",
+        "## Unreleased\r\n \t\r\n\u{2003}\r\n## 0.5.7-rc.19\r\nHistorical\r\n",
+        "## Unreleased\n",
+        "## [Unreleased]\n\t \n## 0.5.7-rc.19\nHistorical\n",
+        "## 0.5.7-rc.19\nHistorical\n",
+    ] {
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            candidate_notes(directory.path(), &development_version).unwrap(),
+            (NotesSelection::Unavailable, None),
+        );
+        assert!(changelog_notes(directory.path(), &development_version).is_err());
+    }
+    fs::write(&path, [0xff]).unwrap();
+    assert!(candidate_notes(directory.path(), &development_version).is_err());
+    let missing = tempfile::tempdir().unwrap();
+    assert!(candidate_notes(missing.path(), &development_version).is_err());
 }

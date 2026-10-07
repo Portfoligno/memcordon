@@ -881,7 +881,10 @@ fn publication_tool_zip() -> Vec<u8> {
 
 #[test]
 fn candidate_payloads_validate_and_reject_publication_before_transport() {
-    use memcordon_ci::release::{bundle::CandidateBundle, source::BuildSourceIdentity};
+    use memcordon_ci::release::{
+        bundle::{CandidateBundle, NotesSelection},
+        source::{self, BuildSourceIdentity},
+    };
     let directory = tempfile::tempdir().unwrap();
     let mut archive = zip::ZipArchive::new(Cursor::new(bundle_zip(true))).unwrap();
     archive.extract(directory.path()).unwrap();
@@ -897,12 +900,28 @@ fn candidate_payloads_validate_and_reject_publication_before_transport() {
     assert!(PreparedBundle::load(directory.path()).is_err());
     assert!(memcordon_ci::release::publish::run(directory.path(), true).is_err());
 
+    let mut unavailable = candidate.clone();
+    unavailable.notes_selection = NotesSelection::Unavailable;
+    unavailable.notes = None;
+    source::write_json(&directory.path().join("candidate.json"), &unavailable).unwrap();
+    let (loaded, _) = CandidateBundle::load(directory.path()).unwrap();
+    assert_eq!(loaded.notes_selection, NotesSelection::Unavailable);
+    assert_eq!(loaded.notes, None);
+    assert!(PreparedBundle::load(directory.path()).is_err());
+    for (selection, notes) in [
+        (NotesSelection::Unavailable, Some("Unexpected notes")),
+        (NotesSelection::Unreleased, None),
+        (NotesSelection::Unreleased, Some(" \t\n")),
+        (NotesSelection::ExactVersion, None),
+        (NotesSelection::ExactVersion, Some(" \t\n")),
+    ] {
+        let mut invalid = unavailable.clone();
+        invalid.notes_selection = selection;
+        invalid.notes = notes.map(str::to_owned);
+        source::write_json(&directory.path().join("candidate.json"), &invalid).unwrap();
+        assert!(CandidateBundle::load(directory.path()).is_err());
+    }
     // Relabeling the candidate metadata never turns it into a tagged envelope.
-    std::fs::copy(
-        directory.path().join("candidate.json"),
-        directory.path().join("prepared.json"),
-    )
-    .unwrap();
     let transport = Script::new(vec![]);
     let attempt = || -> Result<()> {
         let loaded = PreparedBundle::load(directory.path())?;
@@ -916,9 +935,18 @@ fn candidate_payloads_validate_and_reject_publication_before_transport() {
         .publish()?;
         Ok(())
     };
-    assert!(attempt().is_err());
-    assert!(transport.calls.lock().unwrap().is_empty());
-    assert!(CandidateBundle::load(directory.path()).is_err());
+    for metadata in [&candidate, &unavailable] {
+        source::write_json(&directory.path().join("candidate.json"), metadata).unwrap();
+        std::fs::copy(
+            directory.path().join("candidate.json"),
+            directory.path().join("prepared.json"),
+        )
+        .unwrap();
+        assert!(attempt().is_err());
+        assert!(transport.calls.lock().unwrap().is_empty());
+        assert!(CandidateBundle::load(directory.path()).is_err());
+        std::fs::remove_file(directory.path().join("prepared.json")).unwrap();
+    }
 
     let wrong_source = tempfile::tempdir().unwrap();
     let mut archive = zip::ZipArchive::new(Cursor::new(bundle_zip(true))).unwrap();
@@ -945,6 +973,27 @@ fn candidate_payloads_validate_and_reject_publication_before_transport() {
 
 #[test]
 fn shared_assembler_validates_real_working_source_payloads_and_target_coverage() {
+    shared_assembler_notes_fixture(
+        "## [1.2.3]\nActual fixture notes\n",
+        memcordon_ci::release::bundle::NotesSelection::ExactVersion,
+        Some("Actual fixture notes\n"),
+    );
+}
+
+#[test]
+fn shared_assembler_accepts_empty_unreleased_without_historical_notes() {
+    shared_assembler_notes_fixture(
+        "# Changelog\n\n## Unreleased\n\n## 1.2.2\nPrior release notes must not leak.\n",
+        memcordon_ci::release::bundle::NotesSelection::Unavailable,
+        None,
+    );
+}
+
+fn shared_assembler_notes_fixture(
+    changelog: &str,
+    expected_selection: memcordon_ci::release::bundle::NotesSelection,
+    expected_notes: Option<&str>,
+) {
     use memcordon_ci::release::{
         bundle::{self, CandidateBundle, NotesSelection},
         git::Git,
@@ -997,11 +1046,7 @@ fn shared_assembler_validates_real_working_source_payloads_and_target_coverage()
         )
         .unwrap();
     }
-    std::fs::write(
-        root.join("CHANGELOG.md"),
-        "## [1.2.3]\nActual fixture notes\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("CHANGELOG.md"), changelog).unwrap();
     let git = Git::new(root).unwrap();
     git.text(["init", "--quiet"]).unwrap();
     git.text(["config", "user.name", "Assembly fixture"])
@@ -1085,9 +1130,32 @@ fn shared_assembler_validates_real_working_source_payloads_and_target_coverage()
     let destination = staging.path().join("candidate-output");
     bundle::assemble_build(root, &selected, &package_dir, &targets, &destination).unwrap();
     let (loaded, _) = CandidateBundle::load(&destination).unwrap();
-    assert_eq!(loaded.notes_selection, NotesSelection::ExactVersion);
+    assert_eq!(loaded.notes_selection, expected_selection);
+    assert_eq!(loaded.notes.as_deref(), expected_notes);
     assert_eq!(loaded.source, selected);
+    assert!(destination.join("candidate.json").is_file());
+    assert!(destination.join("candidate-manifest.json").is_file());
     assert!(!destination.join("prepared.json").exists());
+    assert!(!destination.join("release-manifest.json").exists());
+    assert!(PreparedBundle::load(&destination).is_err());
+    let serialized: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination.join("candidate.json")).unwrap())
+            .unwrap();
+    assert_eq!(serialized["notes"], serde_json::json!(expected_notes));
+    if expected_selection == NotesSelection::Unavailable {
+        assert_eq!(serialized["notes_selection"], "unavailable");
+    }
+    let rehearsal =
+        memcordon_ci::release::rehearsal_input::RehearsalInput::load(&destination).unwrap();
+    assert_eq!(rehearsal.kind(), "candidate");
+    assert_eq!(rehearsal.version(), selected.version());
+    assert_eq!(rehearsal.commit(), selected.commit());
+    assert_eq!(rehearsal.notes_placeholder(), expected_notes.is_none());
+    assert_eq!(
+        rehearsal.notes(),
+        expected_notes
+            .unwrap_or("Candidate notes unavailable; fixture-only publication rehearsal.",)
+    );
     let missing = &targets[..targets.len() - 1];
     assert!(
         bundle::assemble_build(
