@@ -2,6 +2,8 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## Unreleased
+
 ## 0.5.7-rc.19 - 2026-10-07
 
 ### Added
