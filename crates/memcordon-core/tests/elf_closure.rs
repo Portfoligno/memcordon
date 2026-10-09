@@ -115,4 +115,74 @@ fn malformed_native_abi_ranges_and_loader_authority_are_rejected() {
         parse(&wrong).is_err(),
         "empty search component introduces cwd"
     );
+    let mut wrong = vector();
+    put32(&mut wrong, 176, 1);
+    put64(&mut wrong, 184, 0);
+    put64(&mut wrong, 192, 0x400000);
+    put64(&mut wrong, 208, 512);
+    put64(&mut wrong, 216, 512);
+    assert_eq!(
+        parse(&wrong).unwrap_err(),
+        "ELF string table does not resolve to one held file span",
+        "overlapping load mappings cannot select dependency bytes"
+    );
+}
+
+#[test]
+fn large_symbol_tables_read_only_finite_dependency_windows() {
+    let mut bytes = vector();
+    let table_size = 2 * 1024 * 1024;
+    bytes.resize(384 + table_size, b'x');
+    let length = bytes.len() as u64;
+    put64(&mut bytes, 96, length);
+    put64(&mut bytes, 104, length);
+    put64(&mut bytes, 296, table_size as u64);
+    let mut largest_read = 0;
+    let result = inspect(
+        |offset, output| {
+            largest_read = largest_read.max(output.len());
+            let start = offset as usize;
+            output.copy_from_slice(&bytes[start..start + output.len()]);
+            Ok(())
+        },
+        length,
+        "x86_64-unknown-linux-gnu",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.needed, ["libtest.so"]);
+    assert_eq!(result.search_paths, ["/lib"]);
+    assert_eq!(largest_read, 4097);
+
+    put64(&mut bytes, 264, table_size as u64);
+    assert_eq!(parse(&bytes).unwrap_err(), "ELF string outside table");
+    put64(&mut bytes, 264, 1);
+    put64(&mut bytes, 296, u64::MAX);
+    assert_eq!(
+        parse(&bytes).unwrap_err(),
+        "ELF string table does not resolve to one held file span"
+    );
+}
+
+#[test]
+fn referenced_names_require_termination_within_the_exact_limit_and_table() {
+    let mut bytes = vector();
+    bytes.resize(384 + 4099, b'x');
+    let length = bytes.len() as u64;
+    put64(&mut bytes, 96, length);
+    put64(&mut bytes, 104, length);
+    put64(&mut bytes, 296, 4099);
+    // Remove RUNPATH so its original bytes do not terminate the long name.
+    put64(&mut bytes, 304, 0);
+    bytes[385..].fill(b'a');
+    bytes[385 + 4096] = 0;
+    assert_eq!(parse(&bytes).unwrap().unwrap().needed[0].len(), 4096);
+    bytes[385 + 4096] = b'a';
+    bytes[385 + 4097] = 0;
+    assert!(parse(&bytes).is_err(), "4097-byte name is refused");
+    put64(&mut bytes, 296, 4097);
+    assert!(
+        parse(&bytes).is_err(),
+        "NUL outside declared table is refused"
+    );
 }

@@ -47,6 +47,8 @@ pub mod native_component_harness;
 mod native_executable;
 #[cfg(target_os = "linux")]
 mod native_package_diagnostics;
+#[cfg(target_os = "linux")]
+mod native_source_identity;
 #[cfg(any(target_os = "linux", windows))]
 pub mod original_native_components;
 pub mod packages;

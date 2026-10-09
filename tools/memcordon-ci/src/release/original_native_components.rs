@@ -672,11 +672,14 @@ fn retain_file(
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(source)?;
         let before = file.metadata()?;
-        if !before.is_file() || before.nlink() != 1 || before.len() > limit {
-            return Err(CiError::Message(
-                "original component source type/size differs".into(),
-            ));
-        }
+        super::native_source_identity::validate(
+            source,
+            before.is_file(),
+            before.nlink(),
+            before.len(),
+            limit,
+        )
+        .map_err(CiError::Message)?;
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut file)
             .take(limit + 1)

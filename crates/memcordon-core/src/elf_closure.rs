@@ -181,8 +181,8 @@ pub fn inspect(
     }
     let address = strings.ok_or("ELF dependency string table absent")?;
     let size = string_size.ok_or("ELF dependency string size absent")?;
-    if size == 0 || size > 1024 * 1024 {
-        return Err("ELF dependency string table exceeds bound".into());
+    if size == 0 {
+        return Err("ELF dependency string table is empty".into());
     }
     let candidates = loads
         .iter()
@@ -196,10 +196,23 @@ pub fn inspect(
     if candidates.len() != 1 {
         return Err("ELF string table does not resolve to one held file span".into());
     }
-    let mut bytes = vec![0; size as usize];
-    read(candidates[0], &mut bytes)?;
+    // DT_STRSZ also includes unrelated symbol names. Bound each referenced
+    // dependency string rather than allocating the entire symbol string table.
+    let mut referenced_string = |offset: u64| -> Result<String, String> {
+        let remaining = size
+            .checked_sub(offset)
+            .filter(|remaining| *remaining != 0)
+            .ok_or("ELF string outside table")?;
+        let count = remaining.min(4097) as usize;
+        let mut bytes = [0; 4097];
+        let position = candidates[0]
+            .checked_add(offset)
+            .ok_or("ELF string offset overflow")?;
+        read(position, &mut bytes[..count])?;
+        string(&bytes[..count], 0)
+    };
     for offset in required {
-        let name = string(&bytes, offset)?;
+        let name = referenced_string(offset)?;
         if name.contains('/') || name == "." || name == ".." {
             return Err("ELF needed dependency is not a library basename".into());
         }
@@ -208,7 +221,7 @@ pub fn inspect(
         }
     }
     for offset in paths {
-        for path in string(&bytes, offset)?.split(':') {
+        for path in referenced_string(offset)?.split(':') {
             if path.is_empty() {
                 return Err("ELF search path includes ambient cwd".into());
             }
