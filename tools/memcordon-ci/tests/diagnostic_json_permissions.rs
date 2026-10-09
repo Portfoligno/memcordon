@@ -41,3 +41,37 @@ fn oversized_diagnostic_does_not_replace_existing_observation() {
         0o644
     );
 }
+
+#[test]
+fn readable_native_failure_snapshot_retains_unresolved_owner_state() {
+    use memcordon_ci::consumer_readiness_ledger::{CellEvidence, SourceIdentity};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("component-failure.json");
+    let cell = CellEvidence {
+        format: "memcordon.consumer-readiness.cell".into(),
+        revision: 1,
+        identity: SourceIdentity {
+            run_id: "failed-native-run".into(),
+            source_commit: "1".repeat(40),
+            source_tree_sha256: "2".repeat(64),
+            version: "0.5.8-dev".into(),
+        },
+        key: memcordon_readiness_verifier::ProductKey {
+            target: "aarch64-unknown-linux-gnu".into(),
+            channel: "candidate-native".into(),
+        },
+        product: None,
+        component_build: None,
+        records: Vec::new(),
+        artifacts: Vec::new(),
+        cleanup_failures: vec!["original native recovery remains unresolved".into()],
+        cache_quiescent: false,
+    };
+    source::write_diagnostic_json(&path, &cell).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    let restored: CellEvidence = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(!restored.cache_quiescent);
+    assert!(restored.product.is_none());
+    assert_eq!(restored.cleanup_failures, cell.cleanup_failures);
+    assert_eq!(restored.identity.source_commit, cell.identity.source_commit);
+}

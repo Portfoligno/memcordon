@@ -871,6 +871,7 @@ impl NativeLinuxPackageLease {
             .last()
             .ok_or_else(|| CiError::Message("held package administrator parent absent".into()))?
             .sync_all()?;
+        let held_agent = super::native_executable::retain_readonly(&agent, held_agent)?;
         let legacy = memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry {
             format: "memcordon.local-private-policy".into(),
             revision: 1,

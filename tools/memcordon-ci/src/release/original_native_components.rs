@@ -1203,7 +1203,9 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
         }
         cell.cache_quiescent = false;
         cell.cleanup_failures.push(error.to_string());
-        source::write_json(&destination.join("component-failure.json"), &cell)?;
+        // This failed observation is collected by the ordinary runner after
+        // privileged settlement; private native owner records stay private.
+        source::write_diagnostic_json(&destination.join("component-failure.json"), &cell)?;
         return Err(error);
     }
     destination_custody.verify()?;
