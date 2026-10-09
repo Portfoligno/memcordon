@@ -948,15 +948,9 @@ pub(crate) fn validate_export_execution_graph(
         }
     }
     let result_parent =
-        std::path::Path::new(row["result"].as_str().ok_or("export result path absent")?)
-            .parent()
+        crate::linux_path::parent(row["result"].as_str().ok_or("export result path absent")?)
             .ok_or("export result parent absent")?;
-    if args[17]
-        != result_parent
-            .join("observations")
-            .to_str()
-            .ok_or("export original observation path is not UTF8")?
-            .as_bytes()
+    if args[17] != crate::linux_path::join(&result_parent, "observations").as_bytes()
         || args[22] != challenge_hex.as_bytes()
         || args[23] != scenario.as_bytes()
     {
@@ -1404,13 +1398,11 @@ pub(crate) fn validate_export_external_helper(
         .ok_or("original acquired helper digest absent")?;
     crate::digest(fixture)?;
     let row = crate::wire::json(custody.bytes(&e.observation)?)?;
-    let directory = std::path::Path::new(
+    let directory = crate::linux_path::parent(
         row["challenge"]
             .as_str()
             .ok_or("export original challenge native path absent")?,
     )
-    .parent()
-    .and_then(|path| path.to_str())
     .ok_or("export original helper cwd absent")?;
     if invocation["format"] != "memcordon.linux-external-export-helper-invocation"
         || invocation["revision"] != 1
@@ -1519,9 +1511,7 @@ pub(crate) fn validate_export_external_helper(
     if ancestry.is_empty() {
         return Err("external helper capture ancestry empty".into());
     }
-    let components = std::path::Path::new(directory)
-        .ancestors()
-        .collect::<Vec<_>>();
+    let components = crate::linux_path::ancestors(&directory);
     if ancestry.len() != components.len() {
         return Err("external helper capture ancestry does not cover exact original cwd".into());
     }
@@ -1530,9 +1520,10 @@ pub(crate) fn validate_export_external_helper(
         let mode = stamp["mode"]
             .as_u64()
             .ok_or("external capture native mode absent")?;
-        let sticky_tmp = components[components.len() - 1 - ordinal] == std::path::Path::new("/tmp")
-            && directory != "/tmp"
-            && mode & 0o1000 != 0;
+        let sticky_tmp =
+            crate::linux_path::equivalent(&components[components.len() - 1 - ordinal], "/tmp")
+                && directory != "/tmp"
+                && mode & 0o1000 != 0;
         if stamp["ordinal"] != ordinal
             || stamp["uid"] != 0
             || stamp["gid"].as_u64().is_none()
@@ -1931,10 +1922,8 @@ pub(crate) fn validate_export_recovery(
     let prepared_path = row["prepared"]
         .as_str()
         .ok_or("export original prepared native path absent")?;
-    let directory = std::path::Path::new(prepared_path)
-        .parent()
-        .and_then(|path| path.to_str())
-        .ok_or("export recovery original cwd absent")?;
+    let directory =
+        crate::linux_path::parent(prepared_path).ok_or("export recovery original cwd absent")?;
     let cwd: Vec<u8> = serde_json::from_value(invocation["cwd_native_bytes"].clone())
         .map_err(|error| error.to_string())?;
     if invocation["format"] != "memcordon.linux-export-recovery-invocation"

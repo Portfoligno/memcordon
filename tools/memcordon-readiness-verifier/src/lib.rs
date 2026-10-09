@@ -15,6 +15,7 @@ mod linux_component;
 mod linux_cross_account;
 mod linux_cross_attempt;
 mod linux_isolation;
+mod linux_path;
 pub use linux_account_refusal::LinuxAccountRefusalEvidence;
 mod linux_import_refusal;
 pub use linux_import_refusal::LinuxIsolationImportEvidence;

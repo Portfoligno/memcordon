@@ -27,6 +27,23 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn cross_account_rejects_rehashed_windows_separator_source_aliases() {
+    for field in ["native_readback", "group_readback"] {
+        let mut case = linux_cross_attempt_case::baseline();
+        case.validate().unwrap();
+        case.mutate("cross/canary.json", |raw| {
+            let path = raw["peer_account"][field].as_str().unwrap();
+            raw["peer_account"][field] = json!(path.replace('/', "\\"));
+        });
+        assert_eq!(
+            case.validate().unwrap_err(),
+            "cross original secondary source paths differ",
+            "{field} accepted a Windows separator as Linux source custody"
+        );
+    }
+}
+
+#[test]
 fn complete_original_concurrent_other_attempt_abstract() {
     let mut case = linux_cross_attempt_case::baseline();
     case.validate().unwrap();

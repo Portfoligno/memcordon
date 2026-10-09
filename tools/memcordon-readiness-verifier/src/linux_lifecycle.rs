@@ -1015,25 +1015,16 @@ fn validate_frontend(
         return Err("lifecycle original frontend paths/target arguments differ".into());
     }
     let report = std::str::from_utf8(&arguments[15]).map_err(|error| error.to_string())?;
-    let directory = Path::new(report)
-        .parent()
+    let directory = crate::linux_path::parent(report)
         .ok_or("lifecycle original frontend result parent absent")?;
-    let original_case = directory
-        .parent()
-        .ok_or("lifecycle original case directory absent")?;
-    if directory.file_name().and_then(|name| name.to_str()) != Some("frontend")
-        || Path::new(report).file_name().and_then(|name| name.to_str()) != Some("result.json")
-        || original_case != Path::new(&context.frontend_directory)
+    let original_case =
+        crate::linux_path::parent(&directory).ok_or("lifecycle original case directory absent")?;
+    if crate::linux_path::file_name(&directory) != Some("frontend")
+        || crate::linux_path::file_name(report) != Some("result.json")
+        || !crate::linux_path::equivalent(&original_case, &context.frontend_directory)
         || arguments[11]
-            != original_case
-                .join("mixed.contract.json")
-                .as_os_str()
-                .as_encoded_bytes()
-        || arguments[17]
-            != directory
-                .join("observations")
-                .as_os_str()
-                .as_encoded_bytes()
+            != crate::linux_path::join(&original_case, "mixed.contract.json").as_bytes()
+        || arguments[17] != crate::linux_path::join(&directory, "observations").as_bytes()
     {
         return Err(
             "lifecycle frontend observation/contract scope crosses original result directory"
@@ -2307,15 +2298,12 @@ fn original_context(
     }
     let owner: Value = crate::wire::json(custody.bytes(&e.owner)?)?;
     let (acquisition, lease) = validate_owner(index, e, product, &owner, custody)?;
-    let case_directory = Path::new(
+    let case_directory = crate::linux_path::join(
         lease["artifact_root"]
             .as_str()
             .ok_or("lifecycle original artifact root absent")?,
-    )
-    .join(prefix)
-    .to_str()
-    .ok_or("lifecycle original native case scope is not UTF8")?
-    .to_owned();
+        prefix,
+    );
     let raw_parent = format!(
         "{}/{}/linux-mixed/recipe-",
         e.key.target,
@@ -2343,20 +2331,17 @@ fn original_context(
     if original_leases.len() != 1 {
         return Err("lifecycle original acquired lease path ambiguous".into());
     }
-    let native_lease = Path::new(
+    let native_lease = crate::linux_path::join(
         lease["artifact_root"]
             .as_str()
             .ok_or("lifecycle original artifact root absent")?,
-    )
-    .join(original_leases[0]);
-    let frontend_directory = native_lease
-        .parent()
-        .ok_or("lifecycle original lease parent absent")?
-        .join("mixed-cases")
-        .join(format!("recipe-{ordinal}"))
-        .to_str()
-        .ok_or("lifecycle original frontend scope not UTF8")?
-        .to_owned();
+        original_leases[0],
+    );
+    let frontend_directory = crate::linux_path::join(
+        &crate::linux_path::parent(&native_lease)
+            .ok_or("lifecycle original lease parent absent")?,
+        &format!("mixed-cases/recipe-{ordinal}"),
+    );
     let prepared = decode("prepared.json")?;
     let native = decode("prepared-native-before-ack.json")?;
     let request = decode("original-contract.json")?;

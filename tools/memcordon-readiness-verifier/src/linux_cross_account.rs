@@ -103,24 +103,23 @@ pub(crate) fn validate_creation(
     {
         return Err("cross secondary original purpose intent differs".into());
     }
-    let original_parent = std::path::Path::new(
+    let original_parent = crate::linux_path::parent(
         account["intent"]
             .as_str()
             .ok_or("cross original account intent path absent")?,
     )
-    .parent()
     .ok_or("cross original account directory absent")?;
     for (field, leaf) in [
         ("intent", "exclusive-account-intent.json"),
         ("native_readback", "exclusive-account-getent.bin"),
         ("group_readback", "exclusive-group-getent.bin"),
     ] {
-        if std::path::Path::new(
+        if !crate::linux_path::equivalent(
             account[field]
                 .as_str()
                 .ok_or("cross original account source path absent")?,
-        ) != original_parent.join(leaf)
-        {
+            &crate::linux_path::join(&original_parent, leaf),
+        ) {
             return Err("cross original secondary source paths differ".into());
         }
     }
@@ -225,16 +224,12 @@ pub(crate) fn validate_creation(
     {
         return Err("cross original useradd native image bytes differ".into());
     }
-    if !original_parent.is_absolute()
-        || original_parent.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
+    // This is retained Linux-native custody, independent of the verifier host.
+    if !original_parent.starts_with('/')
         || original_parent
-            .to_str()
-            .is_none_or(|path| path.contains('\0'))
+            .split('/')
+            .any(|component| component == "..")
+        || original_parent.contains('\0')
         || canary["held_peer"]["birth"]
             .as_u64()
             .is_none_or(|birth| birth < held.birth)
@@ -258,10 +253,7 @@ pub(crate) fn validate_creation(
                 "--",
                 name
             ])
-        || invocation["cwd"]
-            != original_parent
-                .to_str()
-                .ok_or("cross original secondary directory nonUTF8")?
+        || invocation["cwd"] != original_parent
         || invocation["intent_sha256"] != custody.hash(intent_path)?
         || creation["format"] != "memcordon.owned-readiness-account-creation"
         || creation["revision"] != 1
@@ -485,14 +477,12 @@ pub(crate) fn validate(
     {
         return Err("cross original secondary native retirement account differs".into());
     }
-    let original_cwd = std::path::Path::new(
+    let original_cwd = crate::linux_path::parent(
         account["intent"]
             .as_str()
             .ok_or("cross original account source absent")?,
     )
-    .parent()
-    .and_then(std::path::Path::parent)
-    .and_then(std::path::Path::to_str)
+    .and_then(|parent| crate::linux_path::parent(&parent))
     .ok_or("cross original retirement source directory absent")?;
     let census_leaf = retired["task_census"]
         .as_str()
@@ -599,7 +589,7 @@ pub(crate) fn validate(
         let (status, stdout) = command(
             &checks[ordinal],
             parent,
-            original_cwd,
+            &original_cwd,
             &identity,
             cell,
             "/usr/bin/getent",
@@ -621,7 +611,7 @@ pub(crate) fn validate(
         if command(
             proof,
             parent,
-            original_cwd,
+            &original_cwd,
             &identity,
             cell,
             program,
@@ -684,7 +674,7 @@ pub(crate) fn validate(
         let (status, stdout) = command(
             &absence[ordinal],
             parent,
-            original_cwd,
+            &original_cwd,
             &identity,
             cell,
             "/usr/bin/getent",

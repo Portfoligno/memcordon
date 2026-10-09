@@ -1872,20 +1872,13 @@ fn verify_preparation(
             return Err("loader actual native frontend file operands differ".into());
         }
     }
-    let result_parent = std::path::Path::new(
+    let result_parent = crate::linux_path::parent(
         receipt["result"]
             .as_str()
             .ok_or("loader result path absent")?,
     )
-    .parent()
     .ok_or("loader result parent absent")?;
-    if arguments[17]
-        != result_parent
-            .join("observations")
-            .to_str()
-            .ok_or("loader observation path not UTF8")?
-            .as_bytes()
-    {
+    if arguments[17] != crate::linux_path::join(&result_parent, "observations").as_bytes() {
         return Err("loader actual frontend observation scope differs".into());
     }
     let deadline = std::str::from_utf8(&arguments[8]).map_err(|_| "loader deadline is not UTF8")?;

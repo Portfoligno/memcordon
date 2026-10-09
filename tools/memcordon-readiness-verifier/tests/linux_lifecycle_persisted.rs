@@ -9,6 +9,40 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn original_frontend_scope_rejects_rehashed_alias_and_sibling_paths() {
+    for mutation in ["windows-separators", "sibling", "parent-traversal"] {
+        let mut case = linux_lifecycle_case::allocation_case("frontend");
+        case.validate().unwrap();
+        let path = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0/frontend-invocation.json";
+        case.mutate(path, |raw| {
+            let mut arguments: Vec<Vec<u8>> =
+                serde_json::from_value(raw["arguments"].clone()).unwrap();
+            for index in [11, 15, 17] {
+                let original = std::str::from_utf8(&arguments[index]).unwrap();
+                let changed = match mutation {
+                    "windows-separators" => original.replace("/recipe-0/", "/recipe-0\\"),
+                    "sibling" => original.replace("/recipe-0/", "/recipe-0-sibling/"),
+                    "parent-traversal" => original.replace("/recipe-0/", "/recipe-0/../recipe-0/"),
+                    _ => unreachable!(),
+                };
+                arguments[index] = changed.into_bytes();
+            }
+            raw["arguments"] = json!(arguments);
+        });
+        let command: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(case.root.path().join(path)).unwrap()).unwrap();
+        case.mutate("x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0/lifecycle-loss-raw.json", |raw| {
+            raw["observations"][0]["frontend_invocation"] = command;
+        });
+        assert_eq!(
+            case.validate().unwrap_err(),
+            "lifecycle frontend observation/contract scope crosses original result directory",
+            "{mutation} escaped original Linux frontend scope"
+        );
+    }
+}
+
+#[test]
 fn persisted_report_delivery_keeps_completed_provider_terminal_separate_from_native_write_failure()
 {
     let mut case = linux_lifecycle_case::delivery_case();
