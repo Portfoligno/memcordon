@@ -474,6 +474,10 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     /// The mixed profile clones from the protected provider context; it never
     /// joins caller mount/root/cwd authority. Original staging and received root
     /// capabilities enter the ledger before any subsequent fallible operation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The protected clone binds original root channel, independent namespaces, lifetime and finite deadline"
+    )]
     pub(super) fn spawn_mixed_namespace(
         &mut self,
         prelaunch: PrivateGatedPrelaunch,
@@ -1550,6 +1554,10 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The native component probe retains original admission, worker, owned streams, separate deadlines and pre-account callback"
+    )]
     pub(crate) fn component_execute_to_pre_account(
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,
@@ -1658,6 +1666,13 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         }
     }
 
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::type_complexity,
+            reason = "The test-only pre-account boundary observes the original lifecycle owner and operational admission together"
+        )
+    )]
     fn retire_mixed_inner(
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,

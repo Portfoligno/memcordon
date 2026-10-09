@@ -381,6 +381,10 @@ impl MountedPrivateRoot {
     /// Native socket credentials, exact held init pidfd/birth and exact
     /// transaction bindings authenticate these copied objects. JSON alone
     /// cannot manufacture this root handle.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Root transfer independently authenticates channel, held init identity, transaction, layout, administrator, and entrypoint"
+    )]
     pub(super) fn receive_from_init(
         channel: &std::os::unix::net::UnixStream,
         init: &super::private_attempt::ProcessIdentityV4,
@@ -496,6 +500,10 @@ impl MountedPrivateRoot {
     /// Copies only administrator-selected regular outputs after the native owner
     /// has retired the entire workload. The namespace root stays held until the
     /// last output is durably published; it is never returned to the frontend.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Publication failure retains the original mounted root, staging, export state, and destination for mandatory cleanup"
+    )]
     pub(super) fn export_and_close(
         self,
         retirement: &super::private_lifecycle::PrivateRetirementObservation,
@@ -820,6 +828,10 @@ impl MountedPrivateRoot {
     }
     /// Readonly image directories are traversable by the exclusive target account.
     /// Runtime store directories remain separately protected at mode 0700.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private root entry binds independent owned images, layout, staging, exclusive account, attempt, and administrator identity"
+    )]
     pub fn enter(
         runtime: InstalledRuntimeImage,
         input: InstalledRuntimeImage,
