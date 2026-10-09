@@ -46,6 +46,11 @@ pub fn retain_package_operation(
             "package-uninstall.stderr.bin",
             "package-uninstall.capture.json",
         ),
+        "verify" => (
+            "package-verify.stdout.bin",
+            "package-verify.stderr.bin",
+            "package-verify.capture.json",
+        ),
         _ => return Err("unknown package operation".to_owned()),
     };
     let streams = match &output {
@@ -283,11 +288,126 @@ pub struct InstalledWindowsPayload {
     pub artifacts: Vec<SelectedArtifact>,
     pub cli: SelectedArtifact,
     pub agent: SelectedArtifact,
+    pub components: Vec<SelectedArtifact>,
+    pub installed_components: Vec<SelectedArtifact>,
     pub fixture: SelectedArtifact,
     pub installed_agent: SelectedArtifact,
     pub installed_manifest: SelectedArtifact,
     pub provider: memcordon_core::PublicProviderBindingV1,
     pub output_directory: PathBuf,
+}
+
+/// Complete measured rc.19 Cargo runtime, acquired separately from this cell.
+/// Its CLI-only native archive cannot supply this predecessor.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsUpgradePredecessor {
+    pub format: String,
+    pub revision: u32,
+    pub payload: InstalledWindowsPayload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsLeasePhase {
+    BeforeOldInstall,
+    AfterOldInstall,
+    AfterOldVerify,
+    BeforeCurrentUpgrade,
+    AfterCurrentUpgrade,
+    BeforeUninstall,
+    AfterUninstall,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowsLeaseDeadlines {
+    pub work: std::time::Instant,
+    pub cleanup: std::time::Instant,
+    pub work_deadline_unix_millis: u64,
+    pub cleanup_deadline_unix_millis: u64,
+}
+
+impl WindowsLeaseDeadlines {
+    /// Clamp a native work operation to the original cutoff. Exhaustion is an
+    /// error before spawning; no retry receives a renewed operation budget.
+    pub fn work_budget(self, maximum: std::time::Duration) -> Result<std::time::Duration> {
+        let remaining = self
+            .work
+            .saturating_duration_since(std::time::Instant::now())
+            .min(maximum);
+        if remaining.is_zero() {
+            return Err(CiError::Message(
+                "original Windows work deadline exhausted".into(),
+            ));
+        }
+        Ok(remaining)
+    }
+    pub fn cleanup_budget(self, maximum: std::time::Duration) -> Result<std::time::Duration> {
+        let remaining = self
+            .cleanup
+            .saturating_duration_since(std::time::Instant::now())
+            .min(maximum);
+        if remaining.is_zero() {
+            return Err(CiError::Message(
+                "reserved Windows cleanup deadline exhausted; retirement uncertain".into(),
+            ));
+        }
+        Ok(remaining)
+    }
+    pub(crate) fn finite_default() -> Self {
+        let start = std::time::Instant::now();
+        let unix = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("native Windows clock precedes Unix epoch")
+                .as_millis(),
+        )
+        .expect("native Windows clock exceeds u64 milliseconds");
+        Self {
+            work: start + std::time::Duration::from_secs(135 * 60),
+            cleanup: start + std::time::Duration::from_secs(150 * 60),
+            work_deadline_unix_millis: unix
+                .checked_add(135 * 60 * 1000)
+                .expect("native Windows work deadline overflow"),
+            cleanup_deadline_unix_millis: unix
+                .checked_add(150 * 60 * 1000)
+                .expect("native Windows cleanup deadline overflow"),
+        }
+    }
+}
+
+pub struct WindowsLeaseEvent<'a> {
+    pub phase: WindowsLeasePhase,
+    pub subject: &'a InstalledWindowsPayload,
+    pub operation: Option<&'static str>,
+    pub result: Option<&'a std::result::Result<(), String>>,
+    /// Actual capture products published by retain_package_operation.
+    pub capture: Option<PathBuf>,
+    pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
+}
+
+fn lease_event<'a>(
+    phase: WindowsLeasePhase,
+    subject: &'a InstalledWindowsPayload,
+    operation: Option<&'static str>,
+    result: Option<&'a std::result::Result<(), String>>,
+) -> WindowsLeaseEvent<'a> {
+    let leaf = |suffix: &str| {
+        operation.map(|operation| {
+            subject
+                .output_directory
+                .join(format!("package-{operation}.{suffix}"))
+        })
+    };
+    WindowsLeaseEvent {
+        phase,
+        subject,
+        operation,
+        result,
+        capture: result.and_then(|_| leaf("capture.json")),
+        stdout: result.and_then(|_| leaf("stdout.bin")),
+        stderr: result.and_then(|_| leaf("stderr.bin")),
+    }
 }
 
 /// Resolve selected paths in the driver context before changing the child cwd.
@@ -352,6 +472,25 @@ impl InstalledWindowsPayload {
                 "installed cases require a selected Windows runtime payload".into(),
             ));
         }
+        let expected: std::collections::BTreeSet<_> = [
+            "memcordon",
+            "memcordon-sealed-agent",
+            "memcordon-target-desktop-bootstrap",
+            "memcordon-session-broker",
+        ]
+        .into_iter()
+        .collect();
+        if distribution
+            .binaries
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
+        {
+            return Err(CiError::Message(
+                "Windows readiness requires all four exact production components".into(),
+            ));
+        }
         let bytes = files::read_file(&payload_directory.join("runtime-manifest.json"))?;
         let manifest = RuntimeManifest::parse(&bytes).map_err(CiError::Message)?;
         if manifest.source_commit != source.commit()
@@ -365,6 +504,8 @@ impl InstalledWindowsPayload {
         }
         let mut cli = None;
         let mut agent = None;
+        let mut components = Vec::new();
+        let mut installed_components = Vec::new();
         for binary in &distribution.binaries {
             let name = target::binary_name(binary, &distribution.target);
             let component = manifest
@@ -384,9 +525,14 @@ impl InstalledWindowsPayload {
                 ));
             }
             let artifact = SelectedArtifact {
-                path: payload_directory.join(name),
+                path: payload_directory.join(&name),
                 sha256: component.sha256.clone(),
             };
+            installed_components.push(SelectedArtifact {
+                path: installed_directory.join(&name),
+                sha256: component.sha256.clone(),
+            });
+            components.push(artifact.clone());
             match component.role {
                 RuntimeComponentRole::PublicCli => cli = Some(artifact),
                 RuntimeComponentRole::SealedAgent => agent = Some(artifact),
@@ -435,6 +581,8 @@ impl InstalledWindowsPayload {
                 sha256: files::checksum(&bytes),
             },
             agent,
+            components,
+            installed_components,
             fixture,
             provider: manifest.public_binding(&bytes).map_err(CiError::Message)?,
             output_directory,
@@ -452,6 +600,14 @@ pub struct InstalledWindowsAssessment {
     pub artifacts: Vec<SelectedArtifact>,
     pub public_smoke_before: std::result::Result<(), String>,
     pub cases: Vec<InstalledCaseResult>,
+    pub positive_cases: Vec<crate::windows_consumer_readiness::CaseAssessment>,
+    pub positive_suite: std::result::Result<(), String>,
+    pub loss_cases: Vec<crate::windows_readiness_faults::LossAssessment>,
+    pub loss_suite: std::result::Result<(), String>,
+    pub capacity_cases: Vec<crate::windows_readiness_capacity::CapacityAssessment>,
+    pub capacity_suite: std::result::Result<(), String>,
+    pub refusal_cases: Vec<crate::windows_readiness_refusals::RefusalAssessment>,
+    pub refusal_suite: std::result::Result<(), String>,
     pub retained_state_recovery: std::result::Result<(), String>,
     pub public_smoke_after: std::result::Result<(), String>,
     pub package_upgrade: std::result::Result<(), String>,
@@ -465,6 +621,14 @@ impl InstalledWindowsAssessment {
             && self.public_smoke_after.is_ok()
             && self.package_upgrade.is_ok()
             && self.package_uninstall.is_ok()
+            && self.positive_suite.is_ok()
+            && self.loss_suite.is_ok()
+            && crate::windows_readiness_faults::accepted(&self.loss_cases)
+            && self.capacity_suite.is_ok()
+            && crate::windows_readiness_capacity::accepted(&self.capacity_cases)
+            && self.refusal_suite.is_ok()
+            && crate::windows_readiness_refusals::accepted(&self.refusal_cases)
+            && crate::windows_consumer_readiness::accepted(&self.positive_cases)
             && self.cases.len() == 2
             && self.cases.iter().map(|case| case.case).eq([
                 crate::windows_causal_acceptance::InstalledCase::SamplingPopulation,
@@ -481,6 +645,12 @@ pub fn run_cases_for_installed_payload(
     Err(CiError::Message(
         "selected installed Windows cases require a native Windows host".to_owned(),
     ))
+}
+
+/// Validate an acquired subject before any installation or workload mutation.
+#[cfg(windows)]
+pub(crate) fn validate_installed_selection(config: &InstalledWindowsPayload) -> Result<()> {
+    native::verify_selected(config)
 }
 
 #[cfg(windows)]
@@ -553,7 +723,7 @@ mod native {
         Ok(())
     }
 
-    fn verify_selected(config: &InstalledWindowsPayload) -> Result<()> {
+    pub(super) fn verify_selected(config: &InstalledWindowsPayload) -> Result<()> {
         let target = match std::env::consts::ARCH {
             "x86_64" => "x86_64-pc-windows-msvc",
             "aarch64" => "aarch64-pc-windows-msvc",
@@ -572,6 +742,8 @@ mod native {
             || String::from(config.provider.runtime_manifest_sha256.clone())
                 != config.installed_manifest.sha256
             || config.installed_agent.sha256 != config.agent.sha256
+            || config.components.len() != 4
+            || config.installed_components.len() != 4
         {
             return Err(CiError::Message(
                 "selected installed channel identity differs".to_owned(),
@@ -593,6 +765,7 @@ mod native {
         for artifact in config
             .artifacts
             .iter()
+            .chain(config.components.iter())
             .chain([&config.cli, &config.agent, &config.fixture])
         {
             verify_file(artifact)?;
@@ -625,18 +798,23 @@ mod native {
     fn package(
         config: &InstalledWindowsPayload,
         operation: &str,
+        deadline: std::time::Instant,
     ) -> std::result::Result<(), String> {
-        let mut command = CommandSpec::new(
-            &config.agent.path,
-            &config.output_directory,
-            Duration::from_secs(120),
-        )
-        .args(["package", operation])
-        .materialize()
-        .map_err(|error| error.to_string())?;
+        let budget = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_secs(120));
+        if budget.is_zero() {
+            return Err(
+                "original Windows installation deadline exhausted before package mutation".into(),
+            );
+        }
+        let mut command = CommandSpec::new(&config.agent.path, &config.output_directory, budget)
+            .args(["package", operation])
+            .materialize()
+            .map_err(|error| error.to_string())?;
         let output = memcordon_testkit::run_with_deadline_output_limit(
             &mut command,
-            Duration::from_secs(120),
+            budget,
             MAX_STREAM_BYTES,
         );
         retain_package_operation(&config.output_directory, operation, output)
@@ -666,13 +844,20 @@ mod native {
         .materialize()
     }
 
-    fn smoke(config: &InstalledWindowsPayload, path: &Path) -> std::result::Result<(), String> {
+    fn smoke(
+        config: &InstalledWindowsPayload,
+        path: &Path,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> std::result::Result<(), String> {
+        let budget = deadlines
+            .work_budget(Duration::from_secs(180))
+            .map_err(|error| error.to_string())?;
         let mut command =
             public_command(config, path, "exit").map_err(|error| error.to_string())?;
         command.args(["--code", "0"]);
         let output = memcordon_testkit::run_with_deadline_output_limit(
             &mut command,
-            Duration::from_secs(180),
+            budget,
             MAX_STREAM_BYTES,
         )
         .map_err(|error| error.to_string())?;
@@ -690,18 +875,21 @@ mod native {
         }
     }
 
-    fn recover_retained_state(config: &InstalledWindowsPayload) -> std::result::Result<(), String> {
-        let mut command = CommandSpec::new(
-            &config.cli.path,
-            &config.output_directory,
-            Duration::from_secs(60),
-        )
-        .args(["windows-recover", "converge", "30000"])
-        .materialize()
-        .map_err(|error| error.to_string())?;
+    fn recover_retained_state(
+        config: &InstalledWindowsPayload,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> std::result::Result<(), String> {
+        let budget = deadlines
+            .cleanup_budget(Duration::from_secs(60))
+            .map_err(|error| error.to_string())?;
+        let millis = budget.as_millis().min(30000).max(1).to_string();
+        let mut command = CommandSpec::new(&config.cli.path, &config.output_directory, budget)
+            .args(["windows-recover", "converge", millis.as_str()])
+            .materialize()
+            .map_err(|error| error.to_string())?;
         let output = memcordon_testkit::run_with_deadline_output_limit(
             &mut command,
-            Duration::from_secs(60),
+            budget,
             MAX_STREAM_BYTES,
         )
         .map_err(|error| error.to_string())?;
@@ -748,8 +936,9 @@ mod native {
         snapshot: &OutputSnapshot,
         case: InstalledCase,
         fixture: &Path,
+        work_deadline: Instant,
     ) -> io::Result<Vec<WindowsImageProcess>> {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = work_deadline.min(Instant::now() + Duration::from_secs(90));
         loop {
             let stdout = snapshot.stdout()?;
             let ready = match case {
@@ -829,7 +1018,11 @@ mod native {
         }
     }
 
-    fn run_case(config: &InstalledWindowsPayload, case: InstalledCase) -> InstalledCaseResult {
+    fn run_case(
+        config: &InstalledWindowsPayload,
+        case: InstalledCase,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> InstalledCaseResult {
         let family = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::new(Mutex::new(None::<OutputSnapshot>));
         let association = Arc::new(Mutex::new(
@@ -873,9 +1066,10 @@ mod native {
             let cli = config.cli.path.clone();
             let output_directory = config.output_directory.clone();
             let fixture = config.fixture.path.clone();
+            let budget = deadlines.work_budget(Duration::from_secs(180))?;
             let execution = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
                 command,
-                Duration::from_secs(180),
+                budget,
                 MAX_STREAM_BYTES,
                 |mut command| command.spawn(),
                 move |_, _, snapshot| {
@@ -883,25 +1077,27 @@ mod native {
                         .lock()
                         .map_err(|_| io::Error::other("output observer poisoned"))? =
                         Some(snapshot.clone());
-                    let ready = wait_ready(&snapshot, case, &fixture)?;
+                    let ready = wait_ready(&snapshot, case, &fixture, deadlines.work)?;
                     *observed_family
                         .lock()
                         .map_err(|_| io::Error::other("fixture family owner poisoned"))? = ready;
                     if case == InstalledCase::GuardianLossAfterRelease {
                         let mut guardian =
                             baseline.hold_new_guardian().map_err(io::Error::other)?;
-                        let mut command =
-                            CommandSpec::new(&cli, &output_directory, Duration::from_secs(30))
-                                .args([
-                                    std::ffi::OsString::from("__observe-windows-guardian"),
-                                    guardian.identity.process_id.to_string().into(),
-                                    guardian.identity.creation_time_100ns.to_string().into(),
-                                ])
-                                .materialize()
-                                .map_err(io::Error::other)?;
+                        let query_budget = deadlines
+                            .work_budget(Duration::from_secs(30))
+                            .map_err(io::Error::other)?;
+                        let mut command = CommandSpec::new(&cli, &output_directory, query_budget)
+                            .args([
+                                std::ffi::OsString::from("__observe-windows-guardian"),
+                                guardian.identity.process_id.to_string().into(),
+                                guardian.identity.creation_time_100ns.to_string().into(),
+                            ])
+                            .materialize()
+                            .map_err(io::Error::other)?;
                         let output = memcordon_testkit::run_with_deadline_output_limit(
                             &mut command,
-                            Duration::from_secs(30),
+                            query_budget,
                             16 * 1024,
                         );
                         retain_guardian_query_capture(&output_directory, &output)
@@ -1062,7 +1258,9 @@ mod native {
         // This independent native image-family check still runs after collection
         // or semantic validation failure. Self-expiry is never accepted as cleanup.
         let cleanup = (|| -> Result<()> {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = deadlines
+                .cleanup
+                .min(Instant::now() + Duration::from_secs(30));
             loop {
                 let observed = family
                     .lock()
@@ -1098,9 +1296,45 @@ mod native {
         assessment
     }
 
-    pub fn run(config: &InstalledWindowsPayload) -> Result<InstalledWindowsAssessment> {
+    pub fn run(
+        config: &InstalledWindowsPayload,
+        observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+        deadlines: WindowsLeaseDeadlines,
+    ) -> Result<InstalledWindowsAssessment> {
+        if deadlines.work >= deadlines.cleanup {
+            return Err(CiError::Message(
+                "Windows lease must reserve original cleanup time after work cutoff".into(),
+            ));
+        }
         fs::create_dir_all(&config.output_directory)?;
         verify_selected(config)?;
+        let predecessor_bytes = read_bounded(
+            &config
+                .output_directory
+                .join("windows-upgrade-predecessor.json"),
+            2 * 1024 * 1024,
+        )?;
+        memcordon_core::workload_contract::reject_duplicate_json_keys(&predecessor_bytes)
+            .map_err(CiError::Message)?;
+        let predecessor: WindowsUpgradePredecessor = serde_json::from_slice(&predecessor_bytes)?;
+        let older = &predecessor.payload;
+        if predecessor.format != "memcordon.windows-upgrade-predecessor"
+            || predecessor.revision != 1
+            || older.channel != InstalledChannel::CargoPackage
+            || older.version != "0.5.7-rc.19"
+            || older.source_commit != "a02e8f1e845349e27706c11d6d57acb27090223a"
+            || older.target != config.target
+            || older.output_directory == config.output_directory
+            || semver::Version::parse(&older.version)
+                .map_err(|error| CiError::Message(error.to_string()))?
+                >= semver::Version::parse(&config.version)
+                    .map_err(|error| CiError::Message(error.to_string()))?
+        {
+            return Err(CiError::Message(
+                "Windows upgrade requires exact older complete rc.19 Cargo runtime".into(),
+            ));
+        }
+        verify_selected(older)?;
         if memcordon_testkit::windows_available_memory_bytes()? < 4 * 1024 * 1024 * 1024 {
             return Err(CiError::Message(
                 "selected Windows installed fixture requires 4 GiB available memory".to_owned(),
@@ -1114,43 +1348,190 @@ mod native {
             artifacts: config.artifacts.clone(),
             public_smoke_before: Err("installation did not complete".to_owned()),
             cases: Vec::new(),
+            positive_cases: Vec::new(),
+            positive_suite: Err("positive readiness suite was not executed".into()),
+            loss_cases: Vec::new(),
+            loss_suite: Err("external native loss suite was not executed".into()),
+            capacity_cases: Vec::new(),
+            capacity_suite: Err("capacity suite was not executed".into()),
+            refusal_cases: Vec::new(),
+            refusal_suite: Err("preauthorization refusal suite was not executed".into()),
             retained_state_recovery: Err("retained-state recovery was not executed".to_owned()),
             public_smoke_after: Err("postrecovery smoke was not executed".to_owned()),
             package_upgrade: Err("upgrade was not executed".to_owned()),
             package_uninstall: Err("uninstall was not executed".to_owned()),
         };
+        let mut current_upgrade_started = false;
+        let mut old_install_started = false;
         let operation = (|| -> std::result::Result<(), String> {
-            package(config, "install")?;
+            observer(lease_event(
+                WindowsLeasePhase::BeforeOldInstall,
+                older,
+                Some("install"),
+                None,
+            ))
+            .map_err(|error| error.to_string())?;
+            old_install_started = true;
+            let old_install = package(older, "install", deadlines.work);
+            observer(lease_event(
+                WindowsLeasePhase::AfterOldInstall,
+                older,
+                Some("install"),
+                Some(&old_install),
+            ))
+            .map_err(|error| error.to_string())?;
+            old_install?;
+            let old_verify = package(older, "verify", deadlines.work);
+            observer(lease_event(
+                WindowsLeasePhase::AfterOldVerify,
+                older,
+                Some("verify"),
+                Some(&old_verify),
+            ))
+            .map_err(|error| error.to_string())?;
+            old_verify?;
+            for component in &older.installed_components {
+                verify_file(component).map_err(|error| error.to_string())?;
+            }
+            verify_file(&older.installed_manifest).map_err(|error| error.to_string())?;
+            drop(quiescent(older).map_err(|error| error.to_string())?);
+            smoke(
+                older,
+                &older.output_directory.join("predecessor-smoke.json"),
+                deadlines,
+            )?;
+            observer(lease_event(
+                WindowsLeasePhase::BeforeCurrentUpgrade,
+                config,
+                Some("upgrade"),
+                None,
+            ))
+            .map_err(|error| error.to_string())?;
+            current_upgrade_started = true;
+            assessment.package_upgrade = package(config, "upgrade", deadlines.work);
+            observer(lease_event(
+                WindowsLeasePhase::AfterCurrentUpgrade,
+                config,
+                Some("upgrade"),
+                Some(&assessment.package_upgrade),
+            ))
+            .map_err(|error| error.to_string())?;
+            assessment.package_upgrade.clone()?;
+            package(config, "verify", deadlines.work)?;
             verify_file(&config.installed_agent).map_err(|error| error.to_string())?;
             verify_file(&config.installed_manifest).map_err(|error| error.to_string())?;
+            for component in &config.installed_components {
+                verify_file(component).map_err(|error| error.to_string())?;
+            }
             drop(quiescent(config).map_err(|error| error.to_string())?);
-            assessment.public_smoke_before =
-                smoke(config, &config.output_directory.join("smoke-before.json"));
+            assessment.positive_suite = crate::windows_consumer_readiness::run_installed_until(
+                config,
+                &config.output_directory.join("windows-readiness-input.json"),
+                &mut assessment.positive_cases,
+                deadlines.work,
+            )
+            .map_err(|error| error.to_string());
+            assessment.positive_suite.clone()?;
+            assessment.loss_suite = crate::windows_readiness_faults::run_until(
+                config,
+                &config.output_directory.join("windows-readiness-input.json"),
+                &mut assessment.loss_cases,
+                deadlines,
+            )
+            .map_err(|error| error.to_string());
+            assessment.loss_suite.clone()?;
+            assessment.capacity_suite = crate::windows_readiness_capacity::run_until(
+                config,
+                &config.output_directory.join("windows-readiness-input.json"),
+                &mut assessment.capacity_cases,
+                deadlines.work,
+            )
+            .map_err(|error| error.to_string());
+            assessment.capacity_suite.clone()?;
+            assessment.refusal_suite = crate::windows_readiness_refusals::run_until(
+                config,
+                &config.output_directory.join("windows-readiness-input.json"),
+                &mut assessment.refusal_cases,
+                deadlines,
+            )
+            .map_err(|error| error.to_string());
+            assessment.refusal_suite.clone()?;
+            assessment.public_smoke_before = smoke(
+                config,
+                &config.output_directory.join("smoke-before.json"),
+                deadlines,
+            );
             assessment.public_smoke_before.clone()?;
             for case in [
                 InstalledCase::SamplingPopulation,
                 InstalledCase::GuardianLossAfterRelease,
             ] {
-                assessment.cases.push(run_case(config, case));
+                assessment.cases.push(run_case(config, case, deadlines));
                 let case = assessment.cases.last().expect("case was appended");
                 if case.workload_cleanup.is_err() {
                     return Err("cannot establish fixture quiescence for later cases".to_owned());
                 }
                 drop(quiescent(config).map_err(|error| error.to_string())?);
             }
-            assessment.retained_state_recovery = recover_retained_state(config);
+            assessment.retained_state_recovery = recover_retained_state(config, deadlines);
             assessment.retained_state_recovery.clone()?;
             drop(quiescent(config).map_err(|error| error.to_string())?);
-            assessment.public_smoke_after =
-                smoke(config, &config.output_directory.join("smoke-after.json"));
+            assessment.public_smoke_after = smoke(
+                config,
+                &config.output_directory.join("smoke-after.json"),
+                deadlines,
+            );
             assessment.public_smoke_after.clone()?;
-            assessment.package_upgrade = package(config, "upgrade");
-            assessment.package_upgrade.clone()?;
             Ok(())
         })();
         // Ordinary uninstall owns cleanup even if installation, collection or a
         // causal assertion failed; its success never rewrites the case behavior.
-        assessment.package_uninstall = package(config, "uninstall");
+        let probe_cleanup = crate::windows_consumer_readiness::cleanup_provider_probe(config)
+            .map_err(|error| error.to_string());
+        let cleanup_subject = if current_upgrade_started {
+            config
+        } else {
+            older
+        };
+        let before_uninstall = if old_install_started {
+            observer(lease_event(
+                WindowsLeasePhase::BeforeUninstall,
+                cleanup_subject,
+                Some("uninstall"),
+                None,
+            ))
+        } else {
+            Ok(())
+        };
+        let uninstall = if old_install_started {
+            package(cleanup_subject, "uninstall", deadlines.cleanup)
+        } else {
+            Err("owned predecessor install never started; no package removal attempted".into())
+        };
+        let after_uninstall = if old_install_started {
+            observer(lease_event(
+                WindowsLeasePhase::AfterUninstall,
+                cleanup_subject,
+                Some("uninstall"),
+                Some(&uninstall),
+            ))
+        } else {
+            Ok(())
+        };
+        assessment.package_uninstall = match (probe_cleanup, uninstall) {
+            (Ok(()), result) => result,
+            (Err(probe), Ok(())) => Err(probe),
+            (Err(probe), Err(uninstall)) => Err(format!("{probe}; package uninstall: {uninstall}")),
+        };
+        for failure in [before_uninstall, after_uninstall]
+            .into_iter()
+            .filter_map(std::result::Result::err)
+        {
+            assessment.package_uninstall = Err(match assessment.package_uninstall {
+                Ok(()) => failure.to_string(),
+                Err(existing) => format!("{existing}; lease observation: {failure}"),
+            });
+        }
         for case in &mut assessment.cases {
             case.package_cleanup = assessment
                 .package_uninstall
@@ -1180,5 +1561,36 @@ mod native {
 pub fn run_cases_for_installed_payload(
     config: &InstalledWindowsPayload,
 ) -> Result<InstalledWindowsAssessment> {
-    native::run(config)
+    native::run(
+        config,
+        &mut |_| Ok(()),
+        WindowsLeaseDeadlines::finite_default(),
+    )
+}
+
+#[cfg(windows)]
+pub fn run_with_observer(
+    config: &InstalledWindowsPayload,
+    observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+) -> Result<InstalledWindowsAssessment> {
+    native::run(config, observer, WindowsLeaseDeadlines::finite_default())
+}
+
+#[cfg(windows)]
+pub fn run_with_observer_until(
+    config: &InstalledWindowsPayload,
+    observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+    deadlines: WindowsLeaseDeadlines,
+) -> Result<InstalledWindowsAssessment> {
+    native::run(config, observer, deadlines)
+}
+
+#[cfg(not(windows))]
+pub fn run_with_observer(
+    _: &InstalledWindowsPayload,
+    _: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+) -> Result<InstalledWindowsAssessment> {
+    Err(CiError::Message(
+        "installed Windows lease observation requires native Windows".into(),
+    ))
 }

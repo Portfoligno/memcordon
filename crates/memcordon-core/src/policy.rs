@@ -205,6 +205,7 @@ impl CommandSpec {
 pub struct Policy {
     workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
     private_workload_contract: Option<crate::workload_contract::WorkloadContractV2>,
+    mixed_workload_contract: Option<crate::workload_contract_v3::WorkloadContractV3>,
     pub memory: Option<ByteSize>,
     pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
@@ -228,6 +229,7 @@ impl Policy {
         Self {
             workload_contract: None,
             private_workload_contract: None,
+            mixed_workload_contract: None,
             memory: Some(memory),
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -246,6 +248,7 @@ impl Policy {
         Self {
             workload_contract: None,
             private_workload_contract: None,
+            mixed_workload_contract: None,
             memory: None,
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -269,7 +272,7 @@ impl Policy {
         request: crate::workload_contract::WorkloadContractV1,
     ) -> Result<Self, String> {
         request.validate()?;
-        if self.private_workload_contract.is_some() {
+        if self.private_workload_contract.is_some() || self.mixed_workload_contract.is_some() {
             return Err("mixed workload request versions".into());
         }
         self.workload_contract = Some(request);
@@ -287,10 +290,27 @@ impl Policy {
         request: crate::workload_contract::WorkloadContractV2,
     ) -> Result<Self, String> {
         request.validate()?;
-        if self.workload_contract.is_some() {
+        if self.workload_contract.is_some() || self.mixed_workload_contract.is_some() {
             return Err("mixed workload request versions".into());
         }
         self.private_workload_contract = Some(request);
+        Ok(self)
+    }
+
+    pub fn mixed_workload_contract(
+        &self,
+    ) -> Option<&crate::workload_contract_v3::WorkloadContractV3> {
+        self.mixed_workload_contract.as_ref()
+    }
+    pub fn with_mixed_workload_contract(
+        mut self,
+        request: crate::workload_contract_v3::WorkloadContractV3,
+    ) -> Result<Self, String> {
+        request.validate()?;
+        if self.workload_contract.is_some() || self.private_workload_contract.is_some() {
+            return Err("mixed workload request versions".into());
+        }
+        self.mixed_workload_contract = Some(request);
         Ok(self)
     }
 

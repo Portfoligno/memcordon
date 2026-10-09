@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 pub const RUNTIME_MANIFEST_FORMAT: &str = "memcordon.runtime-manifest";
 pub const RUNTIME_MANIFEST_REVISION: u32 = 1;
 
+pub fn combined_catalog_digest() -> String {
+    let mut bytes = b"memcordon.profile-catalog/version3\0".to_vec();
+    bytes.extend_from_slice(crate::workload_discovery_v2::profile_catalog_digest_v2().bytes());
+    bytes.extend_from_slice(
+        crate::workload_registry_v3::profile_reference()
+            .semantic_digest
+            .bytes(),
+    );
+    String::from(crate::workload_codec::hash_bytes(&bytes))
+}
+
 /// The baseline catalogue describes existing mechanism limits, not a grant.
 pub fn baseline_catalog_digest(windows: bool) -> String {
     use crate::workload_registry::BaselineProfile;
@@ -173,6 +184,37 @@ impl RuntimeManifest {
                 },
             },
         )
+    }
+
+    /// The new copied-root execution is measured separately from frozen V2.
+    pub fn linux_combined(
+        version: String,
+        source_commit: String,
+        target: String,
+        components: Vec<RuntimeComponentRecord>,
+    ) -> Result<Self, String> {
+        let mut value = Self::linux_selected(version, source_commit, target, components, true)?;
+        let SealedRuntime::Included {
+            native_protocols,
+            mechanism,
+            workload_contract_schema,
+            profile_catalog_sha256,
+            profiles,
+            ..
+        } = &mut value.sealed
+        else {
+            unreachable!("private selection includes runtime");
+        };
+        *native_protocols = NativeProviderProtocols::Linux {
+            provider_contract: 4,
+            launch_wire: 4,
+        };
+        *mechanism = "linux-tcp4-unix-private-v1".into();
+        *workload_contract_schema = 3;
+        *profile_catalog_sha256 = combined_catalog_digest();
+        profiles.push("linux-tcp4-unix-private-v1".into());
+        value.validate()?;
+        Ok(value)
     }
 
     pub fn windows(
@@ -356,6 +398,18 @@ impl RuntimeManifest {
                         "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
                     )
                     && profiles.as_slice() == ["linux-unix-create-v1", "linux-tcp4-private-v1"];
+                let combined = linux
+                    && *workload_contract_schema == 3
+                    && matches!(
+                        self.target.as_str(),
+                        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+                    )
+                    && profiles.as_slice()
+                        == [
+                            "linux-unix-create-v1",
+                            "linux-tcp4-private-v1",
+                            "linux-tcp4-unix-private-v1",
+                        ];
                 let matching_protocol = match native_protocols {
                     NativeProviderProtocols::Linux {
                         provider_contract: 3,
@@ -374,6 +428,10 @@ impl RuntimeManifest {
                             && mechanism == "windows-job-object-v2"
                             && profiles.as_slice() == ["windows-host-network-external-v1"]
                     }
+                    NativeProviderProtocols::Linux {
+                        provider_contract: 4,
+                        launch_wire: 4,
+                    } => combined && mechanism == "linux-tcp4-unix-private-v1",
                     _ => false,
                 };
                 let expected = if windows {
@@ -392,10 +450,12 @@ impl RuntimeManifest {
                     expected
                 };
                 if !matching_protocol
-                    || !(*workload_contract_schema == 1 || private_tcp)
+                    || !(*workload_contract_schema == 1 || private_tcp || combined)
                     || roles != expected
                     || profile_catalog_sha256
-                        != &if private_tcp {
+                        != &if combined {
+                            combined_catalog_digest()
+                        } else if private_tcp {
                             String::from(crate::workload_discovery_v2::profile_catalog_digest_v2())
                         } else {
                             baseline_catalog_digest(windows)

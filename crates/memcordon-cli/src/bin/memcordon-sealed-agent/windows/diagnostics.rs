@@ -73,7 +73,16 @@ pub(crate) fn capture_native(
     native_code: Option<i32>,
     code: memcordon_core::FailureCodeV1,
 ) {
-    capture(CausalEventV1 {
+    capture_native_with_injected_fault(operation, native_code, code, None)
+}
+
+pub(crate) fn capture_native_with_injected_fault(
+    operation: memcordon_core::FailureOperationV1,
+    native_code: Option<i32>,
+    code: memcordon_core::FailureCodeV1,
+    fault: Option<memcordon_core::WindowsSealedFault>,
+) {
+    let mut event = CausalEventV1 {
         sequence: 0,
         origin: memcordon_core::DiagnosticOriginV1::Launcher,
         category: match operation {
@@ -99,7 +108,14 @@ pub(crate) fn capture_native(
         detail_redacted: true,
         detail_truncated: false,
         terminalization_reference: None,
-    });
+    };
+    #[cfg(feature = "test-support")]
+    if let Some(fault) = fault {
+        event.safe_detail = memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault { fault };
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = fault;
+    capture(event);
 }
 
 pub(super) fn merge_into(target: &mut WindowsCausalDiagnosticsV1) {

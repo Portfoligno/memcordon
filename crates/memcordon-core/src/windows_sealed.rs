@@ -2687,6 +2687,16 @@ pub struct WindowsGuardianAttemptObservation {
     pub challenge: crate::BoundedText<128>,
     pub guardian_identity: WindowsProcessIdentityV1,
     pub association: crate::result_v1::ProviderAttemptAssociationV1,
+    /// Observation-only live control metadata, joined to the authenticated
+    /// durable record. These fields grant no replay or terminal authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_target_identity: Option<WindowsProcessIdentityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_process_identity: Option<WindowsProcessIdentityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_thread_identity: Option<WindowsWorkerThreadIdentityV1>,
 }
 
 impl WindowsGuardianAttemptObservation {
@@ -2779,6 +2789,25 @@ impl WindowsGuardianAttemptObservation {
             && self.association.provider.is_consistent()
             && self.association.attempt_id != crate::DiagnosticSha256::from_bytes([0; 32])
             && self.association.request_sha256 != crate::DiagnosticSha256::from_bytes([0; 32])
+            && match (
+                &self.live_nonce,
+                &self.worker_process_identity,
+                &self.worker_thread_identity,
+                &self.live_target_identity,
+            ) {
+                (None, None, None, None) => true,
+                (Some(nonce), Some(process), Some(thread), Some(target)) => {
+                    !nonce.is_empty()
+                        && nonce.len() <= 128
+                        && process.process_id != 0
+                        && process.creation_time_100ns != 0
+                        && target.process_id != 0
+                        && target.creation_time_100ns != 0
+                        && thread.thread_id != 0
+                        && thread.creation_time_100ns != 0
+                }
+                _ => false,
+            }
     }
 }
 

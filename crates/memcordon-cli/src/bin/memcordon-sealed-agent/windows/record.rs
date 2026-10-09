@@ -185,6 +185,23 @@ fn publication_io_error(error: io::Error) -> String {
 #[path = "../../../../tests/sealed_agent/windows_record_faults.rs"]
 mod record_fault_tests;
 
+/// Native component tests use the real publication boundary at an owned path;
+/// this hook changes neither installed storage paths nor production authority.
+#[cfg(test)]
+pub(crate) fn publish_owned_component_record_for_test(
+    record: &mut WindowsAttemptRecordV1,
+    path: &Path,
+) -> Result<(), String> {
+    let expected = record.record_revision;
+    let mut candidate = record.clone();
+    candidate.record_revision = expected
+        .checked_add(1)
+        .ok_or("component record revision exhausted")?;
+    candidate.publish_at(path, expected, |_| Ok(()))?;
+    *record = candidate;
+    Ok(())
+}
+
 impl WindowsAttemptRecordV1 {
     pub fn new(
         attempt_id: String,
@@ -2195,6 +2212,48 @@ fn stage_ack_tombstone(
     record: &WindowsAttemptRecordV1,
     retired: &memcordon_core::WindowsTerminalRetiredV1,
 ) -> Result<(), String> {
+    let tombstone = ack_tombstone_for(record, retired)?;
+    let (path, replay) = replay_record(&record.attempt_id, &record.request_sha256)?;
+    stage_ack_tombstone_at(record, tombstone, &path, replay)?;
+    let (_, committed) = replay_record(&record.attempt_id, &record.request_sha256)?;
+    if committed.acknowledged.is_none() {
+        return Err("ACK tombstone readback is absent".to_owned());
+    }
+    Ok(())
+}
+
+fn stage_ack_tombstone_at(
+    record: &WindowsAttemptRecordV1,
+    tombstone: TerminalAckTombstoneV1,
+    path: &Path,
+    mut replay: ReplayRecordV1,
+) -> Result<(), String> {
+    if replay.attempt_id != record.attempt_id || replay.request_sha256 != record.request_sha256 {
+        return Err("replay record is not bound to the acknowledged attempt".to_owned());
+    }
+    if let Some(existing) = replay.acknowledged.as_ref() {
+        if existing.retired != tombstone.retired
+            || existing.proof_sha256 != tombstone.proof_sha256
+            || existing.launch_incarnation != tombstone.launch_incarnation
+            || existing.caller_process_identity != tombstone.caller_process_identity
+            || existing.caller_token_sha256 != tombstone.caller_token_sha256
+            || existing.recovery_authorization != tombstone.recovery_authorization
+            || existing.job_identity != tombstone.job_identity
+            || existing.owner_manifest_sha256 != tombstone.owner_manifest_sha256
+            || existing.ledger_generation != tombstone.ledger_generation
+        {
+            return Err("ACK tombstone conflicts with prior terminal authority".to_owned());
+        }
+        return Ok(());
+    }
+    replay.acknowledged = Some(tombstone);
+    publish_replay_record_at(path, &replay)
+}
+
+fn ack_tombstone_for(
+    record: &WindowsAttemptRecordV1,
+    retired: &memcordon_core::WindowsTerminalRetiredV1,
+) -> Result<TerminalAckTombstoneV1, String> {
     let proof = record
         .retirement_proof
         .as_ref()
@@ -2215,7 +2274,7 @@ fn stage_ack_tombstone(
         ))
         .map_err(|error| error.to_string())?,
     );
-    let tombstone = TerminalAckTombstoneV1 {
+    Ok(TerminalAckTombstoneV1 {
         schema_version: 1,
         retired: retired.clone(),
         provider_generation: record.provider_generation.clone(),
@@ -2232,25 +2291,11 @@ fn stage_ack_tombstone(
             .recovery_authorization
             .clone()
             .ok_or_else(|| "ACK tombstone has no admitted recovery authorization".to_owned())?,
-    };
-    let (path, mut replay) = replay_record(&record.attempt_id, &record.request_sha256)?;
-    if let Some(existing) = replay.acknowledged.as_ref() {
-        if existing.retired != tombstone.retired
-            || existing.proof_sha256 != tombstone.proof_sha256
-            || existing.launch_incarnation != tombstone.launch_incarnation
-            || existing.caller_process_identity != tombstone.caller_process_identity
-            || existing.caller_token_sha256 != tombstone.caller_token_sha256
-            || existing.recovery_authorization != tombstone.recovery_authorization
-            || existing.job_identity != tombstone.job_identity
-            || existing.owner_manifest_sha256 != tombstone.owner_manifest_sha256
-            || existing.ledger_generation != tombstone.ledger_generation
-        {
-            return Err("ACK tombstone conflicts with prior terminal authority".to_owned());
-        }
-        return Ok(());
-    }
-    replay.acknowledged = Some(tombstone);
-    let mut bytes = serde_json::to_vec(&replay).map_err(|error| error.to_string())?;
+    })
+}
+
+fn publish_replay_record_at(path: &Path, replay: &ReplayRecordV1) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(replay).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     let staged = path.with_extension("json.new");
     let mut file = fs::OpenOptions::new()
@@ -2262,10 +2307,9 @@ fn stage_ack_tombstone(
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     drop(file);
-    replace_atomically(&staged, &path)?;
-    let (_, committed) = replay_record(&record.attempt_id, &record.request_sha256)?;
-    if committed.acknowledged.is_none() {
-        return Err("ACK tombstone readback is absent".to_owned());
+    replace_atomically(&staged, path)?;
+    if read_record_bounded(path).map_err(|error| error.to_string())? != bytes {
+        return Err("replay publication named readback differs".to_owned());
     }
     Ok(())
 }
@@ -2286,24 +2330,23 @@ fn complete_ack_tombstone(
         .ok_or_else(|| "ACK tombstone completion has no committed ACK".to_owned())?;
     if !tombstone.retirement_complete {
         tombstone.retirement_complete = true;
-        let mut bytes = serde_json::to_vec(&replay).map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
-        let staged = path.with_extension("json.new");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)
-            .map_err(|error| error.to_string())?;
-        use std::io::Write;
-        file.write_all(&bytes).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-        replace_atomically(&staged, &path)?;
+        publish_replay_record_at(&path, &replay)?;
     }
     let (_, committed) = replay_record(attempt_id, request_sha256)?;
     let tombstone = committed
         .acknowledged
         .ok_or_else(|| "completed ACK tombstone readback is absent".to_owned())?;
+    if !tombstone.retirement_complete {
+        return Err("ACK tombstone completion did not survive readback".to_owned());
+    }
+    retired_from_ack_tombstone(tombstone, attempt_id, request_sha256)
+}
+
+fn retired_from_ack_tombstone(
+    tombstone: TerminalAckTombstoneV1,
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
     if !tombstone.retirement_complete {
         return Err("ACK tombstone completion did not survive readback".to_owned());
     }
@@ -2364,6 +2407,28 @@ pub fn acknowledged_terminal_from_tombstone(
     let Some(tombstone) = replay.acknowledged else {
         return Ok(None);
     };
+    validate_ack_replay_caller(
+        &tombstone,
+        attempt_id,
+        nonce,
+        request_sha256,
+        caller_process_identity,
+        caller_token_sha256,
+    )?;
+    Ok(Some(recover_incomplete_ack_tombstone(
+        attempt_id,
+        request_sha256,
+    )?))
+}
+
+fn validate_ack_replay_caller(
+    tombstone: &TerminalAckTombstoneV1,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+) -> Result<(), String> {
     if tombstone.schema_version != 1
         || tombstone.caller_process_identity != *caller_process_identity
         || tombstone.caller_token_sha256 != caller_token_sha256
@@ -2377,10 +2442,81 @@ pub fn acknowledged_terminal_from_tombstone(
     {
         return Err("terminal ACK tombstone does not match authenticated replay caller".to_owned());
     }
-    Ok(Some(recover_incomplete_ack_tombstone(
-        attempt_id,
-        request_sha256,
-    )?))
+    Ok(())
+}
+
+/// Owned component fixture only: no installation roots, receipts or references.
+#[cfg(test)]
+pub(crate) fn stage_owned_component_ack_for_test(
+    path: &Path,
+    record: &WindowsAttemptRecordV1,
+) -> Result<(), String> {
+    owned_component_admission_root(path.parent().ok_or("owned replay parent absent")?)?;
+    let replay = if path.exists() {
+        serde_json::from_slice::<ReplayRecordV1>(
+            &read_record_bounded(path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        ReplayRecordV1 {
+            attempt_id: record.attempt_id.clone(),
+            request_sha256: record.request_sha256.clone(),
+            acknowledged: None,
+        }
+    };
+    let retired = record.terminal_retired_receipt(&record.nonce)?;
+    stage_ack_tombstone_at(record, ack_tombstone_for(record, &retired)?, path, replay)
+}
+
+#[cfg(test)]
+pub(crate) fn complete_owned_component_ack_for_test(
+    path: &Path,
+    outbox: &Path,
+    record: &WindowsAttemptRecordV1,
+    nonce: &str,
+    caller: &memcordon_core::WindowsProcessIdentityV1,
+    token: &str,
+) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
+    owned_component_admission_root(path.parent().ok_or("owned replay parent absent")?)?;
+    if outbox.parent() != path.parent() || outbox.exists() {
+        return Err("ACK tombstone still has a durable attempt record".to_owned());
+    }
+    let mut replay: ReplayRecordV1 =
+        serde_json::from_slice(&read_record_bounded(path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if replay.attempt_id != record.attempt_id || replay.request_sha256 != record.request_sha256 {
+        return Err("replay record is not bound to the acknowledged attempt".to_owned());
+    }
+    let tombstone = replay
+        .acknowledged
+        .as_ref()
+        .ok_or("terminal acknowledgment has no ACK tombstone")?;
+    validate_ack_replay_caller(
+        tombstone,
+        &record.attempt_id,
+        nonce,
+        &record.request_sha256,
+        caller,
+        token,
+    )?;
+    if !tombstone.retirement_complete {
+        replay
+            .acknowledged
+            .as_mut()
+            .expect("checked ACK")
+            .retirement_complete = true;
+        publish_replay_record_at(path, &replay)?;
+    }
+    let committed: ReplayRecordV1 =
+        serde_json::from_slice(&read_record_bounded(path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    retired_from_ack_tombstone(
+        committed
+            .acknowledged
+            .ok_or("completed ACK tombstone readback is absent")?,
+        &record.attempt_id,
+        &record.request_sha256,
+    )
 }
 
 pub fn recover_attempt_for_caller(
@@ -2833,9 +2969,20 @@ pub(super) fn reserve_writer_admission(
     let _budget = super::attempt_store::PublicationGuard::acquire(&digest(
         b"installation-attempt-storage-budget-v1",
     ))?;
-    let path = admissions_root()
-        .join(attempt_id)
-        .with_extension("writer.json");
+    reserve_writer_admission_at(&admissions_root(), attempt_id, request_sha256, || {
+        enforce_storage_reservation(Some(attempt_id), false)
+    })
+}
+
+fn reserve_writer_admission_at(
+    root: &Path,
+    attempt_id: &str,
+    request_sha256: &str,
+    enforce_budget: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    validate_attempt_id(attempt_id)?;
+    validate_attempt_id(request_sha256)?;
+    let path = root.join(attempt_id).with_extension("writer.json");
     if path.exists() {
         let old: AdmissionRecordV1 =
             serde_json::from_slice(&read_record_bounded(&path).map_err(|error| error.to_string())?)
@@ -2850,7 +2997,7 @@ pub(super) fn reserve_writer_admission(
         }
         fs::remove_file(&path).map_err(|error| error.to_string())?;
     }
-    enforce_storage_reservation(Some(attempt_id), false)?;
+    enforce_budget()?;
     // SAFETY: the pseudo handle denotes this service process for identity capture.
     let owner = super::process::process_identity(unsafe {
         windows_sys::Win32::System::Threading::GetCurrentProcess()
@@ -2883,9 +3030,16 @@ pub(super) fn retire_writer_admission(
     let _budget = super::attempt_store::PublicationGuard::acquire(&digest(
         b"installation-attempt-storage-budget-v1",
     ))?;
-    let path = admissions_root()
-        .join(attempt_id)
-        .with_extension("writer.json");
+    retire_writer_admission_at(&admissions_root(), attempt_id, local_writer_stopped)
+}
+
+fn retire_writer_admission_at(
+    root: &Path,
+    attempt_id: &str,
+    local_writer_stopped: bool,
+) -> Result<(), String> {
+    validate_attempt_id(attempt_id)?;
+    let path = root.join(attempt_id).with_extension("writer.json");
     let bytes = match read_record_bounded(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2916,6 +3070,59 @@ pub(super) fn retire_writer_admission(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reserve_owned_component_writer_for_test(
+    root: &Path,
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<(), String> {
+    let root = owned_component_admission_root(root)?;
+    let _budget = super::attempt_store::PublicationGuard::acquire_for_test(&digest(
+        root.as_os_str().as_encoded_bytes(),
+    ))?;
+    reserve_writer_admission_at(&root, attempt_id, request_sha256, || {
+        if fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .take(1)
+            .count()
+            >= 1
+        {
+            return Err("owned component writer reservation slot exhausted".into());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn retire_owned_component_writer_for_test(
+    root: &Path,
+    attempt_id: &str,
+    local_writer_stopped: bool,
+) -> Result<(), String> {
+    let root = owned_component_admission_root(root)?;
+    let _budget = super::attempt_store::PublicationGuard::acquire_for_test(&digest(
+        root.as_os_str().as_encoded_bytes(),
+    ))?;
+    retire_writer_admission_at(&root, attempt_id, local_writer_stopped)
+}
+
+#[cfg(test)]
+fn owned_component_admission_root(root: &Path) -> Result<PathBuf, String> {
+    use std::os::windows::fs::MetadataExt;
+    if !root.is_absolute() {
+        return Err("owned component admission root must be absolute".into());
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err("owned component admission root must be ordinary".into());
+    }
+    Ok(root.to_owned())
 }
 
 pub fn validate_admission(attempt_id: &str, request_sha256: &str) -> Result<(), String> {
@@ -3166,6 +3373,28 @@ pub fn pending_terminal_response(
     let record: WindowsAttemptRecordV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     authenticate(&record, attempt_id)?;
+    let response = bound_pending_terminal_response(
+        &record,
+        attempt_id,
+        nonce,
+        request_sha256,
+        caller_process_identity,
+        caller_token_sha256,
+    )?;
+    Ok(response.map(|response| LeasedTerminalResponse {
+        response: Some(response),
+        _reader,
+    }))
+}
+
+fn bound_pending_terminal_response(
+    record: &WindowsAttemptRecordV1,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
     if record.request_sha256 != request_sha256
         || record.caller_process_identity != *caller_process_identity
         || record.caller_token_sha256 != caller_token_sha256
@@ -3205,10 +3434,32 @@ pub fn pending_terminal_response(
     if !binding_matches {
         return Err("pending terminal response is not bound to the replay request".to_owned());
     }
-    Ok(Some(LeasedTerminalResponse {
-        response: Some(response),
-        _reader,
-    }))
+    Ok(Some(response))
+}
+
+/// Exercises the same authenticated decoder against a test's own tempfile.
+/// This test-only helper never accesses installed attempt or replay roots.
+#[cfg(test)]
+pub(crate) fn pending_owned_component_response_for_test(
+    path: &Path,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+) -> Result<Option<memcordon_core::WindowsLauncherResponseV3>, String> {
+    let bytes = read_record_bounded(path).map_err(|error| error.to_string())?;
+    let record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    bound_pending_terminal_response(
+        &record,
+        attempt_id,
+        nonce,
+        request_sha256,
+        caller_process_identity,
+        caller_token_sha256,
+    )
 }
 
 pub fn replay_unavailable_evidence(
@@ -3787,7 +4038,14 @@ fn diagnostic_export_eligible(record: &WindowsAttemptRecordV1) -> bool {
 fn exportable_journal(
     record: &WindowsAttemptRecordV1,
 ) -> memcordon_core::WindowsCausalDiagnosticsV1 {
-    if diagnostic_export_eligible(record) {
+    exportable_journal_if_eligible(record, diagnostic_export_eligible(record))
+}
+
+fn exportable_journal_if_eligible(
+    record: &WindowsAttemptRecordV1,
+    eligible: bool,
+) -> memcordon_core::WindowsCausalDiagnosticsV1 {
+    if eligible {
         return record.causal_diagnostics.clone();
     }
     let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
@@ -3795,6 +4053,20 @@ fn exportable_journal(
         reason: memcordon_core::OriginalUnavailableReasonV1::RetentionExpired,
     };
     journal
+}
+
+/// Explicit deterministic retention boundary for an owned component record.
+/// This does not override the production clock or mutate persisted authority.
+#[cfg(test)]
+pub(crate) fn owned_component_journal_at_for_test(
+    record: &WindowsAttemptRecordV1,
+    same_boot: bool,
+    now: u64,
+) -> memcordon_core::WindowsCausalDiagnosticsV1 {
+    exportable_journal_if_eligible(
+        record,
+        record.diagnostic_retention.export_eligible(same_boot, now),
+    )
 }
 
 fn provider_projection(
@@ -4001,6 +4273,21 @@ pub fn attempts_root() -> PathBuf {
 pub fn observe_live_guardian_attempt(
     expected: &WindowsProcessIdentityV1,
 ) -> Result<memcordon_core::result_v1::ProviderAttemptAssociationV1, String> {
+    observe_live_guardian_details(expected).map(|details| details.0)
+}
+
+pub fn observe_live_guardian_details(
+    expected: &WindowsProcessIdentityV1,
+) -> Result<
+    (
+        memcordon_core::result_v1::ProviderAttemptAssociationV1,
+        String,
+        WindowsProcessIdentityV1,
+        WindowsWorkerThreadIdentityV1,
+        WindowsProcessIdentityV1,
+    ),
+    String,
+> {
     let root = attempts_root();
     super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
         .verify_path(&root)?;
@@ -4043,17 +4330,32 @@ pub fn observe_live_guardian_attempt(
         {
             return Err("live guardian association is ambiguous or not released".into());
         }
-        selected = Some(memcordon_core::result_v1::ProviderAttemptAssociationV1 {
-            provider: provider.clone(),
-            attempt_id: memcordon_core::DiagnosticSha256::try_from(
-                memcordon_core::BoundedText::new(&record.attempt_id).map_err(str::to_owned)?,
-            )
-            .map_err(str::to_owned)?,
-            request_sha256: memcordon_core::DiagnosticSha256::try_from(
-                memcordon_core::BoundedText::new(&record.request_sha256).map_err(str::to_owned)?,
-            )
-            .map_err(str::to_owned)?,
-        });
+        selected = Some((
+            memcordon_core::result_v1::ProviderAttemptAssociationV1 {
+                provider: provider.clone(),
+                attempt_id: memcordon_core::DiagnosticSha256::try_from(
+                    memcordon_core::BoundedText::new(&record.attempt_id).map_err(str::to_owned)?,
+                )
+                .map_err(str::to_owned)?,
+                request_sha256: memcordon_core::DiagnosticSha256::try_from(
+                    memcordon_core::BoundedText::new(&record.request_sha256)
+                        .map_err(str::to_owned)?,
+                )
+                .map_err(str::to_owned)?,
+            },
+            record.nonce.clone(),
+            record
+                .worker_identity
+                .clone()
+                .ok_or("live worker process identity missing")?,
+            record
+                .worker_thread_identity
+                .ok_or("live worker thread identity missing")?,
+            record
+                .target_identity
+                .clone()
+                .ok_or("live released target identity missing")?,
+        ));
     }
     if !process_identity_is_live(expected.clone())? {
         return Err("guardian retired during live association readback".into());

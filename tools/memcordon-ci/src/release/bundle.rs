@@ -269,6 +269,24 @@ pub fn assemble_build(
     target_directories: &[PathBuf],
     destination: &Path,
 ) -> Result<()> {
+    assemble_build_profile(
+        root,
+        source,
+        packages,
+        target_directories,
+        destination,
+        false,
+    )
+}
+
+pub fn assemble_build_profile(
+    root: &Path,
+    source: &BuildSourceIdentity,
+    packages: &Path,
+    target_directories: &[PathBuf],
+    destination: &Path,
+    consumer_readiness: bool,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let record = |state: &str, error: Option<&CiError>| {
         let directory = root.join("target/ci/reports/execution");
@@ -285,7 +303,14 @@ pub fn assemble_build(
         }
     };
     record("in-progress", None);
-    let result = assemble_build_inner(root, source, packages, target_directories, destination);
+    let result = assemble_build_inner(
+        root,
+        source,
+        packages,
+        target_directories,
+        destination,
+        consumer_readiness,
+    );
     record(
         if result.is_ok() {
             "completed"
@@ -303,9 +328,15 @@ fn assemble_build_inner(
     packages: &Path,
     target_directories: &[PathBuf],
     destination: &Path,
+    consumer_readiness: bool,
 ) -> Result<()> {
     source.recheck(root)?;
     let distribution = Distribution::read(root)?;
+    let distribution = if consumer_readiness {
+        distribution.consumer_readiness()?
+    } else {
+        distribution
+    };
     let (packages, package_bytes) = PackageBundle::load(packages)?;
     if &packages.source != source || destination.exists() {
         return Err(CiError::Message(

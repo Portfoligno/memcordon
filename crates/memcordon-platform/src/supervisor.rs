@@ -1035,6 +1035,15 @@ fn run_unix_attempt(
 ) -> Result<AttemptExecution, Error> {
     #[cfg(target_os = "linux")]
     if request.policy.boundary() == BoundaryRequirement::Sealed {
+        if let Some(contract) = request.policy.mixed_workload_contract() {
+            return attempt_execution(crate::sealed::client::mixed_backend_run(
+                &request.policy,
+                &request.command,
+                contract,
+                context,
+                signal,
+            )?);
+        }
         if let Some(contract) = request.policy.private_workload_contract() {
             return attempt_execution(crate::sealed::client::private_backend_run(
                 &request.policy,

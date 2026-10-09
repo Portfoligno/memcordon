@@ -313,6 +313,9 @@ impl SafeDiagnosticDetailV1 {
     pub fn render(&self) -> String {
         match self {
             Self::NoAdditionalDetail => "no additional detail".to_owned(),
+            Self::InjectedWindowsFault { fault } => {
+                format!("observed test-support fault: {fault:?}")
+            }
             Self::CountAndLimit { observed, limit } => format!("observed={observed} limit={limit}"),
             Self::ProviderMessage { id } => match id {
                 SafeMessageIdV1::OriginalFailureCaptured => "original failure captured",
@@ -498,8 +501,17 @@ pub enum NativeFailureCodeV1 {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SafeDiagnosticDetailV1 {
     NoAdditionalDetail,
-    CountAndLimit { observed: u32, limit: u32 },
-    ProviderMessage { id: SafeMessageIdV1 },
+    /// Describes an actual support-only injection site; never an admission input.
+    InjectedWindowsFault {
+        fault: crate::WindowsSealedFault,
+    },
+    CountAndLimit {
+        observed: u32,
+        limit: u32,
+    },
+    ProviderMessage {
+        id: SafeMessageIdV1,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -885,6 +897,12 @@ fn hash_event(hash: &mut Sha256Hasher, event: &CausalEventV1) {
         SafeDiagnosticDetailV1::ProviderMessage { id } => {
             hash.update([2]);
             hash.update((id as u16).to_be_bytes());
+        }
+        SafeDiagnosticDetailV1::InjectedWindowsFault { fault } => {
+            hash.update([3]);
+            let bytes = serde_json::to_vec(&fault).expect("bounded fault enum serializes");
+            hash.update((bytes.len() as u32).to_be_bytes());
+            hash.update(bytes);
         }
     }
     hash.update([

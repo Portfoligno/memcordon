@@ -9,6 +9,9 @@ Sealed providers can additionally enforce an explicitly granted workload
 contract with `--sealed --workload-contract contract.json`. See the
 [workload contract documentation](docs/spec-workload-contract-v1.md).
 
+Linux schema-3 image workloads select an administrator-approved entrypoint with
+`--image-entrypoint ID` and use `--report-format result-v2`.
+
 ![MemCordon command containment overview](docs/assets/banner.png)
 
 ## Install

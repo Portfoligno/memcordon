@@ -144,16 +144,49 @@ fn valid_v1_workload_contract_still_reaches_legacy_invocation() {
     let arguments = vec![
         OsString::from("--sealed"),
         OsString::from("--workload-contract"),
-        path.into_os_string(),
+        path.clone().into_os_string(),
         OsString::from("/bin/true"),
     ];
     match route(&arguments).unwrap() {
         Invocation::Execute(request) => {
             assert_eq!(
                 request.policy.workload_contract,
-                Some(WorkloadContract::V1(contract))
+                Some(WorkloadContract::V1(contract.clone()))
             )
         }
         other => panic!("expected legacy execution, got {other:?}"),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let observations = directory.path().join("observations");
+        let mut observed = arguments.clone();
+        observed.splice(
+            0..0,
+            [
+                OsString::from("--mixed-observation-directory"),
+                observations.clone().into_os_string(),
+            ],
+        );
+        match route(&observed).unwrap() {
+            Invocation::Execute(request) => {
+                assert_eq!(
+                    request.output.mixed_observation_directory,
+                    Some(observations)
+                );
+                assert_eq!(
+                    request.policy.workload_contract,
+                    Some(WorkloadContract::V1(contract))
+                );
+            }
+            other => panic!("expected observed legacy execution, got {other:?}"),
+        }
+        let unsealed = observed
+            .into_iter()
+            .filter(|argument| argument != "--sealed")
+            .collect::<Vec<_>>();
+        assert!(
+            route(&unsealed).is_err(),
+            "observation must not authorize an unsealed legacy workload"
+        );
     }
 }

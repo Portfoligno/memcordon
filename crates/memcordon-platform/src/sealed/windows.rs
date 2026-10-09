@@ -56,6 +56,20 @@ use crate::backend::{BackendInfo, Execution, SealedAvailability};
 #[path = "windows_runtime.rs"]
 mod runtime;
 
+#[cfg(feature = "test-support")]
+#[path = "windows_certification_observation.rs"]
+mod certification_observation;
+#[path = "windows_terminal_observation.rs"]
+mod terminal_observation;
+#[cfg(feature = "test-support")]
+pub use certification_observation::{
+    WindowsCertificationObservation, WindowsCertificationScope, WindowsCertificationSelection,
+};
+pub use terminal_observation::{
+    AuthenticatedWindowsTerminalObservation, MAX_TERMINAL_OBSERVATION_BYTES,
+    WindowsTerminalObservationScope,
+};
+
 const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 const TOKEN_GROUP_ENABLED: u32 = 0x0000_0004;
 const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
@@ -172,21 +186,36 @@ pub fn recover_windows_attempt(
     ),
     String,
 > {
+    recover_windows_attempt_with_request(attempt_id, nonce, request_sha256)
+        .map(|(response, delivery, _)| (response, delivery))
+}
+
+/// Retain the actual authenticated request alongside its response for independent custody.
+pub fn recover_windows_attempt_with_request(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+) -> Result<
+    (
+        WindowsProviderResponseV3,
+        Option<memcordon_core::WindowsTerminalDeliveryEvidenceV1>,
+        WindowsProviderRequestV3,
+    ),
+    String,
+> {
     let provider_binding = runtime::installed_binding()?;
     prepare_current_process_for_restricted_broker()?;
     let pipe = connect()?;
     authenticate_peer(pipe.raw())?;
     let challenge = recovery_challenge()?;
-    write_frame(
-        pipe.raw(),
-        &WindowsProviderRequestV3::RecoverAttempt {
-            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-            attempt_id: attempt_id.to_owned(),
-            nonce: nonce.to_owned(),
-            request_sha256: request_sha256.to_owned(),
-            challenge: challenge.clone(),
-        },
-    )?;
+    let request = WindowsProviderRequestV3::RecoverAttempt {
+        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        attempt_id: attempt_id.to_owned(),
+        nonce: nonce.to_owned(),
+        request_sha256: request_sha256.to_owned(),
+        challenge: challenge.clone(),
+    };
+    write_frame(pipe.raw(), &request)?;
     let (response, authority_raw) =
         read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe.raw())
             .map_err(|error| error.to_string())?;
@@ -228,7 +257,7 @@ pub fn recover_windows_attempt(
                     &retired.terminal_response_sha256,
                 ) =>
         {
-            return Ok((response, None));
+            return Ok((response, None, request));
         }
         WindowsProviderResponseV3::RecoveryAttemptUnavailable {
             schema_version,
@@ -239,7 +268,7 @@ pub fn recover_windows_attempt(
             && returned_challenge == &challenge
             && returned_attempt == attempt_id =>
         {
-            return Ok((response, None));
+            return Ok((response, None, request));
         }
         _ => return Err("recovery response is not bound to the requested attempt".to_owned()),
     }
@@ -266,7 +295,7 @@ pub fn recover_windows_attempt(
         &retired_raw,
     )
     .map_err(|error| error.to_string())?;
-    Ok((response, Some(delivery)))
+    Ok((response, Some(delivery), request))
 }
 
 /// Ask the privileged provider to drive durable recovery to its deadline, then
@@ -582,13 +611,18 @@ pub fn run(
     };
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-request-encoded");
-    let request_sha256 = Sha256::digest(
-        serde_json::to_vec(&request).map_err(|error| transport_error(error.to_string()))?,
-    )
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect::<String>();
-    write_frame(pipe.raw(), &WindowsProviderRequestV3::Launch(request)).map_err(transport_error)?;
+    let request_bytes =
+        serde_json::to_vec(&request).map_err(|error| transport_error(error.to_string()))?;
+    terminal_observation::retain_request(&request_bytes).map_err(transport_error)?;
+    let request_sha256 = Sha256::digest(&request_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    #[cfg(feature = "test-support")]
+    let provider_request = certification_observation::route(request).map_err(transport_error)?;
+    #[cfg(not(feature = "test-support"))]
+    let provider_request = WindowsProviderRequestV3::Launch(request);
+    write_frame(pipe.raw(), &provider_request).map_err(transport_error)?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-launch-written");
     let prepared = read_frame::<WindowsProviderResponseV3>(pipe.raw()).map_err(transport_error)?;
@@ -788,7 +822,7 @@ pub fn run(
                     attempt_id: returned,
                     nonce: returned_nonce,
                     request_sha256: returned_digest,
-                    ..
+                    child_pid,
                 } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
                     && returned == attempt_id
                     && returned_nonce == nonce
@@ -800,6 +834,17 @@ pub fn run(
                         .advance(WindowsRelayEventV1::TargetAuthorized)
                         .map_err(|error| transport_error(error.to_owned()))?;
                     target_authorized = true;
+                    #[cfg(feature = "test-support")]
+                    if certification_observation::after_target_authorized(child_pid)
+                        .map_err(transport_error)?
+                    {
+                        // Dropping the owned pipe closes this actual public
+                        // channel; ordinary requests never enter this branch.
+                        drop(pipe);
+                        return Err(transport_error(
+                            "test-support frontend disconnected its owned public channel".into(),
+                        ));
+                    }
                 }
                 WindowsProviderResponseV3::TargetRetired {
                     schema_version,
@@ -914,6 +959,7 @@ pub fn run(
                         .advance(WindowsRelayEventV1::Reject)
                         .map_err(|error| transport_error(error.to_owned()))?;
                     let terminal_ack_required = rejection.terminal_ack_required();
+                    let observed_terminal = rejection.terminal_receipt().cloned();
                     let mut primary = bound_rejection_error(
                         rejection,
                         policy.workload_contract(),
@@ -939,6 +985,16 @@ pub fn run(
                                         &response_raw,
                                         &retired_raw,
                                     )?);
+                                if let (Some(terminal), Some(delivery)) = (
+                                    observed_terminal.as_ref(),
+                                    primary.windows_terminal_delivery.as_ref(),
+                                ) {
+                                    terminal_observation::retain(
+                                        &provider_binding,
+                                        terminal,
+                                        delivery,
+                                    );
+                                }
                             }
                             Err(acknowledgment) => {
                                 if primary.provider_failure.is_none() {
@@ -1045,6 +1101,7 @@ pub fn run(
         inherited_resources_restricted: true,
         frontend_loss_cleanup_authority_verified: true,
     };
+    terminal_observation::retain(&provider_binding, &terminal, &delivery);
     let memcordon_core::WindowsTerminalPayloadV2::Execution {
         child_pid,
         duration_millis,
@@ -1821,6 +1878,8 @@ fn read_frame_with_raw_detailed<T: DeserializeOwned>(
         failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
         detail: error.to_string(),
     })?;
+    #[cfg(feature = "test-support")]
+    certification_observation::frame(&payload);
     Ok((decoded, payload))
 }
 

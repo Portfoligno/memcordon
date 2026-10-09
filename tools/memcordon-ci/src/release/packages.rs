@@ -8,6 +8,7 @@ use crate::{
     command::{PackageOutput, rustup_cargo},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -297,21 +298,56 @@ pub struct PackageConsumer {
     pub cli_source: PathBuf,
     pub install_root: PathBuf,
     pub bundle: PackageBundle,
+    cargo_home: PathBuf,
+    selected_target: Option<String>,
+    source_members: BTreeMap<PathBuf, [u8; 32]>,
+    consumer_graph: Option<serde_json::Value>,
+    install_graph: Option<serde_json::Value>,
+    selected_features: Vec<String>,
 }
 
 impl PackageConsumer {
     pub fn prepare(root: &Path, packages: &Path) -> Result<Self> {
+        Self::prepare_selection(root, packages, None)
+    }
+
+    pub fn prepare_selected(
+        root: &Path,
+        packages: &Path,
+        distribution: &super::distribution::TargetDistribution,
+    ) -> Result<Self> {
+        distribution.validate()?;
+        Self::prepare_selection(root, packages, Some(distribution))
+    }
+
+    fn prepare_selection(
+        root: &Path,
+        packages: &Path,
+        distribution: Option<&super::distribution::TargetDistribution>,
+    ) -> Result<Self> {
         let (bundle, bytes) = PackageBundle::load(packages)?;
         let directory = tempfile::tempdir()?;
         let mut patches = toml::Table::new();
         let mut dependencies = toml::Table::new();
         let mut cli_source = None;
+        let mut source_members = BTreeMap::new();
         for (record, bytes) in bundle.files.iter().zip(bytes) {
             let name = record.package.as_deref().expect("validated package");
             let extracted = directory.path().join(name);
             artifacts::extract_members(&artifacts::crate_members(&bytes)?, &extracted)?;
+            for (member, bytes) in artifacts::crate_members(&bytes)? {
+                source_members.insert(extracted.join(member), Sha256::digest(bytes).into());
+            }
             if name == "memcordon" {
-                cli_source = Some(extracted.clone());
+                let install_source = directory.path().join("install-source");
+                artifacts::extract_members(&artifacts::crate_members(&bytes)?, &install_source)?;
+                for (member, bytes) in artifacts::crate_members(&bytes)? {
+                    if member != "Cargo.lock" {
+                        source_members
+                            .insert(install_source.join(member), Sha256::digest(bytes).into());
+                    }
+                }
+                cli_source = Some(install_source);
             }
             let path = extracted.to_str().ok_or_else(|| {
                 CiError::Message("Cargo patch TOML path is not representable as UTF-8".into())
@@ -327,9 +363,29 @@ impl PackageConsumer {
                 name.into(),
                 toml::Value::Table(toml::Table::from_iter([(
                     "version".into(),
-                    toml::Value::String(bundle.source.version().to_string()),
+                    toml::Value::String(format!("={}", bundle.source.version())),
                 )])),
             );
+            if name == "memcordon" {
+                if let Some(distribution) = distribution {
+                    dependencies
+                        .get_mut(name)
+                        .expect("inserted CLI dependency")
+                        .as_table_mut()
+                        .expect("dependency table")
+                        .insert(
+                            "features".into(),
+                            toml::Value::Array(
+                                distribution
+                                    .features
+                                    .iter()
+                                    .cloned()
+                                    .map(toml::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                }
+            }
         }
         let config = directory.path().join("package-overrides.toml");
         fs::write(
@@ -371,18 +427,48 @@ impl PackageConsumer {
             "fn main() { let bytes: memcordon_core::ByteSize = \"4MiB\".parse().expect(\"public byte-size parser\"); assert_eq!(bytes.bytes(), 4 * 1024 * 1024); }\n",
         )?;
         let install_root = directory.path().join("install");
-        let value = Self {
+        let cargo_home = directory.path().join("cargo-home");
+        fs::create_dir(&cargo_home)?;
+        let mut value = Self {
             _directory: directory,
             manifest,
             config,
             cli_source: cli_source.expect("required CLI package"),
             install_root,
             bundle,
+            cargo_home,
+            selected_target: distribution.map(|distribution| distribution.target.clone()),
+            source_members,
+            consumer_graph: None,
+            install_graph: None,
+            selected_features: distribution
+                .map(|distribution| distribution.features.clone())
+                .unwrap_or_default(),
         };
         let toolchain = crate::config::toolchains(root)?.stable;
-        prepare_consumer_lock(root, &toolchain, &value.manifest, &value.config)?;
-        let output = rustup_cargo(
-            root,
+        let packaged_lock = value._directory.path().join("memcordon").join("Cargo.lock");
+        let consumer_metadata = prepare_packaged_consumer_lock(
+            &toolchain,
+            &packaged_lock,
+            &value.manifest,
+            &value.config,
+            Some(&value.cargo_home),
+            distribution,
+            false,
+        )?;
+        let install_metadata = prepare_packaged_consumer_lock(
+            &toolchain,
+            &packaged_lock,
+            &value.cli_source.join("Cargo.toml"),
+            &value.config,
+            Some(&value.cargo_home),
+            distribution,
+            true,
+        )?;
+        value.consumer_graph = Some(resolved_graph(&consumer_metadata)?);
+        value.install_graph = Some(resolved_graph(&install_metadata)?);
+        let mut metadata_command = rustup_cargo(
+            value.manifest.parent().expect("consumer manifest parent"),
             &toolchain,
             [
                 std::ffi::OsStr::new("metadata"),
@@ -396,11 +482,27 @@ impl PackageConsumer {
             ],
             Duration::from_secs(300),
         )
-        .output_quiet()?;
+        .isolated_cargo(&value.cargo_home);
+        if let Some(distribution) = distribution {
+            metadata_command = metadata_command
+                .arg("--filter-platform")
+                .arg(&distribution.target);
+        }
+        let output = metadata_command.output_quiet()?;
         if !output.status.success() {
             return Err(CiError::Message("package consumer metadata failed".into()));
         }
         let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+        if Some(resolved_graph(&metadata)?) != value.consumer_graph {
+            return Err(CiError::Message(
+                "locked candidate feature/dependency graph differs from selected adaptation".into(),
+            ));
+        }
+        verify_resolved_external_lock(
+            &packaged_lock,
+            &value.manifest.with_file_name("Cargo.lock"),
+            &metadata,
+        )?;
         for name in PUBLIC_PACKAGES {
             let packages: Vec<_> = metadata
                 .packages
@@ -421,13 +523,247 @@ impl PackageConsumer {
                 return Err(CiError::Message("consumer resolved source checkout or a registry predecessor instead of exact payload".into()));
             }
         }
+        value.verify_packaged_sources()?;
         Ok(value)
     }
 
+    fn verify_packaged_sources(&self) -> Result<()> {
+        for (path, expected) in &self.source_members {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_file() || <[u8; 32]>::from(Sha256::digest(fs::read(path)?)) != *expected
+            {
+                return Err(CiError::Message(
+                    "candidate Cargo modified a canonical packaged source or installation resource"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_selected_graph(&self, root: &Path, cli: bool) -> Result<()> {
+        let manifest = if cli {
+            self.cli_source.join("Cargo.toml")
+        } else {
+            self.manifest.clone()
+        };
+        let toolchain = crate::config::toolchains(root)?.stable;
+        let mut command = rustup_cargo(
+            manifest.parent().expect("candidate manifest parent"),
+            &toolchain,
+            ["metadata", "--locked", "--format-version", "1"],
+            Duration::from_secs(300),
+        )
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("--config")
+        .arg(&self.config)
+        .isolated_cargo(&self.cargo_home);
+        if let Some(target) = &self.selected_target {
+            command = command.arg("--filter-platform").arg(target);
+        }
+        if cli {
+            for feature in &self.selected_features {
+                command = command.arg("--features").arg(feature);
+            }
+        }
+        let output = command.output_quiet()?;
+        if !output.status.success() {
+            return Err(CiError::Message(
+                "locked candidate dependency readback failed".into(),
+            ));
+        }
+        let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+        let expected = if cli {
+            &self.install_graph
+        } else {
+            &self.consumer_graph
+        };
+        if &Some(resolved_graph(&metadata)?) != expected {
+            return Err(CiError::Message(
+                "candidate target/features/dependency kinds or edge graph changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retains the actual locked candidate install graph and the exact final
+    /// archives it consumed. Canonical packaged sources remain unchanged.
+    pub fn retain_install_graph(
+        &self,
+        root: &Path,
+        packages: &Path,
+        destination: &Path,
+        artifact_root: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<PathBuf> {
+        use std::io::Write;
+        self.verify_packaged_sources()?;
+        let manifest = self.cli_source.join("Cargo.toml");
+        let toolchain = crate::config::toolchains(root)?.stable;
+        let mut command = rustup_cargo(
+            &self.cli_source,
+            &toolchain,
+            ["metadata", "--locked", "--format-version", "1"],
+            Duration::from_secs(300),
+        )
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("--config")
+        .arg(&self.config)
+        .isolated_cargo(&self.cargo_home)
+        .bounded_until(deadline);
+        if let Some(target) = &self.selected_target {
+            command = command.arg("--filter-platform").arg(target);
+        }
+        for feature in &self.selected_features {
+            command = command.arg("--features").arg(feature);
+        }
+        let output = command.output_quiet()?;
+        if !output.status.success() {
+            return Err(CiError::Message(
+                "candidate consumed graph metadata failed".into(),
+            ));
+        }
+        let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+        if Some(resolved_graph(&metadata)?) != self.install_graph {
+            return Err(CiError::Message(
+                "candidate consumed graph changed after install".into(),
+            ));
+        }
+        fs::create_dir(destination)?;
+        let persist = |name: &str, bytes: &[u8]| -> Result<PathBuf> {
+            let path = destination.join(name);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(path)
+        };
+        let relative = |path: &Path| -> Result<String> {
+            Ok(path
+                .strip_prefix(artifact_root)
+                .map_err(|_| {
+                    CiError::Message("candidate lineage escapes cell artifact root".into())
+                })?
+                .to_str()
+                .ok_or_else(|| CiError::Message("candidate lineage path encoding differs".into()))?
+                .to_owned())
+        };
+        let raw_metadata = persist("metadata.json", &output.stdout)?;
+        persist("metadata-stderr", &output.stderr)?;
+        let raw_lock = persist(
+            "Cargo.lock",
+            &super::artifacts::read_file(&self.cli_source.join("Cargo.lock"))?,
+        )?;
+        let resolve = metadata
+            .resolve
+            .as_ref()
+            .ok_or_else(|| CiError::Message("candidate consumed resolve graph absent".into()))?;
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut pending = vec![
+            resolve
+                .root
+                .clone()
+                .ok_or_else(|| CiError::Message("candidate install graph root absent".into()))?,
+        ];
+        while let Some(id) = pending.pop() {
+            if reachable.insert(id.clone()) {
+                let node = resolve
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .ok_or_else(|| CiError::Message("candidate consumed node absent".into()))?;
+                pending.extend(node.deps.iter().map(|edge| edge.pkg.clone()));
+            }
+        }
+        fs::create_dir(destination.join("crates"))?;
+        let mut graph = Vec::new();
+        for node in resolve
+            .nodes
+            .iter()
+            .filter(|node| reachable.contains(&node.id))
+        {
+            let package = metadata
+                .packages
+                .iter()
+                .find(|package| package.id == node.id)
+                .ok_or_else(|| CiError::Message("candidate consumed package absent".into()))?;
+            let filename = format!("{}-{}.crate", package.name, package.version);
+            let bytes = if let Some(record) = self
+                .bundle
+                .files
+                .iter()
+                .find(|record| record.package.as_deref() == Some(package.name.as_str()))
+            {
+                let bytes = super::artifacts::read_file(&packages.join(&record.name))?;
+                super::artifacts::check_bytes(record, &bytes)?;
+                bytes
+            } else {
+                let cache = self.cargo_home.join("registry/cache");
+                let mut matches = Vec::new();
+                for entry in fs::read_dir(&cache)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        let candidate = entry.path().join(&filename);
+                        if candidate.is_file() {
+                            matches.push(candidate);
+                        }
+                    }
+                }
+                if matches.len() != 1 {
+                    return Err(CiError::Message(
+                        "candidate consumed external cache archive absent or ambiguous".into(),
+                    ));
+                }
+                super::artifacts::read_file(&matches[0])?
+            };
+            let archive = destination.join("crates").join(&filename);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&archive)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let mut edges = Vec::new();
+            for edge in &node.deps {
+                let dependency = metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.id == edge.pkg)
+                    .ok_or_else(|| {
+                        CiError::Message("candidate consumed edge package absent".into())
+                    })?;
+                for kind in &edge.dep_kinds {
+                    let domain = if kind.kind == cargo_metadata::DependencyKind::Normal {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::to_value(kind.kind)?
+                    };
+                    edges.push(serde_json::json!({"name":dependency.name,"version":dependency.version,"kind":domain,"target":kind.target}));
+                }
+            }
+            graph.push(serde_json::json!({"name":package.name,"version":package.version,"crate_sha256":super::artifacts::checksum(&bytes),"crate_artifact":relative(&archive)?,"features":node.features,"dependencies":edges}));
+        }
+        let graph_path = destination.join("registry-graph.json");
+        super::source::write_json(
+            &graph_path,
+            &serde_json::json!({"format":"memcordon.consumer-readiness.registry-graph","revision":1,"packages":graph,"raw_metadata":relative(&raw_metadata)?,"raw_lock":relative(&raw_lock)?}),
+        )?;
+        fs::File::open(destination.join("crates"))?.sync_all()?;
+        fs::File::open(destination)?.sync_all()?;
+        self.verify_packaged_sources()?;
+        Ok(graph_path)
+    }
+
     pub fn build(&self, root: &Path, target: &Path) -> Result<()> {
+        self.verify_packaged_sources()?;
+        self.verify_selected_graph(root, false)?;
         let stable = crate::config::toolchains(root)?.stable;
-        rustup_cargo(
-            root,
+        let mut test = rustup_cargo(
+            self.manifest.parent().expect("consumer manifest parent"),
             &stable,
             [
                 std::ffi::OsStr::new("test"),
@@ -441,9 +777,13 @@ impl PackageConsumer {
             ],
             Duration::from_secs(900),
         )
-        .run()?;
-        rustup_cargo(
-            root,
+        .isolated_cargo(&self.cargo_home);
+        if let Some(selected) = &self.selected_target {
+            test = test.arg("--target").arg(selected);
+        }
+        test.run()?;
+        let mut run = rustup_cargo(
+            self.manifest.parent().expect("consumer manifest parent"),
             &stable,
             [
                 std::ffi::OsStr::new("run"),
@@ -457,8 +797,13 @@ impl PackageConsumer {
             ],
             Duration::from_secs(900),
         )
-        .run()?;
-        Ok(())
+        .isolated_cargo(&self.cargo_home);
+        if let Some(selected) = &self.selected_target {
+            run = run.arg("--target").arg(selected);
+        }
+        run.run()?;
+        self.verify_packaged_sources()?;
+        self.verify_selected_graph(root, false)
     }
 
     pub fn install_cli(
@@ -467,13 +812,26 @@ impl PackageConsumer {
         target: &Path,
         distribution: &super::distribution::TargetDistribution,
     ) -> Result<()> {
+        if self
+            .selected_target
+            .as_ref()
+            .is_some_and(|target| target != &distribution.target)
+            || self.selected_features != distribution.features
+        {
+            return Err(CiError::Message(
+                "candidate installation selection differs from adapted target/features".into(),
+            ));
+        }
+        self.verify_packaged_sources()?;
+        self.verify_selected_graph(root, true)?;
         let stable = crate::config::toolchains(root)?.stable;
         let mut spec = rustup_cargo(
-            root,
+            &self.cli_source,
             &stable,
             ["install", "--locked", "--path"],
             Duration::from_secs(1800),
         )
+        .isolated_cargo(&self.cargo_home)
         .arg(&self.cli_source)
         .arg("--config")
         .arg(&self.config)
@@ -481,6 +839,7 @@ impl PackageConsumer {
         .arg(&self.install_root)
         .arg("--target-dir")
         .arg(target);
+        spec = spec.arg("--target").arg(&distribution.target);
         for feature in &distribution.features {
             spec = spec.arg("--features").arg(feature);
         }
@@ -488,7 +847,8 @@ impl PackageConsumer {
             spec = spec.arg("--bin").arg(binary);
         }
         spec.run()?;
-        Ok(())
+        self.verify_packaged_sources()?;
+        self.verify_selected_graph(root, true)
     }
 }
 
@@ -500,23 +860,177 @@ pub fn prepare_consumer_lock(
     config: &Path,
 ) -> Result<()> {
     let selected = root.join("Cargo.lock");
+    prepare_packaged_consumer_lock(toolchain, &selected, manifest, config, None, None, false)
+        .map(|_| ())
+}
+
+fn prepare_packaged_consumer_lock(
+    toolchain: &str,
+    selected: &Path,
+    manifest: &Path,
+    config: &Path,
+    cargo_home: Option<&Path>,
+    distribution: Option<&super::distribution::TargetDistribution>,
+    cli: bool,
+) -> Result<cargo_metadata::Metadata> {
     let consumer = manifest.with_file_name("Cargo.lock");
-    fs::copy(&selected, &consumer)?;
-    rustup_cargo(
-        root,
+    fs::copy(selected, &consumer)?;
+    let mut command = rustup_cargo(
+        manifest.parent().expect("consumer manifest parent"),
         toolchain,
         [
-            std::ffi::OsStr::new("update"),
-            std::ffi::OsStr::new("--workspace"),
+            std::ffi::OsStr::new("metadata"),
+            std::ffi::OsStr::new("--format-version"),
+            std::ffi::OsStr::new("1"),
             std::ffi::OsStr::new("--manifest-path"),
             manifest.as_os_str(),
             std::ffi::OsStr::new("--config"),
             config.as_os_str(),
         ],
         Duration::from_secs(300),
-    )
-    .run()?;
-    verify_external_lock(&selected, &consumer)
+    );
+    if let Some(home) = cargo_home {
+        command = command.isolated_cargo(home);
+    }
+    if let Some(distribution) = distribution {
+        command = command.arg("--filter-platform").arg(&distribution.target);
+        if cli {
+            for feature in &distribution.features {
+                command = command.arg("--features").arg(feature);
+            }
+        }
+    }
+    let output = command.output_quiet()?;
+    if !output.status.success() {
+        return Err(CiError::Message(
+            "candidate test lock metadata adaptation failed".into(),
+        ));
+    }
+    let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+    verify_external_lock(selected, &consumer)?;
+    verify_resolved_external_lock(selected, &consumer, &metadata)?;
+    Ok(metadata)
+}
+
+fn resolved_graph(metadata: &cargo_metadata::Metadata) -> Result<serde_json::Value> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| CiError::Message("candidate resolve graph absent".into()))?;
+    let mut nodes = std::collections::BTreeMap::new();
+    for node in &resolve.nodes {
+        let mut features = node
+            .features
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        features.sort();
+        let mut edges = node
+            .deps
+            .iter()
+            .map(|dependency| {
+                let mut kinds = dependency
+                    .dep_kinds
+                    .iter()
+                    .map(|kind| serde_json::to_string(kind))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                kinds.sort();
+                Ok(serde_json::to_string(&(
+                    &dependency.name,
+                    &dependency.pkg,
+                    kinds,
+                ))?)
+            })
+            .collect::<std::result::Result<Vec<_>, serde_json::Error>>()?;
+        edges.sort();
+        if nodes
+            .insert(
+                node.id.to_string(),
+                serde_json::json!({"features":features,"edges":edges}),
+            )
+            .is_some()
+        {
+            return Err(CiError::Message(
+                "candidate graph has duplicate package identity".into(),
+            ));
+        }
+    }
+    Ok(serde_json::json!({"root":resolve.root,"nodes":nodes}))
+}
+
+pub fn verify_same_resolved_graph(
+    selected: &cargo_metadata::Metadata,
+    observed: &cargo_metadata::Metadata,
+) -> Result<()> {
+    if resolved_graph(selected)? != resolved_graph(observed)? {
+        return Err(CiError::Message(
+            "candidate target/features/dependency kinds or edge graph changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn verify_resolved_external_lock(
+    selected: &Path,
+    adapted: &Path,
+    metadata: &cargo_metadata::Metadata,
+) -> Result<()> {
+    verify_external_lock(selected, adapted)?;
+    let text = fs::read_to_string(adapted)?;
+    let lock: toml::Value = toml::from_str(&text)?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| CiError::Message("adapted lock packages absent".into()))?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| CiError::Message("candidate resolved dependency graph absent".into()))?;
+    let reachable = resolve
+        .nodes
+        .iter()
+        .map(|node| &node.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|package| reachable.contains(&package.id))
+    {
+        let Some(source) = package.source.as_ref() else {
+            continue;
+        };
+        if packages
+            .iter()
+            .filter(|entry| {
+                entry.get("name").and_then(toml::Value::as_str) == Some(package.name.as_str())
+                    && entry.get("version").and_then(toml::Value::as_str)
+                        == Some(package.version.to_string().as_str())
+                    && entry.get("source").and_then(toml::Value::as_str)
+                        == Some(source.to_string().as_str())
+            })
+            .count()
+            != 1
+        {
+            return Err(CiError::Message(
+                "reachable external resolution differs from the adapted packaged lock".into(),
+            ));
+        }
+    }
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+    {
+        if package.name.as_str().starts_with("memcordon")
+            && package.name.as_str() != "memcordon-external-consumer"
+            && !PUBLIC_PACKAGES.contains(&package.name.as_str())
+        {
+            return Err(CiError::Message(
+                "candidate resolved an undeclared MemCordon checkout peer".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_external_lock(selected: &Path, consumer: &Path) -> Result<()> {

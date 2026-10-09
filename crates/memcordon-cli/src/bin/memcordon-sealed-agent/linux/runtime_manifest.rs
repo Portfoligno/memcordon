@@ -178,13 +178,22 @@ pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let expected = RuntimeManifest::linux_selected(
-        env!("CARGO_PKG_VERSION").into(),
-        crate::SOURCE_COMMIT.into(),
-        target()?.into(),
-        components,
-        cfg!(feature = "private-tcp"),
-    )?;
+    let expected = if cfg!(feature = "private-tcp") {
+        RuntimeManifest::linux_combined(
+            env!("CARGO_PKG_VERSION").into(),
+            crate::SOURCE_COMMIT.into(),
+            target()?.into(),
+            components,
+        )?
+    } else {
+        RuntimeManifest::linux_selected(
+            env!("CARGO_PKG_VERSION").into(),
+            crate::SOURCE_COMMIT.into(),
+            target()?.into(),
+            components,
+            cfg!(feature = "private-tcp"),
+        )?
+    };
     let path = directory.join("runtime-manifest.json");
     match manifest_bytes(&path, false) {
         Ok(bytes) => {

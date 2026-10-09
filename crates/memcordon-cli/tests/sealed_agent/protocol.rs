@@ -17,6 +17,59 @@ fn frame_round_trips_native_counted_payload() {
 }
 
 #[test]
+fn combined_envelope_has_independent_revision_and_rejects_cross_version_kinds() {
+    use crate::protocol::{MIXED_PROTOCOL_VERSION, read_frame_version};
+    for kind in [
+        MessageKind::MixedLaunch,
+        MessageKind::MixedBrokerLaunch,
+        MessageKind::MixedPlan,
+        MessageKind::MixedDiscovery,
+        MessageKind::MixedPreparedAck,
+        MessageKind::MixedTerminal,
+        MessageKind::MixedRejected,
+        MessageKind::MixedPlanReceipt,
+        MessageKind::MixedDiscoveryReceipt,
+        MessageKind::MixedPreparedObservation,
+    ] {
+        let frame = Frame {
+            kind,
+            nonce: [7; 16],
+            attempt_id: [9; 16],
+            payload: vec![],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        assert_eq!(&bytes[..2], &[0, 4], "new closed domain freezes envelope4");
+        assert_eq!(
+            read_frame_version(&mut bytes.as_slice(), MIXED_PROTOCOL_VERSION).unwrap(),
+            frame
+        );
+        assert!(matches!(
+            read_frame(&mut bytes.as_slice()),
+            Err(ProtocolError::UnsupportedVersion(4))
+        ));
+        bytes[..2].copy_from_slice(&[0, 3]);
+        assert!(
+            read_frame(&mut bytes.as_slice()).is_err(),
+            "mixed kind must not enter legacy envelope"
+        );
+    }
+    let legacy = Frame {
+        kind: MessageKind::Launch,
+        nonce: [7; 16],
+        attempt_id: [9; 16],
+        payload: vec![],
+    };
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &legacy).unwrap();
+    bytes[..2].copy_from_slice(&[0, 4]);
+    assert!(
+        read_frame_version(&mut bytes.as_slice(), MIXED_PROTOCOL_VERSION).is_err(),
+        "legacy kind must not enter combined envelope"
+    );
+}
+
+#[test]
 fn unknown_version_is_rejected_before_payload_allocation() {
     let mut bytes = vec![0, PROTOCOL_VERSION as u8 + 1];
     bytes.extend_from_slice(&[0; 70]);

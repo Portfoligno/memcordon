@@ -7,6 +7,10 @@ fn observation() -> WindowsGuardianAttemptObservation {
     WindowsGuardianAttemptObservation {
         format: "memcordon.windows-live-guardian-observation".into(),
         revision: 1,
+        live_nonce: None,
+        worker_process_identity: None,
+        worker_thread_identity: None,
+        live_target_identity: None,
         challenge: BoundedText::new("independent-query-challenge").unwrap(),
         guardian_identity: WindowsProcessIdentityV1 {
             process_id: 42,

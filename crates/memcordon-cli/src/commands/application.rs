@@ -102,6 +102,14 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     }
     let (program, arguments) = args.command.split_first().expect("router requires command");
     let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
+    if args.policy.mixed_workload_contract().is_some() {
+        #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+        {
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out,"MCWORKLOAD-MIXED-V3-UNAVAILABLE: combined image-only execution requires the selected GNU Linux private runtime").expect("mixed runtime diagnostic should be writable");
+            return 125;
+        }
+    }
     if args.policy.private_workload_contract().is_some() {
         if args.output.report_format != memcordon_core::ReportFormat::ResultV1 {
             return unavailable_private_v2(presentation);
@@ -383,6 +391,14 @@ fn finish_execution(
             }
         };
         if let Err(error) = write_report_bytes_atomic(path, &bytes) {
+            #[cfg(target_os = "linux")]
+            if let Err(observation_error) =
+                memcordon_platform::MixedObservationScope::record_report_delivery_failure(
+                    path, &bytes, &error,
+                )
+            {
+                eprintln!("native report delivery observation failed: {observation_error}");
+            }
             let mut out = presentation.stderr();
             presentation::write_runtime_error(&mut out, error)
                 .expect("report diagnostic should be writable");
@@ -448,6 +464,16 @@ fn finish_error(
                     }
                 };
                 if let Err(report_error) = write_report_bytes_atomic(path, &bytes) {
+                    #[cfg(target_os = "linux")]
+                    if let Err(observation_error) =
+                        memcordon_platform::MixedObservationScope::record_report_delivery_failure(
+                            path,
+                            &bytes,
+                            &report_error,
+                        )
+                    {
+                        eprintln!("native report delivery observation failed: {observation_error}");
+                    }
                     let mut out = presentation.stderr();
                     presentation::write_runtime_error(&mut out, report_error)
                         .expect("report diagnostic should be writable");
@@ -799,6 +825,17 @@ fn resolve(
     phase_path: Option<&Path>,
 ) -> Result<Resolution, Box<Error>> {
     let mut policy = policy_args.policy(budgets);
+    if let Some(contract) = policy_args.mixed_workload_contract() {
+        policy = policy
+            .with_mixed_workload_contract(contract.clone())
+            .map_err(|detail| {
+                Box::new(Error::new(
+                    ErrorCategory::Usage,
+                    "MCUSAGE-WORKLOAD-CONTRACT",
+                    detail,
+                ))
+            })?;
+    }
     if let Some(contract) = policy_args.private_workload_contract() {
         policy = policy
             .with_private_workload_contract(contract.clone())
@@ -810,7 +847,9 @@ fn resolve(
                 ))
             })?;
     }
-    if policy.workload_contract().is_some() && policy.boundary() != BoundaryRequirement::Sealed {
+    if (policy.workload_contract().is_some() || policy.mixed_workload_contract().is_some())
+        && policy.boundary() != BoundaryRequirement::Sealed
+    {
         return Err(Box::new(Error::new(
             ErrorCategory::Usage,
             "MCUSAGE-WORKLOAD-BOUNDARY",
@@ -1263,6 +1302,28 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
 }
 
 pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
+    if args.mixed_format {
+        #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+        {
+            let contract = args
+                .policy
+                .mixed_workload_contract()
+                .expect("validated plan-v2 contract");
+            return match memcordon_platform::mixed_plan(contract) {
+                Ok(value) => print_json(&value, "plan-v2", presentation),
+                Err(error) => {
+                    writeln!(presentation.stderr(), "MCSEALED-MIXED-PLAN: {error}")
+                        .expect("plan diagnostic writable");
+                    125
+                }
+            };
+        }
+        #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+        {
+            writeln!(presentation.stderr(),"MCSEALED-WORKLOAD-V3-UNAVAILABLE: mixed plan requires installed Linux combined provider").expect("plan diagnostic writable");
+            return 125;
+        }
+    }
     #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
     if args.policy.private_workload_contract().is_some() {
         return unavailable_private_v2(presentation);
@@ -1379,6 +1440,35 @@ fn selected_result(
     association: Option<memcordon_core::result_v1::ProviderAttemptAssociationV1>,
 ) -> Result<memcordon_core::ResultReport, String> {
     match args.output.report_format {
+        memcordon_core::ReportFormat::ResultV2 => {
+            let runtime=report.attempts.last().and_then(|attempt|match &attempt.boundary_detail{memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(runtime)=>Some((**runtime).clone()),_=>None}).ok_or("combined result lacks authenticated native mixed carrier; retained uncertainty cannot be replaced by a legacy report")?;
+            let features = [
+                ("sealed-runtime", cfg!(feature = "sealed-runtime")),
+                ("private-tcp", cfg!(feature = "private-tcp")),
+            ]
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(name, _)| name.to_owned())
+            .collect();
+            let value = memcordon_core::result_v2::ResultV2 {
+                format: "memcordon.result".into(),
+                revision: 2,
+                tool: memcordon_core::result_v1::OperationalToolV1 {
+                    name: report.tool.name.clone(),
+                    version: report.tool.version.clone(),
+                    os: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    runtime_features: features,
+                },
+                runtime: runtime.runtime,
+                frontend: runtime.frontend,
+                wrapper_status: exit_code,
+                delivery: memcordon_core::DeliveryEvidence::Prepared,
+                invocation: report.invocation.clone(),
+            };
+            value.validate()?;
+            Ok(memcordon_core::ResultReport::Mixed(Box::new(value)))
+        }
         memcordon_core::ReportFormat::Legacy => {
             Ok(memcordon_core::ResultReport::Legacy(Box::new(report)))
         }
@@ -1425,6 +1515,48 @@ fn unavailable_backend_capability() -> BackendCapabilityReport {
 }
 
 pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
+    if args.mixed_format {
+        #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+        {
+            let value = (|| {
+                let mut value = memcordon_platform::mixed_discovery()?;
+                if let Some(memcordon_core::workload_contract::WorkloadContract::V3(contract)) =
+                    &args.workload_contract
+                {
+                    value.plan = Some(memcordon_platform::mixed_plan(contract)?);
+                }
+                value.validate()?;
+                Ok::<_, String>(value)
+            })();
+            return match value {
+                Ok(value) => {
+                    let met = value.installed_enabled
+                        && value
+                            .plan
+                            .as_ref()
+                            .is_none_or(|plan| plan.available_for_preparation);
+                    let status = print_json(&value, "capabilities-v2", presentation);
+                    if status != 0 {
+                        status
+                    } else if met {
+                        0
+                    } else {
+                        125
+                    }
+                }
+                Err(error) => {
+                    writeln!(presentation.stderr(), "MCSEALED-MIXED-DISCOVERY: {error}")
+                        .expect("doctor diagnostic writable");
+                    125
+                }
+            };
+        }
+        #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
+        {
+            writeln!(presentation.stderr(),"MCSEALED-WORKLOAD-V3-UNAVAILABLE: mixed discovery requires installed Linux combined provider").expect("doctor diagnostic writable");
+            return 125;
+        }
+    }
     #[cfg(not(all(target_os = "linux", feature = "private-tcp")))]
     if matches!(
         args.workload_contract.as_ref(),

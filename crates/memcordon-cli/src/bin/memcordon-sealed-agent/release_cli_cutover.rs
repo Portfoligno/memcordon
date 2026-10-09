@@ -57,12 +57,23 @@ fn linux_entrypoint_install_command(arguments: &[OsString]) -> bool {
     )
 }
 
+fn linux_runtime_image_install_command(arguments: &[OsString]) -> bool {
+    matches!(arguments,
+        [package, policy, image, operation, definition, _, source_root, _, json]
+            if package == "package" && policy == "policy" && image == "image"
+                && operation == "install" && definition == "--definition"
+                && source_root == "--source-root" && json == "--json")
+}
+
 pub(crate) fn retired_release_command(platform: ReleasePlatform, arguments: &[OsString]) -> bool {
     let Some(command) = arguments.first().and_then(|argument| argument.to_str()) else {
         return false;
     };
     if command == "package" {
-        if platform == ReleasePlatform::Linux && linux_entrypoint_install_command(arguments) {
+        if platform == ReleasePlatform::Linux
+            && (linux_entrypoint_install_command(arguments)
+                || linux_runtime_image_install_command(arguments))
+        {
             return false;
         }
         return !matches!(platform, ReleasePlatform::Linux | ReleasePlatform::Windows)

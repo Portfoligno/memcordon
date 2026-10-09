@@ -46,20 +46,33 @@ pub(crate) fn windows_recovery(args: memcordon::invocation::WindowsRecoveryArgs)
             attempt_id,
             nonce,
             request_sha256,
-        } => memcordon_platform::recover_windows_attempt(&attempt_id, &nonce, &request_sha256)
-            .and_then(|(response, delivery)| {
+        } => memcordon_platform::recover_windows_attempt_with_request(&attempt_id, &nonce, &request_sha256)
+            .and_then(|(response, delivery, request)| {
+                #[cfg(not(feature="test-support"))]
+                let _=&request;
                 if matches!(
                     response,
                     memcordon_core::WindowsProviderResponseV3::RecoveryAttemptUnavailable { .. }
                 ) {
+                    #[cfg(feature = "test-support")]
+                    {
+                        // The separately measured support artifact preserves
+                        // the real authenticated refusal as observation. It
+                        // still returns the original denial status and cannot
+                        // acknowledge or create terminal authority.
+                        println!("{}",serde_json::json!({"schema_version":1,
+                            "provider_response":response,"frontend_delivery":delivery,"provider_request":request}));
+                    }
                     return Err("authenticated provider denied recovery authority".to_owned());
                 }
-                serde_json::to_value(serde_json::json!({
+                let value=serde_json::json!({
                     "schema_version": 1,
                     "provider_response": response,
                     "frontend_delivery": delivery,
-                }))
-                .map_err(|error| error.to_string())
+                });
+                #[cfg(feature="test-support")]
+                let value={let mut observed=value;observed["provider_request"]=serde_json::to_value(request).map_err(|error|error.to_string())?;observed};
+                Ok(value)
             }),
         WindowsRecoveryArgs::Converge { deadline_millis } => {
             memcordon_platform::converge_windows_recovery(std::time::Duration::from_millis(

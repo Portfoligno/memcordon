@@ -1,0 +1,388 @@
+# Fixed upstream contract. Runtime discovery and observed results cannot narrow it.
+format = "memcordon.consumer-readiness"
+revision = 1
+profile = "memcordon.consumer-readiness.v1"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+channels = ["candidate-native", "candidate-cargo", "public-native", "public-cargo"]
+requirements = ["CR-01", "CR-02", "CR-03", "CR-04", "CR-05", "CR-06", "CR-07", "CR-08", "CR-09", "CR-10", "CR-11", "CR-12", "CR-13", "CR-14"]
+linux_profile = "linux-tcp4-unix-private-v1"
+linux_request_revision = 3
+linux_result_revision = 2
+windows_profile = "windows-host-network-external-v1"
+windows_request_revision = 1
+windows_result_revision = 1
+windows_churn_creations = 4096
+windows_churn_generations = 3
+windows_churn_live_cohort = 64
+windows_population_processes = 257
+
+[[cases]]
+family = "C-PACKAGE"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["fresh-install","verify","upgrade","final-uninstall"]
+requirements = ["CR-02","CR-04","CR-13"]
+
+[[cases]]
+family = "C-IO"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["empty-input","empty-message","binary-streams","binary-file","native-argv","bounded-large-output"]
+requirements = ["CR-01","CR-06","CR-07"]
+
+[[cases]]
+family = "C-STATUS"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["zero","nonzero","exit-123","exit-124","exit-125","exit-126","exit-127","deadline","memory"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "C-ADMISSION"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["positive","unsupported-request","stale-grant","wrong-caller"]
+requirements = ["CR-09","CR-10"]
+
+[[cases]]
+family = "C-LIFETIME"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["root-first","frontend-loss","guardian-loss","service-loss","worker-loss","recovery"]
+requirements = ["CR-04","CR-08"]
+
+[[cases]]
+family = "C-PARSER"
+platform = "both"
+evidence_class = "installed_product"
+scenarios = ["valid-current-result"]
+requirements = ["CR-09"]
+
+[[cases]]
+family = "C-PARSER"
+platform = "both"
+evidence_class = "native_component_regression"
+scenarios = ["duplicate-key","wrong-format","wrong-revision","unknown-authority-variant","oversized-record","stale-attempt","wrong-product","omitted-case","duplicate-case","forged-cleanup"]
+requirements = ["CR-01","CR-09"]
+
+[[cases]]
+family = "L-MIX-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["joint-build-tcp-unix-http"]
+requirements = ["CR-05","CR-06"]
+
+[[cases]]
+family = "L-MIX-02"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["endpoint-mismatch"]
+requirements = ["CR-05"]
+
+[[cases]]
+family = "L-MIX-03"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["listener-and-file-transfer"]
+requirements = ["CR-05","CR-10"]
+
+[[cases]]
+family = "L-MIX-04"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["cooperation","cross-attempt"]
+requirements = ["CR-05","CR-10"]
+
+[[cases]]
+family = "L-MIX-05"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["empty-input","empty-message","binary-streams","bounded-large-output"]
+requirements = ["CR-05","CR-06"]
+
+[[cases]]
+family = "L-ISO-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["host-tcp","nonloopback","ipv6","udp","raw","packet","netlink"]
+requirements = ["CR-10"]
+
+[[cases]]
+family = "L-ISO-02"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["host-run-socket","host-temp-socket","input-socket","imported-socket","caller-writable-tree"]
+requirements = ["CR-10"]
+
+[[cases]]
+family = "L-ISO-03"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["host-abstract","other-attempt-abstract","own-abstract-positive"]
+requirements = ["CR-05","CR-10"]
+
+[[cases]]
+family = "L-ISO-04"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["symlink","dotdot","proc-root","proc-cwd","proc-fd","opath","hardlink","mount-alias"]
+requirements = ["CR-10"]
+
+[[cases]]
+family = "L-ISO-05"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["stdio-host-socket","extra-host-fd","pidfd-getfd","ptrace","namespace-entry"]
+requirements = ["CR-10"]
+
+[[cases]]
+family = "L-ISO-06"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["same-uid-process","account-alias","stale-reservation"]
+requirements = ["CR-06","CR-10"]
+
+[[cases]]
+family = "L-IMG-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["first-image","interpreter","shared-library","writable-alias"]
+requirements = ["CR-06","CR-10"]
+
+[[cases]]
+family = "L-IMG-02"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["ld-injection","rpath-injection","loader-config"]
+requirements = ["CR-06","CR-10"]
+
+[[cases]]
+family = "L-IMG-03"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["dynamic-rust-build-and-exec","image-only-entrypoint"]
+requirements = ["CR-06"]
+
+[[cases]]
+family = "L-IMG-04"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["export-symlink","export-fifo","export-device","export-socket","export-traversal","export-concurrent-writer"]
+requirements = ["CR-08","CR-10"]
+
+[[cases]]
+family = "L-ID-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["delegated-final-credentials","generated-descendants","v1-preserve-caller","v2-preserve-caller"]
+requirements = ["CR-06"]
+
+[[cases]]
+family = "L-ID-02"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["wrong-caller","wrong-plan","wrong-image","wrong-profile","wrong-identity","wrong-digest","wrong-epoch","disabled-grant","changed-grant","v3-preserve-caller"]
+requirements = ["CR-06","CR-09","CR-10"]
+
+[[cases]]
+family = "L-ID-03"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["revoke-discovery","revoke-preparation","revoke-release","drain-running","revoke-running","restart-fresh-admission"]
+requirements = ["CR-08","CR-10"]
+
+[[cases]]
+family = "L-LIFE-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["root-first-resource-descendant"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "L-LIFE-02"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["frontend-allocation","frontend-release","frontend-drain","worker-allocation","worker-release","worker-drain","guardian-allocation","guardian-release","guardian-drain","control-allocation","control-release","control-drain"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "L-LIFE-03"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["deadline","memory","cancellation","reserved-target-exit"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "L-LIFE-04"
+platform = "linux"
+evidence_class = "native_component_regression"
+scenarios = ["crash-before-account-retirement","lost-terminal-response"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "L-LIFE-05"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["report-persistence-failure","relay-backpressure"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "L-VER-01"
+platform = "linux"
+evidence_class = "installed_product"
+scenarios = ["old-provider","v3-result-v1","unknown-request-variant","duplicate-request","corrupted-binding"]
+requirements = ["CR-09"]
+
+[[cases]]
+family = "L-VER-01"
+platform = "linux"
+evidence_class = "native_component_regression"
+scenarios = ["v1-vectors","v2-vectors","v3-vectors","filter-x64","filter-arm64","projection-mutation","release-barrier","journal-barrier"]
+requirements = ["CR-09","CR-10"]
+
+[[cases]]
+family = "W-PACKAGE"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["materialize","install","verify","component-measure"]
+requirements = ["CR-02","CR-04","CR-13"]
+
+[[cases]]
+family = "W-ENVELOPE"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["ordinary","restricted","sentinel-handles"]
+requirements = ["CR-07","CR-10"]
+
+[[cases]]
+family = "W-ENVELOPE"
+platform = "windows"
+evidence_class = "native_component_regression"
+scenarios = ["remove-creation-job","remove-suspended-check","replace-token","broaden-handle-list"]
+requirements = ["CR-07","CR-10"]
+
+[[cases]]
+family = "W-JOINT"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["ordinary","restricted","endpoint-mismatch"]
+requirements = ["CR-07","CR-10"]
+
+[[cases]]
+family = "W-TOOLCHAIN"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["ordinary","restricted"]
+requirements = ["CR-07"]
+
+[[cases]]
+family = "W-IO"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["empty-stdout-stderr","empty-message","embedded-nul","all-bytes","invalid-utf8","final-fragment","backpressure-separated-streams","empty-file","binary-file","argv-empty","argv-whitespace","argv-quotes","argv-backslashes","argv-unicode","argv-path","argv-nul-rejection"]
+requirements = ["CR-07","CR-09"]
+
+[[cases]]
+family = "W-CHURN"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["natural-4096-three-generations"]
+requirements = ["CR-07","CR-08"]
+
+[[cases]]
+family = "W-POPULATION"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["held-257-deadline"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "W-DESCENDANT"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["root-first","intermediate-parent-first","nested-job","breakaway-denial","allowed-token-change"]
+requirements = ["CR-07","CR-08","CR-10"]
+
+[[cases]]
+family = "W-STATUS"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["zero","nonzero","exit-123","exit-124","exit-125","exit-126","exit-127","target-failure","admission-refusal","deadline","memory"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-CAPACITY"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["serial-retirement","bounded-concurrency","fresh-positive-after-recovery"]
+requirements = ["CR-07","CR-08"]
+
+[[cases]]
+family = "W-CAUSAL"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["known-guardian-original"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-CAUSAL"
+platform = "windows"
+evidence_class = "native_component_regression"
+scenarios = ["receiptless-first-cause","preauthorization","postresume","cleanup","after-exit","native-code-capture"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-GUARDIAN"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["after-release"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "W-REPLAY"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["public-recovery-after-loss"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-REPLAY"
+platform = "windows"
+evidence_class = "native_component_regression"
+scenarios = ["durable-replay","lost-publication-response","lost-acknowledgement","crash-before-durable","crash-after-durable","expiry-authority"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-WRITER"
+platform = "windows"
+evidence_class = "native_component_regression"
+scenarios = ["frozen-live","serialization-error","write-error","rename-error","readback-error","crash-before-durable","crash-after-durable","settlement-reservation"]
+requirements = ["CR-08","CR-09"]
+
+[[cases]]
+family = "W-BINDING"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["component-substitution","unsupported-public-request","stale-policy-epoch","revoked-grant","wrong-authorized-caller"]
+requirements = ["CR-09","CR-10","CR-13"]
+
+[[cases]]
+family = "W-BINDING"
+platform = "windows"
+evidence_class = "native_component_regression"
+scenarios = ["caller-substitution","attempt-substitution","request-substitution","generation-substitution","receiptless-posttarget","seed-replacement","proof-mismatch","projection-bounds"]
+requirements = ["CR-09","CR-10"]
+
+[[cases]]
+family = "W-RETIREMENT"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["natural","frontend-loss","control-service-loss","attempt-worker-loss","output-backpressure"]
+requirements = ["CR-08"]
+
+[[cases]]
+family = "W-UPGRADE"
+platform = "windows"
+evidence_class = "installed_product"
+scenarios = ["recover","fresh-positive","upgrade","verify","uninstall"]
+requirements = ["CR-04","CR-07","CR-13"]

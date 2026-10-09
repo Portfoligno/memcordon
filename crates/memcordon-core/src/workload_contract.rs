@@ -339,6 +339,7 @@ pub struct WorkloadContractV2 {
 pub enum WorkloadContract {
     V1(WorkloadContractV1),
     V2(WorkloadContractV2),
+    V3(crate::workload_contract_v3::WorkloadContractV3),
 }
 
 impl WorkloadContract {
@@ -366,6 +367,7 @@ impl WorkloadContract {
                 request.validate()?;
                 Ok(Self::V2(request))
             }
+            3 => crate::workload_contract_v3::WorkloadContractV3::parse(bytes).map(Self::V3),
             _ => Err("unsupported workload contract version".into()),
         }
     }
@@ -375,7 +377,9 @@ impl WorkloadContractV2 {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         match WorkloadContract::parse(bytes)? {
             WorkloadContract::V2(request) => Ok(request),
-            WorkloadContract::V1(_) => Err("expected workload contract version two".into()),
+            WorkloadContract::V1(_) | WorkloadContract::V3(_) => {
+                Err("expected workload contract version two".into())
+            }
         }
     }
 

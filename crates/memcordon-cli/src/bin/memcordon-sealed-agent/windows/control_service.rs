@@ -662,7 +662,52 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                 &caller_process_identity,
             )?;
             if control_fault(fault) {
-                exercise_control_fault(public, fault)?;
+                // Only the exact refusal returned by the selected support
+                // injection is classified as that fault. Unrelated native
+                // failures preserve their original error path.
+                let expected = format!("MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected {fault:?}");
+                let actual = match exercise_control_fault(public, fault) {
+                    Err(actual) if actual == expected => actual,
+                    Err(actual) => return Err(actual),
+                    Ok(()) => {
+                        return Err(
+                            "selected control fault did not reach its injection site".into()
+                        );
+                    }
+                };
+                let mut rejection = super::record::pretarget_rejection(
+                    "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+                    actual,
+                );
+                let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
+                journal
+                    .observe(memcordon_core::CausalEventV1 {
+                        sequence: 0,
+                        origin: memcordon_core::DiagnosticOriginV1::ControlRelay,
+                        category: memcordon_core::FailureCategoryV1::Launch,
+                        operation:
+                            memcordon_core::FailureOperationV1::UnclassifiedProviderOperation,
+                        code: memcordon_core::FailureCodeV1::UnexpectedProviderFailure,
+                        native_code: None,
+                        observed_phase:
+                            memcordon_core::AttemptObservationPhaseV1::BeforeAuthorization,
+                        safe_detail: memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault {
+                            fault,
+                        },
+                        detail_redacted: true,
+                        detail_truncated: false,
+                        terminalization_reference: None,
+                    })
+                    .map_err(|error| error.to_string())?;
+                rejection.provider_failure = Some(
+                    memcordon_core::ProviderFailureDiagnosticV1::from_journal(
+                        super::package::installed_public_provider_binding()?,
+                        &attempt_id,
+                        &request_sha256,
+                        &journal,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
                 pipe::write_frame(
                     public,
                     &WindowsProviderResponseV3::Reject {
@@ -670,10 +715,7 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                         attempt_id,
                         nonce: launch.nonce.clone(),
                         request_sha256,
-                        rejection: super::record::pretarget_rejection(
-                            "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
-                            format!("injected preauthorization fault: {fault:?}"),
-                        ),
+                        rejection,
                     },
                 )
             } else {
@@ -1233,6 +1275,20 @@ fn launch_client_inner(
         }
         Err(error) => return Err(remote_transfers.abort(error)),
     };
+    #[cfg(feature = "test-support")]
+    let certification_arguments = if matches!(
+        certification_fault,
+        Some(
+            WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+        )
+    ) {
+        launch.command.arguments.clone()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "test-support"))]
+    let certification_arguments = Vec::new();
     let broker = WindowsLaunchBrokerRequestV1 {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: attempt_id.clone(),
@@ -1262,6 +1318,7 @@ fn launch_client_inner(
         &nonce,
         &request_sha256,
         certification_fault,
+        &certification_arguments,
         progress,
     )
 }
@@ -1950,6 +2007,7 @@ fn relay_protocol(
     expected_nonce: &str,
     expected_request_sha256: &str,
     certification_fault: Option<WindowsSealedFault>,
+    certification_arguments: &[Vec<u16>],
     progress: &mut LaunchProgress,
 ) -> Result<(), String> {
     loop {
@@ -2164,6 +2222,45 @@ fn relay_protocol(
             } else {
                 LaunchResponseState::BoundAttemptActive
             };
+            #[cfg(feature = "test-support")]
+            if matches!(
+                certification_fault,
+                Some(
+                    WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+                )
+            ) && let WindowsProviderResponseV3::TargetAuthorized { child_pid, .. } =
+                &public_response
+            {
+                use std::os::windows::ffi::OsStringExt;
+                let descriptor = certification_arguments
+                    .get(1)
+                    .ok_or("owned control actor descriptor absent")?;
+                let descriptor =
+                    std::path::PathBuf::from(std::ffi::OsString::from_wide(descriptor));
+                if !descriptor.is_absolute() {
+                    return Err("owned control actor descriptor must be absolute".into());
+                }
+                let path = descriptor.with_file_name("control-worker-native.json");
+                if path.try_exists().map_err(|error| error.to_string())? {
+                    return Err("owned control actor worker observation already exists".into());
+                }
+                // SAFETY: the pseudo process handle is used only to observe
+                // this measured support service's actual native identity.
+                let process = super::process::process_identity(unsafe {
+                    windows_sys::Win32::System::Threading::GetCurrentProcess()
+                })?;
+                let thread = super::record::current_worker_thread_identity()?;
+                let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-component-control-worker-site","revision":1,
+                    "fault":certification_fault,"process":process,"thread":thread,"target_pid":child_pid,
+                    "target_authorization_observed":true})).map_err(|error|error.to_string())?;
+                memcordon_core::write_report_bytes_atomic(&path, &bytes)
+                    .map_err(|error| error.to_string())?;
+                super::launcher_service::wait_for_certification_release_marker(
+                    certification_arguments,
+                    *child_pid,
+                )?;
+            }
             if certification_fault
                 == Some(WindowsSealedFault::ControlServiceKilledAfterAuthorization)
                 && matches!(

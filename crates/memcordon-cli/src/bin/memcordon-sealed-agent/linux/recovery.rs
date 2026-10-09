@@ -17,6 +17,30 @@ pub fn recover() -> Result<Vec<String>, String> {
     recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT))
 }
 
+/// Administrative retry of persisted native obligations, without recreating
+/// execution observations or treating an ambiguous owner as retired.
+pub fn recover_administrative() -> Result<(), String> {
+    // SAFETY: geteuid has no pointer preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("native recovery requires authenticated root administration".into());
+    }
+    let _package_owner = super::service::acquire_package_lease()?;
+    let unresolved = recover()?;
+    let receipt = serde_json::json!({
+        "format": "memcordon.native-recovery", "revision": 1,
+        "outstanding": unresolved,
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+    );
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        Err("native recovery retains ambiguous ownership obligations".into())
+    }
+}
+
 #[cfg(feature = "test-support")]
 pub fn recover_test_roots(state_root: &Path, cgroup_root: &Path) -> Result<Vec<String>, String> {
     recover_roots(state_root, cgroup_root)
@@ -47,6 +71,36 @@ fn recover_records(
     authenticated: &mut BTreeSet<OsString>,
     ambiguous: &mut Vec<String>,
 ) -> Result<(), String> {
+    let reservations = fs::read_dir(state_root)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for entry in &reservations {
+        let name = entry.file_name();
+        let Some(identity) = name
+            .to_str()
+            .filter(|value| super::cgroup::valid_attempt_identity(value))
+        else {
+            continue;
+        };
+        let bytes = match read_record_no_follow(&entry.path()) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let record = match super::private_attempt::PrivateAttemptRecordV4::parse(bytes.as_bytes()) {
+            Ok(record)
+                if record.attempt_id.as_str() == identity
+                    && record.mixed_admission_metadata.is_some() =>
+            {
+                record
+            }
+            _ => continue,
+        };
+        if let Err(error) = recover_mixed_record(state_root, cgroup_root, &record, &entry.path()) {
+            authenticated.insert(name.clone());
+            ambiguous.push(format!("{identity}: {error}"));
+        }
+    }
     let reservations = fs::read_dir(state_root)
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -168,6 +222,218 @@ fn recover_records(
         fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn recover_mixed_record(
+    state_root: &Path,
+    cgroup_root: &Path,
+    record: &super::private_attempt::PrivateAttemptRecordV4,
+    journal: &Path,
+) -> Result<(), String> {
+    let metadata = record
+        .mixed_admission_metadata
+        .as_ref()
+        .ok_or("mixed recovery metadata absent")?;
+    let lease = crate::policy_registry::native::Lease::acquire()?;
+    let registry = lease.retained_registry_v3(&metadata.registry_digest)?;
+    let layout = registry
+        .root_layouts
+        .as_slice()
+        .iter()
+        .find(|layout| layout.reference().ok().as_ref() == Some(&metadata.request.root_layout))
+        .ok_or("retained recovery root layout absent")?;
+    let account = registry
+        .execution_identities
+        .as_slice()
+        .iter()
+        .find(|identity| {
+            identity.reference().ok().as_ref() == Some(&metadata.request.execution_identity)
+        })
+        .ok_or("retained recovery exclusive identity absent")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(state_root)
+        .map_err(|error| error.to_string())?;
+    let parent = directory.metadata().map_err(|error| error.to_string())?;
+    if parent.uid() != 0 || parent.mode() & 0o022 != 0 {
+        return Err("mixed recovery state ancestry differs".into());
+    }
+    let reference_path = state_root.join(format!("{}.mixed-admission", record.attempt_id.as_str()));
+    let reference = held_recovery_file(&reference_path)?;
+    if let Some(file) = &reference {
+        let mut bytes = Vec::new();
+        file.take(MAX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot::parse(&bytes)?
+            != *metadata
+        {
+            return Err("mixed recovery reference differs from journal".into());
+        }
+    }
+    let journal_file = held_recovery_file(journal)?.ok_or("mixed recovery journal disappeared")?;
+    let mut journal_bytes = Vec::new();
+    (&journal_file)
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut journal_bytes)
+        .map_err(|error| error.to_string())?;
+    if super::private_attempt::PrivateAttemptRecordV4::parse(&journal_bytes)? != *record {
+        return Err("mixed recovery held journal differs from parsed owner".into());
+    }
+    super::mixed_recovery::settle_native(record, cgroup_root, layout.output_files.as_slice())?;
+    super::mixed_admission::require_account_quiescent(account.uid.get(), None)?;
+    // Reservation deletion remains under the same retained native settlement;
+    // an unrelated or malformed reservation is never consumed by filename.
+    for entry in fs::read_dir(state_root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("account-") && name.ends_with(".reservation"))
+        {
+            continue;
+        }
+        let file =
+            held_recovery_file(&entry.path())?.ok_or("mixed recovery reservation disappeared")?;
+        let mut bytes = Vec::new();
+        (&file)
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let expected_keys = std::collections::BTreeSet::from([
+            "format",
+            "revision",
+            "user_namespace_device",
+            "user_namespace_inode",
+            "uid",
+            "attempt",
+            "owner_pid",
+            "owner_birth",
+            "boot_identity",
+        ]);
+        if value
+            .as_object()
+            .ok_or("reservation is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected_keys
+        {
+            return Err("mixed recovery reservation fields differ".into());
+        }
+        let attempt: Vec<u8> = serde_json::from_value(
+            value
+                .get("attempt")
+                .cloned()
+                .ok_or("reservation attempt absent")?,
+        )
+        .map_err(|error| error.to_string())?;
+        let expected = record.attempt_id.as_str();
+        let encoded = attempt
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        if encoded != expected {
+            continue;
+        }
+        let namespace_device = value
+            .get("user_namespace_device")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value != 0)
+            .ok_or("reservation namespace device absent")?;
+        let namespace_inode = value
+            .get("user_namespace_inode")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value != 0)
+            .ok_or("reservation namespace inode absent")?;
+        if entry.file_name()
+            != OsString::from(format!(
+                "account-{namespace_device}-{namespace_inode}-{}.reservation",
+                account.uid.get()
+            ))
+        {
+            return Err("mixed recovery reservation filename differs".into());
+        }
+        let worker = record
+            .mixed_worker
+            .as_ref()
+            .ok_or("mixed recovery reservation has no recorded creator")?;
+        if value.get("owner_pid").and_then(serde_json::Value::as_u64) != Some(u64::from(worker.pid))
+            || value.get("owner_birth").and_then(serde_json::Value::as_u64)
+                != Some(worker.start_time)
+        {
+            return Err("mixed recovery reservation creator differs".into());
+        }
+        if value.get("format").and_then(serde_json::Value::as_str)
+            != Some("memcordon.account-reservation")
+            || value.get("revision").and_then(serde_json::Value::as_u64) != Some(1)
+            || value.get("uid").and_then(serde_json::Value::as_u64)
+                != Some(u64::from(account.uid.get()))
+            || value
+                .get("boot_identity")
+                .and_then(serde_json::Value::as_str)
+                != Some(record.boot_identity.as_str())
+        {
+            return Err("mixed recovery reservation binding differs".into());
+        }
+        unlink_recovery_file(&entry.path(), &file, &directory)?;
+    }
+    if let Some(reference) = reference {
+        unlink_recovery_file(&reference_path, &reference, &directory)?;
+    }
+    unlink_recovery_file(journal, &journal_file, &directory)
+}
+
+fn held_recovery_file(path: &Path) -> Result<Option<File>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.len() > MAX_RECORD_BYTES
+    {
+        return Err("mixed recovery record custody differs".into());
+    }
+    Ok(Some(file))
+}
+fn unlink_recovery_file(path: &Path, file: &File, directory: &File) -> Result<(), String> {
+    let held = file.metadata().map_err(|error| error.to_string())?;
+    let named = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !named.is_file()
+        || (
+            named.dev(),
+            named.ino(),
+            named.len(),
+            named.mtime(),
+            named.mtime_nsec(),
+        ) != (
+            held.dev(),
+            held.ino(),
+            held.len(),
+            held.mtime(),
+            held.mtime_nsec(),
+        )
+    {
+        return Err("mixed recovery named record changed".into());
+    }
+    fs::remove_file(path).map_err(|error| error.to_string())?;
+    if file.metadata().map_err(|error| error.to_string())?.nlink() != 0 {
+        return Err("mixed recovery removed inode remains linked".into());
+    }
+    directory.sync_all().map_err(|error| error.to_string())
 }
 
 /// Reclaim a fully written reservation only after creator loss and boundary absence.
@@ -293,6 +559,7 @@ fn recover_account_reservation(
                     Err(_) => return Ok(false),
                 };
             if record.attempt_id.as_str() != identity
+                || record.mixed_admission_metadata.is_some()
                 || record.boot_identity.as_str() != reservation.boot_identity
                 || record.phase != super::private_attempt::PrivateAttemptPhase::Allocated
                 || record.target.is_some()

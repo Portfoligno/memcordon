@@ -614,8 +614,74 @@ pub fn run_private_namespace_init(
     startup: PrivateNamespaceStartupInit,
     provider_startup_fd: BorrowedFd<'_>,
     provider_control_fd: BorrowedFd<'_>,
-    mut status: File,
+    status: File,
     caller_cwd: OwnedFd,
+    caller_namespace: NamespaceIdentity,
+    provider_namespace: NamespaceIdentity,
+    lifetime: crate::request::Lifetime,
+) -> i32 {
+    run_namespace_init(
+        target,
+        startup,
+        provider_startup_fd,
+        provider_control_fd,
+        status,
+        Some(caller_cwd),
+        None,
+        caller_namespace,
+        provider_namespace,
+        lifetime,
+    )
+}
+
+pub(super) struct MixedNamespacePreparation {
+    pub runtime: super::runtime_image::InstalledRuntimeImage,
+    pub input: super::runtime_image::InstalledRuntimeImage,
+    pub layout: memcordon_core::workload_registry_v3::RootLayoutDefinitionV1,
+    pub staging: super::private_root::NativeRootStaging,
+    pub entry: memcordon_core::workload_registry_v3::ImageEntryV1,
+    pub working_directory: memcordon_core::workload_contract_v3::RootRelativePath,
+    pub root_channel: std::os::unix::net::UnixStream,
+    pub nonce: [u8; 16],
+    pub attempt: [u8; 16],
+    pub identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_mixed_namespace_init(
+    target: PrivateGatedTarget,
+    startup: PrivateNamespaceStartupInit,
+    provider_startup_fd: BorrowedFd<'_>,
+    provider_control_fd: BorrowedFd<'_>,
+    status: File,
+    preparation: MixedNamespacePreparation,
+    caller_namespace: NamespaceIdentity,
+    provider_namespace: NamespaceIdentity,
+    lifetime: crate::request::Lifetime,
+) -> i32 {
+    run_namespace_init(
+        target,
+        startup,
+        provider_startup_fd,
+        provider_control_fd,
+        status,
+        None,
+        Some(preparation),
+        caller_namespace,
+        provider_namespace,
+        lifetime,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_namespace_init(
+    mut target: PrivateGatedTarget,
+    startup: PrivateNamespaceStartupInit,
+    provider_startup_fd: BorrowedFd<'_>,
+    provider_control_fd: BorrowedFd<'_>,
+    mut status: File,
+    caller_cwd: Option<OwnedFd>,
+    mixed: Option<MixedNamespacePreparation>,
     caller_namespace: NamespaceIdentity,
     provider_namespace: NamespaceIdentity,
     lifetime: crate::request::Lifetime,
@@ -645,17 +711,73 @@ pub fn run_private_namespace_init(
     // before target fork, then close this extra capability so the gated target
     // still receives only its exact five descriptors.
     // SAFETY: fchdir reads the live, caller-bound directory descriptor.
-    if unsafe { libc::fchdir(caller_cwd.as_raw_fd()) } == -1 {
+    let prepare_root = (|| -> Result<(), String> {
+        match (caller_cwd, mixed) {
+            (Some(caller_cwd), None) => {
+                if unsafe { libc::fchdir(caller_cwd.as_raw_fd()) } < 0 {
+                    return Err(format!("caller cwd: {}", std::io::Error::last_os_error()));
+                }
+                drop(caller_cwd);
+            }
+            (None, Some(preparation)) => {
+                let root = super::private_root::MountedPrivateRoot::enter(
+                    preparation.runtime,
+                    preparation.input,
+                    preparation.layout,
+                    preparation.staging,
+                    target.identity.uid(),
+                    target.identity.gid(),
+                    preparation.attempt,
+                    preparation.identity,
+                )?;
+                let directory = root.open_working_directory(&preparation.working_directory)?;
+                if unsafe { libc::fchdir(directory.as_raw_fd()) } < 0 {
+                    return Err(format!(
+                        "private root cwd: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                drop(directory);
+                target.entrypoint = root.open_entrypoint(&preparation.entry)?;
+                target.mixed_root_filter = true;
+                let program = super::network_filter::compile_mixed_closed_filter(target.native_abi);
+                let digest = super::network_filter::filter_instruction_digest(&program)
+                    .map_err(str::to_owned)?;
+                if digest != target.expected_filter_digest {
+                    return Err("mixed native filter selection differs from admitted digest".into());
+                }
+                if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } < 0
+                    || unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0
+                {
+                    return Err("mixed namespace init nondumpable readback failed".into());
+                }
+                if unsafe { libc::geteuid() } == target.identity.uid() {
+                    return Err("mixed namespace init identity aliases target".into());
+                }
+                root.publish_to_provider(
+                    &preparation.root_channel,
+                    &preparation.entry,
+                    &target.entrypoint,
+                    preparation.nonce,
+                    preparation.attempt,
+                )?;
+                drop(root);
+                drop(preparation.root_channel);
+            }
+            _ => return Err("namespace root preparation variant differs".into()),
+        }
+        Ok(())
+    })();
+    if let Err(detail) = prepare_root {
         let _ = startup.report(
             &PrivateNamespaceStartupObservation::Failed {
                 phase: PrivateNamespaceStartupPhase::NamespaceSetup,
-                detail: format!("caller cwd: {}", std::io::Error::last_os_error()),
+                detail,
             },
             None,
         );
         return 125;
     }
-    drop(caller_cwd);
     let namespace = match super::network_profile::current_network_namespace() {
         Ok(namespace) => namespace,
         Err(detail) => {

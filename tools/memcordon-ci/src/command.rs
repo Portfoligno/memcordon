@@ -17,6 +17,9 @@ pub struct CommandSpec {
     operation_deadline: Option<Instant>,
     phase: Option<CiPhase>,
     selection: Option<serde_json::Value>,
+    isolated_cargo_home: Option<PathBuf>,
+    clear_environment: bool,
+    output_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +82,9 @@ impl CommandSpec {
             operation_deadline: None,
             phase: None,
             selection: None,
+            isolated_cargo_home: None,
+            clear_environment: false,
+            output_limit: 16 * 1024 * 1024,
         }
     }
 
@@ -156,7 +162,30 @@ impl CommandSpec {
         self
     }
 
+    pub fn isolated_cargo(mut self, home: &Path) -> Self {
+        self.isolated_cargo_home = Some(home.to_path_buf());
+        self
+    }
+
     pub fn apply_environment(&self, command: &mut Command) {
+        if self.clear_environment {
+            command.env_clear();
+        }
+        if let Some(home) = &self.isolated_cargo_home {
+            for (name, _) in std::env::vars_os() {
+                let name_text = name.to_string_lossy();
+                if name_text.starts_with("CARGO_")
+                    || name_text.starts_with("RUSTC_")
+                    || matches!(
+                        name_text.as_ref(),
+                        "RUSTC" | "RUSTFLAGS" | "RUSTDOC" | "RUSTDOCFLAGS"
+                    )
+                {
+                    command.env_remove(name);
+                }
+            }
+            command.env("CARGO_HOME", home);
+        }
         command
             .env_remove("GH_TOKEN")
             .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
@@ -164,6 +193,10 @@ impl CommandSpec {
         command.env_remove("CARGO_REGISTRY_TOKEN");
         command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
         command.env_remove("GITHUB_TOKEN");
+    }
+    pub fn cleared_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
@@ -187,6 +220,24 @@ impl CommandSpec {
     }
 
     pub fn materialize(&self) -> Result<Command> {
+        if let Some(home) = &self.isolated_cargo_home {
+            for ancestor in self.current_dir.ancestors() {
+                for name in ["config", "config.toml"] {
+                    if ancestor.join(".cargo").join(name).try_exists()? {
+                        return Err(CiError::Message(
+                            "candidate Cargo refuses inherited ancestor configuration".into(),
+                        ));
+                    }
+                }
+            }
+            for name in ["config", "config.toml", "credentials", "credentials.toml"] {
+                if home.join(name).try_exists()? {
+                    return Err(CiError::Message(
+                        "candidate Cargo home contains ambient configuration or credentials".into(),
+                    ));
+                }
+            }
+        }
         let mut command = Command::new(&self.program);
         match &self.toolchain {
             Some(ToolchainInvocation::Cargo { toolchain }) => {
@@ -221,6 +272,45 @@ impl CommandSpec {
     pub fn output_quiet(&self) -> Result<ObservedOutput> {
         let mut command = self.materialize()?;
         self.observe(&mut command)
+    }
+
+    /// Bound both capture workers before they allocate subprocess output.
+    pub fn output_limit(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0);
+        self.output_limit = bytes;
+        self
+    }
+
+    /// Observe the exact creation child before its sole native wait owner runs.
+    /// An observation error never drops that child: bounded settlement still
+    /// runs before the original observation error is returned.
+    #[cfg(target_os = "linux")]
+    pub fn output_quiet_with_creation(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+    ) -> Result<ObservedOutput> {
+        let command = self.materialize()?;
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                let child = command.spawn()?;
+                if let Err(error) = observe_creation(&child) {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            |_| Ok(()),
+        );
+        match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "native creation observation={original:?}; native settlement={error}"
+            ))),
+        }
     }
 
     fn observe(&self, command: &mut Command) -> Result<ObservedOutput> {
@@ -308,7 +398,7 @@ impl CommandSpec {
             eprintln!("diagnostic retention incomplete: {error}");
         }
         let budget = self.available_budget()?;
-        let result = run_with_deadline_output_limit(command, budget, 16 * 1024 * 1024);
+        let result = run_with_deadline_output_limit(command, budget, self.output_limit);
         let state = if result.as_ref().is_ok_and(|output| output.status.success()) {
             "completed"
         } else {

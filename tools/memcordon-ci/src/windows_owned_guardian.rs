@@ -173,6 +173,10 @@ mod native {
     }
 
     fn config_hash(service: &ServiceHandle) -> Result<String> {
+        config_observation(service).map(|(digest, _)| digest)
+    }
+
+    fn config_observation(service: &ServiceHandle) -> Result<(String, serde_json::Value)> {
         let mut required = 0;
         // SAFETY: the first call queries the allocation size and no output is read.
         unsafe { QueryServiceConfigW(service.0, ptr::null_mut(), 0, &mut required) };
@@ -193,6 +197,7 @@ mod native {
         // Hash semantic values, never pointer addresses in the native structure.
         let config = unsafe { &*pointer };
         let mut hash = Sha256::new();
+        let mut strings = Vec::new();
         for value in [
             config.dwServiceType,
             config.dwStartType,
@@ -223,8 +228,18 @@ mod native {
             for unit in &text[..length] {
                 hash.update(unit.to_le_bytes());
             }
+            strings.push(text[..length].to_vec());
         }
-        Ok(hex::encode(hash.finalize()))
+        Ok((
+            hex::encode(hash.finalize()),
+            serde_json::json!({
+                "service_type":config.dwServiceType,
+                "start_type":config.dwStartType,
+                "error_control":config.dwErrorControl,
+                "binary_path_utf16":strings[0],
+                "service_start_name_utf16":strings[1],
+            }),
+        ))
     }
 
     fn process_birth(process: HANDLE) -> Result<u64> {
@@ -319,6 +334,63 @@ mod native {
         }
 
         pub fn hold_new_guardian(self) -> Result<HeldGuardian> {
+            self.hold_new_guardian_excluding(&[])
+        }
+
+        /// Capture actual queried SCM values while exact image/manifest and
+        /// every slot service handle remain held. No target/Job is invented.
+        pub fn quiescence_receipt(&self) -> Result<Vec<u8>> {
+            let mut image = self.image.try_clone()?;
+            let mut manifest = self.manifest.try_clone()?;
+            if file_hash(&mut image)? != self.image_sha256
+                || file_hash(&mut manifest)? != self.manifest_sha256
+            {
+                return Err(CiError::Message(
+                    "held quiescence generation bytes changed".into(),
+                ));
+            }
+            let mut observations = Vec::with_capacity(self.slots.len());
+            for slot in &self.slots {
+                let (configuration, native_configuration) = config_observation(&slot.service)?;
+                let current = status(slot)?;
+                if configuration != slot.config_sha256
+                    || current.dwCurrentState != SERVICE_STOPPED
+                    || current.dwProcessId != 0
+                {
+                    return Err(CiError::Message(
+                        "native guardian slot ceased to be quiescent".into(),
+                    ));
+                }
+                observations.push(serde_json::json!({
+                    "service_name":slot.name,
+                    "configuration_sha256":configuration,
+                    "configuration":native_configuration,
+                    "service_type":current.dwServiceType,
+                    "current_state":current.dwCurrentState,
+                    "process_id":current.dwProcessId,
+                    "controls_accepted":current.dwControlsAccepted,
+                    "win32_exit_code":current.dwWin32ExitCode,
+                    "service_specific_exit_code":current.dwServiceSpecificExitCode,
+                    "checkpoint":current.dwCheckPoint,
+                    "wait_hint":current.dwWaitHint,
+                    "service_flags":current.dwServiceFlags,
+                }));
+            }
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.windows-native-guardian-quiescence",
+                "revision":1,
+                "image_sha256":self.image_sha256,
+                "runtime_manifest_sha256":self.manifest_sha256,
+                "slots":observations,
+            }))?)
+        }
+
+        /// Exclusions must remain held by the controller throughout selection.
+        /// Native birth, image, and SCM identity are checked independently here.
+        pub fn hold_new_guardian_excluding(
+            self,
+            exclusions: &[GuardianAssociationIdentity],
+        ) -> Result<HeldGuardian> {
             let mut selected = None;
             for slot in self.slots {
                 if config_hash(&slot.service)? != slot.config_sha256 {
@@ -327,6 +399,47 @@ mod native {
                     ));
                 }
                 let current = status(&slot)?;
+                if let Some(excluded) = exclusions
+                    .iter()
+                    .find(|identity| identity.service_name == slot.name)
+                {
+                    if current.dwCurrentState != SERVICE_RUNNING
+                        || current.dwProcessId != excluded.process_id
+                    {
+                        return Err(CiError::Message(
+                            "excluded held guardian lost its native SCM association".into(),
+                        ));
+                    }
+                    // SAFETY: this is the observed PID of the exact held SCM slot;
+                    // the returned handle is immediately owned and identity checked.
+                    let raw = unsafe {
+                        OpenProcess(
+                            PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000,
+                            0,
+                            current.dwProcessId,
+                        )
+                    };
+                    if raw.is_null() {
+                        return Err(native_failure("cannot revalidate excluded guardian"));
+                    }
+                    // SAFETY: OpenProcess returned this owner's non-null handle.
+                    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+                    let image = process_image(process.as_raw_handle() as HANDLE)?;
+                    if process_birth(raw)? != excluded.creation_time_100ns
+                        || file_identity(&image)? != file_identity(&self.image)?
+                        || (excluded.image_volume, excluded.image_file_index)
+                            != file_identity(&image)?
+                        || excluded.image_sha256 != self.image_sha256
+                        || excluded.generation_manifest_sha256 != self.manifest_sha256
+                        || unsafe { WaitForSingleObject(raw, 0) } != WAIT_TIMEOUT
+                    {
+                        return Err(CiError::Message(
+                            "excluded guardian is not the exact live measured native identity"
+                                .into(),
+                        ));
+                    }
+                    continue;
+                }
                 match (current.dwCurrentState, current.dwProcessId) {
                     (SERVICE_STOPPED, 0) => {}
                     (SERVICE_RUNNING, pid) if pid != 0 && selected.is_none() => {
@@ -385,6 +498,43 @@ mod native {
     }
 
     impl HeldGuardian {
+        pub fn native_exit_status(&self) -> Result<Option<u32>> {
+            if !self.has_retired()? {
+                return Ok(None);
+            }
+            let mut status = 0;
+            // SAFETY: this owner retains the exact retired process creation
+            // handle, independently checked against its configured service.
+            if unsafe {
+                windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                    self.process.as_raw_handle() as HANDLE,
+                    &mut status,
+                )
+            } == 0
+            {
+                return Err(native_failure(
+                    "cannot read held guardian native exit status",
+                ));
+            }
+            Ok(Some(status))
+        }
+        pub fn has_retired(&self) -> Result<bool> {
+            if config_hash(&self.slot.service)? != self.slot.config_sha256 {
+                return Err(CiError::Message(
+                    "held guardian service configuration changed during retirement".into(),
+                ));
+            }
+            let current = status(&self.slot)?;
+            // SAFETY: this owner retains the process handle for the complete check.
+            let wait = unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) };
+            if wait != WAIT_TIMEOUT && wait != windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
+                return Err(native_failure("cannot observe held guardian retirement"));
+            }
+            Ok(wait == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                && current.dwCurrentState == SERVICE_STOPPED
+                && current.dwProcessId == 0)
+        }
+
         pub fn terminate_owned(&mut self) -> Result<()> {
             let process = self.process.as_raw_handle() as HANDLE;
             let current = status(&self.slot)?;

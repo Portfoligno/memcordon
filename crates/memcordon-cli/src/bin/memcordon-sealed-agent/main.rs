@@ -182,10 +182,54 @@ fn main() {
             [package, policy, operation, json]
                 if package == "package"
                     && policy == "policy"
+                    && operation == "recover"
+                    && json == "--json" =>
+            {
+                linux::recovery::recover_administrative()
+            }
+            #[cfg(target_os = "linux")]
+            [package, policy, operation, json]
+                if package == "package"
+                    && policy == "policy"
                     && operation == "inspect"
                     && json == "--json" =>
             {
                 policy_registry::inspect()
+            }
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            [package, policy, image, operation, definition, path, json]
+                if package == "package"
+                    && policy == "policy"
+                    && image == "image"
+                    && operation == "retire"
+                    && definition == "--definition"
+                    && json == "--json" =>
+            {
+                linux::runtime_image::retire(std::path::Path::new(path))
+            }
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            [
+                package,
+                policy,
+                image,
+                operation,
+                definition,
+                path,
+                source_root,
+                source,
+                json,
+            ] if package == "package"
+                && policy == "policy"
+                && image == "image"
+                && operation == "install"
+                && definition == "--definition"
+                && source_root == "--source-root"
+                && json == "--json" =>
+            {
+                linux::runtime_image::install(
+                    std::path::Path::new(path),
+                    std::path::Path::new(source),
+                )
             }
             #[cfg(all(target_os = "linux", feature = "private-tcp"))]
             [

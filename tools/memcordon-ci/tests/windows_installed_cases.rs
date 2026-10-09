@@ -152,6 +152,10 @@ fn report_from_another_invocation_cannot_replace_independently_observed_live_ass
     let observed = memcordon_core::WindowsGuardianAttemptObservation {
         format: "memcordon.windows-live-guardian-observation".into(),
         revision: 1,
+        live_nonce: None,
+        worker_process_identity: None,
+        worker_thread_identity: None,
+        live_target_identity: None,
         challenge: BoundedText::new("fresh-native-query").unwrap(),
         guardian_identity: memcordon_core::WindowsProcessIdentityV1 {
             process_id: 42,

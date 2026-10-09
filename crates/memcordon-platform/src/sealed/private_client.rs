@@ -6,6 +6,268 @@ use std::time::Instant;
 const PRIVATE_LAUNCH_KIND: u16 = 10;
 const PRIVATE_TERMINAL_KIND: u16 = 110;
 
+#[derive(serde::Serialize)]
+pub struct MalformedMixedIngressEvidence {
+    pub response: Vec<u8>,
+    pub provider: memcordon_core::PublicProviderBindingV1,
+    pub nonce: [u8; 16],
+    pub attempt: [u8; 16],
+    pub request_frame: Vec<u8>,
+    pub response_frame: Vec<u8>,
+    pub peer_pid: i32,
+    pub peer_uid: u32,
+    pub peer_gid: u32,
+    pub peer_stat: Vec<u8>,
+    pub peer_pidfd_device: u64,
+    pub peer_pidfd_inode: u64,
+    pub peer_pidfd_before_revents: i16,
+    pub peer_pidfd_after_revents: i16,
+}
+
+/// Exercise the installed parser with a bounded request which the current
+/// request codec itself rejects. This exchange can never carry a valid launch.
+#[doc(hidden)]
+pub fn probe_malformed_mixed_ingress(
+    payload: &[u8],
+) -> Result<
+    (
+        Vec<u8>,
+        memcordon_core::PublicProviderBindingV1,
+        [u8; 16],
+        [u8; 16],
+    ),
+    String,
+> {
+    let evidence = probe_malformed_mixed_ingress_with_evidence(payload)?;
+    Ok((
+        evidence.response,
+        evidence.provider,
+        evidence.nonce,
+        evidence.attempt,
+    ))
+}
+
+#[doc(hidden)]
+pub fn probe_malformed_mixed_ingress_with_evidence(
+    payload: &[u8],
+) -> Result<MalformedMixedIngressEvidence, String> {
+    if payload.is_empty()
+        || payload.len() > memcordon_core::workload_limits::CONTRACT_ENVELOPE_BYTES
+        || memcordon_core::mixed_runtime::MixedRuntimeRequest::parse(payload).is_ok()
+    {
+        return Err("malformed ingress probe requires a bounded invalid current request".into());
+    }
+    verify_endpoint()?;
+    let provider = super::super::linux_runtime::installed_binding()?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    verify_peer(&stream)?;
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut credential_length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: exact initialized SO_PEERCRED output buffers, with the original
+    // authenticated stream held for the complete exchange.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut credential_length,
+        )
+    } != 0
+        || credential_length as usize != std::mem::size_of::<libc::ucred>()
+        || credentials.pid <= 0
+        || credentials.uid != 0
+    {
+        return Err("malformed ingress native peer credentials differ".into());
+    }
+    // SAFETY: native pidfd_open owns a successful returned descriptor; the
+    // selected PID came from the original connected socket's SO_PEERCRED.
+    let peer_pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, credentials.pid, 0) };
+    if peer_pidfd_raw < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: this successful descriptor is newly owned and converted once.
+    let peer_pidfd = unsafe { OwnedFd::from_raw_fd(peer_pidfd_raw as i32) };
+    let peer_file = std::fs::File::from(peer_pidfd);
+    use std::os::unix::fs::MetadataExt;
+    let peer_metadata = peer_file.metadata().map_err(|error| error.to_string())?;
+    let peer_poll = |file: &std::fs::File| -> Result<i16, String> {
+        let mut descriptor = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, referring to the held original PIDFD.
+        if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(descriptor.revents)
+    };
+    let peer_before = peer_poll(&peer_file)?;
+    if peer_before != 0 {
+        return Err("malformed ingress original connected peer already exited".into());
+    }
+    let mut peer_stat = Vec::new();
+    std::fs::File::open(format!("/proc/{}/stat", credentials.pid))
+        .map_err(|error| error.to_string())?
+        .take(65537)
+        .read_to_end(&mut peer_stat)
+        .map_err(|error| error.to_string())?;
+    if peer_stat.is_empty() || peer_stat.len() > 65536 {
+        return Err("malformed ingress peer source exceeds bound".into());
+    }
+    if peer_poll(&peer_file)? != 0 {
+        return Err("malformed ingress peer exited during original native birth read".into());
+    }
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let challenge = nonce()?;
+    let attempt = nonce()?;
+    let deadline = Instant::now()
+        .checked_add(super::super::verification_exchange::VERIFIED_EXCHANGE_BUDGET)
+        .ok_or("malformed ingress exchange deadline overflow")?;
+    let cwd = fs::File::open(".").map_err(|error| error.to_string())?;
+    let frontend = pidfd_self()?;
+    let (input, input_peer) = UnixStream::pair().map_err(|error| error.to_string())?;
+    let (output, output_peer) = UnixStream::pair().map_err(|error| error.to_string())?;
+    let (error, error_peer) = UnixStream::pair().map_err(|error| error.to_string())?;
+    let frame = encoded_frame_for_version(4, 14, challenge, attempt, payload)?;
+    send_nonblocking(
+        &stream,
+        &frame,
+        &[
+            cwd.as_raw_fd(),
+            input.as_raw_fd(),
+            output.as_raw_fd(),
+            error.as_raw_fd(),
+            frontend.as_raw_fd(),
+        ],
+        Some(deadline),
+    )?;
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("malformed ingress exchange deadline expired".into());
+    }
+    let mut bounded =
+        super::super::verification_exchange::DeadlineStream::new(&mut stream, remaining)
+            .map_err(|error| error.to_string())?;
+    let (response, response_header) = read_frame_for_version_with_header(&mut bounded, 4)?;
+    let mut response_frame = response_header.to_vec();
+    response_frame.extend_from_slice(&response.payload);
+    if response.kind != 115 || response.nonce != challenge || response.attempt != attempt {
+        return Err("malformed ingress refusal exchange association differs".into());
+    }
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&response.payload)?;
+    let carrier: memcordon_core::result_v2::MixedRuntimeCarrierV2 =
+        serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
+    carrier.validate()?;
+    let digest = memcordon_core::DiagnosticSha256::from_bytes(Sha256::digest(payload).into());
+    match &carrier.outcome {
+        memcordon_core::result_v2::MixedRuntimeOutcomeV2::RejectedIngress {
+            request_bytes_sha256,
+            allocation,
+            ..
+        } if request_bytes_sha256 == &digest
+            && matches!(
+                allocation.authorization,
+                memcordon_core::result_v2::MixedAuthorizationKnowledgeV2::NeverAuthorized
+            )
+            && allocation.obligations.as_slice().is_empty() => {}
+        _ => {
+            return Err(
+                "malformed ingress probe did not receive exact never-authorized refusal".into(),
+            );
+        }
+    }
+    super::super::linux_runtime::verify(&provider)?;
+    drop((input_peer, output_peer, error_peer));
+    let peer_after = peer_poll(&peer_file)?;
+    Ok(MalformedMixedIngressEvidence {
+        response: response.payload,
+        provider,
+        nonce: challenge,
+        attempt,
+        request_frame: frame,
+        response_frame,
+        peer_pid: credentials.pid,
+        peer_uid: credentials.uid,
+        peer_gid: credentials.gid,
+        peer_stat,
+        peer_pidfd_device: peer_metadata.dev(),
+        peer_pidfd_inode: peer_metadata.ino(),
+        peer_pidfd_before_revents: peer_before,
+        peer_pidfd_after_revents: peer_after,
+    })
+}
+
+fn mixed_advisory_exchange(
+    kind: u16,
+    response_kind: u16,
+    payload: &[u8],
+) -> Result<(Vec<u8>, memcordon_core::PublicProviderBindingV1), String> {
+    if payload.len() > memcordon_core::workload_limits::CONTRACT_BYTES {
+        return Err("mixed advisory payload exceeds bound".into());
+    }
+    verify_endpoint()?;
+    let provider = super::super::linux_runtime::installed_binding()?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    verify_peer(&stream)?;
+    let mut stream = super::super::verification_exchange::DeadlineStream::new(
+        &mut stream,
+        super::super::verification_exchange::VERIFIED_EXCHANGE_BUDGET,
+    )
+    .map_err(|error| error.to_string())?;
+    let challenge = nonce()?;
+    write_frame_for_version(&mut stream, 4, kind, challenge, [0; 16], payload)?;
+    let response = read_frame_for_version(&mut stream, 4)?;
+    if response.kind != response_kind
+        || response.nonce != challenge
+        || response.attempt != [0; 16]
+        || response.payload.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+    {
+        return Err("mixed advisory exchange association differs".into());
+    }
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&response.payload)?;
+    super::super::linux_runtime::verify(&provider)?;
+    Ok((response.payload, provider))
+}
+
+pub fn mixed_plan(
+    contract: &memcordon_core::workload_contract_v3::WorkloadContractV3,
+) -> Result<memcordon_core::mixed_advisory::MixedPlanV2, String> {
+    contract.validate()?;
+    let bytes = serde_json::to_vec(contract).map_err(|error| error.to_string())?;
+    let (bytes, provider) = mixed_advisory_exchange(16, 116, &bytes)?;
+    let value: memcordon_core::mixed_advisory::MixedPlanV2 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    value.validate()?;
+    if value.provider != provider || value.request != *contract {
+        return Err("mixed plan exact request/provider differs".into());
+    }
+    Ok(value)
+}
+
+pub fn mixed_discovery() -> Result<memcordon_core::mixed_advisory::MixedCapabilitiesV2, String> {
+    let (bytes, provider) = mixed_advisory_exchange(17, 117, &[])?;
+    let value: memcordon_core::mixed_advisory::MixedCapabilitiesV2 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    value.validate()?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| error.to_string())?;
+    if value.provider != provider || value.boot_identity.as_str() != boot.trim() {
+        return Err("mixed capability provider/boot differs".into());
+    }
+    Ok(value)
+}
+
 enum PrivateFrontendFailure {
     Transport(String),
     Rejected(Box<memcordon_core::private_runtime::PrivateRuntimeRejection>),
@@ -105,6 +367,250 @@ pub struct PrivateFrontendExecution {
     pub relay_drained: bool,
     pub interruption: Option<i32>,
     pub relay_error: Option<String>,
+}
+
+enum NativeContract<'a> {
+    Legacy(&'a memcordon_core::workload_contract::WorkloadContractV2),
+    Mixed(&'a memcordon_core::workload_contract_v3::WorkloadContractV3),
+}
+enum NativeTerminal {
+    Legacy(memcordon_core::private_runtime::PrivateRuntimeTerminal),
+    Mixed(memcordon_core::result_v2::MixedRuntimeCarrierV2),
+}
+struct NativeFrontendExecution {
+    terminal: NativeTerminal,
+    relay_drained: bool,
+    interruption: Option<i32>,
+    relay_error: Option<String>,
+}
+pub(crate) struct MixedFrontendExecution {
+    pub terminal: memcordon_core::result_v2::MixedRuntimeCarrierV2,
+    pub relay_drained: bool,
+    pub interruption: Option<i32>,
+    pub relay_error: Option<String>,
+}
+pub(crate) fn mixed_run_at(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract_v3::WorkloadContractV3,
+    context: crate::supervisor::AttemptContext,
+    started: Instant,
+    interrupted: impl FnMut() -> Option<i32>,
+) -> Result<MixedFrontendExecution, String> {
+    let receipt = native_run_at(
+        policy,
+        command,
+        NativeContract::Mixed(contract),
+        context,
+        started,
+        interrupted,
+    )
+    .map_err(|error| error.to_string())?;
+    let NativeTerminal::Mixed(terminal) = receipt.terminal else {
+        return Err("mixed invocation received a legacy carrier".into());
+    };
+    Ok(MixedFrontendExecution {
+        terminal,
+        relay_drained: receipt.relay_drained,
+        interruption: receipt.interruption,
+        relay_error: receipt.relay_error,
+    })
+}
+
+pub(crate) fn mixed_backend_run(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract_v3::WorkloadContractV3,
+    context: crate::supervisor::AttemptContext,
+    signal: &crate::signal::SignalSource,
+) -> Result<crate::backend::Execution, memcordon_core::Error> {
+    use memcordon_core::result_v2::*;
+    use memcordon_core::{
+        BoundaryClass, BoundaryRequirement, ChildTermination, Error, ErrorCategory, RunOutcome,
+    };
+    let failure = |detail: String| {
+        let mut error = Error::new(ErrorCategory::Monitor, "MCSEALED-MIXED-TRANSACTION", detail);
+        error.backend = Some("linux-tcp4-unix-private-v1".into());
+        error.workload_may_be_alive = true;
+        error
+    };
+    let started = Instant::now();
+    let monotonic_origin = monotonic_millis().map_err(failure)?;
+    let live = probe().map_err(failure)?;
+    let receipt = mixed_run_at(policy, command, contract, context, started, || {
+        signal.take()
+    })
+    .map_err(failure)?;
+    let frontend_evidence = MixedFrontendEvidenceV2 {
+        relay_drained: receipt.relay_drained,
+        interruption: receipt.interruption,
+        relay_error: receipt
+            .relay_error
+            .as_ref()
+            .map(|detail| {
+                memcordon_core::BoundedText::new(if detail.len() <= 4096 {
+                    detail
+                } else {
+                    "mixed frontend relay error exceeded diagnostic bound"
+                })
+            })
+            .transpose()
+            .map_err(|error| failure(error.to_owned()))?,
+    };
+    let mut errors = receipt.relay_error.into_iter().collect::<Vec<_>>();
+    if !receipt.relay_drained {
+        errors.push("frontend mixed byte relay was not completely drained/restored".into());
+    }
+    let (complete, released, child_pid, authorization, child) = match &receipt.terminal.outcome {
+        MixedRuntimeOutcomeV2::Executed { execution, .. } => {
+            let raw = execution.native_wait_status;
+            let child = if libc::WIFEXITED(raw) {
+                Some(ChildTermination::ExitCode {
+                    code: libc::WEXITSTATUS(raw),
+                })
+            } else if libc::WIFSIGNALED(raw) {
+                Some(ChildTermination::UnixSignal {
+                    signal: libc::WTERMSIG(raw),
+                })
+            } else {
+                return Err(failure(
+                    "mixed native wait status is neither exit nor signal".into(),
+                ));
+            };
+            (
+                true,
+                true,
+                std::num::NonZeroU32::new(execution.target.pid),
+                Some(
+                    execution
+                        .authorization_monotonic_millis
+                        .checked_sub(monotonic_origin)
+                        .ok_or_else(|| {
+                            failure("mixed release predates actual frontend invocation".into())
+                        })?,
+                ),
+                child,
+            )
+        }
+        MixedRuntimeOutcomeV2::RejectedBeforeAuthorization { allocation, .. }
+        | MixedRuntimeOutcomeV2::RejectedIngress { allocation, .. } => {
+            errors.extend(
+                allocation
+                    .obligations
+                    .as_slice()
+                    .iter()
+                    .map(|detail| detail.as_str().to_owned()),
+            );
+            (
+                allocation.obligations.as_slice().is_empty(),
+                false,
+                None,
+                None,
+                None,
+            )
+        }
+        MixedRuntimeOutcomeV2::Indeterminate {
+            retained_obligations,
+            ..
+        } => {
+            errors.extend(
+                retained_obligations
+                    .obligations
+                    .as_slice()
+                    .iter()
+                    .map(|detail| detail.as_str().to_owned()),
+            );
+            (
+                false,
+                matches!(
+                    retained_obligations.authorization,
+                    MixedAuthorizationKnowledgeV2::Authorized
+                ),
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    let cleanup = memcordon_core::CleanupSummary {
+        graceful_attempted: false,
+        force_attempted: false,
+        direct_child_reaped: complete,
+        workload_empty: complete.then_some(true),
+        errors: errors
+            .iter()
+            .map(|message| memcordon_core::CleanupErrorRecord {
+                operation: "mixed-frontend/retirement".into(),
+                message: message.clone(),
+            })
+            .collect(),
+    };
+    let outcome=match &receipt.terminal.outcome{
+        MixedRuntimeOutcomeV2::Executed{execution,..}=>match execution.outcome_origin{
+            MixedOutcomeOriginV2::NativeExit|MixedOutcomeOriginV2::NativeSignal=>RunOutcome::Exited{child:child.clone().expect("validated native termination"),peak:None,cleanup},
+            MixedOutcomeOriginV2::MemoryOom=>RunOutcome::LimitExceeded{limit:policy.memory.ok_or_else(||failure("mixed OOM lacks requested memory limit".into()))?,observed:None,peak:None,evidence:memcordon_core::LimitEvidence{backend:"linux-tcp4-unix-private-v1".into(),metric:"memory.events".into(),detail:"native owned cgroup oom_kill incremented".into()},child_after_termination:child.clone(),cleanup},
+            MixedOutcomeOriginV2::Deadline=>{
+                let configured=policy.deadline.ok_or_else(||failure("mixed native deadline lacks requested timer".into()))?;
+                let duration=effective_deadline_duration(policy,context,Duration::ZERO).ok_or_else(||failure("mixed effective deadline missing".into()))?;
+                let expires=if configured.scope()==memcordon_core::DeadlineScope::Attempt{u128::from(authorization.ok_or_else(||failure("mixed attempt timer lacks actual release clock".into()))?)+duration.as_millis()}else{duration.as_millis()};
+                let observed=monotonic_millis().map_err(failure)?.checked_sub(monotonic_origin).ok_or_else(||failure("mixed observation clock predates invocation".into()))?;
+                let deadline=memcordon_core::DeadlineEvidence::new(u64::try_from(configured.duration().as_millis()).map_err(|error|failure(error.to_string()))?,configured.scope(),"provider-absolute-deadline".into(),u64::try_from(expires).map_err(|error|failure(error.to_string()))?,observed,0,0,None,None).map_err(|error|failure(error.to_string()))?;
+                RunOutcome::DeadlineExceeded{deadline,child_after_termination:child.clone(),peak:None,cleanup}
+            }
+            _ if receipt.interruption.is_some()=>RunOutcome::Interrupted{signal:memcordon_core::Interruption{signal:receipt.interruption.expect("actual native frontend interruption")},child_after_termination:child.clone(),cleanup},
+            _=>RunOutcome::MonitorFailed{error:format!("mixed native owner ended {:?}",execution.outcome_origin),child_after_termination:child.clone(),cleanup},
+        },
+        MixedRuntimeOutcomeV2::RejectedBeforeAuthorization{reason,detail,..}|MixedRuntimeOutcomeV2::RejectedIngress{reason,detail,..}=>RunOutcome::MonitorFailed{error:format!("mixed admission refused {reason:?}: {}",detail.as_str()),child_after_termination:None,cleanup},
+        MixedRuntimeOutcomeV2::Indeterminate{..}=>RunOutcome::MonitorFailed{error:"mixed native ownership remains indeterminate; inspect retained protected obligations".into(),child_after_termination:None,cleanup},
+    };
+    let mut backend = crate::linux_cgroup::sealed_info(live);
+    if let crate::backend::SealedAvailability::Available { capability, .. } =
+        &mut backend.boundary_support.sealed
+    {
+        capability.mechanism = "linux-tcp4-unix-private-v1".into();
+    }
+    Ok(crate::backend::Execution {
+        private_execution: None,
+        policy_enforcement: Default::default(),
+        outcome,
+        backend,
+        child_pid,
+        runtime: None,
+        duration: started.elapsed(),
+        authorization_offset: authorization.map(Duration::from_millis),
+        launch: memcordon_core::LaunchEvidence {
+            mechanism: "linux-tcp4-unix-private-v1".into(),
+            target_released: released,
+            containment_verified_before_authorization: released,
+            guardian_started_before_authorization: released,
+            target_spawn_error_reported: false,
+            boundary_requested: BoundaryRequirement::Sealed,
+            boundary_effective: if released {
+                BoundaryClass::Sealed
+            } else {
+                BoundaryClass::Unavailable
+            },
+            boundary_assignment_verified: released,
+            boundary_reconfiguration_denied: released,
+            inherited_resources_restricted: released,
+            frontend_loss_cleanup_authority_verified: released,
+        },
+        restart_safety: memcordon_core::RestartSafetyProof {
+            direct_child_reaped: complete,
+            workload_empty: complete.then_some(true),
+            helpers_reaped: complete,
+            containment_removed: complete,
+            containment_incapable_of_live_members: complete,
+            sealed_boundary_retired: complete,
+            errors,
+        },
+        boundary_detail: memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(Box::new(
+            MixedRuntimeExecutionV2 {
+                runtime: receipt.terminal,
+                frontend: frontend_evidence,
+            },
+        )),
+    })
 }
 
 #[allow(
@@ -376,8 +882,34 @@ fn private_run_at(
     contract: &memcordon_core::workload_contract::WorkloadContractV2,
     context: crate::supervisor::AttemptContext,
     started: Instant,
-    mut interrupted: impl FnMut() -> Option<i32>,
+    interrupted: impl FnMut() -> Option<i32>,
 ) -> Result<PrivateFrontendExecution, PrivateFrontendFailure> {
+    let receipt = native_run_at(
+        policy,
+        command,
+        NativeContract::Legacy(contract),
+        context,
+        started,
+        interrupted,
+    )?;
+    let NativeTerminal::Legacy(terminal) = receipt.terminal else {
+        return Err("legacy invocation received a mixed carrier".into());
+    };
+    Ok(PrivateFrontendExecution {
+        terminal,
+        relay_drained: receipt.relay_drained,
+        interruption: receipt.interruption,
+        relay_error: receipt.relay_error,
+    })
+}
+fn native_run_at(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: NativeContract<'_>,
+    context: crate::supervisor::AttemptContext,
+    started: Instant,
+    mut interrupted: impl FnMut() -> Option<i32>,
+) -> Result<NativeFrontendExecution, PrivateFrontendFailure> {
     let deadline_budget = effective_deadline_duration(policy, context, Duration::ZERO);
     let attempt_scoped = policy
         .deadline
@@ -420,7 +952,10 @@ fn private_run_at(
                 .ok_or("private cleanup deadline is not representable")
         })
         .transpose()?;
-    contract.validate()?;
+    match &contract {
+        NativeContract::Legacy(value) => value.validate()?,
+        NativeContract::Mixed(value) => value.validate()?,
+    };
     verify_endpoint()?;
     let provider = super::super::linux_runtime::installed_binding()?;
     let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
@@ -430,7 +965,7 @@ fn private_run_at(
         .map_err(|error| error.to_string())?;
     let attempt = nonce()?;
     let challenge = nonce()?;
-    let native_launch = encode_launch(
+    let native_launch = encode_launch_with_environment(
         policy,
         command,
         if attempt_scoped {
@@ -439,20 +974,53 @@ fn private_run_at(
             deadline.map(|end| end.saturating_duration_since(Instant::now()))
         },
         context.restart_attempt,
+        match &contract {
+            NativeContract::Legacy(_) => std::env::vars_os().collect(),
+            NativeContract::Mixed(_) => Vec::new(),
+        },
     )?;
     let invocation_sha256 =
         memcordon_core::DiagnosticSha256::from_bytes(Sha256::digest(&native_launch).into());
-    let request = memcordon_core::private_runtime::PrivateRuntimeRequest {
-        format: "memcordon.private-runtime-request".into(),
-        revision: 1,
-        contract: contract.clone(),
-        native_launch,
-        attempt_deadline_millis,
+    let payload = match &contract {
+        NativeContract::Legacy(contract) => {
+            memcordon_core::private_runtime::PrivateRuntimeRequest {
+                format: "memcordon.private-runtime-request".into(),
+                revision: 1,
+                contract: (*contract).clone(),
+                native_launch,
+                attempt_deadline_millis,
+            }
+            .encode()?
+        }
+        NativeContract::Mixed(contract) => memcordon_core::mixed_runtime::MixedRuntimeRequest {
+            format: "memcordon.mixed-runtime-request".into(),
+            revision: 2,
+            contract: (*contract).clone(),
+            native_launch,
+            attempt_deadline_millis,
+        }
+        .encode()?,
     };
-    let payload = request.encode()?;
     let request_sha256 =
         memcordon_core::DiagnosticSha256::from_bytes(Sha256::digest(&payload).into());
-    let frame = encoded_frame(PRIVATE_LAUNCH_KIND, challenge, attempt, &payload)?;
+    if matches!(&contract, NativeContract::Mixed(_)) {
+        super::mixed_observation_client::record_request(attempt, &payload)?;
+    }
+    let version = match contract {
+        NativeContract::Legacy(_) => VERSION,
+        NativeContract::Mixed(_) => 4,
+    };
+    let frame = encoded_frame_for_version(
+        version,
+        if version == 4 {
+            14
+        } else {
+            PRIVATE_LAUNCH_KIND
+        },
+        challenge,
+        attempt,
+        &payload,
+    )?;
     let cwd = fs::File::open(".").map_err(|error| error.to_string())?;
     let frontend = pidfd_self()?;
     let (mut relay, channels) =
@@ -469,10 +1037,13 @@ fn private_run_at(
     // loss of frontend input could be falsely kept alive by this process.
     drop(channels);
     drop(cwd);
-    let mut incoming = Incoming::new();
+    let mut incoming = Incoming::new(version);
     let mut interruption = None;
     let mut cancel_pending = false;
     let mut relay_error = None;
+    let mut mixed_observation_seen = false;
+    let mut mixed_prepared = None;
+    let mut mixed_release_observation_seen = false;
     loop {
         if return_deadline.is_some_and(|end| Instant::now() >= end) {
             return Err("private frontend original deadline elapsed; provider retirement must be observed independently".into());
@@ -498,6 +1069,69 @@ fn private_run_at(
             if response.nonce != challenge || response.attempt != attempt {
                 return Err("private terminal frame differs from actual invocation".into());
             }
+            if response.kind == 118 {
+                let NativeContract::Mixed(contract) = &contract else {
+                    return Err("legacy invocation received mixed live observation".into());
+                };
+                if mixed_observation_seen {
+                    return Err("mixed provider repeated prepared observation".into());
+                }
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&response.payload)?;
+                let observation: memcordon_core::mixed_observation::MixedPreparedObservationV2 =
+                    serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
+                observation.validate()?;
+                let attempt_text = attempt
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if observation.provider != provider
+                    || observation.admission.attempt_id.as_str() != attempt_text
+                    || observation.admission.request != **contract
+                {
+                    return Err("mixed live observation exact association differs".into());
+                }
+                mixed_observation_client::observe(
+                    &response.payload,
+                    &observation,
+                    deadline.map_or(started + Duration::from_secs(30), |end| {
+                        end.min(started + Duration::from_secs(30))
+                    }),
+                )?;
+                let ack = encoded_frame_for_version(4, 18, challenge, attempt, &[])?;
+                send_nonblocking(&stream, &ack, &[], deadline)?;
+                mixed_observation_seen = true;
+                mixed_prepared = Some(observation);
+                continue;
+            }
+            if response.kind == 119 {
+                let NativeContract::Mixed(contract) = &contract else {
+                    return Err("legacy invocation received mixed release observation".into());
+                };
+                if !mixed_observation_seen || mixed_release_observation_seen {
+                    return Err("mixed release observation ordering differs".into());
+                }
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&response.payload)?;
+                let observation: memcordon_core::mixed_observation::MixedReleaseObservationV2 =
+                    serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
+                observation.validate()?;
+                if observation.prepared.provider != provider
+                    || observation.prepared.admission.request != **contract
+                    || mixed_prepared.as_ref() != Some(&observation.prepared)
+                {
+                    return Err("mixed release observation native association differs".into());
+                }
+                mixed_observation_client::observe_release(
+                    &response.payload,
+                    &observation,
+                    deadline.map_or(started + Duration::from_secs(30), |end| {
+                        end.min(started + Duration::from_secs(30))
+                    }),
+                )?;
+                let ack = encoded_frame_for_version(4, 19, challenge, attempt, &[])?;
+                send_nonblocking(&stream, &ack, &[], deadline)?;
+                mixed_release_observation_seen = true;
+                continue;
+            }
             if response.kind == 106 {
                 let rejected = parse_rejection(&response.payload)?;
                 return Err(format!(
@@ -507,6 +1141,9 @@ fn private_run_at(
                 .into());
             }
             if response.kind == 113 {
+                let NativeContract::Legacy(contract) = &contract else {
+                    return Err("mixed invocation received legacy rejection".into());
+                };
                 let rejection =
                     memcordon_core::private_runtime::PrivateRuntimeRejection::parse_bound(
                         &response.payload,
@@ -520,18 +1157,105 @@ fn private_run_at(
                 relay.finish().map_err(|error| error.to_string())?;
                 return Err(PrivateFrontendFailure::Rejected(Box::new(rejection)));
             }
-            if response.kind != PRIVATE_TERMINAL_KIND {
+            if !(if version == 4 {
+                matches!(response.kind, 114 | 115)
+            } else {
+                response.kind == PRIVATE_TERMINAL_KIND
+            }) {
                 return Err("private provider omitted named terminal".into());
             }
-            let terminal = memcordon_core::private_runtime::PrivateRuntimeTerminal::parse_bound(
-                &response.payload,
-                &provider,
-                attempt,
-                &request_sha256,
-                contract,
-                &invocation_sha256,
-            )?;
+            let terminal = match &contract {
+                NativeContract::Legacy(contract) => NativeTerminal::Legacy(
+                    memcordon_core::private_runtime::PrivateRuntimeTerminal::parse_bound(
+                        &response.payload,
+                        &provider,
+                        attempt,
+                        &request_sha256,
+                        contract,
+                        &invocation_sha256,
+                    )?,
+                ),
+                NativeContract::Mixed(contract) => {
+                    memcordon_core::workload_contract::reject_duplicate_json_keys(
+                        &response.payload,
+                    )?;
+                    let carrier: memcordon_core::result_v2::MixedRuntimeCarrierV2 =
+                        serde_json::from_slice(&response.payload)
+                            .map_err(|error| error.to_string())?;
+                    carrier.validate()?;
+                    if carrier.kind != "linux-mixed-private"
+                        || carrier.carrier_revision != 2
+                        || carrier.provider_contract != 4
+                        || carrier.launch_wire != 4
+                    {
+                        return Err("mixed terminal carrier revision differs".into());
+                    }
+                    use memcordon_core::result_v2::MixedRuntimeOutcomeV2;
+                    let attempt_text = attempt
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    match &carrier.outcome {
+                        MixedRuntimeOutcomeV2::RejectedIngress {
+                            request_bytes_sha256,
+                            ..
+                        } => {
+                            if request_bytes_sha256 != &request_sha256 {
+                                return Err("mixed ingress refusal actual bytes differ".into());
+                            }
+                        }
+                        MixedRuntimeOutcomeV2::Executed {
+                            admission,
+                            provider: observed,
+                            request_bytes_sha256,
+                            ..
+                        } => {
+                            if !mixed_observation_seen || !mixed_release_observation_seen {
+                                return Err("mixed executed terminal omitted native pre-release observation phases".into());
+                            }
+                            admission.validate()?;
+                            if admission.attempt_id.as_str() != attempt_text
+                                || &admission.request != *contract
+                                || observed != &provider
+                                || request_bytes_sha256 != &request_sha256
+                            {
+                                return Err(
+                                    "mixed terminal actual request/provider/attempt differs".into(),
+                                );
+                            }
+                        }
+                        MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
+                            request_sha256: semantic,
+                            request_bytes_sha256,
+                            ..
+                        } => {
+                            if semantic != &contract.digest()?
+                                || request_bytes_sha256 != &request_sha256
+                            {
+                                return Err("mixed refusal actual request differs".into());
+                            }
+                        }
+                        MixedRuntimeOutcomeV2::Indeterminate {
+                            attempt_id,
+                            request_sha256: semantic,
+                            retained_obligations,
+                            ..
+                        } => {
+                            if attempt_id.as_str() != attempt_text
+                                || semantic != &contract.digest()?
+                            {
+                                return Err("mixed indeterminate attempt/request differs".into());
+                            }
+                            if matches!(retained_obligations.authorization,memcordon_core::result_v2::MixedAuthorizationKnowledgeV2::Authorized)&&(!mixed_observation_seen||!mixed_release_observation_seen){return Err("mixed authorized indeterminate terminal omitted native pre-release observation phases".into());}
+                        }
+                    }
+                    NativeTerminal::Mixed(carrier)
+                }
+            };
             super::super::linux_runtime::verify(&provider)?;
+            if matches!(&terminal, NativeTerminal::Mixed(_)) {
+                mixed_observation_client::record_terminal(attempt, &response.payload)?;
+            }
             relay.close_input();
             // Draining never renews the original budget. With no requested
             // deadline the explicit native setup/cleanup allowance is finite.
@@ -548,7 +1272,7 @@ fn private_run_at(
             if let Err(error) = relay.finish() {
                 relay_error = Some(format!("private stdio restoration: {error}"));
             }
-            return Ok(PrivateFrontendExecution {
+            return Ok(NativeFrontendExecution {
                 terminal,
                 relay_drained: drained && relay_error.is_none(),
                 interruption,
@@ -726,12 +1450,14 @@ fn native_send(count: isize) -> std::io::Result<usize> {
 struct Incoming {
     bytes: Vec<u8>,
     total: Option<usize>,
+    version: u16,
 }
 impl Incoming {
-    fn new() -> Self {
+    fn new(version: u16) -> Self {
         Self {
             bytes: Vec::with_capacity(HEADER_LENGTH),
             total: None,
+            version,
         }
     }
     fn read(&mut self, stream: &mut UnixStream) -> Result<Option<WireFrame>, String> {
@@ -764,7 +1490,7 @@ impl Incoming {
             self.total = Some(total);
         }
         if self.total == Some(self.bytes.len()) {
-            return read_frame(&mut self.bytes.as_slice()).map(Some);
+            return read_frame_for_version(&mut self.bytes.as_slice(), self.version).map(Some);
         }
         Ok(None)
     }

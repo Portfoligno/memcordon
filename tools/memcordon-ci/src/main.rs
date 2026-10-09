@@ -17,6 +17,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    ConsumerReadinessNativeComponents(memcordon_ci::release::original_native_components::Args),
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    ConsumerReadinessMalformedIngress(
+        memcordon_ci::release::linux_malformed_ingress::MalformedIngressArguments,
+    ),
+    ConsumerReadinessCell(memcordon_ci::release::consumer_readiness_cell::CellArguments),
+    ConsumerReadinessCleanup(memcordon_ci::release::consumer_readiness_cell::CellArguments),
     Ci {
         #[command(subcommand)]
         command: CiCommand,
@@ -133,6 +142,20 @@ fn run() -> Result<()> {
         _ => workspace_root(&current)?,
     };
     let result = match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        Some(TopLevel::ConsumerReadinessNativeComponents(arguments)) => {
+            memcordon_ci::release::original_native_components::run(&root, &arguments)
+        }
+        Some(TopLevel::ConsumerReadinessCell(arguments)) => {
+            memcordon_ci::release::consumer_readiness_cell::execute(&root, &arguments)
+        }
+        #[cfg(target_os = "linux")]
+        Some(TopLevel::ConsumerReadinessMalformedIngress(arguments)) => {
+            memcordon_ci::release::linux_malformed_ingress::execute(&arguments)
+        }
+        Some(TopLevel::ConsumerReadinessCleanup(arguments)) => {
+            memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments)
+        }
         Some(TopLevel::Ci { command }) => match command {
             CiCommand::Prepare { profile } => memcordon_ci::preparation::prepare(&root, profile),
             CiCommand::CacheContext {

@@ -3,7 +3,7 @@ use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use crate::protocol::{Frame, MAX_FRAME_LENGTH, PROTOCOL_VERSION, read_frame};
+use crate::protocol::{Frame, MAX_FRAME_LENGTH, PROTOCOL_VERSION};
 
 const FRAME_HEADER_LENGTH: usize = 72;
 const MAX_DESCRIPTORS: usize = 8;
@@ -15,7 +15,7 @@ pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
 
 /// Receives the ordinary public channel envelope and its owned descriptors.
 pub fn receive_public(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>, u16), String> {
-    let received = receive_inner(stream, false, Some(PROTOCOL_VERSION))?;
+    let received = receive_inner(stream, false, None)?;
     Ok((received.frame, received.descriptors, received.version))
 }
 
@@ -78,7 +78,11 @@ fn receive_inner(
         return Err("provider request or descriptor inventory was truncated".to_owned());
     }
     let version = u16::from_be_bytes([header[0], header[1]]);
-    if version != PROTOCOL_VERSION || expected_version.is_some_and(|expected| expected != version) {
+    if !matches!(
+        version,
+        PROTOCOL_VERSION | crate::protocol::MIXED_PROTOCOL_VERSION
+    ) || expected_version.is_some_and(|expected| expected != version)
+    {
         return Err("unsupported provider frame version".to_owned());
     }
     let total = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
@@ -135,7 +139,8 @@ fn receive_inner(
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         header_ptr = unsafe { libc::CMSG_NXTHDR(&message, header_ptr) };
     }
-    let frame = read_frame(&mut Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    let frame = crate::protocol::read_frame_version(&mut Cursor::new(bytes), version)
+        .map_err(|error| error.to_string())?;
     Ok(ReceivedMessage {
         frame,
         descriptors,

@@ -47,6 +47,12 @@ path = "src/bin/memcordon-test-fixture.rs"
 required-features = ["test-fixtures"]
 
 [[bin]]
+name = "memcordon-linux-readiness-fixture"
+path = "src/bin/memcordon-linux-readiness-fixture.rs"
+required-features = ["test-fixtures"]
+doc = false
+
+[[bin]]
 name = "memcordon-sealed-test-fixture"
 path = "src/bin/memcordon-sealed-test-fixture.rs"
 required-features = ["test-support"]

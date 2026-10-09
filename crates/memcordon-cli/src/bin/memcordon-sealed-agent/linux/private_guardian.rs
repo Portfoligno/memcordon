@@ -74,6 +74,8 @@ pub struct PrivateGuardian {
     terminal: OwnedFd,
     attempt_id: [u8; 16],
     reaped: bool,
+    mixed_stop_sent: bool,
+    mixed_terminal: Option<GuardianTerminalV4>,
 }
 
 /// Exact death of the real guardian child, not a forged guardian terminal.
@@ -170,6 +172,8 @@ impl PrivateGuardian {
             terminal: terminal_read,
             attempt_id,
             reaped: false,
+            mixed_stop_sent: false,
+            mixed_terminal: None,
         })
     }
 
@@ -203,6 +207,42 @@ impl PrivateGuardian {
         }
         wait_exact_child(self.pid, deadline)?;
         self.reaped = true;
+        Ok(terminal)
+    }
+
+    /// Mixed retirement keeps this exact pidfd and any received terminal until
+    /// the final native reap succeeds. An I/O error never consumes the owner.
+    pub(super) fn retire_mixed_observed(
+        &mut self,
+        loss: bool,
+        deadline: Instant,
+    ) -> Result<GuardianTerminalV4, String> {
+        if !loss && !self.mixed_stop_sent {
+            let control = self
+                .control
+                .as_ref()
+                .ok_or("mixed guardian stop control absent")?;
+            write_one(control.as_raw_fd(), STOP)?;
+            self.mixed_stop_sent = true;
+            self.control.take();
+        }
+        if self.mixed_terminal.is_none() {
+            self.mixed_terminal = Some(read_terminal(
+                self.terminal.as_fd(),
+                self.attempt_id,
+                deadline,
+            )?);
+        }
+        let terminal = self
+            .mixed_terminal
+            .expect("observed mixed guardian terminal");
+        if (terminal.trigger == GuardianTriggerV4::Stopped) == loss {
+            return Err("mixed guardian stop/loss authority differs".into());
+        }
+        if !self.reaped {
+            wait_exact_child(self.pid, deadline)?;
+            self.reaped = true;
+        }
         Ok(terminal)
     }
 

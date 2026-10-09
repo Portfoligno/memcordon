@@ -50,6 +50,13 @@ pub struct ProcessIdentityV4 {
     pub start_time: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MixedDirectoryIdentityV2 {
+    pub device: u64,
+    pub inode: u64,
+}
+
 impl ProcessIdentityV4 {
     /// Capture process identity from a live pidfd and kernel process start
     /// time. A numeric PID received in a message is never enough authority.
@@ -109,6 +116,21 @@ pub struct PrivateAttemptRecordV4 {
     pub caller_envelope_digest: DiagnosticSha256,
     pub admission_metadata:
         Option<memcordon_core::workload_admission_v2::RuntimePrivateAdmissionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_admission_metadata:
+        Option<memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_export_intent: Option<BoundedText<1024>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_root_staging_intent: Option<BoundedText<1024>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_worker: Option<ProcessIdentityV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_cgroup_identity: Option<MixedDirectoryIdentityV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_staging_identity: Option<MixedDirectoryIdentityV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_export_identity: Option<MixedDirectoryIdentityV2>,
     pub phase: PrivateAttemptPhase,
     pub release_knowledge: ReleaseKnowledge,
     pub binding: Option<AttemptBindingV2>,
@@ -165,6 +187,13 @@ impl PrivateAttemptRecordV4 {
             frontend,
             caller_envelope_digest,
             admission_metadata: None,
+            mixed_admission_metadata: None,
+            mixed_export_intent: None,
+            mixed_export_identity: None,
+            mixed_root_staging_intent: None,
+            mixed_worker: None,
+            mixed_cgroup_identity: None,
+            mixed_staging_identity: None,
             phase: PrivateAttemptPhase::Allocated,
             release_knowledge: ReleaseKnowledge::NotReleased,
             binding: None,
@@ -189,6 +218,67 @@ impl PrivateAttemptRecordV4 {
             return Err("V4 attempt or boot identity invalid".into());
         }
         self.frontend.validate()?;
+        if self.admission_metadata.is_some() && self.mixed_admission_metadata.is_some() {
+            return Err("native journal has conflicting admission revisions".into());
+        }
+        if self.mixed_worker.is_some()
+            || self.mixed_cgroup_identity.is_some()
+            || self.mixed_staging_identity.is_some()
+        {
+            if self.mixed_admission_metadata.is_none() {
+                return Err("mixed native ownership appears without matching admission".into());
+            }
+            if let Some(worker) = &self.mixed_worker {
+                worker.validate()?;
+                if worker == &self.frontend {
+                    return Err("mixed worker aliases frontend".into());
+                }
+            }
+            if [&self.mixed_cgroup_identity, &self.mixed_staging_identity]
+                .into_iter()
+                .flatten()
+                .any(|identity| identity.inode == 0)
+            {
+                return Err("mixed directory ownership has zero inode".into());
+            }
+            if self.mixed_staging_identity.is_some() && self.mixed_root_staging_intent.is_none() {
+                return Err("mixed staging identity lacks original intent".into());
+            }
+        }
+        if let Some(path) = &self.mixed_export_intent {
+            if self.mixed_admission_metadata.is_none()
+                || path.as_str()
+                    != format!("/run/memcordon/private-export-{}", self.attempt_id.as_str())
+            {
+                return Err("mixed export journal intent differs from attempt".into());
+            }
+        }
+        if let Some(identity) = &self.mixed_export_identity {
+            if identity.inode == 0 || self.mixed_export_intent.is_none() {
+                return Err("mixed export identity lacks original intent".into());
+            }
+        }
+        if let Some(path) = &self.mixed_root_staging_intent {
+            if self.mixed_admission_metadata.is_none()
+                || path.as_str()
+                    != format!("/run/memcordon/private-root-{}", self.attempt_id.as_str())
+            {
+                return Err("mixed root staging intent differs from attempt".into());
+            }
+        }
+        if let Some(metadata) = &self.mixed_admission_metadata {
+            metadata.validate()?;
+            if metadata.attempt_id != self.attempt_id {
+                return Err("mixed journal attempt association differs".into());
+            }
+            if let Some(binding) = &self.binding {
+                if binding.admission_digest != metadata.canonical_digest()?
+                    || binding.native_invocation_digest != metadata.invocation_sha256
+                {
+                    return Err("mixed journal admission association differs".into());
+                }
+            }
+        }
         if let Some(metadata) = &self.admission_metadata {
             metadata.validate()?;
             if let Some(binding) = &self.binding {
@@ -392,6 +482,7 @@ pub struct DurablePrivateAttempt {
     path: PathBuf,
     directory: File,
     record: PrivateAttemptRecordV4,
+    retirement_file: Option<File>,
 }
 
 impl DurablePrivateAttempt {
@@ -442,6 +533,7 @@ impl DurablePrivateAttempt {
             path,
             directory,
             record,
+            retirement_file: None,
         })
     }
 
@@ -455,6 +547,7 @@ impl DurablePrivateAttempt {
     ) -> Result<(), String> {
         if self.record.phase != PrivateAttemptPhase::Allocated
             || self.record.admission_metadata.is_some()
+            || self.record.mixed_admission_metadata.is_some()
         {
             return Err("private admission metadata must precede native allocation".into());
         }
@@ -467,6 +560,28 @@ impl DurablePrivateAttempt {
             native_invocation_digest: metadata.invocation_sha256.clone(),
         });
         next.admission_metadata = Some(metadata);
+        self.replace(next)
+    }
+
+    pub(super) fn attach_mixed_admission_metadata(
+        &mut self,
+        metadata: memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot,
+    ) -> Result<(), String> {
+        if self.record.phase != PrivateAttemptPhase::Allocated
+            || self.record.admission_metadata.is_some()
+            || self.record.mixed_admission_metadata.is_some()
+        {
+            return Err("mixed admission must precede native allocation".into());
+        }
+        metadata.validate()?;
+        let mut next = self.record.clone();
+        next.binding = Some(AttemptBindingV2 {
+            attempt_id: next.attempt_id.clone(),
+            admission_digest: metadata.canonical_digest()?,
+            caller_envelope_digest: next.caller_envelope_digest.clone(),
+            native_invocation_digest: metadata.invocation_sha256.clone(),
+        });
+        next.mixed_admission_metadata = Some(metadata);
         self.replace(next)
     }
 
@@ -484,7 +599,8 @@ impl DurablePrivateAttempt {
         facts: OperationalGatedFacts,
     ) -> Result<(), String> {
         if self.record.phase != PrivateAttemptPhase::TargetGated
-            || self.record.admission_metadata.is_none()
+            || (self.record.admission_metadata.is_none()
+                && self.record.mixed_admission_metadata.is_none())
         {
             return Err(
                 "private commit requires actual gated target and descriptive local metadata".into(),
@@ -508,6 +624,11 @@ impl DurablePrivateAttempt {
         next.phase = PrivateAttemptPhase::ReleaseIntent;
         next.release_knowledge = ReleaseKnowledge::PossiblyReleased;
         self.replace(next)
+    }
+
+    #[cfg(test)]
+    pub fn release_intent_for_component_test(&mut self) -> Result<(), String> {
+        self.release_intent()
     }
 
     pub fn guardian_ready(&mut self, guardian: ProcessIdentityV4) -> Result<(), String> {
@@ -592,6 +713,176 @@ impl DurablePrivateAttempt {
         }
         self.remove_retired()
     }
+    pub(super) fn begin_mixed_retirement(&mut self) -> Result<(), String> {
+        if self.record.mixed_admission_metadata.is_none() {
+            return Err("mixed retirement journal metadata absent".into());
+        }
+        if self.record.phase == PrivateAttemptPhase::Retired {
+            return if self.retirement_file.is_some() {
+                Ok(())
+            } else {
+                Err("retired mixed journal lacks held finalization custody".into())
+            };
+        }
+        let mut next = self.record.clone();
+        next.phase = PrivateAttemptPhase::Retiring;
+        self.replace(next)
+    }
+    pub(super) fn record_mixed_export_intent(&mut self, path: &Path) -> Result<(), String> {
+        let path = path.to_str().ok_or("mixed export path is not UTF-8")?;
+        if self.record.phase != PrivateAttemptPhase::Retiring
+            || self.record.mixed_admission_metadata.is_none()
+        {
+            return Err("mixed export intent requires native retiring phase".into());
+        }
+        if let Some(existing) = &self.record.mixed_export_intent {
+            return if existing.as_str() == path {
+                Ok(())
+            } else {
+                Err("mixed export intent changed".into())
+            };
+        }
+        let mut next = self.record.clone();
+        next.mixed_export_intent = Some(BoundedText::new(path).map_err(str::to_owned)?);
+        self.replace(next)
+    }
+    pub(super) fn record_mixed_root_staging_intent(&mut self, path: &Path) -> Result<(), String> {
+        let path = path.to_str().ok_or("mixed staging path is not UTF-8")?;
+        if self.record.phase != PrivateAttemptPhase::BoundaryCreated
+            || self.record.mixed_admission_metadata.is_none()
+        {
+            return Err("mixed staging intent requires owned boundary".into());
+        }
+        if let Some(existing) = &self.record.mixed_root_staging_intent {
+            return if existing.as_str() == path {
+                Ok(())
+            } else {
+                Err("mixed staging intent changed".into())
+            };
+        }
+        let mut next = self.record.clone();
+        next.mixed_root_staging_intent = Some(BoundedText::new(path).map_err(str::to_owned)?);
+        self.replace(next)
+    }
+    pub(super) fn record_mixed_worker(&mut self, worker: ProcessIdentityV4) -> Result<(), String> {
+        if self.record.phase != PrivateAttemptPhase::Allocated
+            || self.record.mixed_admission_metadata.is_none()
+        {
+            return Err("mixed worker must precede native allocation".into());
+        }
+        let mut next = self.record.clone();
+        next.mixed_worker = Some(worker);
+        self.replace(next)
+    }
+    pub(super) fn record_mixed_export_identity(
+        &mut self,
+        identity: MixedDirectoryIdentityV2,
+    ) -> Result<(), String> {
+        if self.record.phase != PrivateAttemptPhase::Retiring
+            || self.record.mixed_export_intent.is_none()
+        {
+            return Err("mixed export ownership phase differs".into());
+        }
+        if self
+            .record
+            .mixed_export_identity
+            .as_ref()
+            .is_some_and(|prior| prior != &identity)
+        {
+            return Err("mixed export directory identity changed".into());
+        }
+        let mut next = self.record.clone();
+        next.mixed_export_identity = Some(identity);
+        self.replace(next)
+    }
+    pub(super) fn record_mixed_directory(
+        &mut self,
+        staging: bool,
+        identity: MixedDirectoryIdentityV2,
+    ) -> Result<(), String> {
+        if self.record.phase != PrivateAttemptPhase::BoundaryCreated
+            || self.record.mixed_admission_metadata.is_none()
+        {
+            return Err("mixed native directory ownership phase differs".into());
+        }
+        let mut next = self.record.clone();
+        let slot = if staging {
+            &mut next.mixed_staging_identity
+        } else {
+            &mut next.mixed_cgroup_identity
+        };
+        if let Some(prior) = slot {
+            if prior != &identity {
+                return Err("mixed native directory identity changed".into());
+            }
+        }
+        *slot = Some(identity);
+        self.replace(next)
+    }
+    /// Retain the exact final journal inode until unlink and directory sync
+    /// succeed. A retry after successful unlink checks the held zero-link
+    /// inode and path absence, rather than recreating or adopting a journal.
+    pub(super) fn retire_mixed_after_native_cleanup(
+        &mut self,
+        permit: super::private_lifecycle::VerifiedPrivateRetirement,
+    ) -> Result<(), String> {
+        if !permit.matches(&self.record) || self.record.mixed_admission_metadata.is_none() {
+            return Err("mixed native retirement permit differs".into());
+        }
+        if self.record.phase == PrivateAttemptPhase::Retiring {
+            let mut next = self.record.clone();
+            next.phase = PrivateAttemptPhase::Retired;
+            self.replace(next)?;
+        }
+        if self.record.phase != PrivateAttemptPhase::Retired {
+            return Err("mixed journal finalization phase differs".into());
+        }
+        if self.retirement_file.is_none() {
+            if self.read_back()? != self.record {
+                return Err("mixed final journal content changed".into());
+            }
+            self.retirement_file = Some(
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(&self.path)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let held = self
+            .retirement_file
+            .as_ref()
+            .expect("held final journal")
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        match fs::symlink_metadata(&self.path) {
+            Ok(current) => {
+                if !current.is_file()
+                    || current.uid() != 0
+                    || current.nlink() != 1
+                    || current.mode() & 0o7777 != 0o600
+                    || (current.dev(), current.ino()) != (held.dev(), held.ino())
+                {
+                    return Err("mixed final journal native inode differs".into());
+                }
+                fs::remove_file(&self.path).map_err(|error| error.to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && held.nlink() == 0 => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if self
+            .retirement_file
+            .as_ref()
+            .expect("held final journal")
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .nlink()
+            != 0
+        {
+            return Err("mixed final journal retains unexpected links".into());
+        }
+        self.directory.sync_all().map_err(|error| error.to_string())
+    }
 
     fn remove_retired(mut self) -> Result<(), String> {
         if self.record.phase != PrivateAttemptPhase::Retiring {
@@ -653,5 +944,85 @@ impl DurablePrivateAttempt {
             return Err("V4 durable record differs from owned state".into());
         }
         Ok(record)
+    }
+    #[cfg(test)]
+    pub fn component_native_bytes(&self) -> Result<Vec<u8>, String> {
+        self.component_native_observation().map(|(bytes, _)| bytes)
+    }
+    #[cfg(test)]
+    pub fn component_native_observation(&self) -> Result<(Vec<u8>, serde_json::Value), String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+            .map_err(|e| e.to_string())?;
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        if !before.is_file()
+            || before.uid() != 0
+            || before.nlink() != 1
+            || before.mode() & 0o7777 != 0o600
+            || before.len() > MAX_PRIVATE_RECORD_BYTES as u64
+        {
+            return Err("component native journal custody differs".into());
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take((MAX_PRIVATE_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if PrivateAttemptRecordV4::parse(&bytes)? != self.record {
+            return Err("component native journal differs from actual owner".into());
+        }
+        let stamp = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.nlink(),
+                m.uid(),
+                m.mode(),
+            )
+        };
+        if stamp(&before) != stamp(&file.metadata().map_err(|e| e.to_string())?) {
+            return Err("component native journal changed while read".into());
+        }
+        let named = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+            .map_err(|e| e.to_string())?;
+        if stamp(&before) != stamp(&named.metadata().map_err(|e| e.to_string())?) {
+            return Err("component native journal named inode differs".into());
+        }
+        let mut readback = Vec::new();
+        (&named)
+            .take((MAX_PRIVATE_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut readback)
+            .map_err(|e| e.to_string())?;
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.path.parent().ok_or("journal parent absent")?)
+            .map_err(|e| e.to_string())?
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        let held = self.directory.metadata().map_err(|e| e.to_string())?;
+        if readback != bytes
+            || (parent.dev(), parent.ino(), parent.uid(), parent.mode())
+                != (held.dev(), held.ino(), held.uid(), held.mode())
+            || !parent.is_dir()
+            || !held.is_dir()
+            || held.uid() != 0
+            || held.mode() & 0o022 != 0
+            || stamp(&before) != stamp(&file.metadata().map_err(|error| error.to_string())?)
+            || stamp(&before) != stamp(&named.metadata().map_err(|error| error.to_string())?)
+        {
+            return Err("component journal named byte/parent readback differs".into());
+        }
+        let observation = serde_json::json!({"path":self.path,"device":before.dev(),"inode":before.ino(),"length":before.len(),"links":before.nlink(),"uid":before.uid(),"mode":before.mode(),
+            "parent_path":self.path.parent(),"parent_device":held.dev(),"parent_inode":held.ino(),"parent_uid":held.uid(),"parent_mode":held.mode()});
+        Ok((bytes, observation))
     }
 }

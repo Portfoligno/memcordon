@@ -739,6 +739,7 @@ fn reject_fault(
     expected: WindowsSealedFault,
 ) -> Result<(), String> {
     if actual == Some(expected) {
+        crate::windows::launcher_service::observe_injected_fault(expected);
         Err(format!(
             "MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected {expected:?}"
         ))

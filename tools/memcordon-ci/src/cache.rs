@@ -39,7 +39,7 @@ fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> 
 fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
     let release = match purpose {
         "native-debug" => false,
-        "native-release" => true,
+        "native-release" | "native-readiness" => true,
         _ => return None,
     };
     Some(
@@ -160,6 +160,23 @@ pub fn context(
     inputs.insert("purpose".into(), purpose.into());
     inputs.insert("toolchain".into(), selected_toolchain.clone());
     inputs.insert("shard".into(), shard.into());
+    if purpose == "consumer-readiness" || purpose == "native-readiness" {
+        let selected = distribution::Distribution::read(root)?
+            .consumer_readiness()?
+            .native()?
+            .clone();
+        inputs.insert(
+            "consumer-runtime-selection".into(),
+            serde_json::to_string(&selected)?,
+        );
+        inputs.insert(
+            "consumer-readiness-inventory".into(),
+            artifacts::checksum(&artifacts::read_file(
+                &root.join("ci/consumer-readiness-v1.toml"),
+            )?),
+        );
+        inputs.insert("consumer-profile".into(), "selected-product:release;owned-fixture:release;driver:release;generated-consumer:dev+release".into());
+    }
     let revision = if let Some(recipe) = native_recipe(purpose) {
         inputs.insert(
             "native-test-arguments".into(),
@@ -174,12 +191,17 @@ pub fn context(
             }
             .into(),
         );
-        if purpose == "native-release" {
+        if purpose == "native-release" || purpose == "native-readiness" {
             inputs.insert("product-package".into(), "memcordon".into());
             inputs.insert("product-profile".into(), "release".into());
-            match distribution::Distribution::read(root)
-                .and_then(|selected| Ok(selected.native()?.clone()))
-            {
+            match distribution::Distribution::read(root).and_then(|selected| {
+                let selected = if purpose == "native-readiness" {
+                    selected.consumer_readiness()?
+                } else {
+                    selected
+                };
+                Ok(selected.native()?.clone())
+            }) {
                 Ok(selected) => {
                     inputs.insert(
                         "product-distribution".into(),

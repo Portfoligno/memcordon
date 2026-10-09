@@ -98,10 +98,52 @@ pub struct ActivationV2 {
     pub revoked_admissions: BoundedVec<Nonce128, 256>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationV3 {
+    pub format: String,
+    pub revision: u32,
+    pub registry: memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3,
+    pub registry_digest: DiagnosticSha256,
+    pub epoch: PolicyEpoch,
+    pub revoked_admissions: BoundedVec<Nonce128, 256>,
+}
+impl ActivationV3 {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.format != "memcordon.local-private-activation"
+            || self.revision != 2
+            || self.registry.canonical_digest()? != self.registry_digest
+        {
+            return Err("combined activation format/digest differs".into());
+        }
+        for (index, nonce) in self.revoked_admissions.as_slice().iter().enumerate() {
+            if self.revoked_admissions.as_slice()[..index].contains(nonce) {
+                return Err("duplicate combined revoked admission".into());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn legacy_projection(&self) -> Result<ActivationV2, String> {
+        let registry = self.registry.legacy.clone();
+        Ok(ActivationV2 {
+            format: "memcordon.local-private-activation".into(),
+            revision: 1,
+            registry_digest: registry.canonical_digest()?,
+            registry,
+            epoch: self.epoch.clone(),
+            revoked_admissions: self.revoked_admissions.clone(),
+        })
+    }
+}
+
+const POLICY_DOCUMENT_BYTES: usize = memcordon_core::workload_registry_v3::IMAGE_MANIFEST_BYTES
+    + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES;
+
 #[derive(Clone)]
 pub(crate) enum VersionedLiveBinding {
     V1(Box<memcordon_core::workload_registry::RuntimeAdmissionSnapshot>),
     Private(Box<memcordon_core::workload_admission_v2::RuntimePrivateAdmissionSnapshot>),
+    Mixed(Box<memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot>),
 }
 
 impl VersionedLiveBinding {
@@ -109,6 +151,7 @@ impl VersionedLiveBinding {
         match self {
             Self::V1(value) => &value.registry_digest,
             Self::Private(value) => &value.registry_digest,
+            Self::Mixed(value) => &value.registry_digest,
         }
     }
 
@@ -116,6 +159,7 @@ impl VersionedLiveBinding {
         match self {
             Self::V1(value) => value.admission_nonce,
             Self::Private(value) => value.admission_nonce,
+            Self::Mixed(value) => value.admission_nonce,
         }
     }
 }
@@ -173,14 +217,12 @@ impl ActivationV2 {
 pub enum VersionedActivation {
     V1(Activation),
     V2(ActivationV2),
+    V3(ActivationV3),
 }
 
 impl VersionedActivation {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len()
-            > memcordon_core::workload_limits::REGISTRY_BYTES
-                + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
-        {
+        if bytes.len() > POLICY_DOCUMENT_BYTES {
             return Err("policy activation exceeds bound".into());
         }
         memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
@@ -202,6 +244,12 @@ impl VersionedActivation {
                 value.validate()?;
                 Ok(Self::V2(value))
             }
+            3 => {
+                let value: ActivationV3 =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                value.validate()?;
+                Ok(Self::V3(value))
+            }
             _ => Err("unsupported policy activation schema version".into()),
         }
     }
@@ -210,6 +258,7 @@ impl VersionedActivation {
 pub(crate) enum RegistryConfiguration {
     V1(RuntimePolicyRegistry),
     V2(RuntimePrivatePolicyRegistry),
+    V3(memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3),
 }
 
 impl RegistryConfiguration {
@@ -222,26 +271,26 @@ impl RegistryConfiguration {
         )? {
             1 => RuntimePolicyRegistry::parse(bytes).map(Self::V1),
             2 => RuntimePrivatePolicyRegistry::parse(bytes).map(Self::V2),
+            3 => memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3::parse(bytes)
+                .map(Self::V3),
             _ => Err("unsupported policy registry schema version".into()),
         }
     }
 }
 
 fn document_kind(bytes: &[u8], baseline: &str, private: &str) -> Result<u64, String> {
-    if bytes.len()
-        > memcordon_core::workload_limits::REGISTRY_BYTES
-            + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
-    {
+    if bytes.len() > POLICY_DOCUMENT_BYTES {
         return Err("local policy document exceeds bound".into());
     }
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    if value.get("revision").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err("unsupported local policy revision".into());
-    }
-    match value.get("format").and_then(serde_json::Value::as_str) {
-        Some(format) if format == baseline => Ok(1),
-        Some(format) if format == private => Ok(2),
+    match (
+        value.get("format").and_then(serde_json::Value::as_str),
+        value.get("revision").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(format), Some(1)) if format == baseline => Ok(1),
+        (Some(format), Some(1)) if format == private => Ok(2),
+        (Some(format), Some(2)) if format == private => Ok(3),
         _ => Err("unsupported local policy format".into()),
     }
 }
@@ -260,7 +309,7 @@ fn read_configuration_bytes(path: &Path) -> Result<Vec<u8>, String> {
         return Err("policy configuration is not regular".into());
     }
     let mut bytes = Vec::new();
-    file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
+    file.take(POLICY_DOCUMENT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     Ok(bytes)
@@ -285,6 +334,10 @@ pub fn inspect() -> Result<(), String> {
             "{}",
             serde_json::to_string(&activation).map_err(|error| error.to_string())?
         ),
+        Some(VersionedActivation::V3(activation)) => println!(
+            "{}",
+            serde_json::to_string(&activation).map_err(|error| error.to_string())?
+        ),
     }
     Ok(())
 }
@@ -298,6 +351,7 @@ pub fn apply(path: &Path) -> Result<(), String> {
     let revoke = match &registry {
         RegistryConfiguration::V1(registry) => registry.active_attempt_disposition,
         RegistryConfiguration::V2(registry) => registry.active_attempt_disposition,
+        RegistryConfiguration::V3(registry) => registry.active_attempt_disposition,
     } == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
     let active = lease.versioned_live_bindings()?;
     let activation = match registry {
@@ -306,6 +360,9 @@ pub fn apply(path: &Path) -> Result<(), String> {
         }
         RegistryConfiguration::V2(registry) => {
             serde_json::to_value(lease.activate_v2(registry, None)?)
+        }
+        RegistryConfiguration::V3(registry) => {
+            serde_json::to_value(lease.activate_v3(registry, None)?)
         }
     }
     .map_err(|error| error.to_string())?;
@@ -351,6 +408,30 @@ pub mod native {
         lock: File,
     }
     impl Lease {
+        /// Retained policy is used only to settle an existing native owner;
+        /// reading it cannot grant new preparation or release authority.
+        pub(crate) fn retained_registry_v3(
+            &self,
+            digest: &DiagnosticSha256,
+        ) -> Result<memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3, String>
+        {
+            let name = std::ffi::CString::new(format!("{}.snapshot", String::from(digest.clone())))
+                .expect("digest filename has no NUL");
+            let file = open_at(&self.directory, &name, libc::O_RDONLY)
+                .map_err(|error| error.to_string())?;
+            let mut bytes = Vec::new();
+            file.take(memcordon_core::workload_registry_v3::IMAGE_MANIFEST_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            let registry =
+                memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3::parse(
+                    &bytes,
+                )?;
+            if registry.canonical_digest() != Ok(digest.clone()) {
+                return Err("retained mixed registry digest differs".into());
+            }
+            Ok(registry)
+        }
         pub fn retain_snapshot(&self, registry: &RuntimePolicyRegistry) -> Result<(), String> {
             let digest = registry.canonical_digest()?;
             let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
@@ -382,6 +463,7 @@ pub mod native {
                 let active_digest = match active {
                     VersionedActivation::V1(active) => active.registry_digest,
                     VersionedActivation::V2(active) => active.registry_digest,
+                    VersionedActivation::V3(active) => active.registry_digest,
                 };
                 retained.insert(String::from(active_digest));
             }
@@ -411,7 +493,7 @@ pub mod native {
             use std::os::unix::ffi::OsStrExt;
             let name = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|error| error.to_string())?;
-            if bytes.len() > memcordon_core::workload_limits::REGISTRY_BYTES {
+            if bytes.len() > memcordon_core::workload_registry_v3::IMAGE_MANIFEST_BYTES {
                 return Err("encoded registry exceeds limit".into());
             }
             match open_at(
@@ -428,12 +510,15 @@ pub mod native {
                     let file = open_at(&self.directory, &name, libc::O_RDONLY)
                         .map_err(|error| error.to_string())?;
                     let mut existing = Vec::new();
-                    file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
-                        .read_to_end(&mut existing)
-                        .map_err(|error| error.to_string())?;
+                    file.take(
+                        memcordon_core::workload_registry_v3::IMAGE_MANIFEST_BYTES as u64 + 1,
+                    )
+                    .read_to_end(&mut existing)
+                    .map_err(|error| error.to_string())?;
                     let existing_digest = match version {
                         1 => RuntimePolicyRegistry::parse(&existing)?.canonical_digest()?,
                         2 => RuntimePrivatePolicyRegistry::parse(&existing)?.canonical_digest()?,
+                        3=>memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3::parse(&existing)?.canonical_digest()?,
                         _ => return Err("unsupported policy snapshot version".into()),
                     };
                     if existing_digest != *digest {
@@ -503,9 +588,16 @@ pub mod native {
                     }
                     // These facts preserve local grant lifetime/revocation only;
                     // journal parsing cannot reconstruct OperationalAdmission.
-                    record
-                        .admission_metadata
-                        .map(|metadata| VersionedLiveBinding::Private(Box::new(metadata)))
+                    match (record.admission_metadata, record.mixed_admission_metadata) {
+                        (Some(metadata), None) => {
+                            Some(VersionedLiveBinding::Private(Box::new(metadata)))
+                        }
+                        (None, Some(metadata)) => {
+                            Some(VersionedLiveBinding::Mixed(Box::new(metadata)))
+                        }
+                        (None, None) => None,
+                        _ => return Err("native journal admission revisions conflict".into()),
+                    }
                 } else if record.starts_with("version=4\n") {
                     return Err(
                         "retired qualification journal requires administrative recovery".into(),
@@ -521,6 +613,52 @@ pub mod native {
                     references.push((identity.into(), binding));
                 }
             }
+            // Revision2 mixed admission references are separately named
+            // protected native obligations. Retain them even if a crash has
+            // already removed the accompanying ordinary native journal.
+            for entry in
+                std::fs::read_dir(crate::linux::STATE_ROOT).map_err(|error| error.to_string())?
+            {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let Some(identity) = name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".mixed-admission"))
+                else {
+                    continue;
+                };
+                if !crate::linux::cgroup::valid_attempt_identity(identity) {
+                    return Err("mixed admission filename identity differs".into());
+                }
+                let bytes = crate::linux::protected_read::read_protected_absolute(
+                    &entry.path(),
+                    memcordon_core::workload_limits::CONTRACT_ENVELOPE_BYTES as u64,
+                    None,
+                )?;
+                let metadata =
+                    memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot::parse(
+                        &bytes,
+                    )?;
+                if metadata.attempt_id.as_str() != identity {
+                    return Err("mixed admission live filename correlation differs".into());
+                }
+                if let Some((_, existing)) =
+                    references.iter().find(|(existing, _)| existing == identity)
+                {
+                    if !matches!(existing,VersionedLiveBinding::Mixed(existing) if existing.as_ref()==&metadata)
+                    {
+                        return Err("mixed admission aliases different live authorization".into());
+                    }
+                    continue;
+                }
+                if references.len() == memcordon_core::workload_limits::LIVE_BINDINGS {
+                    return Err("policy live reference capacity exceeded".into());
+                }
+                references.push((
+                    identity.into(),
+                    VersionedLiveBinding::Mixed(Box::new(metadata)),
+                ));
+            }
             Ok(references)
         }
 
@@ -535,6 +673,7 @@ pub mod native {
                 let active_digest = match active {
                     VersionedActivation::V1(active) => active.registry_digest,
                     VersionedActivation::V2(active) => active.registry_digest,
+                    VersionedActivation::V3(active) => active.registry_digest,
                 };
                 snapshots.insert(*active_digest.bytes());
             }
@@ -591,12 +730,16 @@ pub mod native {
                 None => Ok(None),
                 Some(VersionedActivation::V1(value)) => Ok(Some(value)),
                 Some(VersionedActivation::V2(value)) => value.baseline_projection().map(Some),
+                Some(VersionedActivation::V3(value)) => {
+                    value.legacy_projection()?.baseline_projection().map(Some)
+                }
             }
         }
 
         pub fn read_v2(&self) -> Result<Option<ActivationV2>, String> {
             match self.read_any()? {
                 Some(VersionedActivation::V2(value)) => Ok(Some(value)),
+                Some(VersionedActivation::V3(value)) => value.legacy_projection().map(Some),
                 _ => Ok(None),
             }
         }
@@ -607,8 +750,7 @@ pub mod native {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.to_string()),
             };
-            let limit = memcordon_core::workload_limits::REGISTRY_BYTES
-                + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES;
+            let limit = POLICY_DOCUMENT_BYTES;
             let mut bytes = Vec::new();
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -715,12 +857,88 @@ pub mod native {
             Ok(value)
         }
 
+        pub fn activate_v3(
+            &self,
+            registry: memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3,
+            instance: Option<Nonce128>,
+        ) -> Result<ActivationV3, String> {
+            if !cfg!(feature = "private-tcp") {
+                return Err("combined private activation unavailable in this product".into());
+            }
+            registry.validate()?;
+            for image in registry.images.as_slice() {
+                crate::linux::runtime_image::open_installed(image)?.revalidate()?;
+            }
+            let digest = registry.canonical_digest()?;
+            self.check_capacity(&digest)?;
+            self.retain_snapshot_encoded(
+                &digest,
+                &serde_json::to_vec(&registry).map_err(|error| error.to_string())?,
+                3,
+            )?;
+            let previous = self.read()?;
+            let revoked_admissions = next_revocations_versioned(
+                previous.as_ref(),
+                registry.active_attempt_disposition,
+                &self.versioned_live_bindings()?,
+            )?;
+            let epoch = match (instance, previous) {
+                (Some(service_instance), _) => PolicyEpoch {
+                    service_instance,
+                    revision: NonZeroU64::MIN,
+                },
+                (None, Some(previous)) => PolicyEpoch {
+                    service_instance: previous.epoch.service_instance,
+                    revision: NonZeroU64::new(
+                        previous
+                            .epoch
+                            .revision
+                            .get()
+                            .checked_add(1)
+                            .ok_or("policy revision exhausted")?,
+                    )
+                    .ok_or("zero policy revision")?,
+                },
+                (None, None) => PolicyEpoch {
+                    service_instance: random_nonce()?,
+                    revision: NonZeroU64::MIN,
+                },
+            };
+            let value = ActivationV3 {
+                format: "memcordon.local-private-activation".into(),
+                revision: 2,
+                registry,
+                registry_digest: digest,
+                epoch,
+                revoked_admissions,
+            };
+            value.validate()?;
+            self.write_activation(&value)?;
+            Ok(value)
+        }
+
+        pub(crate) fn retain_snapshot_v3(
+            &self,
+            registry: &memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3,
+        ) -> Result<(), String> {
+            let digest = registry.canonical_digest()?;
+            self.retain_snapshot_encoded(
+                &digest,
+                &serde_json::to_vec(registry).map_err(|error| error.to_string())?,
+                3,
+            )
+        }
+
+        pub(crate) fn read_v3(&self) -> Result<Option<ActivationV3>, String> {
+            match self.read_any()? {
+                Some(VersionedActivation::V3(value)) => Ok(Some(value)),
+                _ => Ok(None),
+            }
+        }
+
         fn write_activation<T: Serialize>(&self, value: &T) -> Result<(), String> {
             let mut bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
-            if bytes.len()
-                > memcordon_core::workload_limits::REGISTRY_BYTES
-                    + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
-            {
+            if bytes.len() > POLICY_DOCUMENT_BYTES {
                 return Err("encoded activation exceeds limit".into());
             }
             bytes.push(b'\n');
@@ -815,6 +1033,9 @@ pub fn start_service_instance() -> Result<(), String> {
     let lease = native::Lease::acquire()?;
     let instance = native::random_nonce()?;
     match lease.read_any()? {
+        Some(VersionedActivation::V3(previous)) => {
+            lease.activate_v3(previous.registry, Some(instance))?;
+        }
         Some(VersionedActivation::V2(previous)) => {
             lease.activate_v2(previous.registry, Some(instance))?;
         }

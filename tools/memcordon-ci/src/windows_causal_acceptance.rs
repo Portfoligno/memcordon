@@ -13,6 +13,140 @@ pub const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 /// Fixture size is independent of the production observer capacity.
 pub const WINDOWS_CAUSAL_CONCURRENT_CHILDREN: usize = 256;
 
+#[derive(Clone, Debug)]
+pub struct ObservationExpectation {
+    pub root: memcordon_core::WindowsProcessIdentityV1,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub worker_loss_before_freeze: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplingAssessment {
+    pub capacity: Option<usize>,
+    pub sampled: usize,
+    pub independently_held: usize,
+    pub omissions_preserved: bool,
+}
+
+/// Sampling is diagnostic coverage, never a workload population or retirement
+/// quota. The native held identities are supplied by the trusted controller.
+pub fn validate_process_observation(
+    observation: &memcordon_core::WindowsProcessObservationV2,
+    independently_held: &[memcordon_core::WindowsProcessIdentityV1],
+    expected: &ObservationExpectation,
+) -> Result<SamplingAssessment> {
+    use memcordon_core::{ProcessObservationCoverageV1, ProcessObservationUnavailableReasonV1};
+    observation
+        .validate(
+            &expected.attempt_id,
+            &expected.nonce,
+            &expected.request_sha256,
+        )
+        .map_err(|error| CiError::Message(error.into()))?;
+    let unavailable_worker = matches!(
+        &observation.coverage,
+        ProcessObservationCoverageV1::Unavailable {
+            reason: ProcessObservationUnavailableReasonV1::WorkerLostBeforeFreeze
+        }
+    );
+    if observation
+        .root_identity
+        .as_ref()
+        .is_some_and(|root| root != &expected.root)
+        || observation.root_identity.is_none() && !unavailable_worker
+        || !independently_held.contains(&expected.root)
+        || independently_held
+            .iter()
+            .enumerate()
+            .any(|(index, identity)| independently_held[..index].contains(identity))
+    {
+        return Err(CiError::Message(
+            "sample root/family differs from independently retained identities".into(),
+        ));
+    }
+    if unavailable_worker {
+        if !expected.worker_loss_before_freeze {
+            return Err(CiError::Message(
+                "orderly case cannot substitute unavailable process coverage".into(),
+            ));
+        }
+        // A killed observer cannot invent its final diagnostic accounting. The
+        // caller separately validates authenticated retirement authority and
+        // independently held process/guardian retirement; coverage stays unavailable.
+        if let Some(accounting) = &observation.final_accounting {
+            if !accounting.observed_after_target_retirement
+                || accounting.active_processes_native_u32 != 0
+                || accounting.counter_regression_observed
+            {
+                return Err(CiError::Message(
+                    "unavailable observer retained contradictory native accounting".into(),
+                ));
+            }
+        }
+        return Ok(SamplingAssessment {
+            capacity: None,
+            sampled: 0,
+            independently_held: independently_held.len(),
+            omissions_preserved: true,
+        });
+    }
+    let accounting = observation
+        .final_accounting
+        .as_ref()
+        .ok_or_else(|| CiError::Message("native final Job accounting unavailable".into()))?;
+    if !accounting.observed_after_target_retirement
+        || accounting.active_processes_native_u32 != 0
+        || accounting.counter_regression_observed
+        || (accounting.total_processes_native_u32 as usize) < independently_held.len()
+    {
+        return Err(CiError::Message(
+            "native final Job accounting contradicts held family or retirement".into(),
+        ));
+    }
+    match &observation.coverage {
+        ProcessObservationCoverageV1::Unavailable { reason } => {
+            if !expected.worker_loss_before_freeze
+                || *reason != ProcessObservationUnavailableReasonV1::WorkerLostBeforeFreeze
+            {
+                return Err(CiError::Message(
+                    "orderly case cannot substitute unavailable process coverage".into(),
+                ));
+            }
+            Ok(SamplingAssessment {
+                capacity: None,
+                sampled: 0,
+                independently_held: independently_held.len(),
+                omissions_preserved: true,
+            })
+        }
+        ProcessObservationCoverageV1::Sampled {
+            policy,
+            counters,
+            omissions,
+            sample,
+        } => {
+            if sample
+                .0
+                .iter()
+                .any(|entry| !independently_held.contains(&entry.identity))
+                || counters.identity_observations_verified < sample.0.len() as u64
+            {
+                return Err(CiError::Message(
+                    "sample contains an unheld identity or impossible verified count".into(),
+                ));
+            }
+            Ok(SamplingAssessment {
+                capacity: Some(policy.sample_slots()),
+                sampled: sample.0.len(),
+                independently_held: independently_held.len(),
+                omissions_preserved: omissions.sample_eviction == counters.sample_evictions,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstalledChannel {

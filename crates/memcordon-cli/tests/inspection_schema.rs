@@ -41,6 +41,7 @@ fn platform(windows: bool) -> ProviderPackageMetadataV4 {
         session_broker_install_path: "C:\\Program Files\\Memcordon\\broker.exe".into(),
         session_broker_sha256: "a".repeat(64),
         state_root: "C:\\ProgramData\\Memcordon".into(),
+        policy_root: "C:\\ProgramData\\policy".into(),
         control_service_sid_type: "unrestricted".into(),
         launcher_service_sid_type: "unrestricted".into(),
         session_broker_service_sid_type: "unrestricted".into(),

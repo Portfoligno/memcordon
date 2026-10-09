@@ -147,6 +147,12 @@ fn handle(
         (PROTOCOL_VERSION, MessageKind::PrivateDiscovery) => {
             super::private_runtime::discovery(&request, descriptors.len(), credentials.uid)?
         }
+        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedPlan) => {
+            super::mixed_advisory::plan(&request, descriptors.len(), credentials.uid)?
+        }
+        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedDiscovery) => {
+            super::mixed_advisory::discovery(&request, descriptors.len(), credentials.uid)?
+        }
         (PROTOCOL_VERSION, MessageKind::Launch) => {
             match launch_response(request.clone(), descriptors, credentials, groups) {
                 Ok(response) => response,
@@ -178,6 +184,37 @@ fn handle(
                 }
             }
         }
+        (crate::protocol::MIXED_PROTOCOL_VERSION, MessageKind::MixedLaunch) => {
+            if peer_inside_active_attempt(credentials.pid)? {
+                super::mixed_runtime::rejected_ingress(
+                    &request,
+                    memcordon_core::result_v2::MixedAdmissionRejectionV2::RecursiveProviderRequest,
+                    "caller already belongs to an owned attempt",
+                )?
+            } else {
+                match super::mixed_runtime::forward_public(
+                    stream,
+                    &request,
+                    descriptors,
+                    credentials.pid,
+                    credentials.uid,
+                    credentials.gid,
+                    &groups,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => super::mixed_runtime::rejected_ingress(
+                        &request,
+                        memcordon_core::result_v2::MixedAdmissionRejectionV2::MalformedIngress,
+                        &error,
+                    )?,
+                }
+            }
+        }
+        (crate::protocol::MIXED_PROTOCOL_VERSION, _) => super::mixed_runtime::rejected_ingress(
+            &request,
+            memcordon_core::result_v2::MixedAdmissionRejectionV2::UnsupportedRequest,
+            "unsupported public mixed request kind",
+        )?,
         _ => rejected_text(
             &request,
             "MCSEALED-AUTHORIZATION",
@@ -262,6 +299,13 @@ fn workload_plan_response(
                     request,
                     "MCSEALED-WORKLOAD-V2-UNAVAILABLE",
                     "qualified private V2 plan ingress has been retired",
+                );
+            }
+            memcordon_core::workload_contract::WorkloadContract::V3(_) => {
+                return rejected_text(
+                    request,
+                    "MCSEALED-WORKLOAD-V3-UNAVAILABLE",
+                    "combined V3 plan requires the revision-two private ingress",
                 );
             }
         };

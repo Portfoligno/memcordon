@@ -11,6 +11,11 @@ mod backend;
 mod guardian;
 #[cfg(target_os = "linux")]
 mod linux_cgroup;
+#[cfg(target_os = "linux")]
+mod linux_owned_descriptor;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use linux_owned_descriptor::checked_close as linux_checked_close;
 #[cfg(target_os = "macos")]
 mod macos_deadline;
 #[cfg(target_os = "macos")]
@@ -46,16 +51,33 @@ pub use macos_launch::helper as macos_helper;
 pub use macos_launch::inspector_helper as macos_inspector;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
+#[cfg(target_os = "linux")]
+pub use sealed::client::MixedObservationScope;
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 #[doc(hidden)]
 pub use sealed::client::NativeByteRelayProbe;
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use sealed::client::{
+    MalformedMixedIngressEvidence, probe_malformed_mixed_ingress,
+    probe_malformed_mixed_ingress_with_evidence,
+};
+#[cfg(target_os = "linux")]
+pub use sealed::client::{mixed_discovery, mixed_plan};
+#[cfg(target_os = "linux")]
 pub use sealed::client::{private_discovery, private_plan};
 #[cfg(target_os = "windows")]
 pub use sealed::windows::{
-    converge_windows_recovery, observe_windows_guardian_attempt, recover_windows_attempt,
+    AuthenticatedWindowsTerminalObservation, MAX_TERMINAL_OBSERVATION_BYTES,
+    WindowsTerminalObservationScope, converge_windows_recovery, observe_windows_guardian_attempt,
+    recover_windows_attempt, recover_windows_attempt_with_request,
 };
 mod signal;
+#[cfg(all(target_os = "windows", feature = "test-support"))]
+#[doc(hidden)]
+pub use sealed::windows::{
+    WindowsCertificationObservation, WindowsCertificationScope, WindowsCertificationSelection,
+};
 mod supervisor;
 /// Resolve an exact workload declaration with the authenticated provider without
 /// creating an attempt or reserving target resources.

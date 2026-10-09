@@ -51,6 +51,19 @@ pub struct PrivateObservedTarget {
     identity: ResolvedTargetIdentity,
 }
 
+struct MixedGatedFacts {
+    caller: ProcessIdentityV4,
+    target: ProcessIdentityV4,
+    init: ProcessIdentityV4,
+    guardian: ProcessIdentityV4,
+    caller_namespaces: [memcordon_core::result_v2::NativeNamespaceV2; 5],
+    target_namespaces: [memcordon_core::result_v2::NativeNamespaceV2; 5],
+    root: (u64, u64),
+    identity: ResolvedTargetIdentity,
+    ready: super::private_target::PrivateReadyObservation,
+    init_nondumpable: bool,
+}
+
 impl PrivateObservedTarget {
     pub(crate) fn network_namespace_identity(&self) -> NamespaceIdentity {
         self.native.network_namespace
@@ -79,6 +92,31 @@ pub enum PrivateMonitorOutcome {
     FrontendLost,
     Revoked,
     MemoryOom,
+}
+
+#[cfg(test)]
+impl PrivateAttemptOwner<super::private_attempt::DurablePrivateAttempt> {
+    pub(crate) fn component_native_journal_bytes(&self) -> Result<Vec<u8>, String> {
+        self.record
+            .as_ref()
+            .ok_or("component journal owner absent")?
+            .component_native_bytes()
+    }
+    #[cfg(test)]
+    pub(crate) fn component_account_ownership(
+        &self,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+    ) -> Result<serde_json::Value, String> {
+        let (bytes, journal) = self
+            .record
+            .as_ref()
+            .ok_or("component journal owner absent")?
+            .component_native_observation()?;
+        let account = admission.component_account_ownership()?;
+        Ok(
+            serde_json::json!({"journal":journal,"journal_sha256":DiagnosticSha256::from_bytes(Sha256::digest(&bytes).into()),"account":account}),
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -226,6 +264,15 @@ pub struct PrivateAttemptOwner<J: PrivateNativeJournal = DurablePrivateAttempt> 
     gated_descriptors: Option<GatedDescriptorProof>,
     monitor_outcome: Option<PrivateMonitorOutcome>,
     cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
+    mixed_root: Option<super::private_root::MountedPrivateRoot>,
+    mixed_staging: Option<super::private_root::NativeRootStaging>,
+    mixed_root_retired: Option<super::private_root::PrivateRootRetirement>,
+    mixed_native_retired: Option<PrivateRetirementObservation>,
+    mixed_export_path: Option<std::path::PathBuf>,
+    mixed_export_destination: Option<super::private_root::NativeExportDirectory>,
+    mixed_stdout_sha256: Option<DiagnosticSha256>,
+    mixed_facts: Option<MixedGatedFacts>,
+    native_exec_observed: bool,
 }
 
 impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
@@ -254,6 +301,15 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             gated_descriptors: None,
             monitor_outcome: None,
             cgroup_retirement_raw: None,
+            mixed_root: None,
+            mixed_staging: None,
+            mixed_root_retired: None,
+            mixed_native_retired: None,
+            mixed_export_path: None,
+            mixed_export_destination: None,
+            mixed_stdout_sha256: None,
+            mixed_facts: None,
+            native_exec_observed: false,
         })
     }
 
@@ -413,6 +469,122 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             },
         )?;
         self.attach_init(init)
+    }
+
+    /// The mixed profile clones from the protected provider context; it never
+    /// joins caller mount/root/cwd authority. Original staging and received root
+    /// capabilities enter the ledger before any subsequent fallible operation.
+    pub(super) fn spawn_mixed_namespace(
+        &mut self,
+        prelaunch: PrivateGatedPrelaunch,
+        preparation: super::private_namespace_init::MixedNamespacePreparation,
+        provider_root_channel: std::os::unix::net::UnixStream,
+        caller_namespace: NamespaceIdentity,
+        provider_namespace: NamespaceIdentity,
+        lifetime: crate::request::Lifetime,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::BoundaryCreated
+            || self.namespace_init.is_some()
+            || self.mixed_staging.is_none()
+        {
+            return Err("mixed clone ownership phase differs".into());
+        }
+        let layout = preparation.layout.clone();
+        let entry = preparation.entry.clone();
+        let root_identity = preparation.identity.clone();
+        let nonce = preparation.nonce;
+        let attempt = preparation.attempt;
+        let (provider_startup, init_startup) = private_namespace_startup_channel()?;
+        self.hold_startup(provider_startup)?;
+        let mut fds = [-1_i32; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        self.status = Some(unsafe { File::from_raw_fd(fds[0]) });
+        let status_write = unsafe { File::from_raw_fd(fds[1]) };
+        let target = self.take_target_for_clone(prelaunch)?;
+        let startup_fd = self
+            .startup
+            .as_ref()
+            .expect("stored mixed startup")
+            .as_fd()
+            .as_raw_fd();
+        let control_fd = self
+            .control
+            .as_ref()
+            .expect("stored mixed control")
+            .as_raw_fd();
+        let status_read_fd = self
+            .status
+            .as_ref()
+            .expect("stored mixed status")
+            .as_raw_fd();
+        let provider_pipe_fds = self
+            .stdio
+            .as_ref()
+            .expect("stored mixed stdio")
+            .descriptor_numbers();
+        let provider_root_fd = provider_root_channel.as_raw_fd();
+        let cgroup = self.cgroup_file()?;
+        let init = super::namespace::clone_into_cgroup_with_mode(
+            &cgroup,
+            NamespaceMode::PrivateTcp4,
+            move || {
+                unsafe {
+                    libc::close(status_read_fd);
+                    libc::close(provider_root_fd);
+                    for fd in provider_pipe_fds {
+                        libc::close(fd);
+                    }
+                }
+                let startup = unsafe { BorrowedFd::borrow_raw(startup_fd) };
+                let control = unsafe { BorrowedFd::borrow_raw(control_fd) };
+                super::private_namespace_init::run_mixed_namespace_init(
+                    target,
+                    init_startup,
+                    startup,
+                    control,
+                    status_write,
+                    preparation,
+                    caller_namespace,
+                    provider_namespace,
+                    lifetime,
+                )
+            },
+        )?;
+        self.attach_init(init)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("mixed root startup deadline elapsed".into());
+        }
+        provider_root_channel
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| error.to_string())?;
+        let init = self.namespace_init.as_ref().expect("stored mixed init");
+        let identity = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        let (root, executable) = super::private_root::MountedPrivateRoot::receive_from_init(
+            &provider_root_channel,
+            &identity,
+            init.pidfd.as_fd(),
+            nonce,
+            attempt,
+            layout,
+            root_identity,
+            &entry,
+        )?;
+        self.mixed_root = Some(root);
+        self.expected_descriptors
+            .as_mut()
+            .ok_or("mixed descriptor expectations absent")?
+            .rebind_private_root_executable(executable.as_fd())
+            .map_err(|error| error.to_string())?;
+        let identity = executable.identity();
+        self.entrypoint_digest = Some(DiagnosticSha256::from_bytes(identity.sha256));
+        self.entrypoint_device_inode = Some((identity.device, identity.inode));
+        drop(executable);
+        drop(provider_root_channel);
+        Ok(())
     }
 
     pub fn cgroup_file(&self) -> Result<File, String> {
@@ -611,6 +783,12 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             .take()
             .ok_or("MCSEALED-PRIVATE-RELAY: provider pipes absent")?;
         self.relay = Some(PrivateRelay::prepare(provider, frontend)?);
+        if self.mixed_root.is_some() {
+            self.relay
+                .as_mut()
+                .expect("stored relay")
+                .hash_mixed_stdout();
+        }
         Ok(())
     }
 }
@@ -713,6 +891,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                     _ => return Err("MCSEALED-PRIVATE-EXEC: init exec-event association differs".into()),
                 }
                 self.record_mut().execution_observed()?;
+                self.native_exec_observed = true;
                 Ok(PrivateExecObservation::ExecObservedAndDetached)
             }
             Some(bytes) => match decode_private_control_packet(&bytes)? {
@@ -820,6 +999,108 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
 }
 
 impl PrivateAttemptOwner<DurablePrivateAttempt> {
+    pub(super) fn retire_mixed_unreleased_without_root(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if self.mixed_root.is_some() || self.possibly_released() || self.native_exec_observed {
+            return Err(
+                "unmaterialized cleanup cannot retire a rooted or possibly released attempt".into(),
+            );
+        }
+        self.record_mut().begin_mixed_retirement()?;
+        if self.mixed_native_retired.is_none() {
+            let candidate_exit_code = self.settle_native_resources(deadline)?;
+            self.mixed_native_retired = Some(PrivateRetirementObservation {
+                attempt_id: self.record_mut().record().attempt_id.as_str().to_owned(),
+                retired: None,
+                candidate_exit_code,
+            });
+        }
+        if let Some(staging) = self.mixed_staging.as_mut() {
+            staging.retire_path()?;
+            self.mixed_staging.take();
+        } else if self
+            .record_mut()
+            .record()
+            .mixed_root_staging_intent
+            .is_some()
+            && self.mixed_root_retired.is_none()
+        {
+            return Err("staging creation/readback remains unresolved under durable intent".into());
+        }
+        if self.mixed_root_retired.is_none() {
+            self.mixed_root_retired = Some(
+                super::private_root::PrivateRootRetirement::unmaterialized_after_native_retirement(
+                    self.mixed_native_retired
+                        .as_ref()
+                        .expect("observed native retirement"),
+                    admission.contract.root_layout.clone(),
+                    admission.contract.execution_identity.clone(),
+                ),
+            );
+        }
+        admission.retire_after_native_root_and_account_quiescence(
+            self.mixed_native_retired
+                .as_ref()
+                .expect("observed native retirement"),
+            self.mixed_root_retired
+                .as_ref()
+                .expect("observed unmaterialized retirement"),
+        )?;
+        let permit = VerifiedPrivateRetirement::observed(self.record_mut().record());
+        self.record_mut()
+            .retire_mixed_after_native_cleanup(permit)?;
+        self.record.take();
+        Ok(())
+    }
+    pub(super) fn has_mixed_root(&self) -> bool {
+        self.mixed_root.is_some()
+    }
+    pub(super) fn prepare_mixed_launch(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        attempt: [u8; 16],
+    ) -> Result<super::mixed_admission::PreparedMixedLaunch, String> {
+        use std::os::unix::fs::MetadataExt;
+        let cgroup = self
+            .cgroup
+            .as_ref()
+            .ok_or("mixed cgroup owner absent")?
+            .open()?;
+        let metadata = cgroup.metadata().map_err(|error| error.to_string())?;
+        self.record_mut().record_mixed_directory(
+            false,
+            super::private_attempt::MixedDirectoryIdentityV2 {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        )?;
+        let identity = attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = super::private_root::NativeRootStaging::intended_path(&identity)?;
+        self.record_mut().record_mixed_root_staging_intent(&path)?;
+        if self.mixed_staging.is_some() {
+            return Err("mixed staging allocation is single-use".into());
+        }
+        self.mixed_staging = Some(super::private_root::NativeRootStaging::create(&identity)?);
+        let native_staging = self
+            .mixed_staging
+            .as_ref()
+            .expect("owned mixed staging")
+            .native_identity()?;
+        self.record_mut()
+            .record_mixed_directory(true, native_staging)?;
+        let child = self
+            .mixed_staging
+            .as_ref()
+            .expect("owned mixed staging")
+            .for_namespace_child()?;
+        admission.prepare_native_root_launch(attempt, child)
+    }
     /// Persist actual gated observations before acquiring the final policy
     /// lock. Sync/readback never runs inside activation-versus-release exclusion.
     pub(super) fn prepare_operational_release(
@@ -853,6 +1134,282 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         // Record uncertainty before any instruction can transfer. A later
         // epoch rejection remains conservative and still retires the target.
         self.record_mut().release_intent()
+    }
+
+    pub(super) fn release_mixed(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        observed: &PrivateObservedTarget,
+        release_observed: &mut Option<Instant>,
+        release_monotonic_millis: &mut Option<u64>,
+    ) -> Result<(), super::mixed_admission::MixedReleaseFailure> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ReleaseIntent
+            || self.mixed_root.is_none()
+        {
+            return Err("mixed release lacks durable intent/root custody".into());
+        }
+        self.require_live_target_identity(&observed.target)?;
+        if !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live) {
+            return Err("mixed guardian is not live before release".into());
+        }
+        let control = self
+            .control
+            .as_ref()
+            .ok_or("mixed release setup channel absent")?;
+        admission.release_with_native_gate(observed.target.pid, || {
+            let monotonic = super::clock::monotonic_millis()?;
+            let sampled = Instant::now();
+            let authorization = [1_u8];
+            let sent = unsafe {
+                libc::send(
+                    control.as_raw_fd(),
+                    authorization.as_ptr().cast(),
+                    authorization.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent != authorization.len() as isize {
+                return Err(format!(
+                    "mixed native authorization send: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            *release_observed = Some(sampled);
+            *release_monotonic_millis = Some(monotonic);
+            Ok(())
+        })
+    }
+
+    pub(super) fn capture_mixed_gated_facts(
+        &mut self,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+        observed: &PrivateObservedTarget,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        fn namespaces(
+            pid: u32,
+        ) -> Result<[memcordon_core::result_v2::NativeNamespaceV2; 5], String> {
+            let mut values = Vec::new();
+            for name in ["user", "mnt", "pid", "net", "ipc"] {
+                let metadata = std::fs::metadata(
+                    std::path::Path::new("/proc")
+                        .join(pid.to_string())
+                        .join("ns")
+                        .join(name),
+                )
+                .map_err(|error| error.to_string())?;
+                values.push(memcordon_core::result_v2::NativeNamespaceV2 {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                });
+            }
+            values
+                .try_into()
+                .map_err(|_| "native namespace tuple length differs".into())
+        }
+        self.require_live_target_identity(&observed.target)?;
+        let caller = ProcessIdentityV4::observe(
+            admission.caller.envelope.pid,
+            admission.frontend_pidfd.as_fd(),
+        )?;
+        if caller != admission.frontend {
+            return Err("mixed caller birth changed during native observation".into());
+        }
+        let init = self
+            .namespace_init
+            .as_ref()
+            .ok_or("mixed init owner absent")?;
+        let init_identity = ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())?;
+        if init_identity != observed.namespace_init {
+            return Err("mixed init birth changed".into());
+        }
+        let guardian = self
+            .guardian
+            .as_ref()
+            .ok_or("mixed guardian owner absent")?
+            .identity()?;
+        let caller_namespaces = namespaces(caller.pid)?;
+        let target_namespaces = namespaces(observed.target.pid)?;
+        let init_namespaces = namespaces(init_identity.pid)?;
+        if target_namespaces != init_namespaces
+            || target_namespaces[0] != caller_namespaces[0]
+            || (1..5).any(|index| target_namespaces[index] == caller_namespaces[index])
+        {
+            return Err("mixed target/init/caller namespace separation differs".into());
+        }
+        let root = self.mixed_root.as_ref().ok_or("mixed held root absent")?;
+        let metadata = std::fs::File::from(
+            root.as_fd()
+                .try_clone_to_owned()
+                .map_err(|error| error.to_string())?,
+        )
+        .metadata()
+        .map_err(|error| error.to_string())?;
+        if !root.init_nondumpable() {
+            return Err("mixed namespace init dumpability was not observed".into());
+        }
+        self.require_live_target_identity(&observed.target)?;
+        if ProcessIdentityV4::observe(
+            admission.caller.envelope.pid,
+            admission.frontend_pidfd.as_fd(),
+        )? != caller
+            || ProcessIdentityV4::observe(init.host_pid, init.pidfd.as_fd())? != init_identity
+        {
+            return Err("mixed native process identity changed during observation".into());
+        }
+        self.mixed_facts = Some(MixedGatedFacts {
+            caller,
+            target: observed.target.clone(),
+            init: init_identity,
+            guardian,
+            caller_namespaces,
+            target_namespaces,
+            root: (metadata.dev(), metadata.ino()),
+            identity: observed.identity.clone(),
+            ready: observed.native.ready,
+            init_nondumpable: true,
+        });
+        Ok(())
+    }
+
+    pub(super) fn mixed_prepared_observation(
+        &self,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+        provider: memcordon_core::PublicProviderBindingV1,
+    ) -> Result<memcordon_core::mixed_observation::MixedPreparedObservationV2, String> {
+        use memcordon_core::result_v2::NativeProcessV2;
+        let facts = self
+            .mixed_facts
+            .as_ref()
+            .ok_or("mixed gated native facts absent")?;
+        let process = |identity: &ProcessIdentityV4| NativeProcessV2 {
+            pid: identity.pid,
+            birth: identity.start_time,
+        };
+        let value = memcordon_core::mixed_observation::MixedPreparedObservationV2 {
+            format: "memcordon.mixed-prepared-observation".into(),
+            revision: 2,
+            provider,
+            admission: admission.metadata().clone(),
+            caller: process(&facts.caller),
+            target: process(&facts.target),
+            namespace_init: process(&facts.init),
+            guardian: process(&facts.guardian),
+            user_namespace: facts.target_namespaces[0].clone(),
+            mount_namespace: facts.target_namespaces[1].clone(),
+            pid_namespace: facts.target_namespaces[2].clone(),
+            network_namespace: facts.target_namespaces[3].clone(),
+            ipc_namespace: facts.target_namespaces[4].clone(),
+            root_device: facts.root.0,
+            root_inode: facts.root.1,
+            authorizes_launch: false,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(super) fn mixed_execution_after_retirement(
+        &self,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+        retired: &MixedNativeRetirement,
+        origin: memcordon_core::result_v2::MixedOutcomeOriginV2,
+        authorization_monotonic_millis: u64,
+    ) -> Result<memcordon_core::result_v2::MixedNativeExecutionV2, String> {
+        use memcordon_core::result_v2::*;
+        if !self.native_exec_observed
+            || self.record.is_some()
+            || self.mixed_root_retired.is_none()
+            || self.guardian.is_some()
+        {
+            return Err("mixed native execution/retirement proof is incomplete".into());
+        }
+        let facts = self
+            .mixed_facts
+            .as_ref()
+            .ok_or("mixed gated native facts absent")?;
+        let status = retired
+            .native
+            .native_wait_status()
+            .ok_or("mixed native target wait status absent")?;
+        let observed = VerifiedTrue::observed(true).map_err(str::to_owned)?;
+        let process = |value: &ProcessIdentityV4| NativeProcessV2 {
+            pid: value.pid,
+            birth: value.start_time,
+        };
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| error.to_string())?;
+        let caller = &facts.caller_namespaces;
+        let target = &facts.target_namespaces;
+        let mut groups = memcordon_core::BoundedVec::default();
+        for group in facts.identity.groups() {
+            groups
+                .try_push(*group)
+                .map_err(|_| "mixed native groups exceed finite bound")?;
+        }
+        Ok(MixedNativeExecutionV2 {
+            host_target: memcordon_core::BoundedText::new(super::runtime_manifest::target()?)
+                .map_err(str::to_owned)?,
+            boot_id: memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
+            caller: process(&facts.caller),
+            target: process(&facts.target),
+            namespace_init: process(&facts.init),
+            guardian: process(&facts.guardian),
+            caller_uid: admission.caller.envelope.uid,
+            caller_gid: admission.caller.envelope.gid,
+            caller_user_namespace: caller[0].clone(),
+            caller_mount_namespace: caller[1].clone(),
+            caller_pid_namespace: caller[2].clone(),
+            caller_network_namespace: caller[3].clone(),
+            caller_ipc_namespace: caller[4].clone(),
+            user_namespace: target[0].clone(),
+            mount_namespace: target[1].clone(),
+            pid_namespace: target[2].clone(),
+            network_namespace: target[3].clone(),
+            ipc_namespace: target[4].clone(),
+            root_device: facts.root.0,
+            root_inode: facts.root.1,
+            runtime_image: admission.contract.runtime_image.clone(),
+            input_image: admission.contract.input_image.clone(),
+            root_layout: admission.contract.root_layout.clone(),
+            execution_identity: admission.contract.execution_identity.clone(),
+            target_uid: facts.identity.uid(),
+            target_gid: facts.identity.gid(),
+            supplementary_groups: groups,
+            init_uid: 0,
+            init_nondumpable: VerifiedTrue::observed(facts.init_nondumpable)
+                .map_err(str::to_owned)?,
+            no_new_privileges: observed,
+            capabilities_empty: observed,
+            filter_abi: match facts.ready.native_abi {
+                NativeAbi::X86_64 => MixedFilterAbiV2::X86_64,
+                NativeAbi::Aarch64 => MixedFilterAbiV2::Aarch64,
+            },
+            filter_instruction_sha256: DiagnosticSha256::from_bytes(facts.ready.filter_digest),
+            target_authorized: observed,
+            exec_observed: observed,
+            authorization_monotonic_millis,
+            post_exec_descriptor_count: 3,
+            native_wait_status: status,
+            outcome_origin: origin,
+        })
+    }
+
+    pub(super) fn monitor_mixed(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Option<Instant>,
+        broker_stream: &std::os::unix::net::UnixStream,
+    ) -> Result<PrivateMonitorOutcome, String> {
+        let frontend = admission
+            .frontend_pidfd
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        self.monitor_native(
+            frontend.as_fd(),
+            deadline,
+            || admission.revoked(),
+            broker_stream,
+        )
     }
 
     pub(super) fn release_operational(
@@ -919,6 +1476,350 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         )
     }
 
+    pub(super) fn retire_mixed(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Instant,
+    ) -> Result<MixedNativeRetirement, String> {
+        self.retire_mixed_inner(
+            admission,
+            deadline,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Internal native-harness boundary only. No provider request selects it.
+    #[cfg(test)]
+    pub(super) fn retire_mixed_before_account_for_component(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Instant,
+        callback: &mut dyn FnMut(
+            &Self,
+            &super::mixed_admission::MixedOperationalAdmission,
+        ) -> Result<(), String>,
+    ) -> Result<MixedNativeRetirement, String> {
+        self.retire_mixed_inner(admission, deadline, Some(callback))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn component_pre_account_observation(
+        &self,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+    ) -> Result<serde_json::Value, String> {
+        let native = self
+            .mixed_native_retired
+            .as_ref()
+            .ok_or("component boundary lacks actual native retirement")?;
+        let root = self
+            .mixed_root_retired
+            .as_ref()
+            .ok_or("component boundary lacks actual root retirement")?;
+        let cgroup = self
+            .cgroup_retirement_raw
+            .as_ref()
+            .ok_or("component boundary lacks actual cgroup-empty/removal observations")?;
+        root.require_binding(
+            native.attempt_id(),
+            &admission.contract.root_layout,
+            &admission.contract.execution_identity,
+        )?;
+        if !self.native_exec_observed
+            || self.cgroup.is_some()
+            || self.namespace_init.is_some()
+            || self.guardian.is_some()
+            || self.target_pidfd.is_some()
+            || self.mixed_root.is_some()
+            || self.mixed_staging.is_some()
+        {
+            return Err("component boundary still retains native workload/root owners".into());
+        }
+        let export = self
+            .mixed_export_path
+            .as_ref()
+            .ok_or("component boundary lacks native export path")?;
+        let receipt = super::protected_read::read_protected_absolute(
+            &export.join("export-receipt.json"),
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            None,
+        )?;
+        Ok(
+            serde_json::json!({"attempt_id":native.attempt_id(),"native_wait_status":native.native_wait_status(),"cgroup_retirement":cgroup,"root_layout":admission.contract.root_layout,"execution_identity":admission.contract.execution_identity,"export_path":export,"export_receipt_sha256":DiagnosticSha256::from_bytes(Sha256::digest(&receipt).into()),"admission_reference":admission.component_reference_observation()?}),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn component_execute_to_pre_account(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        attempt: [u8; 16],
+        worker: BorrowedFd<'_>,
+        streams: [OwnedFd; 3],
+        work: Instant,
+        cleanup: Instant,
+        callback: &mut dyn FnMut(
+            &Self,
+            &super::mixed_admission::MixedOperationalAdmission,
+            &memcordon_core::mixed_observation::MixedPreparedObservationV2,
+        ) -> Result<(), String>,
+    ) -> Result<
+        (
+            memcordon_core::result_v2::MixedNativeExecutionV2,
+            memcordon_core::result_v2::MixedRetirementV2,
+        ),
+        String,
+    > {
+        let (control, _peer) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
+        let setup = (|| -> Result<_, String> {
+            self.create_boundary(
+                admission.launch.policy.memory_limit_bytes,
+                admission.launch.policy.swap_limit,
+            )?;
+            let identity = admission.identity.clone();
+            let prepared = self.prepare_mixed_launch(admission, attempt)?;
+            use std::os::unix::fs::MetadataExt;
+            let network = std::fs::metadata("/proc/self/ns/net").map_err(|e| e.to_string())?;
+            let provider_namespace = NamespaceIdentity {
+                device: network.dev(),
+                inode: network.ino(),
+            };
+            self.spawn_mixed_namespace(
+                prepared.prelaunch,
+                prepared.preparation,
+                prepared.provider_root_channel,
+                admission.caller.envelope.network_namespace_identity,
+                provider_namespace,
+                admission.launch.policy.lifetime,
+                work,
+            )?;
+            self.start_guardian(attempt, admission.frontend_pidfd.as_fd(), worker, work)?;
+            let observed = self.observe_gated_target(
+                admission.caller.envelope.network_namespace_identity,
+                provider_namespace,
+                &identity,
+                prepared.abi,
+                prepared.filter,
+                work,
+            )?;
+            self.capture_mixed_gated_facts(admission, &observed)?;
+            self.prepare_relay(streams)?;
+            self.prepare_operational_release(&observed)?;
+            let snapshot = self.mixed_prepared_observation(
+                admission,
+                super::runtime_manifest::installed_binding()?,
+            )?;
+            let mut released = None;
+            let mut clock = None;
+            self.release_mixed(admission, &observed, &mut released, &mut clock)
+                .map_err(|failure| failure.detail)?;
+            if !matches!(
+                self.observe_exec(work)?,
+                PrivateExecObservation::ExecObservedAndDetached
+            ) {
+                return Err("component native exec not observed".into());
+            }
+            if !matches!(
+                self.monitor_mixed(admission, Some(work), &control)?,
+                PrivateMonitorOutcome::Completed
+            ) {
+                return Err("component workload did not complete naturally".into());
+            }
+            let retired = self.retire_mixed_before_account_for_component(
+                admission,
+                cleanup,
+                &mut |owner, admission| callback(owner, admission, &snapshot),
+            )?;
+            let execution = self.mixed_execution_after_retirement(
+                admission,
+                &retired,
+                memcordon_core::result_v2::MixedOutcomeOriginV2::NativeExit,
+                clock.ok_or("actual component authorization clock absent")?,
+            )?;
+            Ok((execution, retired.retirement))
+        })();
+        if setup.is_ok() {
+            return setup;
+        }
+        let retirement = if self.has_mixed_root()
+            || self.mixed_root_retired.is_some()
+            || self.possibly_released()
+        {
+            self.retire_mixed(admission, cleanup).map(|_| ())
+        } else {
+            self.retire_mixed_unreleased_without_root(admission, cleanup)
+        };
+        match (setup, retirement) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => {
+                Err(format!("{error}; component native cleanup: {cleanup}"))
+            }
+        }
+    }
+
+    fn retire_mixed_inner(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Instant,
+        #[cfg(test)] mut before_account: Option<
+            &mut dyn FnMut(
+                &Self,
+                &super::mixed_admission::MixedOperationalAdmission,
+            ) -> Result<(), String>,
+        >,
+    ) -> Result<MixedNativeRetirement, String> {
+        self.record_mut().begin_mixed_retirement()?;
+        let cleanup = (|| -> Result<_, String> {
+            if self.mixed_native_retired.is_none() {
+                let candidate_exit_code = self.settle_native_resources(deadline)?;
+                self.mixed_native_retired = Some(PrivateRetirementObservation {
+                    attempt_id: self.record_mut().record().attempt_id.as_str().to_owned(),
+                    retired: None,
+                    candidate_exit_code,
+                });
+            }
+            if self.mixed_root_retired.is_none() {
+                let identity = admission
+                    .activation
+                    .registry
+                    .resolve(
+                        &admission.contract,
+                        admission.caller.envelope.uid,
+                        &admission.activation.epoch,
+                    )
+                    .map_err(|reason| {
+                        format!("mixed retirement original binding differs: {reason:?}")
+                    })?
+                    .identity
+                    .clone();
+                if self.mixed_export_destination.is_none() {
+                    self.mixed_export_destination =
+                        Some(super::private_root::NativeExportDirectory::intended(
+                            self.mixed_native_retired
+                                .as_ref()
+                                .expect("observed native retirement")
+                                .attempt_id(),
+                        )?);
+                }
+                let intended = self
+                    .mixed_export_destination
+                    .as_ref()
+                    .expect("owned export destination")
+                    .path()
+                    .to_path_buf();
+                self.record_mut().record_mixed_export_intent(&intended)?;
+                self.mixed_export_destination
+                    .as_mut()
+                    .expect("owned export destination")
+                    .allocate()?;
+                let export_identity = self
+                    .mixed_export_destination
+                    .as_ref()
+                    .expect("owned export destination")
+                    .native_identity()?;
+                self.record_mut()
+                    .record_mixed_export_identity(export_identity)?;
+                let root=self.mixed_root.take().ok_or("mixed retirement lacks held root; retain account and native journal for recovery")?;
+                let staging = match self.mixed_staging.take() {
+                    Some(staging) => staging,
+                    None => {
+                        self.mixed_root = Some(root);
+                        return Err("mixed retirement staging owner absent".into());
+                    }
+                };
+                let destination = self
+                    .mixed_export_destination
+                    .take()
+                    .expect("owned export destination");
+                let (root_retired, destination) = match root.export_and_close(
+                    self.mixed_native_retired
+                        .as_ref()
+                        .expect("observed native retirement"),
+                    &identity,
+                    staging,
+                    destination,
+                ) {
+                    Ok(retired) => retired,
+                    Err(failure) => {
+                        self.mixed_root = Some(failure.root);
+                        self.mixed_staging = Some(failure.staging);
+                        self.mixed_export_path = failure.exported;
+                        self.mixed_export_destination = Some(failure.destination);
+                        return Err(failure.detail);
+                    }
+                };
+                self.mixed_root_retired = Some(root_retired);
+                self.mixed_export_path = Some(destination.path().to_path_buf());
+                self.mixed_export_destination = Some(destination);
+            }
+            let native = self
+                .mixed_native_retired
+                .as_ref()
+                .expect("observed native retirement");
+            let root_retired = self
+                .mixed_root_retired
+                .as_ref()
+                .expect("observed root retirement");
+            let export_path = self
+                .mixed_export_path
+                .as_ref()
+                .ok_or("retired mixed export path absent")?;
+            let receipt = super::protected_read::read_protected_absolute(
+                &export_path.join("export-receipt.json"),
+                memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+                None,
+            )?;
+            #[cfg(test)]
+            if let Some(callback) = before_account.as_mut() {
+                callback(self, admission)?;
+            }
+            admission.retire_after_native_root_and_account_quiescence(native, root_retired)?;
+            // Reached only after every owned native retirement operation above
+            // returned its observed-success proof; none is inferred from JSON.
+            let retired_fact = VerifiedTrue::observed(true).map_err(str::to_owned)?;
+            let retirement = memcordon_core::result_v2::MixedRetirementV2 {
+                attempt_id: memcordon_core::BoundedText::new(native.attempt_id())
+                    .map_err(str::to_owned)?,
+                workload_empty: retired_fact,
+                init_reaped: retired_fact,
+                guardian_reaped: retired_fact,
+                relays_drained_and_closed: retired_fact,
+                namespace_references_closed: retired_fact,
+                root_references_closed: retired_fact,
+                staging_removed: retired_fact,
+                account_quiescent: retired_fact,
+                reservation_retired: retired_fact,
+                export_receipt_sha256: memcordon_core::workload_codec::hash_bytes(&receipt),
+            };
+            let permit = VerifiedPrivateRetirement::observed(self.record_mut().record());
+            self.record_mut()
+                .retire_mixed_after_native_cleanup(permit)?;
+            self.record.take();
+            let native = self
+                .mixed_native_retired
+                .take()
+                .expect("observed native retirement");
+            let export_path = self
+                .mixed_export_path
+                .take()
+                .expect("observed export publication");
+            Ok(MixedNativeRetirement {
+                native,
+                retirement,
+                export_path,
+            })
+        })();
+        if let Err(detail) = &cleanup {
+            if let Some(record) = self.record.as_mut() {
+                if record.record().phase != PrivateAttemptPhase::Retired {
+                    let _ = record.cleanup_incomplete(detail);
+                }
+            }
+        }
+        cleanup
+    }
+
     /// Cleanup success is emitted only after each resource was explicitly
     /// observed empty, reaped or closed and the durable record was retired.
     pub fn retire(mut self, deadline: Instant) -> Result<PrivateRetirementObservation, String> {
@@ -956,6 +1857,12 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     }
 }
 
+pub(super) struct MixedNativeRetirement {
+    pub native: PrivateRetirementObservation,
+    pub retirement: memcordon_core::result_v2::MixedRetirementV2,
+    pub export_path: std::path::PathBuf,
+}
+
 impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     /// This consumes only observed native resources. It does not remove a
     /// durable record, release a policy reference, or claim terminal success.
@@ -988,9 +1895,29 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         self.control.take();
         self.expected_descriptors.take();
         self.stdio.take();
+        if self.mixed_staging.is_some() {
+            if let Some(relay) = self.relay.as_mut() {
+                relay.close_stdin_after_target_exit();
+                while !relay.completed() {
+                    if Instant::now() >= deadline {
+                        return Err("mixed relay retirement drain deadline elapsed".into());
+                    }
+                    relay.tick(Duration::from_millis(10))?;
+                }
+                self.mixed_stdout_sha256 = Some(relay.mixed_stdout_digest()?);
+            }
+        }
         self.relay.take();
         self.network.take();
-        if let Some(guardian) = self.guardian.take() {
+        if self.mixed_staging.is_some() {
+            if let Some(guardian) = self.guardian.as_mut() {
+                guardian.retire_mixed_observed(
+                    self.monitor_outcome == Some(PrivateMonitorOutcome::FrontendLost),
+                    deadline,
+                )?;
+            }
+            self.guardian.take();
+        } else if let Some(guardian) = self.guardian.take() {
             if self.monitor_outcome == Some(PrivateMonitorOutcome::FrontendLost) {
                 guardian.finish_after_loss(deadline)?;
             } else {

@@ -344,10 +344,31 @@ pub fn build_selected(
     distribution: &TargetDistribution,
     destination: &Path,
 ) -> Result<()> {
+    build_selected_with_components(root, selected, distribution, destination, false)
+}
+
+pub fn build_selected_with_components(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    consumer_readiness: bool,
+) -> Result<()> {
     selected.recheck(root)?;
-    let operation_deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(140 * 60))
-        .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?;
+    let operation_deadline = if consumer_readiness
+        && matches!(
+            distribution.target.as_str(),
+            "x86_64-unknown-linux-gnu"
+                | "aarch64-unknown-linux-gnu"
+                | "x86_64-pc-windows-msvc"
+                | "aarch64-pc-windows-msvc"
+        ) {
+        super::native_component_harness::original_deadline(root, selected, &distribution.target)?
+    } else {
+        std::time::Instant::now()
+            .checked_add(Duration::from_secs(140 * 60))
+            .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?
+    };
     distribution.validate()?;
     if distribution.target != super::distribution::native_target()? {
         return Err(CiError::Message(
@@ -420,7 +441,10 @@ pub fn build_selected(
     }
     let backend = if distribution.target.contains("linux") {
         "backend-linux-cgroup"
-    } else if distribution.target.contains("windows") {
+    } else if matches!(
+        distribution.target.as_str(),
+        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
+    ) {
         "backend-windows-job"
     } else {
         "backend-macos-watchdog"
@@ -460,15 +484,23 @@ pub fn build_selected(
         executable_names.insert(filename.clone());
         members.insert(filename, bytes);
     }
-    let manifest = if distribution.features.is_empty() {
+    let runtime = distribution.runtime_selection()?;
+    let manifest = if runtime == super::distribution::RuntimeSelection::CliOnly {
         RuntimeManifest::cli_only(
             selected.version().to_string(),
             selected.commit().to_owned(),
             distribution.target.clone(),
             components,
         )
-    } else if distribution.target.contains("windows") {
+    } else if runtime == super::distribution::RuntimeSelection::WindowsSealed {
         RuntimeManifest::windows(
+            selected.version().to_string(),
+            selected.commit().to_owned(),
+            distribution.target.clone(),
+            components,
+        )
+    } else if runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp {
+        RuntimeManifest::linux_combined(
             selected.version().to_string(),
             selected.commit().to_owned(),
             distribution.target.clone(),
@@ -480,10 +512,7 @@ pub fn build_selected(
             selected.commit().to_owned(),
             distribution.target.clone(),
             components,
-            distribution
-                .features
-                .iter()
-                .any(|feature| feature == "private-tcp"),
+            runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp,
         )
     }
     .map_err(CiError::Message)?;
@@ -580,6 +609,23 @@ pub fn build_selected(
         },
     )?;
     TargetBundle::load(destination)?;
+    if consumer_readiness
+        && matches!(
+            distribution.target.as_str(),
+            "x86_64-unknown-linux-gnu"
+                | "aarch64-unknown-linux-gnu"
+                | "x86_64-pc-windows-msvc"
+                | "aarch64-pc-windows-msvc"
+        )
+    {
+        super::native_component_harness::build_original_roles(
+            root,
+            selected,
+            &distribution.target,
+            &root.join(".release/native-components"),
+            operation_deadline,
+        )?;
+    }
     if std::time::Instant::now() >= operation_deadline {
         return Err(CiError::Message(
             "native operation deadline exhausted during archive assembly".into(),

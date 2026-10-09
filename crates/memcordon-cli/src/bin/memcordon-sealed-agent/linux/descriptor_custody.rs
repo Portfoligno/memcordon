@@ -337,6 +337,21 @@ pub struct ExpectedGatedDescriptorInventory {
 }
 
 impl ExpectedGatedDescriptorInventory {
+    pub(super) fn rebind_private_root_executable(
+        &mut self,
+        verified_elf: BorrowedFd<'_>,
+    ) -> io::Result<()> {
+        let elf = native_stat(verified_elf.as_raw_fd())?;
+        if elf.st_mode & libc::S_IFMT != libc::S_IFREG
+            || status_flags(verified_elf.as_raw_fd())? & libc::O_ACCMODE != libc::O_RDONLY
+        {
+            return Err(invalid_data(
+                "private root executable descriptor is not readonly regular content",
+            ));
+        }
+        self.objects[4] = ObjectIdentity::from_fd(verified_elf.as_raw_fd())?;
+        Ok(())
+    }
     pub fn capture(
         target: &TargetPipeStdio,
         provider_control: BorrowedFd<'_>,

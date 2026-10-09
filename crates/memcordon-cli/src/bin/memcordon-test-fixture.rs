@@ -14,11 +14,88 @@ use memcordon_core::{ByteSize, NativeArgument};
 #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
 mod private_installed_loss_fixture;
 
+#[cfg(windows)]
+#[path = "consumer_readiness_windows/mod.rs"]
+mod consumer_readiness_windows;
+
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("memcordon-test-fixture: {}", message.as_ref());
     std::process::exit(2);
 }
 
+#[cfg(target_os = "linux")]
+fn assert_frozen_baseline(mut args: impl Iterator<Item = OsString>) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if args.next().is_some() {
+        fail("frozen baseline fixture takes no arguments");
+    }
+    let stat = fs::read_to_string("/proc/self/stat").unwrap_or_else(|e| fail(e.to_string()));
+    let birth = stat
+        .rsplit_once(") ")
+        .and_then(|(_, tail)| tail.split_whitespace().nth(19))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| fail("native frozen fixture birth absent"));
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_else(|e| fail(e.to_string()));
+    let ids = |field: &str| -> Vec<u32> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .unwrap_or_else(|| fail("frozen native identity field absent"))
+            .split_whitespace()
+            .map(|value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| fail("frozen native identity malformed"))
+            })
+            .collect()
+    };
+    let uid = ids("Uid:");
+    let gid = ids("Gid:");
+    if uid != [65534; 4] || gid != [65534; 4] {
+        fail("frozen target did not preserve original nonroot caller");
+    }
+    let mut pair = [-1; 2];
+    // SAFETY: storage has exactly two descriptors; successful descriptors are immediately owned.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } != 0
+    {
+        fail(io::Error::last_os_error().to_string());
+    }
+    let owned = pair.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    let challenge = b"frozen-unix-baseline";
+    let written = unsafe { libc::write(pair[0], challenge.as_ptr().cast(), challenge.len()) };
+    let mut captured = [0u8; 20];
+    let read = unsafe { libc::read(pair[1], captured.as_mut_ptr().cast(), challenge.len()) };
+    if written != challenge.len() as isize
+        || read != challenge.len() as isize
+        || &captured[..challenge.len()] != challenge
+    {
+        fail("frozen native Unix pair byte exchange differs");
+    }
+    let mut denials = Vec::new();
+    for family in [libc::AF_INET, libc::AF_INET6] {
+        let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd >= 0 {
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            fail("frozen baseline admitted Internet socket authority");
+        }
+        let errno = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_else(|| fail("frozen native socket errno absent"));
+        denials.push(serde_json::json!({"family":family,"native_errno":errno}));
+    }
+    drop(owned);
+    println!(
+        "{}",
+        serde_json::json!({"format":"memcordon.frozen-linux-unix-baseline","revision":1,"pid":std::process::id(),"birth":birth,"uid":uid,"gid":gid,"groups":ids("Groups:"),"unix_bytes":captured[..challenge.len()],"denials":denials})
+    );
+}
 #[cfg(target_os = "linux")]
 fn assert_private_runtime(mut args: impl Iterator<Item = OsString>) {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -1356,6 +1433,10 @@ fn main() {
         .and_then(|value| value.to_str().map(str::to_owned))
         .unwrap_or_else(|| fail("a fixture subcommand is required"));
     let status = match command.as_str() {
+        #[cfg(windows)]
+        "consumer-readiness-windows" => {
+            consumer_readiness_windows::run(args).unwrap_or_else(|error| fail(error.to_string()))
+        }
         #[cfg(target_os = "macos")]
         "macos-signal-parent" => macos_signal_parent(args),
         #[cfg(target_os = "macos")]
@@ -1762,6 +1843,11 @@ fn main() {
                 "{}",
                 serde_json::to_string(&result).unwrap_or_else(|error| fail(error.to_string()))
             );
+            0
+        }
+        #[cfg(target_os = "linux")]
+        "assert-frozen-baseline" => {
+            assert_frozen_baseline(args);
             0
         }
         #[cfg(target_os = "linux")]

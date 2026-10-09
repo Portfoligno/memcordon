@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u16 = 3;
+pub const MIXED_PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DIGEST_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 2 + 2 + 4 + 16 + 16 + DIGEST_LENGTH;
@@ -23,6 +24,12 @@ pub enum MessageKind {
     PrivateBrokerLaunch = 11,
     PrivatePlan = 12,
     PrivateDiscovery = 13,
+    MixedLaunch = 14,
+    MixedBrokerLaunch = 15,
+    MixedPlan = 16,
+    MixedDiscovery = 17,
+    MixedPreparedAck = 18,
+    MixedReleaseAck = 19,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -36,6 +43,12 @@ pub enum MessageKind {
     PrivateRejected = 113,
     PrivatePlanReceipt = 111,
     PrivateDiscoveryReceipt = 112,
+    MixedTerminal = 114,
+    MixedRejected = 115,
+    MixedPlanReceipt = 116,
+    MixedDiscoveryReceipt = 117,
+    MixedPreparedObservation = 118,
+    MixedReleaseObservation = 119,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -56,6 +69,12 @@ impl TryFrom<u16> for MessageKind {
             11 => Ok(Self::PrivateBrokerLaunch),
             12 => Ok(Self::PrivatePlan),
             13 => Ok(Self::PrivateDiscovery),
+            14 => Ok(Self::MixedLaunch),
+            15 => Ok(Self::MixedBrokerLaunch),
+            16 => Ok(Self::MixedPlan),
+            17 => Ok(Self::MixedDiscovery),
+            18 => Ok(Self::MixedPreparedAck),
+            19 => Ok(Self::MixedReleaseAck),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -69,6 +88,12 @@ impl TryFrom<u16> for MessageKind {
             113 => Ok(Self::PrivateRejected),
             111 => Ok(Self::PrivatePlanReceipt),
             112 => Ok(Self::PrivateDiscoveryReceipt),
+            114 => Ok(Self::MixedTerminal),
+            115 => Ok(Self::MixedRejected),
+            116 => Ok(Self::MixedPlanReceipt),
+            117 => Ok(Self::MixedDiscoveryReceipt),
+            118 => Ok(Self::MixedPreparedObservation),
+            119 => Ok(Self::MixedReleaseObservation),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }
@@ -113,7 +138,7 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
     read_frame_version(reader, PROTOCOL_VERSION)
 }
 
-fn read_frame_version(
+pub(crate) fn read_frame_version(
     reader: &mut impl Read,
     expected_version: u16,
 ) -> Result<Frame, ProtocolError> {
@@ -126,6 +151,9 @@ fn read_frame_version(
         return Err(ProtocolError::UnsupportedVersion(version));
     }
     let kind = MessageKind::try_from(u16::from_be_bytes([header[2], header[3]]))?;
+    if version != kind.protocol_version() {
+        return Err(ProtocolError::UnsupportedVersion(version));
+    }
     let total = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if total < HEADER_LENGTH {
         return Err(ProtocolError::InvalidLength(total));
@@ -154,7 +182,27 @@ fn read_frame_version(
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), ProtocolError> {
-    write_frame_version(writer, frame, PROTOCOL_VERSION)
+    write_frame_version(writer, frame, frame.kind.protocol_version())
+}
+
+impl MessageKind {
+    pub(crate) fn protocol_version(self) -> u16 {
+        match self {
+            Self::MixedLaunch
+            | Self::MixedBrokerLaunch
+            | Self::MixedPlan
+            | Self::MixedDiscovery
+            | Self::MixedPreparedAck
+            | Self::MixedReleaseAck
+            | Self::MixedTerminal
+            | Self::MixedRejected
+            | Self::MixedPlanReceipt
+            | Self::MixedDiscoveryReceipt
+            | Self::MixedPreparedObservation
+            | Self::MixedReleaseObservation => MIXED_PROTOCOL_VERSION,
+            _ => PROTOCOL_VERSION,
+        }
+    }
 }
 
 fn write_frame_version(

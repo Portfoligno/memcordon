@@ -56,6 +56,30 @@ pub fn seal_ticket_for_test(identity: EntrypointObjectIdentity) -> EntrypointSea
 }
 
 impl VerifiedEntrypoint {
+    /// Fresh copied immutable image members share the same held native object
+    /// checks as package probes, with the exact administrator image digest.
+    pub(super) fn from_private_root_image(
+        file: File,
+        entry: &memcordon_core::workload_registry_v3::ImageEntryV1,
+    ) -> Result<Self, String> {
+        let memcordon_core::workload_registry_v3::ImageEntryV1::Regular {
+            sha256,
+            size,
+            executable: true,
+            ..
+        } = entry
+        else {
+            return Err(error(
+                "private image entrypoint is not executable regular content",
+            ));
+        };
+        super::runtime_image::verify_regular(&file, entry, true)?;
+        let verified = Self::from_probe_package_image(file, sha256)?;
+        if verified.identity.size != *size {
+            return Err(error("private image executable size differs"));
+        }
+        Ok(verified)
+    }
     /// Verify a held probe image against the installed package's expected digest.
     /// The caller must retain package custody; this does not resolve an
     /// administrator-approved workload entrypoint.

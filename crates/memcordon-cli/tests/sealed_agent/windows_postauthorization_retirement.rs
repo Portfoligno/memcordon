@@ -7,6 +7,9 @@ use memcordon_core::{
 
 #[test]
 fn terminal_seed_freezes_before_proof_and_rejects_replacement() {
+    let receipt = crate::windows::readiness_receipt::begin(
+        "windows_postauthorization_retirement::terminal_seed_freezes_before_proof_and_rejects_replacement",
+    );
     use memcordon_core::{ProcessObservationUnavailableReasonV1, WindowsProcessObservationV2};
 
     let digest = "c7".repeat(32);
@@ -45,15 +48,33 @@ fn terminal_seed_freezes_before_proof_and_rejects_replacement() {
         observation
     );
     assert!(record.retirement_proof.is_none());
-    assert!(
-        record
-            .freeze_terminal_seed_for_test(observation, None, |_| panic!("duplicate seed store"))
-            .is_err()
-    );
+    let before = serde_json::to_vec(&record).unwrap();
+    let replacement = observation.clone();
+    let refused = record
+        .freeze_terminal_seed_for_test(observation, None, |_| panic!("duplicate seed store"))
+        .unwrap_err();
+    let after = serde_json::to_vec(&record).unwrap();
+    assert_eq!(before, after);
+    if let Some(receipt) = receipt {
+        let before_path = receipt.retain("seed.before.json", &before);
+        let after_path = receipt.retain("seed.after.json", &after);
+        let replacement_path = receipt.retain(
+            "seed.replacement.json",
+            &serde_json::to_vec(&replacement).unwrap(),
+        );
+        receipt.finish_payload(
+            serde_json::json!({"kind":"binding-seed","before_record":before_path,
+            "after_record":after_path,"replacement_observation":replacement_path,
+            "refusal":refused,"stores_before_refusal":stores,"stores_after_refusal":stores}),
+        );
+    }
 }
 
 #[test]
 fn frozen_seed_accepts_only_matching_later_retirement_proof() {
+    let evidence = crate::windows::readiness_receipt::begin(
+        "windows_postauthorization_retirement::frozen_seed_accepts_only_matching_later_retirement_proof",
+    );
     let digest = "c8".repeat(32);
     let target = WindowsProcessIdentityV1 {
         process_id: 418,
@@ -94,13 +115,14 @@ fn frozen_seed_accepts_only_matching_later_retirement_proof() {
         .as_mut()
         .expect("fixture has a root identity")
         .creation_time_100ns += 1;
-    assert!(
-        record
-            .stage_terminal_proof_for_test(&mismatched, Some(failure.clone()), |_| {
-                panic!("conflicting seed must not be stored")
-            })
-            .is_err()
-    );
+    let before = serde_json::to_vec(&record).unwrap();
+    let refused = record
+        .stage_terminal_proof_for_test(&mismatched, Some(failure.clone()), |_| {
+            panic!("conflicting seed must not be stored")
+        })
+        .unwrap_err();
+    let after_refusal = serde_json::to_vec(&record).unwrap();
+    assert_eq!(before, after_refusal);
     record
         .stage_terminal_proof_for_test(&receipt, Some(failure), |_| Ok(()))
         .unwrap();
@@ -112,6 +134,27 @@ fn frozen_seed_accepts_only_matching_later_retirement_proof() {
         record.retirement_proof.as_ref(),
         Some(&receipt.retirement_proof)
     );
+    if let Some(evidence) = evidence {
+        let before_path = evidence.retain("proof.before.json", &before);
+        let refused_path = evidence.retain("proof.after-refusal.json", &after_refusal);
+        let after_path = evidence.retain(
+            "proof.after-match.json",
+            &serde_json::to_vec(&record).unwrap(),
+        );
+        let mismatch_path = evidence.retain(
+            "proof.mismatch.json",
+            &serde_json::to_vec(&mismatched).unwrap(),
+        );
+        let matching_path = evidence.retain(
+            "proof.matching.json",
+            &serde_json::to_vec(&receipt).unwrap(),
+        );
+        evidence.finish_payload(
+            serde_json::json!({"kind":"binding-proof","before_record":before_path,
+            "after_refusal_record":refused_path,"after_matching_record":after_path,
+            "mismatched_receipt":mismatch_path,"matching_receipt":matching_path,"refusal":refused}),
+        );
+    }
 }
 
 #[test]
@@ -238,6 +281,9 @@ fn policy_revocation_keeps_observed_status_in_a_bound_terminal_outbox() {
 
 #[test]
 fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox() {
+    let evidence = crate::windows::readiness_receipt::begin(
+        "windows_postauthorization_retirement::suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox",
+    );
     let digest = "9a".repeat(32);
     let nonce = "postauthorization-suspended-cancellation";
     let identity = WindowsProcessIdentityV1 {
@@ -301,6 +347,151 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
         rejection,
     };
     record.stage_terminal_response_for_test(&response).unwrap();
+    // Persist only this component fixture's own bytes. No installed receipt,
+    // replay ledger, policy reference or acknowledgement store is accessed.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("component-outbox.json");
+    crate::windows::record::publish_owned_component_record_for_test(&mut record, &path).unwrap();
+    let persisted = std::fs::read(&path).unwrap();
+    let duplicate_refusal = record
+        .stage_terminal_response_for_test(&response)
+        .unwrap_err();
+    assert_eq!(
+        duplicate_refusal,
+        "attempt is not ready for a create-once terminal outbox"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), persisted);
+    let decode = |nonce: &str, request: &str| {
+        crate::windows::record::pending_owned_component_response_for_test(
+            &path,
+            &record.attempt_id,
+            nonce,
+            request,
+            &record.caller_process_identity,
+            &record.caller_token_sha256,
+        )
+    };
+    let first = decode(nonce, &record.request_sha256).unwrap().unwrap();
+    let repeated = decode(nonce, &record.request_sha256).unwrap().unwrap();
+    assert_eq!(
+        first.terminal_authority_json().unwrap(),
+        repeated.terminal_authority_json().unwrap()
+    );
+    let nonce_refusal = decode("wrong-nonce", &record.request_sha256).unwrap_err();
+    let request_refusal = decode(nonce, &"c2".repeat(32)).unwrap_err();
+    let after_refusals = std::fs::read(&path).unwrap();
+    assert_eq!(after_refusals, persisted);
+    let retention = record.diagnostic_retention.clone();
+    let available_journal = crate::windows::record::owned_component_journal_at_for_test(
+        &record,
+        true,
+        retention.expires_monotonic_millis - 1,
+    );
+    let expired_journal = crate::windows::record::owned_component_journal_at_for_test(
+        &record,
+        true,
+        retention.expires_monotonic_millis,
+    );
+    assert_eq!(available_journal, record.causal_diagnostics);
+    assert!(matches!(
+        &expired_journal.original,
+        memcordon_core::OriginalFailureV1::Unavailable {
+            reason: memcordon_core::OriginalUnavailableReasonV1::RetentionExpired
+        }
+    ));
+    assert!(expired_journal.secondary.as_slice().is_empty());
+    // Projection loss at the exact fixed clock boundary cannot rewrite the
+    // physically retained terminal authority or take over its ACK ownership.
+    let after_expiry_projection = std::fs::read(&path).unwrap();
+    assert_eq!(after_expiry_projection, persisted);
+    assert_eq!(
+        record.terminal_response_json.as_deref(),
+        Some(response.terminal_authority_json().unwrap().as_str())
+    );
+    // Lose the acknowledgement response after the owned outbox and ACK ledger
+    // were physically committed. Recovery must use those same named bytes.
+    record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::AckCommitted;
+    crate::windows::record::publish_owned_component_record_for_test(&mut record, &path).unwrap();
+    let ack_record = std::fs::read(&path).unwrap();
+    let ack_path = root.path().join("component-ack.json");
+    crate::windows::record::stage_owned_component_ack_for_test(&ack_path, &record).unwrap();
+    let staged_ack = std::fs::read(&ack_path).unwrap();
+    crate::windows::record::stage_owned_component_ack_for_test(&ack_path, &record).unwrap();
+    assert_eq!(std::fs::read(&ack_path).unwrap(), staged_ack);
+    let recover = |nonce: &str, caller: &WindowsProcessIdentityV1| {
+        crate::windows::record::complete_owned_component_ack_for_test(
+            &ack_path,
+            &path,
+            &record,
+            nonce,
+            caller,
+            &record.caller_token_sha256,
+        )
+    };
+    let active_refusal = recover(nonce, &record.caller_process_identity).unwrap_err();
+    assert_eq!(
+        active_refusal,
+        "ACK tombstone still has a durable attempt record"
+    );
+    assert_eq!(std::fs::read(&ack_path).unwrap(), staged_ack);
+    std::fs::remove_file(&path).unwrap();
+    let ack_nonce_refusal = recover("wrong-nonce", &record.caller_process_identity).unwrap_err();
+    let mut other_caller = record.caller_process_identity.clone();
+    other_caller.creation_time_100ns += 1;
+    let ack_caller_refusal = recover(nonce, &other_caller).unwrap_err();
+    assert_eq!(std::fs::read(&ack_path).unwrap(), staged_ack);
+    let completed = recover(nonce, &record.caller_process_identity).unwrap();
+    let completed_ack = std::fs::read(&ack_path).unwrap();
+    let repeated_ack = recover(nonce, &record.caller_process_identity).unwrap();
+    assert_eq!(completed, repeated_ack);
+    assert_eq!(std::fs::read(&ack_path).unwrap(), completed_ack);
+    if let Some(evidence) = evidence {
+        let durable = evidence.retain("persisted-record.json", &persisted);
+        let after = evidence.retain("after-refusals-record.json", &after_refusals);
+        let first = evidence.retain(
+            "first-response.json",
+            first.terminal_authority_json().unwrap().as_bytes(),
+        );
+        let repeated = evidence.retain(
+            "repeated-response.json",
+            repeated.terminal_authority_json().unwrap().as_bytes(),
+        );
+        let available_journal = evidence.retain(
+            "pre-expiry-journal.json",
+            &serde_json::to_vec(&available_journal).unwrap(),
+        );
+        let expired_journal = evidence.retain(
+            "expired-journal.json",
+            &serde_json::to_vec(&expired_journal).unwrap(),
+        );
+        let expiry_record = evidence.retain(
+            "after-expiry-projection-record.json",
+            &after_expiry_projection,
+        );
+        let ack_record = evidence.retain("ack-outbox-record.json", &ack_record);
+        let staged_ack = evidence.retain("staged-ack.json", &staged_ack);
+        let completed_ack = evidence.retain("completed-ack.json", &completed_ack);
+        let completed = evidence.retain(
+            "retired-response.json",
+            &serde_json::to_vec(&completed).unwrap(),
+        );
+        let repeated_ack = evidence.retain(
+            "repeated-retired-response.json",
+            &serde_json::to_vec(&repeated_ack).unwrap(),
+        );
+        evidence.finish_payload(serde_json::json!({"kind":"replay-owned-outbox",
+            "record":durable,"after_record":after,"first_response":first,"repeated_response":repeated,
+            "duplicate_refusal":duplicate_refusal,"nonce_refusal":nonce_refusal,"request_refusal":request_refusal,
+            "attempt_id":record.attempt_id,"nonce":nonce,"request_sha256":record.request_sha256,
+            "ack_record":ack_record,"staged_ack":staged_ack,"completed_ack":completed_ack,
+            "retired_response":completed,"repeated_retired_response":repeated_ack,
+            "active_record_refusal":active_refusal,"ack_nonce_refusal":ack_nonce_refusal,
+            "ack_caller_refusal":ack_caller_refusal,"outbox_absent_after_ack":!path.exists(),
+            "available_journal":available_journal,"expired_journal":expired_journal,"expiry_record":expiry_record,
+            "retention":retention,"pre_expiry_clock":retention.expires_monotonic_millis-1,
+            "expired_clock":retention.expires_monotonic_millis,"same_boot":true,
+            "fixture_resource_claims":true,"installed_state_accessed":false}));
+    }
     let replayed: WindowsLauncherResponseV3 =
         serde_json::from_str(record.terminal_response_json.as_deref().unwrap()).unwrap();
     assert_eq!(
@@ -321,6 +512,9 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
 
 #[test]
 fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
+    let evidence = crate::windows::readiness_receipt::begin(
+        "windows_postauthorization_retirement::receiptless_posttarget_rejection_cannot_bypass_terminal_binding",
+    );
     let digest = "8b".repeat(32);
     let nonce = "receiptless-posttarget-rejection";
     let identity = WindowsProcessIdentityV1 {
@@ -379,10 +573,12 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
         rejection,
     };
 
+    let before = serde_json::to_vec(&record).unwrap();
+    let first_refusal = record
+        .stage_terminal_response_for_test(&response)
+        .unwrap_err();
     assert_eq!(
-        record
-            .stage_terminal_response_for_test(&response)
-            .unwrap_err(),
+        first_refusal,
         "terminal outbox response is not bound and consistent for the attempt"
     );
     assert!(record.terminal_response_json.is_none());
@@ -405,4 +601,21 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
         Some(memcordon_core::TerminalizationReferenceV1::FirstError)
     );
     assert!(record.terminal_response_json.is_none());
+    if let Some(evidence) = evidence {
+        let before_path = evidence.retain("receiptless.before.json", &before);
+        let after_path = evidence.retain(
+            "receiptless.after.json",
+            &serde_json::to_vec(&record).unwrap(),
+        );
+        let response_path = evidence.retain(
+            "receiptless.response.json",
+            &serde_json::to_vec(&response).unwrap(),
+        );
+        let original_path = evidence.retain(
+            "receiptless.original.json",
+            &serde_json::to_vec(&retained_original).unwrap(),
+        );
+        evidence.finish_payload(serde_json::json!({"kind":"binding-receiptless", "before_record":before_path,
+            "after_record":after_path,"response":response_path,"original":original_path,"refusal":first_refusal}));
+    }
 }

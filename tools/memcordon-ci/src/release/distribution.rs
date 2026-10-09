@@ -22,7 +22,58 @@ pub struct TargetDistribution {
     pub units: Vec<String>,
 }
 
+/// Build feature closure, independent of the spelling of transitive features.
+/// This selects existing runtime suites; it does not certify consumer readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeSelection {
+    CliOnly,
+    LinuxBaseline,
+    LinuxPrivateTcp,
+    WindowsSealed,
+}
+
 impl Distribution {
+    /// Explicit full consumer profile; ordinary distribution defaults stay independent.
+    pub fn consumer_readiness(mut self) -> Result<Self> {
+        for target in &mut self.targets {
+            match target.target.as_str() {
+                "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {
+                    target.features = vec!["sealed-runtime".into(), "private-tcp".into()];
+                    target.binaries = vec!["memcordon".into(), "memcordon-sealed-agent".into()];
+                    target.units = [
+                        "memcordon-sealed-agent.service",
+                        "memcordon-sealed-agent.socket",
+                        "memcordon-sealed-launcher.service",
+                        "memcordon-sealed-launcher.socket",
+                        "memcordon-sealed-network-launcher.service",
+                        "memcordon-sealed-network-launcher.socket",
+                        "memcordon.conf",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                }
+                "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" => {
+                    target.features =
+                        vec!["sealed-runtime".into(), "windows-sealed-runtime".into()];
+                    target.binaries = [
+                        "memcordon",
+                        "memcordon-sealed-agent",
+                        "memcordon-target-desktop-bootstrap",
+                        "memcordon-session-broker",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                    target.units.clear();
+                }
+                _ => {}
+            }
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn read(root: &Path) -> Result<Self> {
         let bytes = super::artifacts::read_file(&root.join("ci").join("distribution.toml"))?;
         let value: Self = toml::from_str(
@@ -78,6 +129,25 @@ pub fn native_target() -> Result<&'static str> {
 }
 
 impl TargetDistribution {
+    pub fn runtime_selection(&self) -> Result<RuntimeSelection> {
+        self.validate()?;
+        Ok(
+            if self
+                .features
+                .iter()
+                .any(|value| value == "windows-sealed-runtime")
+            {
+                RuntimeSelection::WindowsSealed
+            } else if self.features.iter().any(|value| value == "private-tcp") {
+                RuntimeSelection::LinuxPrivateTcp
+            } else if self.features.iter().any(|value| value == "sealed-runtime") {
+                RuntimeSelection::LinuxBaseline
+            } else {
+                RuntimeSelection::CliOnly
+            },
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         let linux = matches!(
             self.target.as_str(),

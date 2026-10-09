@@ -7,6 +7,7 @@ members = [
     "crates/memcordon-cli",
     "crates/memcordon-testkit",
     "tools/memcordon-ci",
+    "tools/memcordon-readiness-verifier",
     "tools/memcordon-deadline-oracle",
     "tools/memcordon-windows-loader-lab",
 ]

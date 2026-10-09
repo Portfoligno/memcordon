@@ -21,6 +21,27 @@ pub struct ResolvedTargetIdentity {
 }
 
 impl ResolvedTargetIdentity {
+    pub(super) fn exclusive(
+        definition: &memcordon_core::workload_registry_v3::ExclusiveIdentityDefinitionV3,
+        caller_uid: u32,
+    ) -> Result<Self, String> {
+        definition.reference()?;
+        if !definition.enabled || definition.uid.get() == caller_uid {
+            return Err("exclusive target must be enabled and distinct from frontend".into());
+        }
+        let groups = definition
+            .supplementary_groups
+            .as_slice()
+            .iter()
+            .map(|group| group.get())
+            .collect();
+        Ok(Self {
+            uid: definition.uid.get(),
+            gid: definition.gid.get(),
+            groups,
+            delegated: true,
+        })
+    }
     /// Explicit fixture identity, excluded from production permission paths.
     #[cfg(test)]
     pub(crate) fn for_native_test(uid: u32, gid: u32) -> Result<Self, String> {

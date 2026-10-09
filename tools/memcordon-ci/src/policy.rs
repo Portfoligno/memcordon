@@ -1007,7 +1007,8 @@ fn ordinary_driver_before_suite(steps: &[Value], suite_index: usize) -> Result<(
         .iter()
         .enumerate()
         .filter(|(_, step)| {
-            step.get(key("run")).and_then(Value::as_str) == Some(ORDINARY_DRIVER_BUILD)
+            matches!(step.get(key("run")).and_then(Value::as_str),Some(run) if run==ORDINARY_DRIVER_BUILD
+                ||run=="rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness")
         })
         .collect();
     if builds.len() != 1 || builds[0].0 >= suite_index || builds[0].1.get(key("if")).is_some() {
@@ -2148,10 +2149,325 @@ fn check_rehearsal_tool(jobs: &Mapping) -> Result<()> {
     Ok(())
 }
 
+fn check_readiness_candidate_steps(
+    job: &Mapping,
+    steps: &[Value],
+    name: &str,
+    native_name: &str,
+) -> Result<()> {
+    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)
+        || job
+            .get(key("outputs"))
+            .and_then(|outputs| outputs.get("artifact-id"))
+            .and_then(Value::as_str)
+            != Some("${{ steps.readiness-upload.outputs.artifact-id }}")
+        || job
+            .get(key("outputs"))
+            .and_then(|outputs| outputs.get("artifact-digest"))
+            .and_then(Value::as_str)
+            != Some("${{ steps.readiness-upload.outputs.artifact-digest }}")
+    {
+        return Err(failure(
+            "readiness owner deadline or immutable upload routing differs",
+        ));
+    }
+    let rows = job
+        .get(key("strategy"))
+        .and_then(|strategy| strategy.get("matrix"))
+        .and_then(|matrix| matrix.get("include"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("readiness owner row absent"))?;
+    if rows[0].get("producer-job").and_then(Value::as_str) != Some(name)
+        || rows[0].get("native-job").and_then(Value::as_str) != Some(native_name)
+    {
+        return Err(failure(
+            "readiness producer name or selected native artifact owner differs",
+        ));
+    }
+    let operations = [
+        (
+            "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json",
+            "matrix.producer-job != ''",
+        ),
+        (
+            "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+            "matrix.producer-job != ''",
+        ),
+        (
+            "./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+            "always() && matrix.producer-job != ''",
+        ),
+        (
+            "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+            "always() && matrix.producer-job != ''",
+        ),
+    ];
+    let mut previous = None;
+    for (run, condition) in operations {
+        let selected = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.get("run").and_then(Value::as_str) == Some(run))
+            .collect::<Vec<_>>();
+        if selected.len() != 1
+            || selected[0].1.get("if").and_then(Value::as_str) != Some(condition)
+            || selected[0].1.get("continue-on-error").is_some()
+            || previous.is_some_and(|previous| previous >= selected[0].0)
+        {
+            return Err(failure(
+                "readiness acquire/cleanup/seal order or failure propagation differs",
+            ));
+        }
+        previous = Some(selected[0].0);
+    }
+    let upload = steps
+        .iter()
+        .filter(|step| step.get("id").and_then(Value::as_str) == Some("readiness-upload"))
+        .collect::<Vec<_>>();
+    if upload.len() != 1
+        || upload[0].get("if").and_then(Value::as_str)
+            != Some("always() && matrix.producer-job != ''")
+        || upload[0]["with"]["overwrite"].as_bool() != Some(false)
+        || upload[0]["with"]["include-hidden-files"].as_bool() != Some(true)
+        || upload[0]["with"]["if-no-files-found"].as_str() != Some("error")
+        || upload[0]["with"]["path"].as_str() != Some(".release/readiness-cell")
+    {
+        return Err(failure(
+            "readiness original producer artifact custody differs",
+        ));
+    }
+    Ok(())
+}
+
 fn check_release_structure(jobs: &Mapping) -> Result<()> {
     check_rehearsal_tool(jobs)?;
     check_rehearsal_job(jobs, false)?;
     check_rehearsal_job(jobs, true)?;
+    let mut candidate_owners = vec![
+        "select".to_owned(),
+        "native-linux-x64".into(),
+        "native-linux-arm64".into(),
+        "native-windows-x64".into(),
+        "native-windows-arm64".into(),
+    ];
+    let mut public_owners = Vec::new();
+    for platform in ["linux-x64", "linux-arm64", "windows-x64", "windows-arm64"] {
+        for channel in ["native", "cargo"] {
+            candidate_owners.push(format!("candidate-{platform}-{channel}"));
+            public_owners.push(format!("public-{platform}-{channel}"));
+        }
+    }
+    for (name, scope, condition) in [
+        (
+            "readiness-candidate-report",
+            "candidate-before-publication",
+            "always() && needs.select.result == 'success' && needs.select.outputs.recovery-mode == 'reprepare'",
+        ),
+        (
+            "readiness-complete-report",
+            "complete-profile",
+            "always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'",
+        ),
+    ] {
+        let job = jobs
+            .get(key(name))
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| failure("finite readiness reporting owner absent"))?;
+        let mut expected = candidate_owners.clone();
+        if scope == "complete-profile" {
+            expected.extend(
+                ["assemble", "publish", "recovery-inputs", "recovery-publish"].map(str::to_owned),
+            );
+            expected.extend(public_owners.clone());
+        }
+        let required = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let actual = job["needs"]
+            .as_sequence()
+            .ok_or_else(|| failure("finite report dependencies absent"))?;
+        let actual_keys = actual
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        if actual.len() != required.len()
+            || actual_keys != required
+            || job["if"].as_str() != Some(condition)
+            || job["timeout-minutes"].as_u64() != Some(20)
+        {
+            return Err(failure(
+                "finite candidate/full report dependency set, condition or deadline differs",
+            ));
+        }
+        let permissions = job
+            .get(key("permissions"))
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| failure("report read permissions absent"))?;
+        exact_mapping_keys(
+            permissions,
+            &["contents", "actions"],
+            "report read permissions",
+        )?;
+        if scalar(permissions, "contents") != Some("read")
+            || scalar(permissions, "actions") != Some("read")
+        {
+            return Err(failure("report must remain read only"));
+        }
+        let steps = job["steps"]
+            .as_sequence()
+            .ok_or_else(|| failure("report steps absent"))?;
+        let invocation = format!(
+            "./target/ci/release/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope {scope} --destination .release/readiness-report"
+        );
+        let reports = steps
+            .iter()
+            .filter(|step| step["run"].as_str() == Some(invocation.as_str()))
+            .collect::<Vec<_>>();
+        if reports.len()!=1||reports[0].get("continue-on-error").is_some()||reports[0].get("if").is_some()||!steps.iter().any(|step|step["run"].as_str()==Some("rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier")){return Err(failure("independent finite verifier invocation/failure propagation absent"));}
+        let uploads = steps
+            .iter()
+            .filter(|step| step["with"]["path"].as_str() == Some(".release/readiness-report"))
+            .collect::<Vec<_>>();
+        if uploads.len() != 1
+            || uploads[0]["if"].as_str() != Some("always()")
+            || uploads[0]["with"]["overwrite"].as_bool() != Some(false)
+            || uploads[0]["with"]["include-hidden-files"].as_bool() != Some(true)
+            || uploads[0]["with"]["if-no-files-found"].as_str() != Some("error")
+        {
+            return Err(failure(
+                "report failure diagnostics must retain original custody",
+            ));
+        }
+    }
+    for (id, target, runner) in [
+        ("linux-x64", "x86_64-unknown-linux-gnu", "ubuntu-24.04"),
+        (
+            "linux-arm64",
+            "aarch64-unknown-linux-gnu",
+            "ubuntu-24.04-arm",
+        ),
+        ("windows-x64", "x86_64-pc-windows-msvc", "windows-2022"),
+        ("windows-arm64", "aarch64-pc-windows-msvc", "windows-11-arm"),
+    ] {
+        for channel in ["native", "cargo"] {
+            let name = format!("public-{id}-{channel}");
+            let job = jobs
+                .get(key(&name))
+                .and_then(Value::as_mapping)
+                .ok_or_else(|| failure("mandatory public readiness owner absent"))?;
+            exact_string_sequence(
+                &job["needs"],
+                &[
+                    "select",
+                    "assemble",
+                    "publish",
+                    "recovery-inputs",
+                    "recovery-publish",
+                ],
+                "public selected original pair and publisher dependencies",
+            )?;
+            if job["if"].as_str()
+                != Some(
+                    "always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'",
+                )
+                || job["name"].as_str() != Some(name.as_str())
+                || job["outputs"]["artifact-id"].as_str()
+                    != Some("${{ steps.readiness-upload.outputs.artifact-id }}")
+                || job["outputs"]["artifact-digest"].as_str()
+                    != Some("${{ steps.readiness-upload.outputs.artifact-digest }}")
+            {
+                return Err(failure(
+                    "public readiness original publication condition or immutable routing differs",
+                ));
+            }
+            let permissions = job
+                .get(key("permissions"))
+                .and_then(Value::as_mapping)
+                .ok_or_else(|| failure("public readiness read permissions absent"))?;
+            exact_mapping_keys(
+                permissions,
+                &["contents", "actions"],
+                "public artifact read permissions",
+            )?;
+            if scalar(permissions, "contents") != Some("read")
+                || scalar(permissions, "actions") != Some("read")
+            {
+                return Err(failure(
+                    "public readiness must retain read-only permissions",
+                ));
+            }
+            let rows = job
+                .get(key("strategy"))
+                .and_then(|strategy| strategy.get("matrix"))
+                .and_then(|matrix| matrix.get("include"))
+                .and_then(Value::as_sequence)
+                .ok_or_else(|| failure("public readiness row absent"))?;
+            if rows.len() != 1
+                || rows[0]["target"].as_str() != Some(target)
+                || rows[0]["runner"].as_str() != Some(runner)
+                || rows[0]["channel"].as_str() != Some(format!("public-{channel}").as_str())
+                || rows[0]["producer-job"].as_str() != Some(name.as_str())
+                || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)
+            {
+                return Err(failure(
+                    "public readiness native target/channel/owner/deadline differs",
+                ));
+            }
+            let steps = job
+                .get(key("steps"))
+                .and_then(Value::as_sequence)
+                .ok_or_else(|| failure("public readiness steps absent"))?;
+            let mut previous = None;
+            for (run, condition) in [
+                (
+                    "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json",
+                    None,
+                ),
+                (
+                    "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+                    None,
+                ),
+                (
+                    "./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+                    Some("always()"),
+                ),
+                (
+                    "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
+                    Some("always()"),
+                ),
+            ] {
+                let selected = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| step.get("run").and_then(Value::as_str) == Some(run))
+                    .collect::<Vec<_>>();
+                if selected.len() != 1
+                    || selected[0].1.get("if").and_then(Value::as_str) != condition
+                    || selected[0].1.get("continue-on-error").is_some()
+                    || previous.is_some_and(|previous| previous >= selected[0].0)
+                {
+                    return Err(failure(
+                        "public readiness operation order/always-cleanup/failure propagation differs",
+                    ));
+                }
+                previous = Some(selected[0].0);
+            }
+            let upload = steps
+                .iter()
+                .filter(|step| step.get("id").and_then(Value::as_str) == Some("readiness-upload"))
+                .collect::<Vec<_>>();
+            if upload.len() != 1
+                || upload[0]["if"].as_str() != Some("always()")
+                || upload[0]["with"]["overwrite"].as_bool() != Some(false)
+                || upload[0]["with"]["include-hidden-files"].as_bool() != Some(true)
+                || upload[0]["with"]["if-no-files-found"].as_str() != Some("error")
+                || upload[0]["with"]["name"].as_str()
+                    != Some(
+                        "readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                    )
+            {
+                return Err(failure("public original producer artifact custody differs"));
+            }
+        }
+    }
     for (name, value) in jobs {
         let name = name
             .as_str()
@@ -2161,7 +2477,16 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             .get(key("timeout-minutes"))
             .and_then(Value::as_u64)
             .is_none_or(|minutes| {
-                minutes == 0 || minutes > if name.starts_with("native-") { 180 } else { 90 }
+                minutes == 0
+                    || minutes
+                        > if name.starts_with("native-")
+                            || name.starts_with("candidate-")
+                            || name.starts_with("public-")
+                        {
+                            180
+                        } else {
+                            90
+                        }
             })
         {
             return Err(failure("release operation deadline missing or excessive"));
@@ -2199,20 +2524,78 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             ));
         }
         check_release_row(native, target, runner, None)?;
-        check_native_cache_role(native, "native-release")?;
+        check_native_cache_role(native, "native-readiness")?;
         let steps = ordinary_steps(native, "release native")?;
         let build = steps
             .iter()
             .position(|step| {
                 step.get(key("run")).and_then(Value::as_str)
-                    == Some("./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json")
+                    == Some("./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness")
             })
             .ok_or_else(|| failure("actual native build absent"))?;
         if steps[build].get(key("if")).is_some() {
             return Err(failure("native build cannot be skipped"));
         }
         ordinary_driver_before_suite(steps, build)?;
-        let channels = if id.starts_with("windows") {
+        if !id.starts_with("macos") {
+            let selected = "runner.os == 'Linux' || runner.os == 'Windows'";
+            let always_selected = "always() && (runner.os == 'Linux' || runner.os == 'Windows')";
+            let expected = [
+                (
+                    "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json",
+                    selected,
+                ),
+                (
+                    "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness",
+                    selected,
+                ),
+                (
+                    "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup",
+                    always_selected,
+                ),
+            ];
+            let mut previous = build;
+            for (run, condition) in expected {
+                let matching = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, step)| step["run"].as_str() == Some(run))
+                    .collect::<Vec<_>>();
+                if matching.len() != 1
+                    || matching[0].0 <= previous
+                    || matching[0].1["if"].as_str() != Some(condition)
+                {
+                    return Err(failure(
+                        "original native component source/execution/always-cleanup owner differs",
+                    ));
+                }
+                previous = matching[0].0;
+            }
+            let uploads = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| {
+                    step["uses"].as_str() == Some(PINNED_UPLOAD_ARTIFACT_ACTION)
+                        && step["with"]["path"].as_str() == Some(".release/native-readiness")
+                })
+                .collect::<Vec<_>>();
+            if uploads.len() != 1
+                || uploads[0].0 <= previous
+                || uploads[0].1["if"].as_str() != Some(always_selected)
+                || uploads[0].1["with"]["name"].as_str()
+                    != Some(
+                        "readiness-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                    )
+                || uploads[0].1["with"]["if-no-files-found"].as_str() != Some("error")
+                || uploads[0].1["with"]["include-hidden-files"].as_bool() != Some(true)
+                || uploads[0].1["with"]["overwrite"].as_bool() != Some(false)
+            {
+                return Err(failure(
+                    "original native producer immutable evidence transport differs",
+                ));
+            }
+        }
+        let channels = if !id.starts_with("macos") {
             vec!["native", "cargo"]
         } else {
             vec!["both"]
@@ -2221,7 +2604,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             let name = if channel == "both" {
                 format!("installed-{id}")
             } else {
-                format!("installed-{id}-{channel}")
+                format!("candidate-{id}-{channel}")
             };
             required.push(name.clone());
             let job = mapping(
@@ -2235,11 +2618,26 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 &["select", "packages", &native_name],
                 "installed target-local dependencies",
             )?;
-            check_release_row(job, target, runner, Some(channel))?;
+            let selected_channel = if channel == "both" {
+                channel.to_owned()
+            } else {
+                format!("candidate-{channel}")
+            };
+            check_release_row(job, target, runner, Some(&selected_channel))?;
             let steps = ordinary_steps(job, "installed channel")?;
+            if channel != "both" {
+                check_readiness_candidate_steps(job, steps, &name, &native_name)?;
+                continue;
+            }
             for (selected, condition) in [
-                ("native", "matrix.channel != 'cargo'"),
-                ("cargo", "matrix.channel != 'native'"),
+                (
+                    "native",
+                    "matrix.producer-job == '' && matrix.channel != 'cargo'",
+                ),
+                (
+                    "cargo",
+                    "matrix.producer-job == '' && matrix.channel != 'native'",
+                ),
             ] {
                 let run = format!(
                     "./target/ci/release/memcordon-ci release installed-consumers --channel {selected} --destination .release/installed-results/{selected}"
@@ -2264,6 +2662,24 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                     .get(key("if"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if condition
+                    == "always() && matrix.producer-job != '' && steps.readiness-cache.outputs.compiled-cache-usable == 'true' && steps.readiness-cleanup.outputs.cache-quiescent == 'true' && steps.readiness-consumers.outputs.cache-hit != 'true'"
+                {
+                    let with = mapping(
+                        step.get(key("with"))
+                            .ok_or_else(|| failure("readiness cache inputs absent"))?,
+                        "readiness cache",
+                    )?;
+                    if scalar(with, "path") != Some("target/ci-consumers")
+                        || scalar(with, "key")
+                            != Some("${{ steps.readiness-consumers.outputs.cache-primary-key }}")
+                    {
+                        return Err(failure(
+                            "readiness cache must retain only selected consumer products",
+                        ));
+                    }
+                    continue;
+                }
                 if !condition.contains("(steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true')") {
                     return Err(failure("installed shared writer cache needs every started channel quiescent"));
                 }
@@ -2870,7 +3286,13 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
         let name = name.as_str().ok_or_else(|| failure("job name invalid"))?;
         let job = mapping(job, "preparation job")?;
         let writer = matches!(name, "publish" | "recovery-publish");
-        let preparation = !writer && name != "published-consumer";
+        let preparation = !writer
+            && name != "published-consumer"
+            && !name.starts_with("public-")
+            && !matches!(
+                name,
+                "readiness-candidate-report" | "readiness-complete-report"
+            );
         if matches!(name, "recovery-inputs" | "rehearse" | "recovery-rehearse")
             && !job.contains_key(key("permissions"))
         {
@@ -2905,7 +3327,11 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             .and_then(Value::as_sequence)
             .ok_or_else(|| failure("preparation steps absent"))?;
         let mut diagnostic = false;
-        if name.starts_with("native-") || name.starts_with("installed-") || name == "select" {
+        if name.starts_with("native-")
+            || name.starts_with("installed-")
+            || name.starts_with("candidate-")
+            || name == "select"
+        {
             let checkout = steps
                 .iter()
                 .position(|step| {
@@ -2934,7 +3360,7 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             }
         }
         if name == "assemble" {
-            let assembly = steps.iter().position(|step| step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json")).ok_or_else(|| failure("assembly absent"))?;
+            let assembly = steps.iter().position(|step| step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness")).ok_or_else(|| failure("assembly absent"))?;
             if !steps[..assembly].iter().any(|step| {
                 step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal")
                     && step["if"].is_null()

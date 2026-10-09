@@ -12,11 +12,21 @@ use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
 const VERSION: u16 = 3;
+#[path = "mixed_observation_client.rs"]
+mod mixed_observation_client;
 #[path = "private_client.rs"]
 mod private_client;
 #[path = "private_relay.rs"]
 mod private_relay;
+pub use mixed_observation_client::MixedObservationScope;
+pub(crate) use private_client::mixed_backend_run;
 pub(crate) use private_client::private_backend_run;
+#[doc(hidden)]
+pub use private_client::{
+    MalformedMixedIngressEvidence, probe_malformed_mixed_ingress,
+    probe_malformed_mixed_ingress_with_evidence,
+};
+pub use private_client::{mixed_discovery, mixed_plan};
 pub use private_client::{private_discovery, private_plan};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
@@ -510,6 +520,8 @@ pub(crate) fn launch(
     let cwd = fs::File::open(".").map_err(|error| LaunchError::Transport(error.to_string()))?;
     let frontend_pidfd = pidfd_self().map_err(LaunchError::Transport)?;
     let descriptors = [cwd.as_raw_fd(), 0, 1, 2, frontend_pidfd.as_raw_fd()];
+    mixed_observation_client::record_legacy_frame(attempt, false, &frame)
+        .map_err(LaunchError::Transport)?;
     send_with_descriptors(&stream, &frame, &descriptors).map_err(LaunchError::Transport)?;
     let WireFrame {
         kind,
@@ -552,6 +564,10 @@ pub(crate) fn launch(
             "terminal workload native attempt binding differs".into(),
         ));
     }
+    let original_terminal = encoded_frame(kind, returned_nonce, returned_attempt, &payload)
+        .map_err(LaunchError::Transport)?;
+    mixed_observation_client::record_legacy_frame(attempt, true, &original_terminal)
+        .map_err(LaunchError::Transport)?;
     Ok(terminal)
 }
 
@@ -808,6 +824,21 @@ fn encode_launch(
     deadline_budget: Option<Duration>,
     restart_attempt: u64,
 ) -> Result<Vec<u8>, String> {
+    encode_launch_with_environment(
+        policy,
+        command,
+        deadline_budget,
+        restart_attempt,
+        std::env::vars_os().collect(),
+    )
+}
+fn encode_launch_with_environment(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    deadline_budget: Option<Duration>,
+    restart_attempt: u64,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<Vec<u8>, String> {
     if command.arguments().len() > MAX_ARGUMENTS {
         return Err("launch argument count exceeds protocol limit".to_owned());
     }
@@ -819,7 +850,6 @@ fn encode_launch(
     for argument in command.arguments() {
         put_bytes(&mut output, argument.as_bytes())?;
     }
-    let environment: Vec<_> = std::env::vars_os().collect();
     if environment.len() > MAX_ENVIRONMENT_ENTRIES {
         return Err("launch environment count exceeds protocol limit".to_owned());
     }
@@ -1291,6 +1321,17 @@ fn write_frame(
     attempt: [u8; 16],
     payload: &[u8],
 ) -> Result<(), String> {
+    write_frame_for_version(stream, VERSION, kind, nonce, attempt, payload)
+}
+
+fn write_frame_for_version(
+    stream: &mut impl Write,
+    version: u16,
+    kind: u16,
+    nonce: [u8; 16],
+    attempt: [u8; 16],
+    payload: &[u8],
+) -> Result<(), String> {
     let total = HEADER_LENGTH
         .checked_add(payload.len())
         .ok_or_else(|| "frame length overflow".to_owned())?;
@@ -1299,7 +1340,7 @@ fn write_frame(
     }
     let digest = Sha256::digest(payload);
     stream
-        .write_all(&VERSION.to_be_bytes())
+        .write_all(&version.to_be_bytes())
         .and_then(|()| stream.write_all(&kind.to_be_bytes()))
         .and_then(|()| stream.write_all(&(total as u32).to_be_bytes()))
         .and_then(|()| stream.write_all(&nonce))
@@ -1324,6 +1365,13 @@ fn read_frame_for_version(
     stream: &mut impl Read,
     expected_version: u16,
 ) -> Result<WireFrame, String> {
+    read_frame_for_version_with_header(stream, expected_version).map(|(frame, _)| frame)
+}
+
+fn read_frame_for_version_with_header(
+    stream: &mut impl Read,
+    expected_version: u16,
+) -> Result<(WireFrame, [u8; HEADER_LENGTH]), String> {
     let mut header = [0_u8; HEADER_LENGTH];
     stream
         .read_exact(&mut header)
@@ -1347,10 +1395,13 @@ fn read_frame_for_version(
     if Sha256::digest(&payload).as_slice() != &header[40..72] {
         return Err("provider payload digest mismatch".to_owned());
     }
-    Ok(WireFrame {
-        kind,
-        nonce,
-        attempt,
-        payload,
-    })
+    Ok((
+        WireFrame {
+            kind,
+            nonce,
+            attempt,
+            payload,
+        },
+        header,
+    ))
 }

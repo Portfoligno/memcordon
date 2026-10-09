@@ -55,6 +55,7 @@ fn named_private_policy_projects_only_explicit_baseline_grants() {
     let parsed = match VersionedActivation::parse(&bytes).unwrap() {
         VersionedActivation::V2(parsed) => parsed,
         VersionedActivation::V1(_) => panic!("V2 activation was downgraded"),
+        VersionedActivation::V3(_) => panic!("V2 activation changed revision"),
     };
     assert_eq!(parsed.registry_digest, value.registry_digest);
     assert_eq!(parsed.epoch, value.epoch);

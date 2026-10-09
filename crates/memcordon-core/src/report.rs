@@ -976,7 +976,7 @@ pub struct InvocationReport {
 }
 
 impl InvocationReport {
-    fn validate(&self) -> Result<(), ReportModelError> {
+    pub(crate) fn validate(&self) -> Result<(), ReportModelError> {
         if self.syntax != "plus-budgets-v1" || self.budget_tokens.len() > 2 {
             return Err(ReportModelError::InvocationBudgets);
         }

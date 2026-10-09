@@ -169,7 +169,7 @@ fn handle(
         payload: Vec::new(),
     };
     write_authentication_response(stream, &authenticated)?;
-    let (request, descriptors) = super::transport::receive(stream)?;
+    let (request, descriptors, _) = super::transport::receive_public(stream)?;
     let response = if request.nonce != authentication.nonce
         || request.attempt_id != authentication.attempt_id
     {
@@ -182,6 +182,15 @@ fn handle(
         )?
     } else {
         match request.kind {
+            MessageKind::MixedBrokerLaunch if network && cfg!(feature = "private-tcp") => {
+                super::mixed_runtime::execute_brokered(
+                    stream,
+                    &request,
+                    descriptors,
+                    peer.pid,
+                    peer.process_start_time,
+                )?
+            }
             MessageKind::PrivateBrokerLaunch if network && cfg!(feature = "private-tcp") => {
                 super::private_runtime::execute_brokered(
                     stream,
@@ -371,7 +380,11 @@ pub(super) fn forward_private(
         request.attempt_id,
     )?;
     let frame = Frame {
-        kind: MessageKind::PrivateBrokerLaunch,
+        kind: if request.kind == MessageKind::MixedLaunch {
+            MessageKind::MixedBrokerLaunch
+        } else {
+            MessageKind::PrivateBrokerLaunch
+        },
         nonce: request.nonce,
         attempt_id: request.attempt_id,
         payload,
@@ -427,20 +440,72 @@ pub(super) fn forward_private(
             }
         }
         if sockets[0].revents != 0 {
-            break;
+            let version = if request.kind == MessageKind::MixedLaunch {
+                crate::protocol::MIXED_PROTOCOL_VERSION
+            } else {
+                crate::protocol::PROTOCOL_VERSION
+            };
+            let response = crate::protocol::read_frame_version(&mut stream, version)
+                .map_err(|error| error.to_string())?;
+            if response.nonce != request.nonce || response.attempt_id != request.attempt_id {
+                return Err("network worker response association differs".into());
+            }
+            if request.kind == MessageKind::MixedLaunch
+                && matches!(
+                    response.kind,
+                    MessageKind::MixedPreparedObservation | MessageKind::MixedReleaseObservation
+                )
+            {
+                if cancelled {
+                    return Err("mixed observation arrived after cancellation".into());
+                }
+                write_frame(&mut &*frontend_stream, &response)
+                    .map_err(|error| error.to_string())?;
+                frontend_stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                    .map_err(|error| error.to_string())?;
+                let ack = super::transport::receive_public(frontend_stream);
+                let restore = frontend_stream
+                    .set_read_timeout(None)
+                    .map_err(|error| error.to_string());
+                let (ack, ack_fds, ack_version) = ack?;
+                restore?;
+                let expected = if response.kind == MessageKind::MixedPreparedObservation {
+                    MessageKind::MixedPreparedAck
+                } else {
+                    MessageKind::MixedReleaseAck
+                };
+                if ack_version != version
+                    || ack.kind != expected
+                    || ack.nonce != request.nonce
+                    || ack.attempt_id != request.attempt_id
+                    || !ack.payload.is_empty()
+                    || !ack_fds.is_empty()
+                {
+                    return Err("public mixed observation acknowledgement differs".into());
+                }
+                write_frame(&mut stream, &ack).map_err(|error| error.to_string())?;
+                continue;
+            }
+            let accepted = if request.kind == MessageKind::MixedLaunch {
+                matches!(
+                    response.kind,
+                    MessageKind::MixedTerminal | MessageKind::MixedRejected
+                )
+            } else {
+                matches!(
+                    response.kind,
+                    MessageKind::PrivateTerminal
+                        | MessageKind::PrivateRejected
+                        | MessageKind::Rejected
+                )
+            };
+            if !accepted {
+                return Err("network worker returned wrong selected carrier".into());
+            }
+            return Ok(response);
         }
     }
-    let response = read_frame(&mut stream).map_err(|error| error.to_string())?;
-    if response.nonce != request.nonce
-        || response.attempt_id != request.attempt_id
-        || !matches!(
-            response.kind,
-            MessageKind::PrivateTerminal | MessageKind::PrivateRejected | MessageKind::Rejected
-        )
-    {
-        return Err("MCSEALED-PRIVATE-BINDING: network worker response differs".into());
-    }
-    Ok(response)
 }
 
 pub(super) fn check_network_endpoint() -> Result<(), String> {

@@ -105,6 +105,18 @@ impl From<super::job::JobObservationError> for LaunchAttemptError {
 }
 
 impl LaunchAttemptError {
+    fn captured_fault(self, fault: WindowsSealedFault) -> Self {
+        let mut event = self.observation();
+        #[cfg(feature = "test-support")]
+        {
+            event.safe_detail =
+                memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault { fault };
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = fault;
+        super::diagnostics::capture(event);
+        self
+    }
     fn captured(self) -> Self {
         super::diagnostics::capture(self.observation());
         self
@@ -442,7 +454,7 @@ impl LaunchAttemptError {
             job_operation: None,
             workload_admission: None,
         }
-        .captured()
+        .captured_fault(fault)
     }
 
     fn mutant_observed(
@@ -559,10 +571,35 @@ fn inject_fault(
         .certification_fault
         .filter(|fault| faults.contains(fault))
     {
+        #[cfg(feature = "test-support")]
+        if matches!(
+            fault,
+            WindowsSealedFault::TerminateJob
+                | WindowsSealedFault::ActiveProcessQuery
+                | WindowsSealedFault::RelayRetire
+                | WindowsSealedFault::GuardianReap
+                | WindowsSealedFault::FinalHandleClose
+        ) {
+            super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
+        }
         Err(LaunchAttemptError::certification_fault(fault, phase))
     } else {
         Ok(())
     }
+}
+
+/// Capture at a typed support-only injection site before propagating its error.
+/// The existing cause vocabulary and native-code domain are retained.
+pub(super) fn observe_injected_fault(fault: WindowsSealedFault) {
+    #[cfg(feature = "test-support")]
+    {
+        let _ = LaunchAttemptError::certification_fault(
+            fault,
+            memcordon_core::BoundarySetupPhase::Authorization,
+        );
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = fault;
 }
 
 struct ActiveJob {
@@ -946,14 +983,18 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             let provider = super::package::installed_public_provider_binding()?;
             let result: Result<memcordon_core::WindowsGuardianAttemptObservation, String> =
                 (|| {
+                    let (association, nonce, worker, thread, target) =
+                        super::record::observe_live_guardian_details(&guardian_identity)?;
                     let observation = memcordon_core::WindowsGuardianAttemptObservation {
                         format: "memcordon.windows-live-guardian-observation".into(),
                         revision: 1,
                         challenge: challenge.clone(),
                         guardian_identity: guardian_identity.clone(),
-                        association: super::record::observe_live_guardian_attempt(
-                            &guardian_identity,
-                        )?,
+                        association,
+                        live_nonce: Some(nonce),
+                        worker_process_identity: Some(worker),
+                        worker_thread_identity: Some(thread),
+                        live_target_identity: Some(target),
                     };
                     if !observation.is_consistent() || observation.association.provider != provider
                     {
@@ -2742,9 +2783,10 @@ fn launch_attempt(
         if let Err(detail) = cleanup_guard.record.mark_released() {
             retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
         }
-        if let Err(detail) =
-            wait_for_certification_release_marker(&request.launch.command.arguments)
-        {
+        if let Err(detail) = wait_for_certification_release_marker(
+            &request.launch.command.arguments,
+            target.process_id,
+        ) {
             retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
         }
         let guardian_ready = unsafe { WaitForSingleObject(ready.raw(), 0) } == WAIT_OBJECT_0;
@@ -3002,7 +3044,9 @@ fn launch_attempt(
             if request.certification_fault
                 == Some(WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) =>
         {
-            cleanup_guard.observe_failure(&error);
+            // The selection trigger is not an observed native failure. Keep
+            // any already observed first cause unchanged; guardian recovery
+            // must describe the actual worker loss or honest unavailability.
             cleanup_guard.abandon_to_guardian();
             target_cleanup_barrier.abandon_to_guardian();
             drop(relay_retired_event);
@@ -3014,6 +3058,22 @@ fn launch_attempt(
             drop(registration);
             drop(job);
             pipe::disconnect(connection);
+            #[cfg(feature = "test-support")]
+            {
+                // ExitThread bypasses Rust destructors. Retire local query,
+                // token and relay handles explicitly before native thread loss.
+                drop(process_observer);
+                drop(frontend_canaries);
+                drop(primary_token);
+                drop(frontend);
+                // SAFETY: this explicit component-only fault runs on the
+                // owned per-attempt worker. Both cleanup barriers were handed
+                // to the live guardian before all local Job/target handles
+                // closed. The independently held controller observes native
+                // thread retirement; no other process/thread is selected.
+                unsafe { windows_sys::Win32::System::Threading::ExitThread(CANCEL_STATUS) };
+            }
+            #[cfg(not(feature = "test-support"))]
             return Err(LaunchAttemptError::authority_loss(error.detail));
         }
         Err(error) => {
@@ -3346,6 +3406,14 @@ fn launch_attempt(
         | WindowsSealedFault::GuardianKilledAfterAuthorization),
     ) = request.certification_fault
     {
+        #[cfg(feature = "test-support")]
+        if fault == WindowsSealedFault::RecordRetire {
+            // This branch follows the real signaled target wait and terminal
+            // proof staging; it does not infer exit from the selected enum.
+            super::diagnostics::set_phase(
+                memcordon_core::AttemptObservationPhaseV1::TargetExitObserved,
+            );
+        }
         return Err(LaunchAttemptError::certification_fault(
             fault,
             memcordon_core::BoundarySetupPhase::Retirement,
@@ -4540,7 +4608,10 @@ fn monitor(
                     | WindowsSealedFault::AllJobOwnersClosedAfterAuthorization
             )
         ) {
-            wait_for_certification_release_marker(&request.launch.command.arguments)?;
+            wait_for_certification_release_marker(
+                &request.launch.command.arguments,
+                target.process_id,
+            )?;
             match request.certification_fault {
                 Some(WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) => {
                     return Err("certification removed the per-attempt launcher worker"
@@ -4585,7 +4656,10 @@ fn monitor(
             && request.certification_fault
                 == Some(WindowsSealedFault::GuardianKilledAfterAuthorization)
         {
-            wait_for_certification_release_marker(&request.launch.command.arguments)?;
+            wait_for_certification_release_marker(
+                &request.launch.command.arguments,
+                target.process_id,
+            )?;
             // SAFETY: target was resumed and guardian is the live per-attempt
             // authority removed by this release-required native scenario.
             if unsafe { TerminateProcess(guardian, CANCEL_STATUS) } == 0
@@ -4661,6 +4735,15 @@ fn monitor(
             break TerminalReason::Deadline;
         }
         if control_connected {
+            let selected_transport_fault = request.certification_fault.filter(|fault| {
+                matches!(
+                    fault,
+                    WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+                        | WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+                        | WindowsSealedFault::FrontendKilledAfterAuthorization
+                )
+            });
             let available = match pipe::frame_available_detailed(connection) {
                 Ok(available) => available,
                 Err(error) => {
@@ -4668,11 +4751,18 @@ fn monitor(
                         pipe::FrameAvailabilityError::Native { code, .. } => code,
                         pipe::FrameAvailabilityError::PeerClosed => None,
                     };
-                    super::diagnostics::capture_native(
+                    super::diagnostics::capture_native_with_injected_fault(
                         memcordon_core::FailureOperationV1::ReadControlFrame,
                         code,
                         memcordon_core::FailureCodeV1::ControlTransport,
+                        selected_transport_fault,
                     );
+                    #[cfg(feature = "test-support")]
+                    if selected_transport_fault.is_some() {
+                        return Err(LaunchAttemptError::authority_loss(
+                            "selected native control-channel loss observed".into(),
+                        ));
+                    }
                     control_connected = false;
                     false
                 }
@@ -4680,13 +4770,20 @@ fn monitor(
             if available {
                 match pipe::read_frame_detailed::<WindowsLauncherRequestV3>(connection) {
                     Err(error) => {
-                        super::diagnostics::capture_native(
+                        super::diagnostics::capture_native_with_injected_fault(
                             memcordon_core::FailureOperationV1::ReadControlFrame,
                             error
                                 .native_code
                                 .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
                             memcordon_core::FailureCodeV1::ControlTransport,
+                            selected_transport_fault,
                         );
+                        #[cfg(feature = "test-support")]
+                        if selected_transport_fault.is_some() {
+                            return Err(LaunchAttemptError::authority_loss(
+                                "selected native control-frame loss observed".into(),
+                            ));
+                        }
                         control_connected = false;
                     }
                     Ok(WindowsLauncherRequestV3::Cancel {
@@ -4700,6 +4797,24 @@ fn monitor(
                         && nonce == request.launch.nonce
                         && request_sha256 == request.request_sha256 =>
                     {
+                        if matches!(
+                            selected_transport_fault,
+                            Some(
+                                WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+                                    | WindowsSealedFault::FrontendKilledAfterAuthorization
+                            )
+                        ) {
+                            super::diagnostics::capture_native_with_injected_fault(
+                                memcordon_core::FailureOperationV1::ReadControlFrame,
+                                None,
+                                memcordon_core::FailureCodeV1::ControlTransport,
+                                selected_transport_fault,
+                            );
+                            #[cfg(feature = "test-support")]
+                            return Err(LaunchAttemptError::authority_loss(
+                                "selected frontend cancellation reached native launcher".into(),
+                            ));
+                        }
                         break TerminalReason::Interrupted(signal);
                     }
                     Ok(_) => {
@@ -4947,7 +5062,11 @@ pub(crate) fn record_job_process_identity(
     Ok(())
 }
 
-fn wait_for_certification_release_marker(arguments: &[Vec<u16>]) -> Result<(), String> {
+pub(super) fn wait_for_certification_release_marker(
+    arguments: &[Vec<u16>],
+    target_pid: u32,
+) -> Result<(), String> {
+    use std::io::Read;
     use std::os::windows::ffi::OsStringExt;
 
     let marker = arguments
@@ -4955,9 +5074,98 @@ fn wait_for_certification_release_marker(arguments: &[Vec<u16>]) -> Result<(), S
         .map(|value| std::ffi::OsString::from_wide(value))
         .map(std::path::PathBuf::from)
         .ok_or_else(|| "guardian-loss certification marker path is absent".to_owned())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let readiness_fixture = arguments.first().is_some_and(|mode| {
+        String::from_utf16(mode).is_ok_and(|mode| mode == "consumer-readiness-windows")
+    });
+    let transcript = if readiness_fixture {
+        let mut file = std::fs::File::open(&marker).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 64 * 1024 {
+            return Err("certification readiness descriptor exceeds bound".into());
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let path = std::path::PathBuf::from(
+            descriptor
+                .get("transcript")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("certification readiness transcript omitted")?,
+        );
+        if !path.is_absolute() {
+            return Err("certification readiness transcript must be absolute".into());
+        }
+        Some((
+            path,
+            descriptor
+                .get("start_gate")
+                .is_some_and(|gate| !gate.is_null()),
+        ))
+    } else {
+        None
+    };
+    // The component controller owns up to30s native acquisition plus30s
+    // authenticated association readback; keep15s inside its90s outer guard
+    // for release observation and output drain. Ordinary markers retain10s.
+    let deadline = Instant::now()
+        + Duration::from_secs(if transcript.as_ref().is_some_and(|(_, gated)| *gated) {
+            75
+        } else {
+            10
+        });
     while Instant::now() < deadline {
-        if marker.is_file() {
+        if let Some((transcript, controller_gate)) = &transcript {
+            if let Ok(mut file) = std::fs::File::open(transcript) {
+                let mut sequence = 0_u64;
+                // A live transcript can end between its separate length/body
+                // writes. Retry that incomplete tail; completed records stay
+                // strict and must belong to the held target.
+                for _ in 0..64 {
+                    let mut length = [0u8; 4];
+                    if file.read_exact(&mut length).is_ok() {
+                        let length = u32::from_le_bytes(length) as usize;
+                        if length > 64 * 1024 {
+                            return Err("certification readiness event exceeds bound".into());
+                        }
+                        let mut bytes = vec![0u8; length];
+                        if file.read_exact(&mut bytes).is_ok() {
+                            memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                            let event: serde_json::Value = serde_json::from_slice(&bytes)
+                                .map_err(|error| error.to_string())?;
+                            if event.get("sequence").and_then(serde_json::Value::as_u64)
+                                != Some(sequence)
+                                || (sequence == 0
+                                    && event.get("stage").and_then(serde_json::Value::as_str)
+                                        != Some("started"))
+                                || event.get("pid").and_then(serde_json::Value::as_u64)
+                                    != Some(u64::from(target_pid))
+                            {
+                                return Err(
+                                    "certification readiness event differs from held native target"
+                                        .into(),
+                                );
+                            }
+                            if !*controller_gate
+                                || event.get("stage").and_then(serde_json::Value::as_str)
+                                    == Some("controller-released")
+                            {
+                                return Ok(());
+                            }
+                            sequence = sequence
+                                .checked_add(1)
+                                .ok_or("certification event sequence exhausted")?;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if marker.is_file() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));

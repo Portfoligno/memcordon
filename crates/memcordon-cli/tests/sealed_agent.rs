@@ -77,6 +77,12 @@ mod native_descriptor_custody;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/native_entrypoint.rs"]
 mod native_entrypoint;
+#[cfg(all(target_os = "linux", feature = "private-tcp"))]
+#[path = "sealed_agent/native_mixed_recovery.rs"]
+mod native_mixed_recovery;
+#[cfg(all(target_os = "linux", feature = "private-tcp"))]
+#[path = "sealed_agent/native_mixed_release.rs"]
+mod native_mixed_release;
 #[cfg(target_os = "linux")]
 #[path = "release/native_private_image_inputs.rs"]
 mod native_private_image_inputs;
@@ -88,6 +94,9 @@ mod native_private_owner_loss;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/native_private_tcp.rs"]
 mod native_private_tcp;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_versions.rs"]
+mod native_versions;
 #[path = "sealed_agent/package.rs"]
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]

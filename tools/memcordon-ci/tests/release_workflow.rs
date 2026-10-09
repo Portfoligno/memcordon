@@ -22,7 +22,7 @@ fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_sou
     let assembly = steps
         .iter()
         .position(|step| {
-            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json")
+            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness")
         })
         .unwrap();
     let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
@@ -51,7 +51,10 @@ fn windows_release_jobs_configure_lf_before_checkout() {
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
     for (name, job) in workflow["jobs"].as_mapping().unwrap() {
         let name = name.as_str().unwrap();
-        if !name.starts_with("native-windows-") && !name.starts_with("installed-windows-") {
+        if !name.starts_with("native-windows-")
+            && !name.starts_with("candidate-windows-")
+            && !name.starts_with("public-windows-")
+        {
             continue;
         }
         let steps = job["steps"].as_sequence().unwrap();
@@ -72,6 +75,39 @@ fn windows_release_jobs_configure_lf_before_checkout() {
             "{name} must establish LF checkout before source materialization"
         );
     }
+}
+
+#[test]
+fn public_readiness_owners_cannot_drop_cleanup_or_rewrite_original_publication_dependencies() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    check(&workflow).unwrap();
+    let mut missing = workflow.clone();
+    missing["jobs"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(Value::String("public-linux-arm64-cargo".into()));
+    assert!(check(&missing).is_err());
+    let mut skipped = workflow.clone();
+    let steps = skipped["jobs"]["public-windows-x64-native"]["steps"]
+        .as_sequence_mut()
+        .unwrap();
+    let cleanup = steps
+        .iter_mut()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("consumer-readiness cleanup "))
+        })
+        .unwrap();
+    cleanup["if"] = Value::String("success()".into());
+    assert!(check(&skipped).is_err());
+    let mut fresh_candidate = workflow.clone();
+    fresh_candidate["jobs"]["public-linux-x64-native"]["needs"]
+        .as_sequence_mut()
+        .unwrap()
+        .push(Value::String("candidate-linux-x64-native".into()));
+    assert!(check(&fresh_candidate).is_err());
 }
 
 #[test]
@@ -98,6 +134,53 @@ fn release_quality_installs_required_components_before_running_the_suite() {
 }
 
 #[test]
+fn original_native_component_jobs_preserve_execution_cleanup_and_immutable_upload() {
+    let original: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    check(&original).unwrap();
+    for job in [
+        "native-linux-x64",
+        "native-linux-arm64",
+        "native-windows-x64",
+        "native-windows-arm64",
+    ] {
+        for mutation in 0..3 {
+            let mut changed = original.clone();
+            let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+            match mutation {
+                0 => {
+                    let position = steps
+                        .iter()
+                        .position(|step| step["id"].as_str() == Some("native_readiness"))
+                        .unwrap();
+                    steps.remove(position);
+                }
+                1 => {
+                    let cleanup = steps
+                        .iter_mut()
+                        .find(|step| step["id"].as_str() == Some("native_readiness_cleanup"))
+                        .unwrap();
+                    cleanup["if"] = Value::String("success()".into());
+                }
+                _ => {
+                    let upload = steps
+                        .iter_mut()
+                        .find(|step| {
+                            step["with"]["path"].as_str() == Some(".release/native-readiness")
+                        })
+                        .unwrap();
+                    upload["with"]["overwrite"] = Value::Bool(true);
+                }
+            }
+            assert!(
+                check(&changed).is_err(),
+                "{job} original producer mutation {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
     let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
@@ -116,13 +199,13 @@ fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
     cancel["jobs"]["publish"]["concurrency"]["cancel-in-progress"] = Value::Bool(true);
     assert!(check(&cancel).is_err());
     let mut skip = baseline.clone();
-    for step in skip["jobs"]["installed-linux-x64"]["steps"]
+    for step in skip["jobs"]["candidate-linux-x64-native"]["steps"]
         .as_sequence_mut()
         .unwrap()
     {
         if step["run"].as_str()
             == Some(
-                "./target/ci/release/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native",
+                "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
             )
         {
             step["continue-on-error"] = Value::Bool(true);
@@ -150,7 +233,7 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
             "sourcechecks" | "miri" | "fuzz" | "installed" => {
                 let missing = match case {
                     "sourcechecks" => "source-checks",
-                    "installed" => "installed-windows-arm64-cargo",
+                    "installed" => "candidate-windows-arm64-cargo",
                     other => other,
                 };
                 changed["jobs"]["assemble"]["needs"]
@@ -163,7 +246,7 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
                     serde_yaml::from_str("[select, packages]").unwrap()
             }
             "wrongtarget" => {
-                changed["jobs"]["installed-linux-x64"]["needs"] =
+                changed["jobs"]["candidate-linux-x64-native"]["needs"] =
                     serde_yaml::from_str("[select, packages, native-linux-arm64]").unwrap()
             }
             "partialshards" => {
@@ -173,7 +256,7 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
                     .pop();
             }
             "sharedcacheuncertain" => {
-                for step in changed["jobs"]["installed-linux-x64"]["steps"]
+                for step in changed["jobs"]["installed-macos-x64"]["steps"]
                     .as_sequence_mut()
                     .unwrap()
                 {

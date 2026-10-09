@@ -416,6 +416,7 @@ jobs:
           overwrite: false
 
   native-linux-x64:
+    name: native-linux-x64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -451,9 +452,9 @@ jobs:
             ~/.cargo/git/db
           key: release-native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
       - id: cache
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-release --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-readiness --shard complete
       - id: products
         if: steps.cache.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -463,7 +464,27 @@ jobs:
             target/ci/native
           key: ${{ steps.cache.outputs.product-key }}
       - id: build
-        run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json
+        run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness
+      - name: Bind original native readiness source
+        if: runner.os == 'Linux' || runner.os == 'Windows'
+        run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json
+      - id: native_readiness
+        name: Execute original measured native components
+        if: runner.os == 'Linux' || runner.os == 'Windows'
+        run: ./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness
+      - id: native_readiness_cleanup
+        name: Settle original native component owners
+        if: always() && (runner.os == 'Linux' || runner.os == 'Windows')
+        run: ./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup
+      - name: Retain original native producer evidence
+        if: always() && (runner.os == 'Linux' || runner.os == 'Windows')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: readiness-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-readiness
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - id: payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -472,14 +493,14 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
-      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
+      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci-build
             target/ci/native
           key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+      - if: always() && steps.build.outputs.cache-quiescent == 'true' && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -500,6 +521,7 @@ jobs:
           overwrite: false
 
   native-linux-arm64:
+    name: native-linux-arm64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -539,6 +561,7 @@ jobs:
     steps: *native-target-steps
 
   native-windows-x64:
+    name: native-windows-x64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -552,6 +575,7 @@ jobs:
     steps: *native-target-steps
 
   native-windows-arm64:
+    name: native-windows-arm64
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -564,15 +588,19 @@ jobs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps: *native-target-steps
 
-  installed-linux-x64:
+  candidate-linux-x64-native:
+    name: candidate-linux-x64-native
     needs: [select, packages, native-linux-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, native-job: native-linux-x64, channel: both}]
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, native-job: native-linux-x64, channel: candidate-native, producer-job: candidate-linux-x64-native}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: &readiness-producer-outputs
+      artifact-id: ${{ steps.readiness-upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.readiness-upload.outputs.artifact-digest }}
     steps: &installed-target-steps
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -593,6 +621,13 @@ jobs:
           path: .release/packages
           merge-multiple: true
           digest-mismatch: error
+      - if: matrix.producer-job != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
       - id: deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -603,10 +638,46 @@ jobs:
           key: release-installed-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - if: matrix.producer-job != ''
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin consumer-readiness
+      - if: matrix.producer-job != ''
+        run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
+      - id: readiness-cache
+        if: matrix.producer-job != ''
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard candidate
+      - id: readiness-consumers
+        if: matrix.producer-job != '' && steps.readiness-cache.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: ${{ steps.readiness-cache.outputs.consumer-key }}
+      - id: readiness
+        if: matrix.producer-job != ''
+        run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - id: readiness-cleanup
+        if: always() && matrix.producer-job != ''
+        run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - if: always() && matrix.producer-job != '' && steps.readiness-cache.outputs.compiled-cache-usable == 'true' && steps.readiness-cleanup.outputs.cache-quiescent == 'true' && steps.readiness-consumers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: ${{ steps.readiness-consumers.outputs.cache-primary-key }}
+      - if: always() && matrix.producer-job != ''
+        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
+      - id: readiness-upload
+        if: always() && matrix.producer-job != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/readiness-cell
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - id: cache
+        if: matrix.producer-job == ''
         run: ./target/ci/release/memcordon-ci release consumer-cache
       - id: consumers
-        if: steps.cache.outputs.compiled-cache-usable == 'true'
+        if: matrix.producer-job == '' && steps.cache.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -614,10 +685,10 @@ jobs:
             target/ci-build/private-native-tests
           key: ${{ steps.cache.outputs.consumer-key }}
       - id: native
-        if: matrix.channel != 'cargo'
+        if: matrix.producer-job == '' && matrix.channel != 'cargo'
         run: ./target/ci/release/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native
       - id: cargo
-        if: matrix.channel != 'native'
+        if: matrix.producer-job == '' && matrix.channel != 'native'
         run: ./target/ci/release/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo
       - if: always()
         continue-on-error: true
@@ -628,14 +699,14 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           overwrite: false
-      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.consumers.outputs.cache-hit != 'true'
+      - if: always() && matrix.producer-job == '' && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.consumers.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci-consumers
             target/ci-build/private-native-tests
           key: ${{ steps.consumers.outputs.cache-primary-key }}
-      - if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+      - if: always() && matrix.producer-job == '' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -655,15 +726,43 @@ jobs:
           include-hidden-files: true
           overwrite: false
 
-  installed-linux-arm64:
+  candidate-linux-arm64-native:
+    name: candidate-linux-arm64-native
     needs: [select, packages, native-linux-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, native-job: native-linux-arm64, channel: both}]
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, native-job: native-linux-arm64, channel: candidate-native, producer-job: candidate-linux-arm64-native}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *installed-target-steps
+
+  candidate-linux-x64-cargo:
+    name: candidate-linux-x64-cargo
+    needs: [select, packages, native-linux-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, native-job: native-linux-x64, channel: candidate-cargo, producer-job: candidate-linux-x64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *installed-target-steps
+
+  candidate-linux-arm64-cargo:
+    name: candidate-linux-arm64-cargo
+    needs: [select, packages, native-linux-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, native-job: native-linux-arm64, channel: candidate-cargo, producer-job: candidate-linux-arm64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
   installed-macos-x64:
@@ -688,52 +787,60 @@ jobs:
     timeout-minutes: 90
     steps: *installed-target-steps
 
-  installed-windows-x64-native:
+  candidate-windows-x64-native:
+    name: candidate-windows-x64-native
     needs: [select, packages, native-windows-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: native}]
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: candidate-native, producer-job: candidate-windows-x64-native}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
-  installed-windows-x64-cargo:
+  candidate-windows-x64-cargo:
+    name: candidate-windows-x64-cargo
     needs: [select, packages, native-windows-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: cargo}]
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, native-job: native-windows-x64, channel: candidate-cargo, producer-job: candidate-windows-x64-cargo}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
-  installed-windows-arm64-native:
+  candidate-windows-arm64-native:
+    name: candidate-windows-arm64-native
     needs: [select, packages, native-windows-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: native}]
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: candidate-native, producer-job: candidate-windows-arm64-native}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
-  installed-windows-arm64-cargo:
+  candidate-windows-arm64-cargo:
+    name: candidate-windows-arm64-cargo
     needs: [select, packages, native-windows-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: cargo}]
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, native-job: native-windows-arm64, channel: candidate-cargo, producer-job: candidate-windows-arm64-cargo}]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
   assemble:
-    needs: [select, packages, source-checks, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, installed-linux-x64, installed-linux-arm64, installed-macos-x64, installed-macos-arm64, installed-windows-x64-native, installed-windows-x64-cargo, installed-windows-arm64-native, installed-windows-arm64-cargo]
+    needs: [select, packages, source-checks, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, candidate-linux-x64-native, candidate-linux-x64-cargo, candidate-linux-arm64-native, candidate-linux-arm64-cargo, installed-macos-x64, installed-macos-arm64, candidate-windows-x64-native, candidate-windows-x64-cargo, candidate-windows-arm64-native, candidate-windows-arm64-cargo]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -803,7 +910,7 @@ jobs:
           path: .release/targets/windows-arm64
           merge-multiple: true
           digest-mismatch: error
-      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json
+      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness
       - id: candidate
         if: needs.select.outputs.preparation-kind == 'candidate'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -1068,6 +1175,273 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
+
+  public-linux-x64-native:
+    name: public-linux-x64-native
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: &public-readiness-condition always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'
+    permissions: &public-readiness-permissions
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, channel: public-native, producer-job: public-linux-x64-native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: &public-readiness-steps
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci/native -p memcordon --features test-fixtures --bin memcordon-test-fixture
+      - run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
+      - id: readiness-cache
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard public
+      - id: readiness-consumers
+        if: steps.readiness-cache.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: ${{ steps.readiness-cache.outputs.consumer-key }}
+      - run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - id: readiness-cleanup
+        if: always()
+        run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
+      - if: always() && steps.readiness-cache.outputs.compiled-cache-usable == 'true' && steps.readiness-cleanup.outputs.cache-quiescent == 'true' && steps.readiness-consumers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-consumers
+          key: ${{ steps.readiness-consumers.outputs.cache-primary-key }}
+      - if: always()
+        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
+      - id: readiness-upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/readiness-cell
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+
+  public-linux-x64-cargo:
+    name: public-linux-x64-cargo
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, channel: public-cargo, producer-job: public-linux-x64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-linux-arm64-native:
+    name: public-linux-arm64-native
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, channel: public-native, producer-job: public-linux-arm64-native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-linux-arm64-cargo:
+    name: public-linux-arm64-cargo
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, channel: public-cargo, producer-job: public-linux-arm64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-windows-x64-native:
+    name: public-windows-x64-native
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2022, channel: public-native, producer-job: public-windows-x64-native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-windows-x64-cargo:
+    name: public-windows-x64-cargo
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2022, channel: public-cargo, producer-job: public-windows-x64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-windows-arm64-native:
+    name: public-windows-arm64-native
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: public-native, producer-job: public-windows-arm64-native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  public-windows-arm64-cargo:
+    name: public-windows-arm64-cargo
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish]
+    if: *public-readiness-condition
+    permissions: *public-readiness-permissions
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, channel: public-cargo, producer-job: public-windows-arm64-cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    outputs: *readiness-producer-outputs
+    steps: *public-readiness-steps
+
+  readiness-candidate-report:
+    needs: [select, native-linux-x64, native-linux-arm64, native-windows-x64, native-windows-arm64, candidate-linux-x64-native, candidate-linux-x64-cargo, candidate-linux-arm64-native, candidate-linux-arm64-cargo, candidate-windows-x64-native, candidate-windows-x64-cargo, candidate-windows-arm64-native, candidate-windows-arm64-cargo]
+    if: always() && needs.select.result == 'success' && needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier
+      - run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
+      - name: Read candidate consumer readiness observations
+        run: ./target/ci/release/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope candidate-before-publication --destination .release/readiness-report
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: readiness-candidate-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/readiness-report
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+
+  readiness-complete-report:
+    needs: [select, assemble, publish, recovery-inputs, recovery-publish, native-linux-x64, native-linux-arm64, native-windows-x64, native-windows-arm64, candidate-linux-x64-native, candidate-linux-x64-cargo, candidate-linux-arm64-native, candidate-linux-arm64-cargo, candidate-windows-x64-native, candidate-windows-x64-cargo, candidate-windows-arm64-native, candidate-windows-arm64-cargo, public-linux-x64-native, public-linux-x64-cargo, public-linux-arm64-native, public-linux-arm64-cargo, public-windows-x64-native, public-windows-x64-cargo, public-windows-arm64-native, public-windows-arm64-cargo]
+    if: *public-readiness-condition
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'reprepare'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - if: needs.select.outputs.recovery-mode == 'publication-only'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
+          run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: .release/prepared
+          merge-multiple: true
+          digest-mismatch: error
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier
+      - run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
+      - name: Read complete consumer readiness observations
+        run: ./target/ci/release/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope complete-profile --destination .release/readiness-report
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: readiness-complete-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/readiness-report
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
 
   published-consumer:
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]

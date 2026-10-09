@@ -4,6 +4,20 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Added
+
+- Linux schema-3 workload contracts can combine private loopback TCP and UNIX
+  sockets with administrator-installed immutable runtime and input images, a
+  fresh private filesystem root, and an exclusive execution identity.
+- `--image-entrypoint ID` selects the contract's approved image entrypoint;
+  arguments after `--` are passed to that entrypoint. `--report-format result-v2`
+  reports its authenticated execution, exported outputs, and native retirement.
+
+### Fixed
+
+- Failed Linux provider setup and interrupted image workloads retain cleanup
+  ownership across native retirement retries.
+
 ## 0.5.7-rc.19 - 2026-10-07
 
 ### Added

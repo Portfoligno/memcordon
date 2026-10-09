@@ -126,6 +126,7 @@ pub enum ProviderPackageMetadataV4 {
         session_broker_install_path: String,
         session_broker_sha256: String,
         state_root: String,
+        policy_root: String,
         control_service_sid_type: String,
         launcher_service_sid_type: String,
         session_broker_service_sid_type: String,

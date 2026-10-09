@@ -2,6 +2,7 @@
 //! must transfer nonblocking pipe/socket endpoints; changing a shared caller
 //! file-description's flags would mutate authority outside this attempt.
 
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
@@ -18,6 +19,7 @@ struct Channel {
     length: usize,
     source_eof: bool,
     capture: Option<Vec<u8>>,
+    digest: Option<Sha256>,
 }
 
 impl Channel {
@@ -30,6 +32,7 @@ impl Channel {
             length: 0,
             source_eof: false,
             capture: None,
+            digest: None,
         }
     }
 
@@ -49,6 +52,9 @@ impl Channel {
                 )
             };
             if count > 0 {
+                if let Some(digest) = self.digest.as_mut() {
+                    digest.update(&self.pending[..count as usize]);
+                }
                 if let Some(capture) = self.capture.as_mut() {
                     if capture.len().saturating_add(count as usize) > 4096 {
                         return Err(
@@ -129,6 +135,23 @@ pub struct PrivateRelay {
 }
 
 impl PrivateRelay {
+    pub(super) fn hash_mixed_stdout(&mut self) {
+        self.stdout.digest = Some(Sha256::new());
+    }
+    pub(super) fn mixed_stdout_digest(&self) -> Result<memcordon_core::DiagnosticSha256, String> {
+        if !self.stdout.completed() {
+            return Err("mixed stdout is not natively drained".into());
+        }
+        let digest = self
+            .stdout
+            .digest
+            .as_ref()
+            .ok_or("mixed stdout digest was not enabled before release")?
+            .clone();
+        Ok(memcordon_core::DiagnosticSha256::from_bytes(
+            digest.finalize().into(),
+        ))
+    }
     pub(crate) fn capture_public_abi_stdout(&mut self) {
         self.stdout.capture = Some(Vec::new());
     }

@@ -14,6 +14,7 @@ pub enum ReportFormat {
     #[default]
     Legacy,
     ResultV1,
+    ResultV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -986,6 +987,7 @@ impl ResultV1 {
 pub enum ResultReport {
     Legacy(Box<MemcordonReport>),
     Operational(Box<ResultV1>),
+    Mixed(Box<crate::result_v2::ResultV2>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1315,6 +1317,7 @@ impl PlanV1 {
 impl ResultReport {
     pub fn prepare_writer(&mut self, writer_pid: NonZeroU32) {
         match self {
+            Self::Mixed(report) => report.delivery = DeliveryEvidence::PreparedBy { writer_pid },
             Self::Operational(report) => {
                 report.delivery = DeliveryEvidence::PreparedBy { writer_pid }
             }
@@ -1338,6 +1341,11 @@ impl ResultReport {
 
     pub fn write_bytes(&self, writer: &mut impl std::io::Write) -> Result<(), String> {
         match self {
+            Self::Mixed(report) => {
+                report.validate()?;
+                serde_json::to_writer_pretty(&mut *writer, report)
+                    .map_err(|error| error.to_string())?;
+            }
             Self::Legacy(report) => serde_json::to_writer_pretty(&mut *writer, report)
                 .map_err(|error| error.to_string())?,
             Self::Operational(report) => {

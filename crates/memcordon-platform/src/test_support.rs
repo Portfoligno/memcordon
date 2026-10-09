@@ -924,6 +924,84 @@ pub struct WindowsImageProcess {
 
 #[cfg(windows)]
 impl WindowsImageProcess {
+    /// Reads the actual creator PID from this same retained native process
+    /// object. Callers must separately hold and compare the parent's birth and
+    /// liveness; a PID alone is not an ancestry identity.
+    pub fn native_parent_process_id(&self) -> io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct BasicInformation {
+            reserved1: usize,
+            peb: usize,
+            reserved2: [usize; 2],
+            process_id: usize,
+            parent_process_id: usize,
+        }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process: windows_sys::Win32::Foundation::HANDLE,
+                class: u32,
+                information: *mut std::ffi::c_void,
+                length: u32,
+                returned: *mut u32,
+            ) -> i32;
+        }
+        let mut information = BasicInformation {
+            reserved1: 0,
+            peb: 0,
+            reserved2: [0; 2],
+            process_id: 0,
+            parent_process_id: 0,
+        };
+        let mut returned = 0;
+        // SAFETY: the process handle remains owned by this object, class0 writes
+        // only the correctly sized native-width initialized output structure.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self._handle.as_raw_handle(),
+                0,
+                (&mut information as *mut BasicInformation).cast(),
+                std::mem::size_of::<BasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "held native parent query failed NTSTATUS {status:#x}"
+            )));
+        }
+        if returned as usize != std::mem::size_of::<BasicInformation>()
+            || information.process_id != self.identity.pid as usize
+        {
+            return Err(io::Error::other(
+                "held native parent query returned a different process identity",
+            ));
+        }
+        u32::try_from(information.parent_process_id)
+            .map_err(|_| io::Error::other("native parent PID exceeds DWORD width"))
+    }
+
+    /// Reads exit status from the same retained native process handle.
+    pub fn native_exit_status(&self) -> io::Result<Option<u32>> {
+        use std::os::windows::io::AsRawHandle;
+        if !self.has_exited()? {
+            return Ok(None);
+        }
+        let mut status = 0;
+        // SAFETY: this owner retains the original queryable process handle and
+        // status storage remains writable throughout this synchronous query.
+        if unsafe {
+            windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                self._handle.as_raw_handle(),
+                &mut status,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(status))
+    }
     /// Observe retirement of the original held process, independently of PID reuse.
     pub fn has_exited(&self) -> io::Result<bool> {
         use std::os::windows::io::AsRawHandle;
@@ -1332,6 +1410,11 @@ enum ChildSetup {
     Session,
     InheritDescriptor(std::os::fd::OwnedFd),
     #[cfg(target_os = "linux")]
+    InheritDescriptorAt {
+        descriptor: std::os::fd::OwnedFd,
+        destination: i32,
+    },
+    #[cfg(target_os = "linux")]
     PublicCredentialsAndGate {
         uid: u32,
         gid: u32,
@@ -1364,6 +1447,115 @@ pub fn inherit_test_descriptor(
     Ok(raw)
 }
 
+/// Place an owned hostile test descriptor at the selected nonstandard slot
+/// only in this command's child; the parent never clears its CLOEXEC flag.
+#[cfg(target_os = "linux")]
+pub fn inherit_test_descriptor_at(
+    command: &mut Command,
+    descriptor: std::os::fd::OwnedFd,
+    destination: i32,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if descriptor.as_raw_fd() < 3 || destination < 3 || destination > 4096 {
+        return Err(io::Error::other(
+            "test descriptor slot outside finite nonstandard bound",
+        ));
+    }
+    configure_child_setup(
+        command,
+        ChildSetup::InheritDescriptorAt {
+            descriptor,
+            destination,
+        },
+    );
+    Ok(())
+}
+
+/// Read the original host's bounded native IPv4 interface census.
+#[cfg(target_os = "linux")]
+pub fn native_nonloopback_ipv4() -> io::Result<std::net::Ipv4Addr> {
+    let mut first = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes the pointer to its owned native list.
+    if unsafe { libc::getifaddrs(&mut first) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct Addresses(*mut libc::ifaddrs);
+    impl Drop for Addresses {
+        fn drop(&mut self) {
+            // SAFETY: this guard uniquely owns the getifaddrs allocation.
+            unsafe { libc::freeifaddrs(self.0) }
+        }
+    }
+    let _owner = Addresses(first);
+    let mut current = first;
+    let mut count = 0usize;
+    while !current.is_null() {
+        count += 1;
+        if count > 4096 {
+            return Err(io::Error::other(
+                "native interface census exceeds finite bound",
+            ));
+        }
+        // SAFETY: each link remains valid until the unique allocation guard drops.
+        let interface = unsafe { &*current };
+        // SAFETY: the kernel list identifies the address family before the cast.
+        if !interface.ifa_addr.is_null()
+            && unsafe { (*interface.ifa_addr).sa_family } == libc::AF_INET as libc::sa_family_t
+        {
+            // SAFETY: AF_INET addresses have the sockaddr_in layout.
+            let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+            let ip = std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes());
+            if !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && interface.ifa_flags & libc::IFF_UP as u32 != 0
+            {
+                return Ok(ip);
+            }
+        }
+        current = interface.ifa_next;
+    }
+    Err(io::Error::other(
+        "original host has no required nonloopback IPv4 destination",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn native_test_bind_mount(
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    // SAFETY: CStr provides valid terminated paths; MS_BIND ignores filesystem/data.
+    if unsafe {
+        libc::mount(
+            source.as_ptr(),
+            destination.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn native_test_unmount(destination: &std::ffi::CStr, abort: bool) -> io::Result<()> {
+    // SAFETY: the caller retains its exact task-owned mount destination.
+    if unsafe {
+        libc::umount2(
+            destination.as_ptr(),
+            if abort { libc::MNT_DETACH } else { 0 },
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
     use std::os::fd::AsRawFd;
@@ -1382,6 +1574,17 @@ fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
                     let raw = descriptor.as_raw_fd();
                     let flags = libc::fcntl(raw, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                ChildSetup::InheritDescriptorAt {
+                    descriptor,
+                    destination,
+                } => {
+                    if libc::dup2(descriptor.as_raw_fd(), *destination) != *destination
+                        || libc::fcntl(*destination, libc::F_SETFD, 0) != 0
+                    {
                         return Err(io::Error::last_os_error());
                     }
                 }

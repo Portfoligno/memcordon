@@ -132,4 +132,41 @@ fn selected_lock_reconciles_a_new_offline_local_workspace_without_mutating_sourc
             && package.get("source").is_none()
     }));
     verify_external_lock(&selected, &consumer.join("Cargo.lock")).unwrap();
+    let output = memcordon_ci::command::rustup_cargo(
+        &consumer,
+        &toolchain,
+        ["metadata", "--locked", "--format-version", "1"],
+        std::time::Duration::from_secs(30),
+    )
+    .arg("--manifest-path")
+    .arg(&manifest)
+    .arg("--config")
+    .arg(&config)
+    .output_quiet()
+    .unwrap();
+    assert!(output.status.success());
+    let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout).unwrap();
+    memcordon_ci::release::packages::verify_same_resolved_graph(&metadata, &metadata).unwrap();
+    let mut changed = serde_json::to_value(&metadata).unwrap();
+    changed["resolve"]["nodes"][0]["features"] = serde_json::json!(["unselected-feature"]);
+    let changed: cargo_metadata::Metadata = serde_json::from_value(changed).unwrap();
+    assert!(
+        memcordon_ci::release::packages::verify_same_resolved_graph(&metadata, &changed).is_err()
+    );
+    let mut changed = serde_json::to_value(&metadata).unwrap();
+    let nodes = changed["resolve"]["nodes"].as_array_mut().unwrap();
+    let dependency = nodes
+        .iter_mut()
+        .find_map(|node| {
+            node["deps"]
+                .as_array_mut()
+                .filter(|edges| !edges.is_empty())
+        })
+        .unwrap();
+    dependency[0]["dep_kinds"][0]["kind"] = serde_json::json!("dev");
+    dependency[0]["dep_kinds"][0]["target"] = serde_json::json!("cfg(windows)");
+    let changed: cargo_metadata::Metadata = serde_json::from_value(changed).unwrap();
+    assert!(
+        memcordon_ci::release::packages::verify_same_resolved_graph(&metadata, &changed).is_err()
+    );
 }

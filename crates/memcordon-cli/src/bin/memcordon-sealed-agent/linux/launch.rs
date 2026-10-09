@@ -179,7 +179,7 @@ pub(crate) fn prepare_probe_gated_prelaunch(
     )
 }
 
-fn build_private_gated_prelaunch(
+pub(super) fn build_private_gated_prelaunch(
     identity: ResolvedTargetIdentity,
     entrypoint: VerifiedEntrypoint,
     entrypoint_digest: memcordon_core::DiagnosticSha256,
@@ -206,6 +206,7 @@ fn build_private_gated_prelaunch(
     )
     .map_err(|error| format!("MCSEALED-PRIVATE-DESCRIPTOR-EXPECTATION: {error}"))?;
     let target = PrivateGatedTarget {
+        mixed_root_filter: false,
         entrypoint,
         identity,
         stdio: target_stdio,

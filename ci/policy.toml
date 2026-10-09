@@ -6,10 +6,10 @@ production_packages = [
   "memcordon",
   "memcordon-testkit",
 ]
-ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
-ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0" }
+ci_packages = ["memcordon-ci", "memcordon-readiness-verifier", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-readiness-verifier = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0" }
 publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
-non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-readiness-verifier", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
 
 [workflow]
 required_public_matrix = [
@@ -22,10 +22,13 @@ required_public_matrix = [
 ]
 self_extracting_shell_allowlist = []
 environment_allowlist = [
-  { file = ".github/workflows/release.yml", steps = ["Read original preparation artifacts", "Publish prepared bytes", "Publish original prepared bytes"], variable = "GH_TOKEN", source = "${{ github.token }}" },
+  { file = ".github/workflows/release.yml", steps = ["Read original preparation artifacts", "Publish prepared bytes", "Publish original prepared bytes", "Read candidate consumer readiness observations", "Read complete consumer readiness observations"], variable = "GH_TOKEN", source = "${{ github.token }}" },
   { file = ".github/workflows/release.yml", steps = ["Publish prepared bytes", "Publish original prepared bytes"], variable = "CARGO_REGISTRY_TOKEN", source = "${{ steps.registry-auth.outputs.token }}" },
 ]
 allowed_run_commands = [
+  "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json",
+  "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness",
+  "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup",
   "git config --global core.autocrlf false",
   "./target/ci/release/memcordon-ci ci performance-plan",
   "./target/ci/release/memcordon-ci ci workflow-scope",
@@ -34,8 +37,22 @@ allowed_run_commands = [
   "./target/ci/release/memcordon-ci release select-preparation",
   "./target/ci/release/memcordon-ci release packages --build-source .release/build-source.json",
   "./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json",
+  "./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness",
   "./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json",
+  "./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness",
+  "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin consumer-readiness",
+  "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness",
+  "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-readiness-verifier",
+  "./target/ci/release/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope candidate-before-publication --destination .release/readiness-report",
+  "./target/ci/release/memcordon-ci release consumer-readiness-report --identity .release/readiness-identity.json --verifier ./target/ci/release/memcordon-readiness-verifier --scope complete-profile --destination .release/readiness-report",
+  "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci/native -p memcordon --features test-fixtures --bin memcordon-test-fixture",
+  "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json",
+  "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+  "./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
+  "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json",
   "./target/ci/release/memcordon-ci release consumer-cache",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard candidate",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard public",
   "./target/ci/release/memcordon-ci release working-windows-prepare",
   "./target/ci/release/memcordon-ci release working-windows-consumer --channel native --destination target/ci/windows-installed/native",
   "./target/ci/release/memcordon-ci release working-windows-consumer --channel cargo --destination target/ci/windows-installed/cargo",
@@ -63,6 +80,7 @@ allowed_run_commands = [
   "./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete",
   "./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete",
   "./target/ci/release/memcordon-ci ci cache-context --purpose native-release --shard complete",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose native-readiness --shard complete",
   "./target/ci/release/memcordon-ci release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload",
   "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined",
   "./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native",

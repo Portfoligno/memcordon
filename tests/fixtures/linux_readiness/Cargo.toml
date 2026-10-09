@@ -1,0 +1,11 @@
+[package]
+name = "memcordon-owned-linux-readiness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "owned-readiness-child"
+path = "src/main.rs"

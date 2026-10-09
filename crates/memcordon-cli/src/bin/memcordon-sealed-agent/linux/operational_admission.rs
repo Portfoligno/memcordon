@@ -25,13 +25,133 @@ pub(crate) struct AccountReservation {
     file: File,
     path: PathBuf,
 }
+pub(super) struct ReservationFailure {
+    pub detail: String,
+    pub owned: Option<AccountReservation>,
+}
+impl From<String> for ReservationFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            owned: None,
+        }
+    }
+}
 
 impl AccountReservation {
-    fn reserve(
+    #[cfg(test)]
+    pub(super) fn component_observation(&self) -> Result<serde_json::Value, String> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::FileExt;
+        let before = self.file.metadata().map_err(|error| error.to_string())?;
+        let parent = self
+            .directory
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        if !before.is_file()
+            || before.uid() != 0
+            || before.nlink() != 1
+            || before.mode() & 0o077 != 0
+            || before.len() > 65536
+            || !parent.is_dir()
+            || parent.uid() != 0
+            || parent.mode() & 0o022 != 0
+        {
+            return Err("component reservation native custody differs".into());
+        }
+        let named_parent = || -> Result<std::fs::Metadata, String> {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(self.path.parent().ok_or("reservation parent absent")?)
+                .map_err(|error| error.to_string())?
+                .metadata()
+                .map_err(|error| error.to_string())
+        };
+        let parent_stamp = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.mode(),
+                metadata.nlink(),
+            )
+        };
+        if parent_stamp(&named_parent()?) != parent_stamp(&parent) {
+            return Err("component reservation named parent changed".into());
+        }
+        let read = |file: &File| -> Result<Vec<u8>, String> {
+            let mut bytes = vec![0; before.len() as usize];
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let count = file
+                    .read_at(&mut bytes[offset..], offset as u64)
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    return Err("component reservation truncated".into());
+                }
+                offset += count;
+            }
+            let mut extra = [0];
+            if file
+                .read_at(&mut extra, before.len())
+                .map_err(|error| error.to_string())?
+                != 0
+            {
+                return Err("component reservation length changed".into());
+            }
+            Ok(bytes)
+        };
+        let bytes = read(&self.file)?;
+        let named = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+            .map_err(|error| error.to_string())?;
+        let stamp = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.nlink(),
+                metadata.uid(),
+                metadata.mode(),
+            )
+        };
+        if stamp(&before) != stamp(&named.metadata().map_err(|error| error.to_string())?)
+            || read(&named)? != bytes
+            || stamp(&before) != stamp(&self.file.metadata().map_err(|error| error.to_string())?)
+            || stamp(&before) != stamp(&named.metadata().map_err(|error| error.to_string())?)
+            || parent_stamp(&named_parent()?) != parent_stamp(&parent)
+            || parent_stamp(
+                &self
+                    .directory
+                    .metadata()
+                    .map_err(|error| error.to_string())?,
+            ) != parent_stamp(&parent)
+        {
+            return Err("component reservation named bytes changed".into());
+        }
+        Ok(
+            serde_json::json!({"path":self.path,"device":before.dev(),"inode":before.ino(),"length":before.len(),"links":before.nlink(),"uid":before.uid(),"mode":before.mode(),
+            "parent_device":parent.dev(),"parent_inode":parent.ino(),"parent_uid":parent.uid(),"parent_mode":parent.mode(),"bytes":bytes,
+            "sha256":Sha256::digest(&bytes).iter().map(|byte|format!("{byte:02x}")).collect::<String>()}),
+        )
+    }
+    pub(super) fn reserve(
         caller: &CapturedCallerEnvelopeV2,
         uid: u32,
         attempt: [u8; 16],
     ) -> Result<Self, String> {
+        Self::reserve_owned(caller, uid, attempt).map_err(|failure| failure.detail)
+    }
+    pub(super) fn reserve_owned(
+        caller: &CapturedCallerEnvelopeV2,
+        uid: u32,
+        attempt: [u8; 16],
+    ) -> Result<Self, ReservationFailure> {
         super::attempt::secure_state_root()?;
         let directory = OpenOptions::new()
             .read(true)
@@ -44,20 +164,26 @@ impl AccountReservation {
             namespace.device, namespace.inode
         );
         let path = PathBuf::from(super::STATE_ROOT).join(&name);
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
-            .map_err(|error| {
+            .map_err(|error| -> String {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     "MCSEALED-PRIVATE-BUSY: target account remains reserved".into()
                 } else {
                     error.to_string()
                 }
             })?;
-        let bytes = serde_json::to_vec(&serde_json::json!({
+        let mut owned = Self {
+            directory,
+            file,
+            path,
+        };
+        let persistence = (|| -> Result<(), String> {
+            let bytes = serde_json::to_vec(&serde_json::json!({
             "format": "memcordon.account-reservation", "revision": 1,
             "user_namespace_device": namespace.device,
             "user_namespace_inode": namespace.inode, "uid": uid, "attempt": attempt,
@@ -66,20 +192,35 @@ impl AccountReservation {
             "boot_identity": std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| error.to_string())?.trim(),
         }))
         .map_err(|error| error.to_string())?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| directory.sync_all())
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            directory,
-            file,
-            path,
-        })
+            owned
+                .file
+                .write_all(&bytes)
+                .and_then(|()| owned.file.sync_all())
+                .and_then(|()| owned.directory.sync_all())
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        if let Err(detail) = persistence {
+            return Err(ReservationFailure {
+                detail,
+                owned: Some(owned),
+            });
+        }
+        Ok(owned)
     }
 
     pub(super) fn retire(self) -> Result<(), String> {
+        self.retire_observed()
+    }
+    pub(super) fn retire_observed(&self) -> Result<(), String> {
         let held = self.file.metadata().map_err(|error| error.to_string())?;
-        let current = std::fs::symlink_metadata(&self.path).map_err(|error| error.to_string())?;
+        let current = match std::fs::symlink_metadata(&self.path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && held.nlink() == 0 => {
+                return self.directory.sync_all().map_err(|error| error.to_string());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         if !current.is_file()
             || current.nlink() != 1
             || current.uid() != 0

@@ -475,6 +475,16 @@ fn errno(value: i32) -> u32 {
 /// Compile the ABI-specific syscall catalogue and scalar argument checks.
 /// Validate the generated instruction structure before returning it to the installer.
 pub fn compile_initial_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
+    compile_closed_filter(abi, false)
+}
+
+/// Combined sockets are safe only after native private-root/descriptor closure.
+/// This deliberately inspects scalar socket arguments, never user pointers.
+pub fn compile_mixed_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
+    compile_closed_filter(abi, true)
+}
+
+fn compile_closed_filter(abi: NativeAbi, mixed: bool) -> Vec<sock_filter> {
     let numbers = abi.syscalls();
     let mut program = vec![
         load(ARCH_OFFSET),
@@ -488,8 +498,14 @@ pub fn compile_initial_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
     }
     for (number, result) in [
         (numbers.clone3, errno(libc::ENOSYS)),
-        (numbers.socketpair, errno(libc::EPERM)),
+        (
+            numbers.socketpair,
+            if mixed { 0 } else { errno(libc::EPERM) },
+        ),
     ] {
+        if result == 0 {
+            continue;
+        }
         program.push(jump_equal(number, 0, 1));
         program.push(return_action(result));
     }
@@ -584,7 +600,23 @@ pub fn compile_initial_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
         program.push(load(NR_OFFSET));
     }
 
-    let socket_checks = socket_checks();
+    if mixed {
+        let checks = unix_stream_checks();
+        program.push(jump_equal(numbers.socketpair, 1, 0));
+        program.push(instruction(
+            BPF_JMP_JA,
+            0,
+            0,
+            u32::try_from(checks.len()).expect("fixed Unix socketpair block fits"),
+        ));
+        program.extend(checks);
+        program.push(load(NR_OFFSET));
+    }
+    let socket_checks = if mixed {
+        mixed_socket_checks()
+    } else {
+        socket_checks()
+    };
     program.push(jump_equal(numbers.socket, 1, 0));
     program.push(instruction(
         BPF_JMP_JA,
@@ -597,6 +629,17 @@ pub fn compile_initial_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
     for (_, number) in unconditional_catalogue(abi) {
         program.push(jump_equal(*number, 0, 1));
         program.push(return_action(SECCOMP_RET_ALLOW));
+    }
+    if mixed {
+        // Exact native sendmsg/recvmsg enable SCM_RIGHTS inside the fresh root.
+        // No host/socket capability exists in the three entry descriptors.
+        for number in match abi {
+            NativeAbi::X86_64 => [46, 47],
+            NativeAbi::Aarch64 => [211, 212],
+        } {
+            program.push(jump_equal(number, 0, 1));
+            program.push(return_action(SECCOMP_RET_ALLOW));
+        }
     }
     program.push(return_action(errno(libc::EPERM)));
     validate_program(&program).expect("fixed initial filter must have valid forward jumps");
@@ -663,11 +706,26 @@ pub fn install_gated_private_filter(
     abi: NativeAbi,
     expected_digest: [u8; 32],
 ) -> Result<InstalledFilterProof, String> {
+    install_selected_filter(abi, expected_digest, false)
+}
+
+pub fn install_gated_mixed_filter(
+    abi: NativeAbi,
+    expected_digest: [u8; 32],
+) -> Result<InstalledFilterProof, String> {
+    install_selected_filter(abi, expected_digest, true)
+}
+
+fn install_selected_filter(
+    abi: NativeAbi,
+    expected_digest: [u8; 32],
+    mixed: bool,
+) -> Result<InstalledFilterProof, String> {
     let native_abi = native_abi()?;
     if abi != native_abi {
         return Err("MCSEALED-PRIVATE-FILTER: requested ABI is not native".into());
     }
-    let mut program = compile_initial_closed_filter(abi);
+    let mut program = compile_closed_filter(abi, mixed);
     let digest = filter_instruction_digest(&program)
         .map_err(|reason| format!("MCSEALED-PRIVATE-FILTER: invalid program: {reason}"))?;
     if digest != expected_digest {
@@ -782,6 +840,53 @@ fn socket_checks() -> Vec<sock_filter> {
         return_action(protocol_error),
         return_action(SECCOMP_RET_ALLOW),
     ]
+}
+
+fn unix_stream_checks() -> Vec<sock_filter> {
+    let family_error = errno(libc::EAFNOSUPPORT);
+    let protocol_error = errno(libc::EPROTONOSUPPORT);
+    let flags = (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32;
+    vec![
+        load(ARG0_HIGH),
+        jump_equal(0, 1, 0),
+        return_action(family_error),
+        load(ARG0_LOW),
+        jump_equal(libc::AF_UNIX as u32, 1, 0),
+        return_action(family_error),
+        load(ARG1_HIGH),
+        jump_equal(0, 1, 0),
+        return_action(protocol_error),
+        load(ARG1_LOW),
+        instruction(BPF_JMP_JSET_K, 0, 1, !flags),
+        return_action(protocol_error),
+        instruction(BPF_ALU_AND_K, 0, 0, 0xf),
+        jump_equal(libc::SOCK_STREAM as u32, 1, 0),
+        return_action(protocol_error),
+        load(ARG2_HIGH),
+        jump_equal(0, 1, 0),
+        return_action(protocol_error),
+        load(ARG2_LOW),
+        jump_equal(0, 1, 0),
+        return_action(protocol_error),
+        return_action(SECCOMP_RET_ALLOW),
+    ]
+}
+
+fn mixed_socket_checks() -> Vec<sock_filter> {
+    let unix = unix_stream_checks();
+    let mut checks = vec![
+        load(ARG0_LOW),
+        jump_equal(libc::AF_UNIX as u32, 1, 0),
+        instruction(
+            BPF_JMP_JA,
+            0,
+            0,
+            u32::try_from(unix.len()).expect("fixed Unix socket block fits"),
+        ),
+    ];
+    checks.extend(unix);
+    checks.extend(socket_checks());
+    checks
 }
 
 fn clone_checks() -> Vec<sock_filter> {

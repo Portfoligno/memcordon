@@ -589,6 +589,7 @@ pub fn compiled_metadata() -> Result<ProviderPackageMetadataV4, String> {
         session_broker_install_path: installed_session_broker().to_string_lossy().into_owned(),
         session_broker_sha256: crate::package::sha256_regular_no_follow(&source_broker)?,
         state_root: state_root().to_string_lossy().into_owned(),
+        policy_root: super::policy_registry::root().to_string_lossy().into_owned(),
         control_service_sid_type: "restricted".to_owned(),
         launcher_service_sid_type: "restricted".to_owned(),
         session_broker_service_sid_type: "unrestricted".to_owned(),

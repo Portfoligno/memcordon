@@ -13,6 +13,9 @@ pub mod policy_registry;
 pub mod process;
 mod process_impl;
 pub mod qualification;
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_readiness_receipt.rs"]
+pub(crate) mod readiness_receipt;
 pub mod record;
 pub mod security;
 pub mod service;

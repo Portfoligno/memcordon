@@ -206,11 +206,15 @@ fn native_publication_crash_child() {
 
 #[test]
 fn native_publisher_process_exit_preserves_atomic_old_or_new_record() {
+    let mut receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_publisher_process_exit_preserves_atomic_old_or_new_record",
+    );
     for after_rename in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attempt.json");
         let mut record = observed_record();
         record.publish_at(&path, 0, |_| Ok(())).unwrap();
+        let before = read_record_bounded(&path).unwrap();
         let mut publisher = ChildLifetime(
             Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -225,11 +229,32 @@ fn native_publisher_process_exit_preserves_atomic_old_or_new_record() {
                 .spawn()
                 .unwrap(),
         );
+        let mut created = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut exited = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut user = windows_sys::Win32::Foundation::FILETIME::default();
+        // SAFETY: Child retains the live process handle until wait completes;
+        // all FILETIME outputs are writable and remain live throughout the call.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Threading::GetProcessTimes(
+                    publisher.0.as_raw_handle(),
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+            },
+            0
+        );
+        let publisher_pid = publisher.0.id();
+        let publisher_birth =
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
         serde_json::to_writer(publisher.0.stdin.as_mut().unwrap(), &(&path, after_rename)).unwrap();
         drop(publisher.0.stdin.take());
         assert_eq!(publisher.0.wait().unwrap().code(), Some(73));
-        let retained: WindowsAttemptRecordV1 =
-            serde_json::from_slice(&read_record_bounded(&path).unwrap()).unwrap();
+        let after = read_record_bounded(&path).unwrap();
+        let retained: WindowsAttemptRecordV1 = serde_json::from_slice(&after).unwrap();
         authenticate(&retained, &retained.attempt_id).unwrap();
         assert_eq!(retained.record_revision, if after_rename { 2 } else { 1 });
         assert_eq!(
@@ -237,6 +262,32 @@ fn native_publisher_process_exit_preserves_atomic_old_or_new_record() {
             record.causal_diagnostics.original
         );
         assert_eq!(record.record_revision, 1);
+        if let Some(receipt) = receipt.as_mut() {
+            receipt.record(
+                if after_rename {
+                    "crash-after-rename"
+                } else {
+                    "crash-before-rename"
+                },
+                &before,
+                &after,
+                &record.causal_diagnostics.original,
+                record.record_revision,
+                retained.record_revision,
+                false,
+                None,
+            );
+            receipt.publisher_process(super::super::readiness_receipt::PublisherProcess {
+                process_id: publisher_pid,
+                creation_time_100ns: publisher_birth,
+                held_before_input_delivery: true,
+                exit_status: 73,
+                retirement_observed: true,
+            });
+        }
+    }
+    if let Some(receipt) = receipt {
+        receipt.finish("writer");
     }
 }
 
@@ -315,6 +366,9 @@ fn worker_thread_identity_is_in_authenticated_durable_record() {
 
 #[test]
 fn native_publication_fault_matrix_preserves_original_and_honest_commit_boundary() {
+    let mut receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_publication_fault_matrix_preserves_original_and_honest_commit_boundary",
+    );
     for phase in [
         PublicationPhase::ReadPrevious,
         PublicationPhase::Serialize,
@@ -361,6 +415,32 @@ fn native_publication_fault_matrix_preserves_original_and_honest_commit_boundary
             committed.record_revision, 1,
             "unconfirmed publication changed caller acknowledgment"
         );
+        if let Some(receipt) = receipt.as_mut() {
+            let phase_name = match phase {
+                PublicationPhase::ReadPrevious => "read-previous",
+                PublicationPhase::Serialize => "serialize",
+                PublicationPhase::CreateStaging => "create-staging",
+                PublicationPhase::WritePrefix => "write-prefix",
+                PublicationPhase::WriteRemainder => "write-remainder",
+                PublicationPhase::Flush => "flush",
+                PublicationPhase::Rename => "rename",
+                PublicationPhase::AfterRename => "after-rename",
+                PublicationPhase::Readback => "readback",
+            };
+            receipt.record(
+                phase_name,
+                &before,
+                &after,
+                &original,
+                committed.record_revision,
+                retained.record_revision,
+                result.is_err(),
+                None,
+            );
+        }
+    }
+    if let Some(receipt) = receipt {
+        receipt.finish("writer");
     }
 }
 
@@ -387,6 +467,9 @@ fn stale_revision_original_replacement_and_staging_collision_never_publish() {
 
 #[test]
 fn native_rename_sharing_failure_retains_typed_code_and_original() {
+    let mut receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_rename_sharing_failure_retains_typed_code_and_original",
+    );
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     let directory = tempfile::tempdir().unwrap();
@@ -454,7 +537,25 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
     journal.observe_secondary(event).unwrap();
     assert_eq!(journal.original, committed.causal_diagnostics.original);
     drop(protected);
-    assert_eq!(read_record_bounded(&path).unwrap(), before);
+    let after = read_record_bounded(&path).unwrap();
+    assert_eq!(after, before);
+    let retained: WindowsAttemptRecordV1 = serde_json::from_slice(&after).unwrap();
+    authenticate(&retained, &retained.attempt_id).unwrap();
+    if let Some(mut receipt) = receipt.take() {
+        receipt.record(
+            "native-sharing-rename",
+            &before,
+            &after,
+            &committed.causal_diagnostics.original,
+            committed.record_revision,
+            retained.record_revision,
+            true,
+            Some(memcordon_core::NativeFailureCodeV1::Win32(
+                u32::try_from(expected_code).unwrap(),
+            )),
+        );
+        receipt.finish("writer");
+    }
 }
 
 #[test]
@@ -483,6 +584,10 @@ fn both_native_disk_full_codes_are_captured_before_formatting() {
 
 #[test]
 fn frozen_native_publication_does_not_own_workload_job_cleanup() {
+    let receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::frozen_native_publication_does_not_own_workload_job_cleanup",
+    );
+    let mut observations = Vec::new();
     for guardian_cleanup in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attempt.json");
@@ -544,6 +649,24 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         let mut worker_authority = lifetime_child();
         let (mut guardian, disarm) = runtime_guardian(&job, &worker_authority);
         assert!(guardian.0.try_wait().unwrap().is_none());
+        let job_members: Vec<_> = job
+            .process_ids()
+            .unwrap()
+            .into_iter()
+            .map(super::super::readiness_receipt::HeldNativeProcess::open)
+            .collect();
+        assert_eq!(job_members.len(), 2);
+        assert!(job_members.iter().all(|process| !process.exited()));
+        assert!(
+            job_members
+                .iter()
+                .all(|process| job.contains(process.raw()).unwrap())
+        );
+        let held_worker =
+            super::super::readiness_receipt::HeldNativeProcess::open(worker_authority.0.id());
+        let held_guardian =
+            super::super::readiness_receipt::HeldNativeProcess::open(guardian.0.id());
+        assert!(!held_worker.exited() && !held_guardian.exited());
         if guardian_cleanup {
             worker_authority.0.kill().unwrap();
             worker_authority.0.wait().unwrap();
@@ -583,6 +706,12 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
             !worker.is_finished(),
             "writer was not still frozen during Job cleanup"
         );
+        assert!(job_members.iter().all(|process| process.exited()));
+        assert!(held_guardian.exited());
+        let worker_retired_during_cleanup = held_worker.exited();
+        assert_eq!(worker_retired_during_cleanup, guardian_cleanup);
+        let active_after = job.active_processes_observed().unwrap();
+        assert_eq!(active_after, 0);
         if !guardian_cleanup {
             assert_eq!(
                 wait_attempted
@@ -608,5 +737,189 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         .unwrap();
         assert_eq!(committed.record_revision, 1);
         assert!(!committed.cleanup_state.termination_requested);
+        if let Some(receipt) = receipt.as_ref() {
+            let phase = if guardian_cleanup {
+                "guardian"
+            } else {
+                "worker"
+            };
+            let after = read_record_bounded(&directory.path().join("attempt.json")).unwrap();
+            authenticate(&committed, &committed.attempt_id).unwrap();
+            observations.push(serde_json::json!({
+                "cleanup_owner":phase,"job_active_before":job_members.len(),"job_active_after":active_after,
+                "job_members":job_members.iter().map(|process| serde_json::json!({"identity":process.identity,
+                    "held_before_cleanup":true,"retirement_observed":process.exited()})).collect::<Vec<_>>(),
+                "worker_identity":held_worker.identity,"worker_retired_during_cleanup":worker_retired_during_cleanup,
+                "guardian_identity":held_guardian.identity,"guardian_retired_during_cleanup":held_guardian.exited(),
+                "writer_frozen_during_cleanup":true,"cleanup_publication_confirmed":false,
+                "after_record":receipt.retain(&format!("{phase}.after.json"), &after),
+                "original":receipt.retain(&format!("{phase}.original.json"), &serde_json::to_vec(&committed.causal_diagnostics.original).unwrap())
+            }));
+        }
     }
+    if let Some(receipt) = receipt {
+        receipt.finish_payload(
+            serde_json::json!({"kind":"writer-frozen","observations":observations}),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires explicit owned native component receipt input"]
+fn native_settlement_reservation_requires_local_writer_retirement() {
+    let receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_settlement_reservation_requires_local_writer_retirement",
+    ).expect("native reservation test requires explicit owned component input");
+    let attempt_id = receipt.attempt_id();
+    let request_sha256 = digest(attempt_id.as_bytes());
+    let admission_directory = tempfile::tempdir().unwrap();
+    let admission_root = admission_directory.path().to_owned();
+    let path = admission_root
+        .join(&attempt_id)
+        .with_extension("writer.json");
+    assert!(!path.exists(), "owned component reservation must be fresh");
+    reserve_owned_component_writer_for_test(&admission_root, &attempt_id, &request_sha256).unwrap();
+    struct Reservation(PathBuf, String);
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            let _ = retire_owned_component_writer_for_test(&self.0, &self.1, true);
+        }
+    }
+    let reservation = Reservation(admission_root.clone(), attempt_id.clone());
+    let writer_directory = tempfile::tempdir().unwrap();
+    let writer_path = writer_directory.path().join("attempt.json");
+    let publish_path = writer_path.clone();
+    let mut candidate = observed_record();
+    candidate.attempt_id = attempt_id.clone();
+    candidate.request_sha256 = request_sha256.clone();
+    let (frozen, wait_frozen) = std::sync::mpsc::sync_channel(1);
+    let (release, wait_release) = std::sync::mpsc::sync_channel(1);
+    let publisher = std::thread::spawn(move || {
+        candidate.publish_at(&publish_path, 0, |phase| {
+            if phase == PublicationPhase::Flush {
+                frozen.send(()).unwrap();
+                wait_release.recv_timeout(Duration::from_secs(60)).unwrap();
+            }
+            Ok(())
+        })
+    });
+    wait_frozen.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!publisher.is_finished());
+    let before = read_record_bounded(&path).unwrap();
+    let owner = super::super::readiness_receipt::HeldNativeProcess::open(std::process::id());
+    assert!(!owner.exited());
+    let refusal =
+        retire_owned_component_writer_for_test(&admission_root, &attempt_id, false).unwrap_err();
+    assert_eq!(
+        refusal,
+        "cannot release a live writer reservation without local retirement proof"
+    );
+    let after_refusal = read_record_bounded(&path).unwrap();
+    assert_eq!(before, after_refusal);
+    assert!(!publisher.is_finished());
+    release.send(()).unwrap();
+    publisher.join().unwrap().unwrap();
+    let published_bytes = read_record_bounded(&writer_path).unwrap();
+    let published: WindowsAttemptRecordV1 = serde_json::from_slice(&published_bytes).unwrap();
+    authenticate(&published, &attempt_id).unwrap();
+    assert_eq!(published.record_revision, 1);
+    retire_owned_component_writer_for_test(&admission_root, &attempt_id, true).unwrap();
+    assert!(!path.exists());
+    drop(reservation);
+    let before_path = receipt.retain("reservation.before.json", &before);
+    let after_path = receipt.retain("reservation.after-refusal.json", &after_refusal);
+    let published_path = receipt.retain("reservation.published.json", &published_bytes);
+    receipt.finish_payload(serde_json::json!({"kind":"writer-reservation",
+        "attempt_id":attempt_id,"request_sha256":request_sha256,"owner_identity":owner.identity,
+        "owner_held_live_during_refusal":true,"before_reservation":before_path,
+        "after_refusal_reservation":after_path,"retirement_without_local_proof":refusal,
+        "writer_frozen_during_refusal":true,"writer_joined_before_retirement":true,
+        "published_record":published_path,
+        "local_writer_retirement_proved":true,"reservation_absent_after_retirement":true}));
+}
+
+#[test]
+fn native_durable_record_rejects_provider_generation_substitution() {
+    let receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_durable_record_rejects_provider_generation_substitution",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attempt.json");
+    let mut record = observed_record();
+    record.publish_at(&path, 0, |_| Ok(())).unwrap();
+    let bytes = read_record_bounded(&path).unwrap();
+    authenticate(&record, &record.attempt_id).unwrap();
+    memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+        &bytes,
+        &record.attempt_id,
+        &record.provider_generation,
+    )
+    .unwrap();
+    let wrong_generation = digest(record.provider_generation.as_bytes());
+    assert_ne!(wrong_generation, record.provider_generation);
+    let refusal = memcordon_core::parse_and_authenticate_windows_attempt_record_v4(
+        &bytes,
+        &record.attempt_id,
+        &wrong_generation,
+    )
+    .unwrap_err();
+    assert_eq!(read_record_bounded(&path).unwrap(), bytes);
+    if let Some(receipt) = receipt {
+        let record_path = receipt.retain("generation.record.json", &bytes);
+        receipt.finish_payload(
+            serde_json::json!({"kind":"binding-generation","record":record_path,
+            "attempt_id":record.attempt_id,"provider_generation":record.provider_generation,
+            "substituted_generation":wrong_generation,"refusal":refusal}),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an explicitly installed isolated native component provider and receipt input"]
+fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
+    let receipt = super::super::readiness_receipt::begin(
+        "windows::record::record_fault_tests::native_provider_projection_preserves_original_and_reports_bounded_loss",
+    ).expect("native projection test requires explicit component input");
+    let mut record = observed_record();
+    let original = record.causal_diagnostics.original.clone();
+    let memcordon_core::OriginalFailureV1::Observed { event } = &original else {
+        panic!("fixture must have original cause");
+    };
+    let secondary_attempts = memcordon_core::MAX_DIAGNOSTIC_SECONDARY_EVENTS + 17;
+    for _ in 0..secondary_attempts {
+        record
+            .causal_diagnostics
+            .observe_secondary(event.clone())
+            .unwrap();
+    }
+    assert_eq!(record.causal_diagnostics.original, original);
+    assert_eq!(
+        record.causal_diagnostics.secondary.as_slice().len(),
+        memcordon_core::MAX_DIAGNOSTIC_SECONDARY_EVENTS
+    );
+    assert_eq!(record.causal_diagnostics.loss.secondary_events_omitted, 17);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attempt.json");
+    record.publish_at(&path, 0, |_| Ok(())).unwrap();
+    let bytes = read_record_bounded(&path).unwrap();
+    authenticate(&record, &record.attempt_id).unwrap();
+    let (projection, availability) = provider_projection(Some(&record));
+    assert_eq!(
+        availability,
+        memcordon_core::DiagnosticProjectionAvailabilityV1::Available
+    );
+    let projection = projection.unwrap();
+    assert_eq!(projection.original, original);
+    assert_eq!(projection.loss.secondary_events_omitted, 17);
+    let projection_bytes = serde_json::to_vec(&projection).unwrap();
+    assert!(projection_bytes.len() <= memcordon_core::MAX_DIAGNOSTIC_PROJECTION_BYTES);
+    let record_path = receipt.retain("projection.record.json", &bytes);
+    let projection_path = receipt.retain("projection.public.json", &projection_bytes);
+    let original_path = receipt.retain(
+        "projection.original.json",
+        &serde_json::to_vec(&original).unwrap(),
+    );
+    receipt.finish_payload(serde_json::json!({"kind":"binding-projection","record":record_path,
+        "projection":projection_path,"original":original_path,"secondary_attempts":secondary_attempts,
+        "availability":availability}));
 }

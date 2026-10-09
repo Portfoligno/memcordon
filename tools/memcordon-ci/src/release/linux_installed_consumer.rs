@@ -445,7 +445,7 @@ fn bounded<T, const N: usize>(values: impl IntoIterator<Item = T>) -> Result<Bou
     Ok(result)
 }
 
-fn registry(payload: &MaterializedPayload) -> Result<RuntimePrivatePolicyRegistry> {
+pub(super) fn registry(payload: &MaterializedPayload) -> Result<RuntimePrivatePolicyRegistry> {
     let digest = DiagnosticSha256::from_bytes(
         sha2::Sha256::digest(artifacts::read_file(&payload.fixture.path)?).into(),
     );
@@ -2494,7 +2494,51 @@ fn advisory_rejections(
 }
 
 #[cfg(target_os = "linux")]
+pub enum SelectedInstallOperation {
+    Install,
+    Upgrade,
+}
+#[cfg(target_os = "linux")]
+pub trait InstalledLeaseExtension {
+    fn before_install(&mut self, payload: &MaterializedPayload, output: &Path) -> Result<()>;
+    fn selected_installation_operation(&self) -> SelectedInstallOperation;
+    fn after_install(&mut self, payload: &MaterializedPayload, output: &Path) -> Result<()>;
+    fn execute_cases(&mut self, payload: &MaterializedPayload, output: &Path) -> Result<()>;
+    fn finalize_before_uninstall(
+        &mut self,
+        payload: &MaterializedPayload,
+        output: &Path,
+    ) -> Result<()>;
+    fn after_uninstall(
+        &mut self,
+        payload: &MaterializedPayload,
+        output: &Path,
+        succeeded: bool,
+    ) -> Result<()>;
+}
+
+#[cfg(target_os = "linux")]
 pub fn run(root: &Path, payload: &MaterializedPayload, output: &Path) -> Result<()> {
+    run_owned(root, payload, output, None)
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_with_extension(
+    root: &Path,
+    payload: &MaterializedPayload,
+    output: &Path,
+    extension: &mut dyn InstalledLeaseExtension,
+) -> Result<()> {
+    run_owned(root, payload, output, Some(extension))
+}
+
+#[cfg(target_os = "linux")]
+fn run_owned(
+    root: &Path,
+    payload: &MaterializedPayload,
+    output: &Path,
+    mut extension: Option<&mut dyn InstalledLeaseExtension>,
+) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     fs::create_dir(output)?;
     let host_before = host_network_snapshot()?;
@@ -2518,12 +2562,39 @@ pub fn run(root: &Path, payload: &MaterializedPayload, output: &Path) -> Result<
         "memcordon-sealed-agent",
         &payload.distribution.target,
     );
-    sudo(
-        &payload.directory,
-        &[agent.into_os_string(), "package".into(), "install".into()],
+    source::write_json(
+        &output.join("installed-owner.json"),
+        &serde_json::json!({
+            "format": "memcordon.installed-consumer-owner", "revision": 1,
+            "target": payload.distribution.target, "phase": "install-owned-before-mutation",
+            "package_agent": agent, "final_uninstall_required": true,
+        }),
     )?;
     let body = (|| -> Result<()> {
+        if let Some(extension) = extension.as_mut() {
+            extension.before_install(payload, output)?;
+        }
+        let operation = match extension
+            .as_ref()
+            .map(|extension| extension.selected_installation_operation())
+            .unwrap_or(SelectedInstallOperation::Install)
+        {
+            SelectedInstallOperation::Install => "install",
+            SelectedInstallOperation::Upgrade => "upgrade",
+        };
+        sudo(
+            &payload.directory,
+            &[agent.into_os_string(), "package".into(), operation.into()],
+        )?;
+        if let Some(extension) = extension.as_mut() {
+            extension.after_install(payload, output)?;
+        }
         run_installed_baseline_cases(root, &output.join("baseline-native"))?;
+        if payload.distribution.runtime_selection()?
+            == super::distribution::RuntimeSelection::LinuxBaseline
+        {
+            return Ok(());
+        }
         let registry = registry(payload)?;
         let entrypoint = registry
             .execution_identities
@@ -2901,16 +2972,52 @@ pub fn run(root: &Path, payload: &MaterializedPayload, output: &Path) -> Result<
             })
             .collect::<Vec<_>>();
         installed_owner_loss_cases(payload, work.path(), output, group, &current_contracts)?;
+        if extension.is_some() {
+            let native_group = group.parse::<u32>().map_err(|error| {
+                CiError::Message(format!(
+                    "actual installed frozen group is not numeric: {error}"
+                ))
+            })?;
+            super::linux_readiness_legacy_cases::capture(
+                work.path(),
+                output,
+                native_group,
+                &registry,
+                &current_contracts,
+            )?;
+        }
+        if let Some(extension) = extension.as_mut() {
+            extension.execute_cases(payload, output)?;
+        }
         Ok(())
     })();
     let (body, cleanup, unit_diagnostics) = diagnose_then_cleanup(
         body,
         || capture_private_unit_diagnostics(work.path(), output),
         || {
-            sudo(
+            let finalization = if let Some(extension) = extension.as_mut() {
+                extension.finalize_before_uninstall(payload, output)
+            } else {
+                Ok(())
+            };
+            let uninstall = sudo(
                 work.path(),
                 &[AGENT.into(), "package".into(), "uninstall".into()],
-            )
+            );
+            let observation = if let Some(extension) = extension.as_mut() {
+                extension.after_uninstall(payload, output, uninstall.is_ok())
+            } else {
+                Ok(())
+            };
+            let failures = [finalization, uninstall.map(|_| ()), observation]
+                .into_iter()
+                .filter_map(|result| result.err().map(|error| error.to_string()))
+                .collect::<Vec<_>>();
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CiError::Message(failures.join("; ")))
+            }
         },
     );
     // A failed uninstall can mean live or uncertain native ownership. Preserve
@@ -2991,7 +3098,7 @@ pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
     target::build_selected(root, &source, &distribution, &target_directory)?;
     // The extracted consumer is constructed here too, before native privileges
     // are used, so stale archives cannot bypass its exact source checks.
-    let consumer = PackageConsumer::prepare(root, &package_directory)?;
+    let consumer = PackageConsumer::prepare_selected(root, &package_directory, &distribution)?;
     if consumer.bundle.source != source {
         return Err(CiError::Message(
             "working Cargo consumer source differs".into(),

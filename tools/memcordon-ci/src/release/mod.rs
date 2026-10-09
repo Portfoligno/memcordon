@@ -2,15 +2,57 @@
 pub mod artifacts;
 pub mod bundle;
 pub mod compatibility;
+pub mod consumer_readiness_cell;
 pub mod distribution;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;
+#[cfg(target_os = "linux")]
+pub mod linux_account_normalize;
+#[cfg(target_os = "linux")]
+pub mod linux_cross_attempt_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_export_recovery;
+#[cfg(target_os = "linux")]
+pub mod linux_image_normalize;
+#[cfg(target_os = "linux")]
+pub mod linux_import_normalize;
 pub mod linux_installed_consumer;
+#[cfg(target_os = "linux")]
+pub mod linux_isolation_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_isolation_recovery;
+#[cfg(target_os = "linux")]
+pub mod linux_malformed_ingress;
+#[cfg(target_os = "linux")]
+pub mod linux_mixed_installed;
+#[cfg(target_os = "linux")]
+pub mod linux_native_component;
+#[cfg(target_os = "linux")]
+pub mod linux_native_package;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_image_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_lease;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_legacy_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_lifecycle_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_limits_cases;
+#[cfg(target_os = "linux")]
+pub mod linux_readiness_policy_cases;
+pub mod native_component_harness;
+#[cfg(any(target_os = "linux", windows))]
+pub mod original_native_components;
 pub mod packages;
 pub mod preparation;
 pub mod public_consumer;
 pub mod publish;
+#[cfg(any(target_os = "linux", windows))]
+pub mod readiness_product;
+pub mod readiness_report;
+pub mod readiness_transport;
 pub mod recovery;
 pub mod registry;
 pub mod rehearsal;
@@ -20,6 +62,8 @@ pub mod source;
 pub mod tag;
 pub mod target;
 pub mod windows_installed_consumer;
+#[cfg(windows)]
+pub mod windows_readiness_lease;
 
 use crate::{CiError, Result};
 use clap::Subcommand;
@@ -33,6 +77,7 @@ pub enum ConsumerChannel {
 
 #[derive(Subcommand)]
 pub enum ReleaseCommand {
+    ConsumerReadinessReport(readiness_report::ReportArguments),
     SelectPreparation,
     WorkingWindowsPrepare {
         #[arg(long, default_value = "target/ci/windows-prepared")]
@@ -88,6 +133,8 @@ pub enum ReleaseCommand {
         prepared: PathBuf,
     },
     BuildTarget {
+        #[arg(long)]
+        consumer_readiness: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -96,6 +143,8 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     Assemble {
+        #[arg(long)]
+        consumer_readiness: bool,
         #[arg(long, conflicts_with = "build_source")]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -276,6 +325,9 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 installed_consumer::run(root, &target, &packages, &destination)
             }
         },
+        ReleaseCommand::ConsumerReadinessReport(arguments) => {
+            readiness_report::run(root, &arguments)
+        }
         ReleaseCommand::RecoveryInputs => recovery::recovery_inputs(root),
         ReleaseCommand::RehearsalTool => rehearsal_tool::package(root),
         ReleaseCommand::RehearsalTransaction {
@@ -286,16 +338,30 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Publish { prepared } => publish::run(&prepared, true),
         ReleaseCommand::Inspect { prepared } => publish::run(&prepared, false),
         ReleaseCommand::BuildTarget {
+            consumer_readiness,
             source,
             build_source,
             destination,
         } => {
             let selected =
                 preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
-            let distribution = distribution::Distribution::read(root)?.native()?.clone();
-            target::build_selected(root, &selected, &distribution, &destination)
+            let distribution = distribution::Distribution::read(root)?;
+            let distribution = if consumer_readiness {
+                distribution.consumer_readiness()?
+            } else {
+                distribution
+            };
+            let distribution = distribution.native()?.clone();
+            target::build_selected_with_components(
+                root,
+                &selected,
+                &distribution,
+                &destination,
+                consumer_readiness,
+            )
         }
         ReleaseCommand::Assemble {
+            consumer_readiness,
             source,
             build_source,
             packages,
@@ -328,7 +394,14 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                     },
                 )
             });
-            bundle::assemble_build(root, &selected, &packages, &targets, &destination)
+            bundle::assemble_build_profile(
+                root,
+                &selected,
+                &packages,
+                &targets,
+                &destination,
+                consumer_readiness,
+            )
         }
         ReleaseCommand::Packages {
             source,

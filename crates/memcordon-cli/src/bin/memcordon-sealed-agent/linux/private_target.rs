@@ -412,22 +412,27 @@ pub struct PrivateExecArguments {
 
 impl PrivateExecArguments {
     pub fn from_request(request: &NativePrivateLaunchInput) -> Result<Self, String> {
-        if request.launch.program.is_empty() {
+        Self::from_native_launch(&request.launch)
+    }
+    pub(super) fn from_native_launch(
+        launch: &crate::request::LaunchRequestV2,
+    ) -> Result<Self, String> {
+        if launch.program.is_empty() {
             return Err("MCSEALED-PRIVATE-ARGV: empty executable name".into());
         }
-        let mut argv = Vec::with_capacity(request.launch.arguments.len() + 1);
+        let mut argv = Vec::with_capacity(launch.arguments.len() + 1);
         argv.push(
-            CString::new(request.launch.program.clone())
+            CString::new(launch.program.clone())
                 .map_err(|_| "MCSEALED-PRIVATE-ARGV: NUL in executable name")?,
         );
-        for argument in &request.launch.arguments {
+        for argument in &launch.arguments {
             argv.push(
                 CString::new(argument.as_slice())
                     .map_err(|_| "MCSEALED-PRIVATE-ARGV: NUL in argument")?,
             );
         }
-        let mut environment = Vec::with_capacity(request.launch.environment.len());
-        for (name, value) in &request.launch.environment {
+        let mut environment = Vec::with_capacity(launch.environment.len());
+        for (name, value) in &launch.environment {
             if name.is_empty() || name.contains(&b'=') || name.contains(&0) || value.contains(&0) {
                 return Err("MCSEALED-PRIVATE-ENV: invalid environment field".into());
             }
@@ -461,6 +466,7 @@ pub struct PrivateGatedTarget {
     pub command: PrivateExecArguments,
     pub native_abi: NativeAbi,
     pub expected_filter_digest: [u8; 32],
+    pub mixed_root_filter: bool,
 }
 
 impl PrivateGatedTarget {
@@ -500,11 +506,15 @@ impl PrivateGatedTarget {
         if let Err(error) = apply_target_identity(&self.identity) {
             fail(&mut control, FAILURE_IDENTITY, &error);
         }
-        let filter =
-            match install_gated_private_filter(self.native_abi, self.expected_filter_digest) {
-                Ok(filter) => filter,
-                Err(error) => fail(&mut control, FAILURE_FILTER, &error),
-            };
+        let install = if self.mixed_root_filter {
+            super::network_filter::install_gated_mixed_filter
+        } else {
+            install_gated_private_filter
+        };
+        let filter = match install(self.native_abi, self.expected_filter_digest) {
+            Ok(filter) => filter,
+            Err(error) => fail(&mut control, FAILURE_FILTER, &error),
+        };
         if gate.advance(PrivateGateEvent::FilterInstalled).is_err() {
             fail(
                 &mut control,

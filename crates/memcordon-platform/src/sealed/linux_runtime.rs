@@ -80,15 +80,30 @@ pub(super) fn installed_binding() -> Result<PublicProviderBindingV1, String> {
             ..
         }
     );
-    if manifest
-        != RuntimeManifest::linux_selected(
+    let combined = matches!(
+        &manifest.sealed,
+        memcordon_core::runtime_manifest::SealedRuntime::Included {
+            workload_contract_schema: 3,
+            ..
+        }
+    );
+    let expected = if combined {
+        RuntimeManifest::linux_combined(
+            manifest.version.clone(),
+            manifest.source_commit.clone(),
+            target.into(),
+            manifest.components.clone(),
+        )?
+    } else {
+        RuntimeManifest::linux_selected(
             manifest.version.clone(),
             manifest.source_commit.clone(),
             target.into(),
             manifest.components.clone(),
             private_tcp,
         )?
-    {
+    };
+    if manifest != expected {
         return Err("provider runtime support differs".into());
     }
     let agent = manifest

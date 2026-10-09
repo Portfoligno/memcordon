@@ -91,6 +91,7 @@ pub enum BoundaryMechanismEvidence {
     },
     LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2),
     LinuxPrivateTcp4(Box<crate::private_runtime::PrivateRuntimeExecution>),
+    LinuxMixedPrivate(Box<crate::result_v2::MixedRuntimeExecutionV2>),
     WindowsJobObjectV2(Box<WindowsSealedEvidenceV2>),
     MacosEndpointSecurityV1(MacosSealedEvidence),
 }
@@ -472,6 +473,35 @@ pub fn boundary_evidence_is_consistent(
                     == (native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
                 && (!restart_safety.is_safe()
                     || native.cleanup_state() == crate::result_v1::CleanupStateV1::Complete)
+        }
+        BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
+            native.runtime.validate().is_ok()
+                && launch.mechanism == "linux-tcp4-unix-private-v1"
+                && launch.boundary_requested == BoundaryRequirement::Sealed
+                && (!restart_safety.is_safe()
+                    || (native.frontend.relay_drained && native.frontend.relay_error.is_none()))
+                && match &native.runtime.outcome {
+                    crate::result_v2::MixedRuntimeOutcomeV2::Executed { .. } => {
+                        launch.target_released
+                            && launch.boundary_effective == BoundaryClass::Sealed
+                            && restart_safety.sealed_boundary_retired
+                    }
+                    crate::result_v2::MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
+                        allocation,
+                        ..
+                    }
+                    | crate::result_v2::MixedRuntimeOutcomeV2::RejectedIngress {
+                        allocation, ..
+                    } => {
+                        !launch.target_released
+                            && launch.boundary_effective == BoundaryClass::Unavailable
+                            && (restart_safety.sealed_boundary_retired
+                                == allocation.obligations.as_slice().is_empty())
+                    }
+                    crate::result_v2::MixedRuntimeOutcomeV2::Indeterminate { .. } => {
+                        !restart_safety.is_safe()
+                    }
+                }
         }
         BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
