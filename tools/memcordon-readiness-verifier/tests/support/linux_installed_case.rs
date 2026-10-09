@@ -4,7 +4,7 @@ use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
 pub fn installed(family: &str, scenario: &str) -> PersistedCase {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let target = "x86_64-unknown-linux-gnu";
     let cell = ProductKey {
         target: target.into(),

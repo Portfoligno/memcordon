@@ -706,7 +706,14 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
             !worker.is_finished(),
             "writer was not still frozen during Job cleanup"
         );
-        assert!(job_members.iter().all(|process| process.exited()));
+        let retirement_deadline = Instant::now() + Duration::from_secs(5);
+        while !job_members.iter().all(|process| process.exited()) {
+            assert!(
+                Instant::now() < retirement_deadline,
+                "held workload processes did not retire after Job accounting became empty"
+            );
+            std::thread::yield_now();
+        }
         assert!(held_guardian.exited());
         let worker_retired_during_cleanup = held_worker.exited();
         assert_eq!(worker_retired_during_cleanup, guardian_cleanup);

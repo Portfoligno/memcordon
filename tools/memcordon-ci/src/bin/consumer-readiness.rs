@@ -362,6 +362,7 @@ fn run(operation: Operation) -> Result<(), String> {
             // and elapsed time independently of the caller's JSON claims.
             let archived = CommandSpec::new("git", &cwd, std::time::Duration::from_secs(60))
                 .args(["archive", "--format=tar", source.commit()])
+                .output_limit(memcordon_ci::release::source::MAX_SOURCE_ARCHIVE_BYTES)
                 .output_quiet()
                 .map_err(|error| error.to_string())?;
             if !archived.status.success() {

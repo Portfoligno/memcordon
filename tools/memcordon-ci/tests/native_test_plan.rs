@@ -6,7 +6,10 @@ use memcordon_ci::native_test_plan::commands;
 fn native_build_and_execution_have_independent_deadlines_and_matching_targets() {
     let release = commands(true);
     assert_eq!(release.len(), 2);
-    assert_eq!(release[0].deadline, Duration::from_secs(25 * 60));
+    assert_eq!(
+        release[0].deadline,
+        Duration::from_secs(if cfg!(windows) { 40 * 60 } else { 25 * 60 })
+    );
     assert_eq!(release[1].deadline, Duration::from_secs(15 * 60));
     assert_eq!(release[0].arguments.last(), Some(&"--no-run"));
     let build_inputs: Vec<_> = release[0]

@@ -802,9 +802,10 @@ fn source_archive(
             selection.identity.source_commit.as_str(),
         ])
         .bounded_until(selection.work)
+        .output_limit(super::source::MAX_SOURCE_ARCHIVE_BYTES)
         .output_quiet()?;
     if !output.status.success()
-        || output.stdout.len() > 16 * 1024 * 1024
+        || output.stdout.len() > super::source::MAX_SOURCE_ARCHIVE_BYTES
         || artifacts::checksum(&output.stdout) != selection.identity.source_tree_sha256
     {
         return Err(CiError::Message(

@@ -425,8 +425,9 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
     if bytes.len() <= limit && first.len() <= limit {
         return (first.into_owned(), false);
     }
-    if let Some(failure) = libtest_failure_section(bytes) {
-        let before = " [excerpt truncated; first libtest failure section] ";
+    let failures = libtest_failure_sections(bytes);
+    if !failures.is_empty() {
+        let before = " [excerpt truncated; libtest failure sections] ";
         let after = " [excerpt truncated; remaining output] ";
         let content_budget = limit - before.len() - after.len();
         let failure_budget = content_budget / 2;
@@ -435,7 +436,13 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
         let mut text = String::with_capacity(limit);
         append_excerpt_head(&mut text, bytes, head_budget);
         text.push_str(before);
-        text.push_str(&head_tail_excerpt(failure, failure_budget).0);
+        let section_budget = failure_budget / failures.len();
+        let remainder = failure_budget % failures.len();
+        for (index, failure) in failures.into_iter().enumerate() {
+            text.push_str(
+                &head_tail_excerpt(failure, section_budget + usize::from(index < remainder)).0,
+            );
+        }
         text.push_str(after);
         append_excerpt_tail(&mut text, bytes, tail_budget);
         return (text, true);
@@ -443,9 +450,10 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
     head_tail_excerpt(bytes, limit)
 }
 
-fn libtest_failure_section(bytes: &[u8]) -> Option<&[u8]> {
+fn libtest_failure_sections(bytes: &[u8]) -> Vec<&[u8]> {
     let mut offset = 0;
     let mut start = None;
+    let mut sections = Vec::new();
     for raw_line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -456,13 +464,13 @@ fn libtest_failure_section(bytes: &[u8]) -> Option<&[u8]> {
         if line.starts_with(b"test result: FAILED.")
             && let Some(start) = start
         {
-            return Some(&bytes[start..offset]);
+            sections.push(&bytes[start..offset]);
         }
         if line.starts_with(b"test result: ") {
             start = None;
         }
     }
-    None
+    sections
 }
 
 fn head_tail_excerpt(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -471,6 +479,11 @@ fn head_tail_excerpt(bytes: &[u8], limit: usize) -> (String, bool) {
         return (first.into_owned(), false);
     }
     let marker = " [excerpt truncated] ";
+    if limit <= marker.len() {
+        let mut text = String::new();
+        append_excerpt_head(&mut text, bytes, limit);
+        return (text, true);
+    }
     let content_budget = limit - marker.len();
     let head_budget = content_budget / 2;
     let tail_budget = content_budget - head_budget;

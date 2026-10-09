@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::Duration;
 
 #[test]
-fn command_excerpts_preserve_first_middle_libtest_failure_for_lf_and_crlf() {
+fn command_excerpts_preserve_each_middle_libtest_failure_for_lf_and_crlf() {
     let limit = 64 * 1024;
     let failure = "failures:\n\n---- actual_asset_loss stdout ----\nthread 'actual_asset_loss' panicked at release_rehearsal_loss.rs:387:\nactual first failure observation\n\nfailures:\n    actual_asset_loss\n\ntest result: FAILED. 0 passed; 1 failed\n";
     let later = b"failures:\n\n---- another_case stdout ----\nsecond failure observation\n\nfailures:\n    another_case\n\ntest result: FAILED. 0 passed; 1 failed\n";
@@ -29,8 +29,8 @@ fn command_excerpts_preserve_first_middle_libtest_failure_for_lf_and_crlf() {
         assert!(excerpt.starts_with(std::str::from_utf8(beginning).unwrap()));
         assert!(excerpt.ends_with(std::str::from_utf8(terminal).unwrap()));
         assert!(excerpt.contains(&failure));
-        assert!(!excerpt.contains("second failure observation"));
-        assert!(excerpt.contains("first libtest failure section"));
+        assert!(excerpt.contains("second failure observation"));
+        assert!(excerpt.contains("libtest failure sections"));
     }
 }
 
@@ -74,7 +74,7 @@ fn command_excerpts_ignore_incidental_failure_headings_and_reset_after_success()
         bytes.extend(vec![b'y'; limit]);
         let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
         assert!(excerpt.len() <= limit);
-        assert!(!excerpt.contains("first libtest failure section"));
+        assert!(!excerpt.contains("libtest failure sections"));
     }
 
     let mut bytes = vec![b'x'; limit];

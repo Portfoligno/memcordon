@@ -166,6 +166,54 @@ fn native_install_fixture_only_may_override_standard_path() {
 }
 
 #[test]
+fn installed_joint_compiler_only_may_select_standard_toolchain_environment() {
+    let fixture = Path::new("crates/memcordon-cli/src/bin/consumer_readiness_linux/mod.rs");
+    let compiler = br#"fn run(command: &mut std::process::Command) {
+        command.env_clear().env("CARGO_HOME", "/owned/cargo-home")
+            .env("RUSTC", "/owned/rustc").env("TMPDIR", "/owned/tmp");
+    }"#;
+    validate_rust_policy_bytes(fixture, compiler).unwrap();
+    assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), compiler).is_err());
+    for source in [
+        br#"fn run(command: &mut std::process::Command) { command.env("MEMCORDON_FAULT", "ready"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command, key: &str) { command.env(key, "value"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.envs([("RUSTC", "/owned/rustc")]); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("PATH", "/unowned/bin"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", "/owned/cargo-home").env("RUSTC", "/owned/rustc").env("TMPDIR", "/owned/tmp"); }"#.as_slice(),
+    ] {
+        assert!(validate_rust_policy_bytes(fixture, source).is_err());
+    }
+}
+
+#[test]
+fn isolated_cargo_boundary_only_may_select_standard_cargo_home() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    let standard = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", "/owned/cargo-home"); }"#;
+    validate_rust_policy_bytes(boundary, standard).unwrap();
+    assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), standard).is_err());
+    for source in [
+        br#"fn run(command: &mut std::process::Command) { command.env("CUSTOM_CI_FLAG", "value"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("RUSTC", "/unowned/rustc"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command, key: &str) { command.env(key, "value"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.envs([("CARGO_HOME", "/owned/cargo-home")]); }"#.as_slice(),
+    ] {
+        assert!(validate_rust_policy_bytes(boundary, source).is_err());
+    }
+}
+
+#[test]
+fn mixed_release_helpers_use_the_reviewed_descriptor_inheritance_boundary() {
+    let fixture = Path::new("crates/memcordon-cli/tests/sealed_agent/native_mixed_release.rs");
+    validate_rust_policy_bytes(
+        fixture,
+        include_bytes!("../../../crates/memcordon-cli/tests/sealed_agent/native_mixed_release.rs"),
+    )
+    .unwrap();
+    let direct = br#"fn run(command: &mut std::process::Command) { unsafe { command.pre_exec(|| Ok(())); } }"#;
+    assert!(validate_rust_policy_bytes(fixture, direct).is_err());
+}
+
+#[test]
 fn unrelated_exec_method_is_not_rejected_by_name() {
     let source = b"struct Example; impl Example { fn exec(&self) {} } fn use_it(value: &Example) { value.exec(); }";
     validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), source)

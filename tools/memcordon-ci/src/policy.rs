@@ -3665,6 +3665,9 @@ struct RustPolicy {
     subprocess_env_mutations: usize,
     standard_path_mutations: usize,
     standard_proxy_mutations: usize,
+    standard_compiler_mutations: usize,
+    cleared_environments: usize,
+    cargo_home_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -3727,6 +3730,9 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+        if expression.method == "env_clear" {
+            self.cleared_environments += 1;
+        }
         if expression.method == "env_remove" {
             self.calls_env_remove = true;
         }
@@ -3744,6 +3750,16 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "http_proxy" | "https_proxy" | "all_proxy" | "NO_PROXY" | "no_proxy"))
             {
                 self.standard_proxy_mutations += 1;
+            }
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "CARGO_HOME" | "RUSTC" | "TMPDIR"))
+            {
+                self.standard_compiler_mutations += 1;
+            }
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "CARGO_HOME")
+            {
+                self.cargo_home_mutations += 1;
             }
         }
         syn::visit::visit_expr_method_call(self, expression);
@@ -3790,6 +3806,22 @@ fn reviewed_proxy_environment(relative: &Path, visitor: &RustPolicy) -> bool {
         && visitor.subprocess_env_mutations == visitor.standard_proxy_mutations
 }
 
+fn reviewed_compiler_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    // The installed Linux joint fixture runs its selected, held compiler with
+    // an empty inherited environment and explicit standard toolchain paths.
+    relative == Path::new("crates/memcordon-cli/src/bin/consumer_readiness_linux/mod.rs")
+        && visitor.subprocess_env_mutations == visitor.standard_compiler_mutations
+        && visitor.standard_compiler_mutations == 3
+        && visitor.cleared_environments == 1
+}
+
+fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    // CommandSpec removes ambient Cargo/compiler overrides before selecting
+    // the owned standard Cargo home; callers cannot provide arbitrary keys.
+    relative == Path::new("tools/memcordon-ci/src/command.rs")
+        && visitor.subprocess_env_mutations == visitor.cargo_home_mutations
+}
+
 fn reviewed_macos_writer_image(relative: &Path) -> bool {
     [
         Path::new("crates/memcordon-platform/src/macos_watchdog.rs"),
@@ -3822,6 +3854,8 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
         && relative != sealed_launch
         && !native_path_fixture
         && !reviewed_proxy_environment(relative, &visitor)
+        && !reviewed_compiler_environment(relative, &visitor)
+        && !reviewed_isolated_cargo_environment(relative, &visitor)
         && !reviewed_git_environment(relative)
     {
         visitor
@@ -3916,6 +3950,8 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             && relative != sealed_launch
             && !native_path_fixture
             && !reviewed_proxy_environment(relative, &visitor)
+            && !reviewed_compiler_environment(relative, &visitor)
+            && !reviewed_isolated_cargo_environment(relative, &visitor)
             && !reviewed_git_environment(relative)
         {
             visitor

@@ -16,6 +16,10 @@ pub const PUBLIC_PACKAGES: [&str; 4] = [
 ];
 const MAX_RECORD: u64 = 1024 * 1024;
 
+/// Complete selected Git tar, including source and regression fixtures.
+/// This is independent of the smaller bound for individual evidence records.
+pub const MAX_SOURCE_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedSource {

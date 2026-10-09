@@ -115,7 +115,7 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
     for missing in [
         "native-macos-x64",
         "native-macos-arm64",
-        "installed-windows-x64-cargo",
+        "candidate-windows-x64-cargo",
         "assemble",
     ] {
         let mut changed = exact.clone();

@@ -273,7 +273,14 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
     let SealedRuntime::Included { profiles, .. } = private.sealed else {
         panic!("selected runtime missing");
     };
-    assert_eq!(profiles, ["linux-unix-create-v1", "linux-tcp4-private-v1"]);
+    assert_eq!(
+        profiles,
+        [
+            "linux-unix-create-v1",
+            "linux-tcp4-private-v1",
+            "linux-tcp4-unix-private-v1"
+        ]
+    );
 }
 
 fn retained_component(
@@ -348,21 +355,39 @@ fn runtime_inventory_matches_retained_linux_source_contract_in_both_channels() {
                 native.push(runtime_component(role, path.into(), &bytes));
                 retained.push(retained_component(owner.path(), role, id, path));
             }
-            let expected = RuntimeManifest::linux_selected(
-                "1.2.3".into(),
-                source().commit().into(),
-                target.into(),
-                retained,
-                private,
-            )
+            let expected = if private {
+                RuntimeManifest::linux_combined(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    retained,
+                )
+            } else {
+                RuntimeManifest::linux_selected(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    retained,
+                    private,
+                )
+            }
             .unwrap();
-            let produced = RuntimeManifest::linux_selected(
-                "1.2.3".into(),
-                source().commit().into(),
-                target.into(),
-                native,
-                private,
-            )
+            let produced = if private {
+                RuntimeManifest::linux_combined(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    native,
+                )
+            } else {
+                RuntimeManifest::linux_selected(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    native,
+                    private,
+                )
+            }
             .unwrap();
             assert_eq!(
                 RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),

@@ -1,7 +1,11 @@
 use std::time::Duration;
 
 const STANDARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
+// A cold Windows all-targets release build includes the native service and
+// fixture graphs as well as the workspace tests. Keep compilation finite,
+// independently of the shorter execution deadline and enclosing lane budget.
 const BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
+const WINDOWS_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(40 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeTestCommand {
@@ -32,7 +36,11 @@ pub fn commands(release_mode: bool) -> Vec<NativeTestCommand> {
     vec![
         NativeTestCommand {
             arguments: build_arguments,
-            deadline: BUILD_DEADLINE,
+            deadline: if cfg!(windows) && release_mode {
+                WINDOWS_RELEASE_BUILD_DEADLINE
+            } else {
+                BUILD_DEADLINE
+            },
         },
         NativeTestCommand {
             arguments,

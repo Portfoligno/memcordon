@@ -1,7 +1,6 @@
 //! Held same-image helpers for the actual inner leased-release regression.
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 pub(super) struct HeldHelper {
@@ -44,14 +43,15 @@ impl HeldHelper {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        memcordon_platform::test_support::inherit_test_descriptor_at(
+            &mut command,
+            image
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| e.to_string())?,
+            fd,
+        )
+        .map_err(|e| e.to_string())?;
         let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         helpers.push(Self {
