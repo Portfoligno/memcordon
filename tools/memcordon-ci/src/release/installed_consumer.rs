@@ -257,6 +257,7 @@ pub fn acquire_cargo_predecessor(
     let packages_directory = receipts.join("packages");
     fs::create_dir(&packages_directory)?;
     let mut records = Vec::new();
+    let mut payloads = Vec::new();
     for name in source::PUBLIC_PACKAGES {
         let expected = format!("{name}-{version}.crate");
         let matches = manifest
@@ -301,15 +302,23 @@ pub fn acquire_cargo_predecessor(
                 "predecessor registry crate came from a different source commit".into(),
             ));
         }
-        fs::write(packages_directory.join(&record.name), bytes)?;
+        fs::write(packages_directory.join(&record.name), &bytes)?;
+        payloads.push(bytes);
         records.push(record.clone());
     }
-    let packages = super::packages::PackageBundle {
+    let mut packages = super::packages::PackageBundle {
         format: "memcordon.packages".into(),
         revision: 1,
         source: selected.clone().into(),
         files: records,
     };
+    let order = super::packages::archive_order(&packages, &payloads)?;
+    packages.files.sort_by_key(|record| {
+        order
+            .iter()
+            .position(|name| Some(name) == record.package.as_ref())
+            .expect("validated predecessor archive order")
+    });
     source::write_json(&packages_directory.join("packages.json"), &packages)?;
     super::packages::PackageBundle::load(&packages_directory)?;
     let acquisition = tempfile::Builder::new()

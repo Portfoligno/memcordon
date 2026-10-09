@@ -99,6 +99,83 @@ fn normalized_dependencies_are_ordered_independently_of_bundle_rows() {
     assert!(packages::archive_order(&bundle, &hidden).is_err());
 }
 #[test]
+fn independent_dependency_siblings_require_archive_order_in_persisted_bundle() {
+    let names = [
+        "memcordon-core",
+        "memcordon-windows-launch-core",
+        "memcordon-platform",
+        "memcordon",
+    ];
+    let payloads: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let dependencies = match *name {
+                "memcordon-core" => "",
+                "memcordon" => "[dependencies.memcordon-platform]\nversion=\"=1.2.3\"\n[dependencies.memcordon-windows-launch-core]\nversion=\"=1.2.3\"",
+                _ => "[dependencies.memcordon-core]\nversion=\"=1.2.3\"",
+            };
+            crate_bytes(name, dependencies)
+        })
+        .collect();
+    let mut bundle = PackageBundle {
+        format: "memcordon.packages".into(),
+        revision: 1,
+        source: source().into(),
+        files: names
+            .iter()
+            .zip(&payloads)
+            .map(|(name, bytes)| artifacts::FileRecord {
+                name: format!("{name}-1.2.3.crate"),
+                kind: "crate".into(),
+                target: None,
+                package: Some((*name).into()),
+                byte_len: bytes.len() as u64,
+                sha256: artifacts::checksum(bytes),
+            })
+            .collect(),
+    };
+    let order = packages::archive_order(&bundle, &payloads).unwrap();
+    assert_eq!(
+        order,
+        [
+            "memcordon-core",
+            "memcordon-platform",
+            "memcordon-windows-launch-core",
+            "memcordon"
+        ]
+    );
+    let directory = tempfile::tempdir().unwrap();
+    for (record, bytes) in bundle.files.iter().zip(&payloads) {
+        std::fs::write(directory.path().join(&record.name), bytes).unwrap();
+    }
+    let persist = |bundle: &PackageBundle| {
+        std::fs::write(
+            directory.path().join("packages.json"),
+            serde_json::to_vec(bundle).unwrap(),
+        )
+        .unwrap();
+    };
+    persist(&bundle);
+    assert_eq!(
+        PackageBundle::load(directory.path())
+            .unwrap_err()
+            .to_string(),
+        "package bundle is not in actual archive dependency order"
+    );
+    bundle.files.swap(1, 2);
+    persist(&bundle);
+    let (loaded, _) = PackageBundle::load(directory.path()).unwrap();
+    assert_eq!(
+        loaded
+            .files
+            .iter()
+            .map(|file| file.package.as_ref().unwrap())
+            .collect::<Vec<_>>(),
+        order.iter().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn target_archives_reject_traversal_truncation_and_wrong_architecture() {
     for name in [
         "../escape",
