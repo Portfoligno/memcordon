@@ -233,6 +233,7 @@ pub fn reconstruct_effective_invocation(
 /// Data from the outer selected installation lifetime. The root controller
 /// observes native owners; the public frontend runs under the separate caller.
 pub struct InstalledMixedDriverInput<'a> {
+    pub recovery_harness: &'a super::linux_recovery_harness::HeldRecoveryHarness,
     pub lease_id: String,
     pub admin_root: &'a Path,
     pub payload: &'a MaterializedPayload,
@@ -2305,6 +2306,14 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained original lifecycle report");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        lease_owner_path: &input
+                            .output
+                            .parent()
+                            .ok_or_else(|| {
+                                CiError::Message("original installed lease parent absent".into())
+                            })?
+                            .join("lease-owner.json"),
+                        recovery_harness: input.recovery_harness,
                         identity: &input.identity,
                         cell: &input.cell,
                         provider: input.provider,
@@ -2366,6 +2375,14 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained limits report owner");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        lease_owner_path: &input
+                            .output
+                            .parent()
+                            .ok_or_else(|| {
+                                CiError::Message("original installed lease parent absent".into())
+                            })?
+                            .join("lease-owner.json"),
+                        recovery_harness: input.recovery_harness,
                         identity: &input.identity,
                         cell: &input.cell,
                         provider: input.provider,

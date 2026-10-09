@@ -947,6 +947,8 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
         let operational = scope.prepare("operational", &operational)?;
         let parser = scope.prepare("parser", &parser)?;
         let preparation = scope.prepare_operational_fixture(
+            &operational,
+            &selection.scope_recipe(),
             &root,
             &selection.identity,
             &selection.target,
@@ -2585,9 +2587,15 @@ fn prepare_build(
             parser = Some(artifact.path.clone());
         }
         retained.push(artifact);
+        let cargo_status = role
+            .compiler_output
+            .parent()
+            .ok_or_else(|| CiError::Message("original role compiler parent absent".into()))?
+            .join("cargo-status.json");
         for (name, path) in [
             ("cargo-output.jsonl", &role.compiler_output),
             ("cargo-stderr.bin", &role.compiler_errors),
+            ("cargo-status.json", &cargo_status),
         ] {
             retained.push(retain_file(
                 path,

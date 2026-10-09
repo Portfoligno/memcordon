@@ -54,6 +54,7 @@ pub struct ReadinessLinuxLease<'a> {
     admin_root: PathBuf,
     admin_owner: Option<std::fs::File>,
     admin_retired: bool,
+    recovery_harness: Option<super::linux_recovery_harness::HeldRecoveryHarness>,
 }
 impl<'a> ReadinessLinuxLease<'a> {
     #[expect(
@@ -129,6 +130,7 @@ impl<'a> ReadinessLinuxLease<'a> {
             admin_root,
             admin_owner: None,
             admin_retired: false,
+            recovery_harness: None,
         };
         value.event("owned-before-mutation","selected-installation-owned",true,&serde_json::json!({"predecessor_source":value.predecessor.source,"predecessor_artifacts":value.predecessor.artifacts,"uninstall_required":true}))?;
         Ok(value)
@@ -211,7 +213,49 @@ impl InstalledLeaseExtension for ReadinessLinuxLease<'_> {
             .expect("created admin owner")
             .metadata()?;
         self.event("owned-before-mutation","administrative-staging-created",true,&serde_json::json!({"path":self.admin_root,"device":metadata.dev(),"inode":metadata.ino()}))?;
+        if selected.source.commit() != self.identity.source_commit
+            || selected.source.version().to_string() != self.identity.version
+            || selected.distribution.target != self.cell.target
+        {
+            return Err(CiError::Message(
+                "original recovery build source differs from installed lease".into(),
+            ));
+        }
+        selected.source.recheck(self.workspace)?;
+        let acquisition = self.admin_root.join("recovery-harness");
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(&acquisition)?;
+        super::native_component_harness::retain_original_host(
+            self.workspace,
+            &selected.source,
+            &self.cell.target,
+            &acquisition,
+            self.deadline,
+        )?;
+        let harness = super::native_component_harness::build(
+            self.workspace,
+            &self.cell.target,
+            "memcordon",
+            "sealed_agent",
+            Some("private-tcp,test-support"),
+            &acquisition.join("operational"),
+            self.deadline,
+        )?;
+        selected.source.recheck(self.workspace)?;
+        self.recovery_harness = Some(super::linux_recovery_harness::HeldRecoveryHarness::acquire(
+            &harness,
+            &self.identity,
+            &self.cell,
+            &self.journal.lease_id,
+            self.work_deadline_unix_millis,
+            self.cleanup_deadline_unix_millis,
+            &self.admin_root.join("recovery-harness-owner.json"),
+        )?);
         let cleanup_agent = self.admin_root.join("cleanup-agent");
+        self.recovery_harness
+            .as_ref()
+            .ok_or_else(|| CiError::Message("original recovery acquisition absent".into()))?
+            .retain_evidence(&self.output.join("recovery-harness-acquisition"))?;
         let bytes = super::artifacts::read_file(&binary_path(
             &selected.directory,
             "memcordon-sealed-agent",
@@ -321,6 +365,9 @@ impl InstalledLeaseExtension for ReadinessLinuxLease<'_> {
                 cleanup_deadline: self.cleanup_deadline,
                 work_deadline_unix_millis: self.work_deadline_unix_millis,
                 cleanup_deadline_unix_millis: self.cleanup_deadline_unix_millis,
+                recovery_harness: self.recovery_harness.as_ref().ok_or_else(|| {
+                    CiError::Message("original recovery harness owner absent".into())
+                })?,
             },
             owned_fixture_recipes(&self.cell)?,
         )
@@ -615,17 +662,71 @@ pub(super) fn recover_installation(
         ));
     }
     verify_cleanup_agent_name(&owner.cleanup_agent, &agent, &bytes)?;
-    let recovery = CommandSpec::new(&owner.cleanup_agent, workspace, Duration::from_secs(60))
-        .args(["package", "policy", "recover", "--json"])
-        .bounded_until(deadline)
-        .output_quiet()?;
+    let recovery_owner_path = expected_admin.join("recovery-harness-owner.json");
+    let recovery_owner_bytes =
+        super::linux_mixed_installed::read_owned_resource(&recovery_owner_path, 1024 * 1024)?;
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&recovery_owner_bytes)
+        .map_err(CiError::Message)?;
+    let recovery_owner: super::linux_recovery_harness::RecoveryHarnessOwner =
+        serde_json::from_slice(&recovery_owner_bytes)?;
+    if recovery_owner.owner_path != recovery_owner_path
+        || recovery_owner.executable
+            != expected_admin.join("recovery-harness/operational/native-test-harness")
+    {
+        return Err(CiError::Message(
+            "original interrupted recovery image path differs".into(),
+        ));
+    }
+    let recovery_harness = super::linux_recovery_harness::HeldRecoveryHarness::reconstruct(
+        &recovery_owner,
+        identity,
+        cell,
+        &owner.lease_id,
+        owner.work_deadline_unix_millis,
+        owner.cleanup_deadline_unix_millis,
+    )?;
+    use super::linux_original_recovery::contract::{Context, Identity, Input, Record};
+    let record = |path: &Path| -> Result<Record> {
+        let bytes = super::linux_mixed_installed::read_owned_resource(path, 16 * 1024 * 1024)?;
+        Ok(Record {
+            path: path.to_owned(),
+            length: bytes.len() as u64,
+            sha256: super::artifacts::checksum(&bytes),
+        })
+    };
+    let acquired_path = output.join("mixed-cases/owned-resources-acquired.json");
+    let acquired_record = match fs::symlink_metadata(&acquired_path) {
+        Ok(_) => Some(record(&acquired_path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let input = Input {
+        format: "memcordon.original-native-recovery-input".into(),
+        revision: 1,
+        identity: Identity {
+            run_id: identity.run_id.clone(),
+            source_commit: identity.source_commit.clone(),
+            source_tree_sha256: identity.source_tree_sha256.clone(),
+            version: identity.version.clone(),
+        },
+        native_target: cell.target.clone(),
+        scope_id: owner.lease_id.clone(),
+        artifact_root: output.to_owned(),
+        original_artifact_root: output.to_owned(),
+        origin_sha256: String::new(),
+        work_deadline_unix_millis: owner.work_deadline_unix_millis,
+        cleanup_deadline_unix_millis: owner.cleanup_deadline_unix_millis,
+        recovery_harness_owner_sha256: recovery_harness.owner_sha256()?,
+        context: Context::InterruptedLease {
+            lease_owner: record(&owner_path)?,
+            resources_acquired: acquired_record,
+        },
+    };
+    let recovery = super::linux_original_recovery::run(&recovery_harness, &input, deadline)?;
     source::write_json(
         &output.join("interrupted-native-recovery.json"),
-        &serde_json::json!({"status":recovery.status.code(),"stdout":recovery.stdout,"stderr":recovery.stderr}),
+        &serde_json::json!({"format":"memcordon.original-installed-lease-recovery","revision":1,"result":recovery.result,"process":recovery.process,"capture":recovery.capture}),
     )?;
-    if !recovery.status.success() {
-        return Err(CiError::Message("native recovery retains unresolved attempt owners; resources and installation retained".into()));
-    }
     let mixed = output.join("mixed-cases");
     let acquired = mixed.join("owned-resources-acquired.json");
     let images = mixed.join("owned-resources-images.json");

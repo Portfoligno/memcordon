@@ -1846,21 +1846,133 @@ fn validate_final_settlement(
             "lifecycle preauthorization/delivery adopts unrelated executed descendant graph".into(),
         );
     }
-    validate_native_recovery(
-        &decode("native-recovery-invocation.json")?,
-        &decode("native-recovery-process.json")?,
-        custody.bytes(path("native-recovery-invocation.json")?)?,
-        custody.bytes(path("native-recovery-stdout.bin")?)?,
-        custody.bytes(path("native-recovery-stderr.bin")?)?,
-        &context.owner,
-        &context.input.key,
-        custody.bytes(
-            context.owner["selected_agent"]
-                .as_str()
-                .ok_or("lifecycle actual recovery agent bytes absent")?,
-        )?,
-        context.case_directory.as_bytes(),
-    )?;
+    let recovery_invocation = decode("native-recovery-invocation.json")?;
+    if let Some(proof) = recovery_invocation.get("original_fixture") {
+        let mut records = std::collections::BTreeMap::new();
+        for (leaf, reference) in proof["acquisition_artifacts"]
+            .as_object()
+            .ok_or("lifecycle recovery acquisition references absent")?
+        {
+            records.insert(
+                leaf.clone(),
+                custody
+                    .bytes(
+                        reference
+                            .as_str()
+                            .ok_or("lifecycle recovery acquisition reference malformed")?,
+                    )?
+                    .to_vec(),
+            );
+        }
+        let recovered = crate::validate_embedded_original_fixture_recovery(
+            &recovery_invocation,
+            &decode("native-recovery-process.json")?,
+            &proof["capture"],
+            &records,
+        )?;
+        let recovery_owner_bytes: Vec<u8> = serde_json::from_value(proof["owner_bytes"].clone())
+            .map_err(|error| error.to_string())?;
+        let recovery_owner = crate::wire::json(&recovery_owner_bytes)?;
+        let original_lease = decode("original-lease-owner.json")?;
+        let admin = original_lease["admin_root"]
+            .as_str()
+            .ok_or("lifecycle original admin root absent")?;
+        if recovery_owner["cell"] != context.owner["cell"]
+            || recovery_owner["owner_path"]
+                != crate::linux_path::join(admin, "recovery-harness-owner.json")
+            || recovery_owner["executable"]
+                != crate::linux_path::join(
+                    admin,
+                    "recovery-harness/operational/native-test-harness",
+                )
+        {
+            return Err(
+                "lifecycle recovery harness replaces original installation acquisition".into(),
+            );
+        }
+        if serde_json::to_value(&recovered.identity).map_err(|error| error.to_string())?
+            != context.owner["identity"]
+            || serde_json::json!(recovered.scope_id) != context.owner["lease_id"]
+            || recovered.native_target != context.input.key.target
+            || recovered.original_artifact_root.to_str() != Some(context.case_directory.as_str())
+            || serde_json::json!(recovered.work_deadline_unix_millis)
+                != context.owner["work_deadline_unix_millis"]
+            || serde_json::json!(recovered.cleanup_deadline_unix_millis)
+                != context.owner["cleanup_deadline_unix_millis"]
+        {
+            return Err("lifecycle fixture recovery crosses original source/lifetime".into());
+        }
+        let (original_prepared, original_lease, journal, actions) = match &recovered.context {
+            crate::original_fixture_recovery_contract::Context::Lifecycle {
+                lease_owner,
+                prepared,
+                allocation_journal,
+                phase_journal,
+                controller_intent,
+                controller_action,
+            } if context.input.key.family == "L-LIFE-02" => (
+                prepared,
+                lease_owner,
+                allocation_journal,
+                vec![
+                    ("phase-journal.bin", phase_journal),
+                    ("controller-intent.json", controller_intent),
+                    ("controller-action.json", controller_action),
+                ],
+            ),
+            crate::original_fixture_recovery_contract::Context::Delivery {
+                lease_owner,
+                prepared,
+                allocation_journal,
+                report_destination,
+                report_delivery_failure,
+            } if context.input.key.family == "L-LIFE-05"
+                && context.input.key.scenario == "report-persistence-failure" =>
+            {
+                (
+                    prepared,
+                    lease_owner,
+                    allocation_journal,
+                    vec![
+                        ("report-destination.json", report_destination),
+                        ("report-delivery-failure.json", report_delivery_failure),
+                    ],
+                )
+            }
+            _ => return Err("lifecycle fixture recovery context differs".into()),
+        };
+        if original_prepared.sha256 != custody.hash(path("prepared.json")?)?
+            || original_lease.sha256 != custody.hash(path("original-lease-owner.json")?)?
+            || journal.sha256 != custody.hash(path("allocation-phase-journal.bin")?)?
+            || proof["capture"]["stdout"]
+                != serde_json::json!(custody.bytes(path("native-recovery-stdout.bin")?)?)
+            || proof["capture"]["stderr"]
+                != serde_json::json!(custody.bytes(path("native-recovery-stderr.bin")?)?)
+        {
+            return Err("lifecycle fixture recovery originals/captures differ".into());
+        }
+        for (name, record) in actions {
+            if record.sha256 != custody.hash(path(name)?)? {
+                return Err("lifecycle fixture recovery original intervention differs".into());
+            }
+        }
+    } else {
+        validate_native_recovery(
+            &decode("native-recovery-invocation.json")?,
+            &decode("native-recovery-process.json")?,
+            custody.bytes(path("native-recovery-invocation.json")?)?,
+            custody.bytes(path("native-recovery-stdout.bin")?)?,
+            custody.bytes(path("native-recovery-stderr.bin")?)?,
+            &context.owner,
+            &context.input.key,
+            custody.bytes(
+                context.owner["selected_agent"]
+                    .as_str()
+                    .ok_or("lifecycle actual recovery agent bytes absent")?,
+            )?,
+            context.case_directory.as_bytes(),
+        )?;
+    }
     let result_hash = if let Some(result) = context.peers.get("actual-result.json") {
         custody.hash(result)?.to_owned()
     } else {

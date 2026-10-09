@@ -37,6 +37,12 @@ mod linux_exports;
 mod linux_images;
 mod linux_limits;
 mod linux_recovery;
+mod original_fixture_recovery;
+pub use original_fixture_recovery::contract as original_fixture_recovery_contract;
+pub use original_fixture_recovery::{
+    OriginalFixtureRecovery, validate_embedded_original_fixture_recovery,
+    validate_original_fixture_recovery,
+};
 mod linux_recovery_route;
 mod linux_registry;
 mod linux_release;

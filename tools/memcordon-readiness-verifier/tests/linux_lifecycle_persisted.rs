@@ -4,9 +4,102 @@ mod linux_installed_case;
 mod linux_lifecycle_case;
 #[path = "support/linux_prepared_case.rs"]
 mod linux_prepared_case;
+#[path = "support/original_fixture_recovery_case.rs"]
+mod original_fixture_recovery_case;
 #[path = "support/persisted_case.rs"]
 mod persisted_case;
 use serde_json::json;
+
+#[test]
+fn measured_recovery_joins_the_complete_original_lifecycle_graph() {
+    use memcordon_readiness_verifier::original_fixture_recovery_contract as contract;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    let mut case = linux_lifecycle_case::allocation_case("frontend");
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    let read =
+        |leaf: &str| std::fs::read(case.root.path().join(format!("{prefix}/{leaf}"))).unwrap();
+    let owner: serde_json::Value = serde_json::from_slice(&read("lifecycle-owner.json")).unwrap();
+    let lease: serde_json::Value =
+        serde_json::from_slice(&read("original-lease-owner.json")).unwrap();
+    let old: serde_json::Value =
+        serde_json::from_slice(&read("native-recovery-invocation.json")).unwrap();
+    let cwd: Vec<u8> = serde_json::from_value(old["cwd_native_bytes"].clone()).unwrap();
+    let root = String::from_utf8(cwd).unwrap();
+    let admin = lease["admin_root"].as_str().unwrap();
+    let mut originals = BTreeMap::new();
+    let mut record = |role: &str, leaf: &str| {
+        let bytes = read(leaf);
+        originals.insert(
+            role.into(),
+            if role == "lease_owner" {
+                format!("{root}/lease-owner.json")
+            } else {
+                format!("{root}/{leaf}")
+            },
+        );
+        contract::Record {
+            path: format!("{admin}/recovery-stage/input-{role}.bin").into(),
+            length: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        }
+    };
+    let context = contract::Context::Lifecycle {
+        lease_owner: record("lease_owner", "original-lease-owner.json"),
+        prepared: record("prepared", "prepared.json"),
+        allocation_journal: record("allocation_journal", "allocation-phase-journal.bin"),
+        phase_journal: record("phase_journal", "phase-journal.bin"),
+        controller_intent: record("controller_intent", "controller-intent.json"),
+        controller_action: record("controller_action", "controller-action.json"),
+    };
+    let family = original_fixture_recovery_case::Family {
+        identity: owner["identity"].clone(),
+        cell: owner["cell"].clone(),
+        scope: owner["lease_id"].as_str().unwrap().into(),
+        work: owner["work_deadline_unix_millis"].as_u64().unwrap(),
+        cleanup: owner["cleanup_deadline_unix_millis"].as_u64().unwrap(),
+        admin: admin.into(),
+        original_root: root,
+        context,
+        originals,
+    };
+    let (mut invocation, process, _, records) =
+        original_fixture_recovery_case::family(family.clone());
+    let mut references = serde_json::Map::new();
+    for (leaf, bytes) in records {
+        let path = format!("recovery-acquisition/{leaf}");
+        case.write(&path, &bytes);
+        references.insert(leaf, json!(path));
+    }
+    invocation["original_fixture"]["acquisition_artifacts"] = references.into();
+    case.json(
+        &format!("{prefix}/native-recovery-invocation.json"),
+        &invocation,
+    );
+    case.json(&format!("{prefix}/native-recovery-process.json"), &process);
+    case.write(&format!("{prefix}/native-recovery-stdout.bin"), b"");
+    case.write(&format!("{prefix}/native-recovery-stderr.bin"), b"");
+    case.validate().unwrap();
+    let (mut unrelated, process, _, records) =
+        original_fixture_recovery_case::family(original_fixture_recovery_case::Family {
+            scope: "unrelated-original-lease".into(),
+            ..family
+        });
+    unrelated["original_fixture"]["acquisition_artifacts"] =
+        invocation["original_fixture"]["acquisition_artifacts"].clone();
+    for (leaf, bytes) in records {
+        case.write(&format!("recovery-acquisition/{leaf}"), &bytes);
+    }
+    case.json(
+        &format!("{prefix}/native-recovery-invocation.json"),
+        &unrelated,
+    );
+    case.json(&format!("{prefix}/native-recovery-process.json"), &process);
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "lifecycle fixture recovery crosses original source/lifetime"
+    );
+}
 
 #[test]
 fn original_frontend_scope_rejects_rehashed_alias_and_sibling_paths() {

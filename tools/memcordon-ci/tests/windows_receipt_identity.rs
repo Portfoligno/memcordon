@@ -2,6 +2,19 @@
 mod windows_receipt_identity;
 
 #[test]
+fn cargo_aliases_are_sources_and_never_receipt_authority() {
+    let path = std::path::Path::new("actual-cargo-output.exe");
+    windows_receipt_identity::validate_compiler_source(path, 0x2020, 2).unwrap();
+    assert!(windows_receipt_identity::validate(path, false, 0x2020, 2).is_err());
+    windows_receipt_identity::validate(path, false, 0x2020, 1).unwrap();
+    for (attributes, links) in [(0x400, 2), (0x10, 2), (0x410, 1), (0x2020, 0)] {
+        assert!(
+            windows_receipt_identity::validate_compiler_source(path, attributes, links).is_err()
+        );
+    }
+}
+
+#[test]
 fn receipt_type_reparse_and_link_refusals_keep_queried_metadata() {
     let path = std::path::Path::new("original-receipt");
     windows_receipt_identity::validate(path, false, 0, 1).unwrap();

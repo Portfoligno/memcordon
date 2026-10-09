@@ -20,12 +20,7 @@ pub fn recover() -> Result<Vec<String>, String> {
 /// Administrative retry of persisted native obligations, without recreating
 /// execution observations or treating an ambiguous owner as retired.
 pub fn recover_administrative() -> Result<(), String> {
-    // SAFETY: geteuid has no pointer preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Err("native recovery requires authenticated root administration".into());
-    }
-    let _package_owner = super::service::acquire_package_lease()?;
-    let unresolved = recover()?;
+    let unresolved = recover_authenticated_administration()?;
     let receipt = serde_json::json!({
         "format": "memcordon.native-recovery", "revision": 1,
         "outstanding": unresolved,
@@ -39,6 +34,17 @@ pub fn recover_administrative() -> Result<(), String> {
     } else {
         Err("native recovery retains ambiguous ownership obligations".into())
     }
+}
+
+/// The original measured fixture shares the real root/package-lease operation.
+/// Its provenance input does not replace authenticated persisted native owners.
+pub(crate) fn recover_authenticated_administration() -> Result<Vec<String>, String> {
+    // SAFETY: geteuid has no pointer preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("native recovery requires authenticated root administration".into());
+    }
+    let _package_owner = super::service::acquire_package_lease()?;
+    recover()
 }
 
 #[cfg(feature = "test-support")]

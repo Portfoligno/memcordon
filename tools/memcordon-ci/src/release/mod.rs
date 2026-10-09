@@ -31,6 +31,8 @@ pub mod linux_native_component;
 #[cfg(target_os = "linux")]
 pub mod linux_native_package;
 #[cfg(target_os = "linux")]
+pub(super) mod linux_original_recovery;
+#[cfg(target_os = "linux")]
 pub mod linux_readiness_image_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_readiness_lease;
@@ -42,6 +44,8 @@ pub mod linux_readiness_lifecycle_cases;
 pub mod linux_readiness_limits_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_readiness_policy_cases;
+#[cfg(unix)]
+pub mod linux_recovery_harness;
 #[cfg(target_os = "linux")]
 mod native_cargo_aliases;
 pub mod native_component_harness;
@@ -51,6 +55,8 @@ mod native_executable;
 mod native_execution_association;
 #[cfg(target_os = "linux")]
 mod native_package_diagnostics;
+#[cfg(unix)]
+pub mod native_recipe_case;
 #[cfg(target_os = "linux")]
 mod native_source_identity;
 #[cfg(any(target_os = "linux", windows))]

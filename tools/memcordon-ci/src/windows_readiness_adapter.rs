@@ -263,6 +263,112 @@ pub fn copy_owned_artifact(
     hold_artifact(destination, Some(expected), 512 * 1024 * 1024)
 }
 
+/// Materialize actual Cargo output into independent receipt custody. The held
+/// source may have Cargo aliases; no alias becomes an authoritative image.
+#[cfg(windows)]
+pub fn copy_compiler_artifact(
+    source: &Path,
+    build_root: &Path,
+    destination: &Path,
+    expected: &str,
+) -> crate::Result<HeldWindowsArtifact> {
+    use std::{
+        fs::OpenOptions,
+        io::Read,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        GetFileInformationByHandle,
+    };
+    if !source.is_absolute()
+        || !build_root.is_absolute()
+        || !source.starts_with(build_root)
+        || source == build_root
+        || source
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || source.strip_prefix(build_root).is_ok_and(|relative| {
+            relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        })
+    {
+        return Err(crate::CiError::Message(
+            "compiler artifact crosses original build root".into(),
+        ));
+    }
+    let _source_ancestors = hold_ancestors(
+        source
+            .parent()
+            .ok_or_else(|| crate::CiError::Message("compiler source parent absent".into()))?,
+    )?;
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(source)
+    };
+    let identity = |file: &std::fs::File| -> std::io::Result<(u32, u64, u32, u32, u64)> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: File owns the live handle and info is a valid sized output.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        crate::windows_receipt_identity::validate_compiler_source(
+            source,
+            info.dwFileAttributes,
+            info.nNumberOfLinks,
+        )?;
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            info.dwFileAttributes,
+            info.nNumberOfLinks,
+            (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+        ))
+    };
+    let file = open()?;
+    let before = identity(&file)?;
+    if before.4 == 0 || before.4 > 512 * 1024 * 1024 {
+        return Err(crate::CiError::Message(
+            "compiler source exceeds executable byte bound".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(512 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    let named = open()?;
+    let mut named_bytes = Vec::new();
+    (&named)
+        .take(512 * 1024 * 1024 + 1)
+        .read_to_end(&mut named_bytes)?;
+    if before.4 != bytes.len() as u64
+        || identity(&file)? != before
+        || identity(&named)? != before
+        || named_bytes != bytes
+        || crate::windows_causal_acceptance::sha256(&bytes) != expected
+    {
+        return Err(crate::CiError::Message(
+            "held compiler source identity, links or bytes changed".into(),
+        ));
+    }
+    let _destination_ancestors =
+        hold_ancestors(destination.parent().ok_or_else(|| {
+            crate::CiError::Message("compiler destination parent absent".into())
+        })?)?;
+    let _published = publish_receipt(destination, &bytes)?;
+    let copied = hold_artifact(destination, Some(expected), 512 * 1024 * 1024)?;
+    if identity(&file)? != before || identity(&named)? != before {
+        return Err(crate::CiError::Message(
+            "compiler source changed during independent publication".into(),
+        ));
+    }
+    Ok(copied)
+}
+
 #[cfg(windows)]
 struct PublicInvocationProjection {
     path: String,

@@ -8,7 +8,11 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
     assert_eq!(release.len(), 2);
     assert_eq!(
         release[0].deadline,
-        Duration::from_secs(if cfg!(windows) { 40 * 60 } else { 25 * 60 })
+        Duration::from_secs(if cfg!(any(windows, target_os = "macos")) {
+            40 * 60
+        } else {
+            25 * 60
+        })
     );
     assert_eq!(release[1].deadline, Duration::from_secs(15 * 60));
     assert_eq!(release[0].arguments.last(), Some(&"--no-run"));

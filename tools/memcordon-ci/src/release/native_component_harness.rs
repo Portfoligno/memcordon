@@ -245,7 +245,7 @@ fn retain_acquisition_origin(
 }
 
 #[cfg(any(target_os = "linux", windows))]
-fn retain_original_host(
+pub(super) fn retain_original_host(
     root: &Path,
     selected: &source::BuildSourceIdentity,
     target: &str,
@@ -420,8 +420,9 @@ fn build_windows_actor(
         super::target::validate_executable(&bytes, target)?;
         let filename = format!("{name}.exe");
         let checksum = artifacts::checksum(&bytes);
-        held.push(crate::windows_readiness_adapter::copy_owned_artifact(
+        held.push(crate::windows_readiness_adapter::copy_compiler_artifact(
             &actual,
+            &build_root,
             &destination.join(&filename),
             &checksum,
         )?);

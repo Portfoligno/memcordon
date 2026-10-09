@@ -1071,64 +1071,66 @@ pub fn run_case(
             }
         }
     }
-    let invocation = serde_json::json!({"format":"memcordon.linux-lifecycle-native-recovery-invocation","revision":1,
-        "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"key":key,
-        "program":"/usr/libexec/memcordon-sealed-agent","arguments":["package","policy","recover","--json"],
-        "cwd_native_bytes":root.as_os_str().as_encoded_bytes(),"timeout_millis":60000,
-        "work_deadline_unix_millis":context.work_deadline_unix_millis,"cleanup_deadline_unix_millis":context.cleanup_deadline_unix_millis,
-        "cleanup_deadline_scope":"original-installed-lease","cleared_environment":true,"selected_agent_sha256":context.selected_agent_sha256});
+    use super::linux_original_recovery::{contract, record};
+    let original_input = contract::Input {
+        format: "memcordon.original-native-recovery-input".into(),
+        revision: 1,
+        identity: contract::Identity {
+            run_id: context.identity.run_id.clone(),
+            source_commit: context.identity.source_commit.clone(),
+            source_tree_sha256: context.identity.source_tree_sha256.clone(),
+            version: context.identity.version.clone(),
+        },
+        native_target: context.cell.target.clone(),
+        scope_id: context.lease_id.into(),
+        artifact_root: root.clone(),
+        original_artifact_root: root.clone(),
+        origin_sha256: String::new(),
+        work_deadline_unix_millis: context.work_deadline_unix_millis,
+        cleanup_deadline_unix_millis: context.cleanup_deadline_unix_millis,
+        recovery_harness_owner_sha256: context.recovery_harness.owner_sha256()?,
+        context: if delivery {
+            contract::Context::Delivery {
+                lease_owner: record(context.lease_owner_path)?,
+                prepared: record(&root.join("prepared.json"))?,
+                allocation_journal: record(&root.join("allocation-phase-journal.bin"))?,
+                report_destination: record(&root.join("report-destination.json"))?,
+                report_delivery_failure: record(&root.join("report-delivery-failure.json"))?,
+            }
+        } else {
+            contract::Context::Lifecycle {
+                lease_owner: record(context.lease_owner_path)?,
+                prepared: record(&root.join("prepared.json"))?,
+                allocation_journal: record(&root.join("allocation-phase-journal.bin"))?,
+                phase_journal: record(&root.join("phase-journal.bin"))?,
+                controller_intent: record(&root.join("controller-intent.json"))?,
+                controller_action: record(&root.join("controller-action.json"))?,
+            }
+        },
+    };
+    let recovery = super::linux_original_recovery::run(
+        context.recovery_harness,
+        &original_input,
+        context.cleanup_deadline,
+    )?;
+    let mut invocation = recovery.invocation.clone();
+    invocation["original_fixture"] = recovery.proof().clone();
+    invocation["original_fixture"]["acquisition_artifacts"] =
+        super::linux_recovery_harness::acquisition_artifacts(
+            context.artifact_root,
+            &context
+                .lease_owner_path
+                .parent()
+                .ok_or_else(|| CiError::Message("original lifecycle lease parent absent".into()))?
+                .join("recovery-harness-acquisition"),
+        )?;
     let invocation_bytes = serde_json::to_vec(&invocation)?;
     retain_bytes(
         &root.join("native-recovery-invocation.json"),
         &invocation_bytes,
         &mut report.files,
     )?;
-    let mut process = None;
-    let recovery_owner_index = report.workers.len();
-    let recovery = crate::command::CommandSpec::new(
-        "/usr/libexec/memcordon-sealed-agent",
-        &root,
-        std::time::Duration::from_secs(60),
-    )
-    .args(["package", "policy", "recover", "--json"])
-    .cleared_environment()
-    .bounded_until(context.cleanup_deadline)
-    .output_quiet_with_creation(|child| {
-        let birth =
-            crate::linux_consumer_readiness::process_birth(child.id()).map_err(CiError::Message)?;
-        let mut held = HeldLinuxProcess::acquire(child.id(), birth).map_err(CiError::Message)?;
-        let image = held
-            .hold_executable_image(context.cleanup_deadline)
-            .map_err(CiError::Message)?;
-        if image["sha256"] != context.selected_agent_sha256 {
-            return Err(CiError::Message(
-                "actual native recovery agent image differs".into(),
-            ));
-        }
-        let identity = held.retirement_identity().map_err(CiError::Message)?;
-        report.workers.push(held);
-        process = Some((identity, image));
-        Ok(())
-    })?;
-    let (preinput, image) = process.ok_or_else(|| {
-        CiError::Message("actual native recovery creation identity absent".into())
-    })?;
-    let recovery_owner = report
-        .workers
-        .get(recovery_owner_index)
-        .ok_or_else(|| CiError::Message("actual native recovery wait owner absent".into()))?;
-    if !recovery_owner.exited().map_err(CiError::Message)? {
-        return Err(CiError::Message(
-            "actual native recovery Child wait did not settle original PIDFD".into(),
-        ));
-    }
-    let process = recovery_owner
-        .retirement_identity()
-        .map_err(CiError::Message)?;
-    let process = serde_json::json!({"format":"memcordon.linux-lifecycle-native-recovery-process","revision":1,
-        "preinput":preinput,"process":process,"native_image":image,"invocation_sha256":super::artifacts::checksum(&invocation_bytes),
-        "raw_wait_status":recovery.status.into_raw(),"native_exit":recovery.status.code(),"signal":recovery.status.signal(),
-        "stdout_sha256":super::artifacts::checksum(&recovery.stdout),"stderr_sha256":super::artifacts::checksum(&recovery.stderr)});
+    let process = &recovery.process;
     retain_bytes(
         &root.join("native-recovery-process.json"),
         &serde_json::to_vec(&process)?,
@@ -1144,11 +1146,6 @@ pub fn run_case(
         &recovery.stderr,
         &mut report.files,
     )?;
-    if !recovery.status.success() {
-        return Err(CiError::Message(
-            "actual native lifecycle recovery retains outstanding obligations".into(),
-        ));
-    }
     let owner = &report.native.owners[index];
     let observer = owner.observer.as_ref().expect("retained native observer");
     if !observer
@@ -1443,6 +1440,35 @@ pub fn normalize_completed(
             "work_deadline_unix_millis":input.work_deadline_unix_millis,"cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis}),
             )?,
         )?;
+        let recovery_invocation: serde_json::Value =
+            serde_json::from_slice(&super::linux_mixed_installed::read_owned_resource(
+                &directory.join("native-recovery-invocation.json"),
+                1024 * 1024,
+            )?)?;
+        if let Some(references) =
+            recovery_invocation["original_fixture"]["acquisition_artifacts"].as_object()
+        {
+            for (leaf, reference) in references {
+                let path = reference.as_str().ok_or_else(|| {
+                    CiError::Message("lifecycle recovery acquisition reference malformed".into())
+                })?;
+                let bytes = super::linux_mixed_installed::read_owned_resource(
+                    &input.artifact_root.join(path),
+                    if leaf == "acquisition-2.bin" {
+                        512 * 1024 * 1024
+                    } else {
+                        16 * 1024 * 1024
+                    },
+                )?;
+                if !added.iter().any(|artifact| artifact.path == path) {
+                    added.push(Artifact {
+                        path: path.into(),
+                        length: bytes.len() as u64,
+                        sha256: super::artifacts::checksum(&bytes),
+                    });
+                }
+            }
+        }
         let mut peers = Vec::new();
         for name in [
             "challenge.bin",

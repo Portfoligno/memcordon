@@ -325,6 +325,52 @@ impl CommandSpec {
         }
     }
 
+    /// Supply an already retained finite input without blocking a pipe before
+    /// the sole deadline owner starts. Creation failures still settle the child.
+    #[cfg(unix)]
+    pub fn output_quiet_with_stdin_and_creation(
+        &self,
+        input: &std::fs::File,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+    ) -> Result<ObservedOutput> {
+        use std::io::{Seek, SeekFrom};
+        let metadata = input.metadata()?;
+        let flags = rustix::fs::fcntl_getfl(input).map_err(std::io::Error::from)?;
+        if !metadata.is_file()
+            || metadata.len() > 65536
+            || flags & rustix::fs::OFlags::ACCMODE != rustix::fs::OFlags::RDONLY
+        {
+            return Err(CiError::Message(
+                "native recovery stdin is not a finite readonly record".into(),
+            ));
+        }
+        let mut supplied = input.try_clone()?;
+        supplied.seek(SeekFrom::Start(0))?;
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::from(supplied));
+        let mut observation_error = None;
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
+            command,
+            self.available_budget()?,
+            self.output_limit,
+            |mut command| {
+                let child = command.spawn()?;
+                if let Err(error) = observe_creation(&child) {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            |_| Ok(()),
+        );
+        match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "native creation observation={original:?}; native settlement={error}"
+            ))),
+        }
+    }
+
     fn observe(&self, command: &mut Command) -> Result<ObservedOutput> {
         let budget = self.available_budget()?;
         let started = Instant::now();

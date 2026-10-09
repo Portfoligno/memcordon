@@ -83,6 +83,9 @@ mod native_mixed_recovery;
 #[cfg(all(target_os = "linux", feature = "private-tcp"))]
 #[path = "sealed_agent/native_mixed_release.rs"]
 mod native_mixed_release;
+#[cfg(all(target_os = "linux", feature = "private-tcp"))]
+#[path = "sealed_agent/native_original_recovery.rs"]
+mod native_original_recovery;
 #[cfg(target_os = "linux")]
 #[path = "release/native_private_image_inputs.rs"]
 mod native_private_image_inputs;

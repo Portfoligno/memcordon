@@ -65,6 +65,7 @@ pub struct NativeAdminScope {
     component_package: Option<super::linux_native_package::NativeLinuxPackageLease>,
     component_workspace: Option<PathBuf>,
     component_fixture: Option<(PathBuf, String, File)>,
+    recovery_harness: Option<super::linux_recovery_harness::HeldRecoveryHarness>,
 }
 
 /// Read-only loans of the original acquired account records. The caller keeps
@@ -330,6 +331,7 @@ impl NativeAdminScope {
             component_package: None,
             component_workspace: None,
             component_fixture: None,
+            recovery_harness: None,
         })
     }
 
@@ -982,7 +984,16 @@ impl NativeAdminScope {
             work_unix,
             cleanup_unix,
             |directory, cutoff| {
-                package.recover_component(workspace, directory, cutoff, work_unix, cleanup_unix)
+                package.recover_component(
+                    workspace,
+                    directory,
+                    cutoff,
+                    work_unix,
+                    cleanup_unix,
+                    self.recovery_harness.as_ref().ok_or_else(|| {
+                        CiError::Message("original recovery harness owner absent".into())
+                    })?,
+                )
             },
         )?);
         Ok(())
@@ -998,6 +1009,8 @@ impl NativeAdminScope {
     )]
     pub fn prepare_operational_fixture(
         &mut self,
+        operational: &MeasuredHarness,
+        scope_id: &str,
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
         target: &str,
@@ -1014,6 +1027,19 @@ impl NativeAdminScope {
                 "original operational fixture package cannot be reacquired".into(),
             ));
         }
+        let cell = memcordon_readiness_verifier::ProductKey {
+            target: target.into(),
+            channel: "candidate-native".into(),
+        };
+        self.recovery_harness = Some(super::linux_recovery_harness::HeldRecoveryHarness::acquire(
+            operational,
+            identity,
+            &cell,
+            scope_id,
+            work_unix,
+            cleanup_unix,
+            &self.path.join("recovery-harness-owner.json"),
+        )?);
         let admin = self.path.join("component-package-admin");
         fs::DirBuilder::new().mode(0o700).create(&admin)?;
         self.root.sync_all()?;
@@ -1032,7 +1058,12 @@ impl NativeAdminScope {
         let output = admin.join("native-package-evidence");
         self.component_package = Some(
             super::linux_native_package::NativeLinuxPackageLease::acquire(
-                payload, &admin, &output,
+                self.recovery_harness.as_ref().ok_or_else(|| {
+                    CiError::Message("original recovery harness owner absent".into())
+                })?,
+                payload,
+                &admin,
+                &output,
             )?,
         );
         self.component_workspace = Some(workspace.to_path_buf());
@@ -1053,6 +1084,9 @@ impl NativeAdminScope {
                 cleanup,
                 work_unix,
                 cleanup_unix,
+                self.recovery_harness.as_ref().ok_or_else(|| {
+                    CiError::Message("original recovery harness owner absent".into())
+                })?,
             )?;
         let bytes = serde_json::to_vec(
             &serde_json::json!({"contract":activated.contract,"registry":activated.registry}),
@@ -1598,7 +1632,6 @@ impl NativeRecipeBatch {
         cleanup_unix: u64,
         mut recover: impl FnMut(&Path, Instant) -> Result<()>,
     ) -> Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
         if run_id.is_empty()
             || recipe_id.is_empty()
             || target != super::distribution::native_target()?
@@ -1667,9 +1700,6 @@ impl NativeRecipeBatch {
         let mut prepared = Vec::new();
         for (harness, test, name) in recipes {
             let directory = output.join(name);
-            fs::create_dir(&directory)?;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-            File::open(output)?.sync_all()?;
             let mut challenge = [0u8; 32];
             File::open("/dev/urandom")?.read_exact(&mut challenge)?;
             let mut value = serde_json::json!({"run_id":run_id,"recipe_id":recipe_id,
@@ -1797,37 +1827,7 @@ fn capture(reader: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec
 }
 
 pub(crate) fn protected_directory(path: &Path) -> Result<Vec<File>> {
-    if !path.is_absolute() {
-        return Err(CiError::Message(
-            "native component controller path must be absolute".into(),
-        ));
-    }
-    let mut current = PathBuf::from("/");
-    let mut held = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => (),
-            std::path::Component::Normal(name) => current.push(name),
-            _ => {
-                return Err(CiError::Message(
-                    "native component controller path is not normalized".into(),
-                ));
-            }
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&current)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(CiError::Message(
-                "native component controller ancestry is not protected administrator custody"
-                    .into(),
-            ));
-        }
-        held.push(file);
-    }
-    Ok(held)
+    super::linux_recovery_harness::protected_directory(path)
 }
 
 /// Copy only measured bytes into the administrator's protected native scope;
@@ -1891,14 +1891,7 @@ impl NativeTestOwner {
         output: &Path,
     ) -> std::result::Result<Self, OwnedNativeTestFailure> {
         let before = (|| -> Result<_> {
-            if !matches!(
-                test,
-                "native_index_mutations_emit_actual_parser_receipts"
-                    | "operational_parser_receipts::native_operational_parser_mutations_emit_actual_receipts"
-                    | "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts"
-                    | "native_versions::native_version_vectors_emit_actual_component_receipts"
-                    | "private_attempt::durable_journal_barriers_emit_actual_component_receipts"
-            ) {
+            if !super::native_recipe_case::admitted(test) {
                 return Err(CiError::Message(
                     "root-only native component recipe is not frozen".into(),
                 ));
@@ -1918,7 +1911,7 @@ impl NativeTestOwner {
             ancestry.extend(protected_directory(output.parent().ok_or_else(|| {
                 CiError::Message("native component output parent absent".into())
             })?)?);
-            fs::create_dir(output)?;
+            super::native_recipe_case::create(output)?;
             ancestry.extend(protected_directory(output)?);
             let image = OpenOptions::new()
                 .read(true)

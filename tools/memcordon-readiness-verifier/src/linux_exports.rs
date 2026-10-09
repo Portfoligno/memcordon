@@ -2,6 +2,7 @@
 use crate::{CaseKey, VerificationResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1894,126 +1895,243 @@ pub(crate) fn validate_export_recovery(
     };
     let invocation = decode(artifact("invocation")?)?;
     let process = decode(artifact("process")?)?;
-    closed(
-        &invocation,
-        &[
-            "format",
-            "revision",
-            "identity",
-            "cell",
-            "lease_id",
-            "attempt_id",
-            "program",
-            "arguments",
-            "cwd_native_bytes",
-            "timeout_millis",
-            "cleared_environment",
-            "work_deadline_unix_millis",
-            "cleanup_deadline_unix_millis",
-            "selected_agent_sha256",
-        ],
-    )?;
-    let agent = product
-        .components
-        .iter()
-        .find(|component| component.role == "sealed-agent")
-        .ok_or("export recovery installed agent absent")?;
-    let row = decode(&e.observation)?;
-    let prepared_path = row["prepared"]
-        .as_str()
-        .ok_or("export original prepared native path absent")?;
-    let directory =
-        crate::linux_path::parent(prepared_path).ok_or("export recovery original cwd absent")?;
-    let cwd: Vec<u8> = serde_json::from_value(invocation["cwd_native_bytes"].clone())
-        .map_err(|error| error.to_string())?;
-    if invocation["format"] != "memcordon.linux-export-recovery-invocation"
-        || invocation["revision"] != 1
-        || invocation["identity"] != owner["identity"]
-        || invocation["cell"] != owner["cell"]
-        || invocation["lease_id"] != e.lease_id
-        || invocation["attempt_id"] != attempt
-        || invocation["program"] != "/usr/libexec/memcordon-sealed-agent"
-        || invocation["arguments"] != serde_json::json!(["package", "policy", "recover", "--json"])
-        || cwd != directory.as_bytes()
-        || invocation["timeout_millis"] != 60000
-        || invocation["cleared_environment"] != true
-        || invocation["selected_agent_sha256"] != agent.installed_sha256
-        || ["work_deadline_unix_millis", "cleanup_deadline_unix_millis"]
-            .iter()
-            .any(|field| invocation[field] != owner[field])
-    {
-        return Err("export recovery actual command/agent/cwd differs".into());
-    }
-    closed(
-        &process,
-        &[
-            "format",
-            "revision",
-            "preinput",
-            "process",
-            "native_image",
-            "invocation_sha256",
-            "raw_wait_status",
-            "native_exit",
-            "signal",
-            "stdout_sha256",
-            "stderr_sha256",
-        ],
-    )?;
-    for field in ["preinput", "process"] {
+    if invocation.get("original_fixture").is_some() {
+        let proof = &invocation["original_fixture"];
+        let references = proof["acquisition_artifacts"]
+            .as_object()
+            .ok_or("export recovery acquisition references absent")?;
+        let mut records = std::collections::BTreeMap::new();
+        for (leaf, reference) in references {
+            records.insert(
+                leaf.clone(),
+                custody
+                    .bytes(
+                        reference
+                            .as_str()
+                            .ok_or("export recovery acquisition reference malformed")?,
+                    )?
+                    .to_vec(),
+            );
+        }
+        let input = crate::validate_embedded_original_fixture_recovery(
+            &invocation,
+            &process,
+            &proof["capture"],
+            &records,
+        )?;
+        let recovery_owner_bytes: Vec<u8> = serde_json::from_value(proof["owner_bytes"].clone())
+            .map_err(|error| error.to_string())?;
+        let recovery_owner = crate::wire::json(&recovery_owner_bytes)?;
+        let lease = decode(&e.original_lease_owner)?;
+        let admin = lease["admin_root"]
+            .as_str()
+            .ok_or("export original admin root absent")?;
+        if recovery_owner["cell"] != owner["cell"]
+            || recovery_owner["owner_path"]
+                != crate::linux_path::join(admin, "recovery-harness-owner.json")
+            || recovery_owner["executable"]
+                != crate::linux_path::join(
+                    admin,
+                    "recovery-harness/operational/native-test-harness",
+                )
+        {
+            return Err(
+                "export recovery harness replaces original installation acquisition".into(),
+            );
+        }
+        let row = decode(&e.observation)?;
+        let original_prepared = row["prepared"]
+            .as_str()
+            .ok_or("export original prepared path absent")?;
+        let expected_root = crate::linux_path::parent(original_prepared)
+            .ok_or("export original recovery root absent")?;
+        if serde_json::to_value(&input.identity).map_err(|error| error.to_string())?
+            != owner["identity"]
+            || input.scope_id != e.lease_id
+            || input.native_target != e.key.target
+            || input.original_artifact_root.to_str() != Some(expected_root.as_str())
+            || serde_json::json!(input.work_deadline_unix_millis)
+                != owner["work_deadline_unix_millis"]
+            || serde_json::json!(input.cleanup_deadline_unix_millis)
+                != owner["cleanup_deadline_unix_millis"]
+        {
+            return Err("export fixture recovery crosses original source/lifetime".into());
+        }
+        match &input.context {
+            crate::original_fixture_recovery_contract::Context::Export {
+                prepared: record,
+                lease_owner,
+                original_journal,
+                original_reservation,
+            } if record.sha256 == custody.hash(&e.prepared)?
+                && lease_owner.sha256 == custody.hash(&e.original_lease_owner)?
+                && original_journal
+                    .as_ref()
+                    .map(|record| record.sha256.as_str())
+                    == if recovery["original_journal_present"] == true {
+                        Some(
+                            custody.hash(
+                                e.recovery_artifacts
+                                    .get("original_journal")
+                                    .ok_or("export original journal artifact absent")?,
+                            )?,
+                        )
+                    } else {
+                        None
+                    } =>
+            {
+                let reservation_bytes = recovery["reservation_before"]
+                    .get("bytes")
+                    .map(|bytes| {
+                        serde_json::from_value::<Vec<u8>>(bytes.clone())
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?;
+                if original_reservation
+                    .as_ref()
+                    .map(|record| record.sha256.clone())
+                    != reservation_bytes
+                        .as_ref()
+                        .map(|bytes| hex::encode(Sha256::digest(bytes)))
+                {
+                    return Err("export fixture recovery original reservation differs".into());
+                }
+            }
+            _ => {
+                return Err(
+                    "export fixture recovery replaces original prepared association".into(),
+                );
+            }
+        }
+        if proof["capture"]["stdout"] != serde_json::json!(custody.bytes(artifact("stdout")?)?)
+            || proof["capture"]["stderr"] != serde_json::json!(custody.bytes(artifact("stderr")?)?)
+        {
+            return Err("export fixture recovery raw captures differ".into());
+        }
+    } else {
         closed(
-            &process[field],
+            &invocation,
             &[
-                "pid",
-                "birth",
-                "parent_pid",
-                "parent_birth",
-                "retirement_observed",
+                "format",
+                "revision",
+                "identity",
+                "cell",
+                "lease_id",
+                "attempt_id",
+                "program",
+                "arguments",
+                "cwd_native_bytes",
+                "timeout_millis",
+                "cleared_environment",
+                "work_deadline_unix_millis",
+                "cleanup_deadline_unix_millis",
+                "selected_agent_sha256",
             ],
         )?;
-    }
-    closed(
-        &process["native_image"],
-        &["device", "inode", "length", "sha256"],
-    )?;
-    let before: crate::HeldProcessIdentity =
-        serde_json::from_value(process["preinput"].clone()).map_err(|error| error.to_string())?;
-    let after: crate::HeldProcessIdentity =
-        serde_json::from_value(process["process"].clone()).map_err(|error| error.to_string())?;
-    if before.pid == 0
-        || before.pid > i32::MAX as u32
-        || before.birth == 0
-        || before.retirement_observed
-        || !after.retirement_observed
-        || before.pid != after.pid
-        || before.birth != after.birth
-        || before.parent_pid != after.parent_pid
-        || before.parent_birth != after.parent_birth
-        || process["format"] != "memcordon.linux-export-recovery-process"
-        || process["revision"] != 1
-        || process["raw_wait_status"] != 0
-        || process["native_exit"] != 0
-        || !process["signal"].is_null()
-        || process["invocation_sha256"] != custody.hash(artifact("invocation")?)?
-        || process["stdout_sha256"] != custody.hash(artifact("stdout")?)?
-        || process["stderr_sha256"] != custody.hash(artifact("stderr")?)?
-        || process["native_image"]["sha256"] != agent.installed_sha256
-        || ["device", "inode", "length"].iter().any(|field| {
-            process["native_image"][field]
-                .as_u64()
-                .is_none_or(|value| value == 0)
-        })
-        || !custody.bytes(artifact("stderr")?)?.is_empty()
-    {
-        return Err("export recovery original child/kernel image/wait/capture differs".into());
-    }
-    let result = decode(artifact("stdout")?)?;
-    closed(&result, &["format", "revision", "outstanding"])?;
-    if result["format"] != "memcordon.native-recovery"
-        || result["revision"] != 1
-        || result["outstanding"] != serde_json::json!([])
-    {
-        return Err("export native recovery remains outstanding".into());
+        let agent = product
+            .components
+            .iter()
+            .find(|component| component.role == "sealed-agent")
+            .ok_or("export recovery installed agent absent")?;
+        let row = decode(&e.observation)?;
+        let prepared_path = row["prepared"]
+            .as_str()
+            .ok_or("export original prepared native path absent")?;
+        let directory = crate::linux_path::parent(prepared_path)
+            .ok_or("export recovery original cwd absent")?;
+        let cwd: Vec<u8> = serde_json::from_value(invocation["cwd_native_bytes"].clone())
+            .map_err(|error| error.to_string())?;
+        if invocation["format"] != "memcordon.linux-export-recovery-invocation"
+            || invocation["revision"] != 1
+            || invocation["identity"] != owner["identity"]
+            || invocation["cell"] != owner["cell"]
+            || invocation["lease_id"] != e.lease_id
+            || invocation["attempt_id"] != attempt
+            || invocation["program"] != "/usr/libexec/memcordon-sealed-agent"
+            || invocation["arguments"]
+                != serde_json::json!(["package", "policy", "recover", "--json"])
+            || cwd != directory.as_bytes()
+            || invocation["timeout_millis"] != 60000
+            || invocation["cleared_environment"] != true
+            || invocation["selected_agent_sha256"] != agent.installed_sha256
+            || ["work_deadline_unix_millis", "cleanup_deadline_unix_millis"]
+                .iter()
+                .any(|field| invocation[field] != owner[field])
+        {
+            return Err("export recovery actual command/agent/cwd differs".into());
+        }
+        closed(
+            &process,
+            &[
+                "format",
+                "revision",
+                "preinput",
+                "process",
+                "native_image",
+                "invocation_sha256",
+                "raw_wait_status",
+                "native_exit",
+                "signal",
+                "stdout_sha256",
+                "stderr_sha256",
+            ],
+        )?;
+        for field in ["preinput", "process"] {
+            closed(
+                &process[field],
+                &[
+                    "pid",
+                    "birth",
+                    "parent_pid",
+                    "parent_birth",
+                    "retirement_observed",
+                ],
+            )?;
+        }
+        closed(
+            &process["native_image"],
+            &["device", "inode", "length", "sha256"],
+        )?;
+        let before: crate::HeldProcessIdentity =
+            serde_json::from_value(process["preinput"].clone())
+                .map_err(|error| error.to_string())?;
+        let after: crate::HeldProcessIdentity = serde_json::from_value(process["process"].clone())
+            .map_err(|error| error.to_string())?;
+        if before.pid == 0
+            || before.pid > i32::MAX as u32
+            || before.birth == 0
+            || before.retirement_observed
+            || !after.retirement_observed
+            || before.pid != after.pid
+            || before.birth != after.birth
+            || before.parent_pid != after.parent_pid
+            || before.parent_birth != after.parent_birth
+            || process["format"] != "memcordon.linux-export-recovery-process"
+            || process["revision"] != 1
+            || process["raw_wait_status"] != 0
+            || process["native_exit"] != 0
+            || !process["signal"].is_null()
+            || process["invocation_sha256"] != custody.hash(artifact("invocation")?)?
+            || process["stdout_sha256"] != custody.hash(artifact("stdout")?)?
+            || process["stderr_sha256"] != custody.hash(artifact("stderr")?)?
+            || process["native_image"]["sha256"] != agent.installed_sha256
+            || ["device", "inode", "length"].iter().any(|field| {
+                process["native_image"][field]
+                    .as_u64()
+                    .is_none_or(|value| value == 0)
+            })
+            || !custody.bytes(artifact("stderr")?)?.is_empty()
+        {
+            return Err("export recovery original child/kernel image/wait/capture differs".into());
+        }
+        let result = decode(artifact("stdout")?)?;
+        closed(&result, &["format", "revision", "outstanding"])?;
+        if result["format"] != "memcordon.native-recovery"
+            || result["revision"] != 1
+            || result["outstanding"] != serde_json::json!([])
+        {
+            return Err("export native recovery remains outstanding".into());
+        }
     }
     let present = recovery["original_journal_present"]
         .as_bool()

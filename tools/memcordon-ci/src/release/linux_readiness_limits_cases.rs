@@ -10,6 +10,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub struct LimitsContext<'a> {
+    pub lease_owner_path: &'a Path,
+    pub recovery_harness: &'a super::linux_recovery_harness::HeldRecoveryHarness,
     pub identity: &'a SourceIdentity,
     pub cell: &'a memcordon_readiness_verifier::ProductKey,
     pub provider: &'a memcordon_core::PublicProviderBindingV1,

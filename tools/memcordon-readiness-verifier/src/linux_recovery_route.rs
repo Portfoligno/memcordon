@@ -753,25 +753,124 @@ pub(crate) fn validate(
                 .into(),
         );
     }
-    let invocation: LinuxRecoveryInvocation = wire::decode(custody.bytes(invocation_path)?)?;
-    let process: LinuxRecoveryCommandProcess = wire::decode(custody.bytes(process_path)?)?;
-    let capture: LinuxRecoveryCapture = wire::decode(custody.bytes(capture_path)?)?;
-    validate_linux_recovery_command_process(
-        &invocation,
-        &process,
-        &capture,
-        custody.bytes(invocation_path)?,
-        custody.bytes(owner_path)?,
-        &deadline["source"],
-        &identity,
-        &e.component_recipe_id,
-        &e.key.target,
-        admin,
-        custody.bytes(boundary_path)?,
-        custody.bytes(ownership_path)?,
-        work,
-        cleanup,
-    )?;
+    let actual_invocation: serde_json::Value = wire::decode(custody.bytes(invocation_path)?)?;
+    if actual_invocation["format"] == "memcordon.original-native-recovery-invocation" {
+        let actual_process = wire::decode(custody.bytes(process_path)?)?;
+        let actual_capture = wire::decode(custody.bytes(capture_path)?)?;
+        let owner_bytes: Vec<u8> =
+            serde_json::from_value(actual_invocation["original_fixture"]["owner_bytes"].clone())
+                .map_err(|error| error.to_string())?;
+        let recovery_owner = crate::wire::json(&owner_bytes)?;
+        if recovery_owner["owner_path"]
+            != crate::linux_path::join(scope, "recovery-harness-owner.json")
+            || recovery_owner["executable"]
+                != crate::linux_path::join(scope, "operational/native-test-harness")
+            || recovery_owner["cell"]
+                != serde_json::json!({"target":e.key.target,"channel":"candidate-native"})
+        {
+            return Err("component recovery harness replaces original acquired scope/image".into());
+        }
+        let mut recovery_acquisition = BTreeMap::new();
+        recovery_acquisition.insert("owner.json".into(), owner_bytes);
+        for (leaf, artifact) in [
+            (
+                "cargo-output.jsonl",
+                format!("{base}/roles/operational/cargo-output.jsonl"),
+            ),
+            (
+                "cargo-stderr.bin",
+                format!("{base}/roles/operational/cargo-stderr.bin"),
+            ),
+            (
+                "acquisition-0.bin",
+                format!("{base}/roles/operational/cargo-status.json"),
+            ),
+            (
+                "acquisition-1.bin",
+                format!("{base}/roles/compiler/native-host.json"),
+            ),
+            (
+                "acquisition-2.bin",
+                format!("{base}/roles/compiler/native-compiler.bin"),
+            ),
+            (
+                "acquisition-3.bin",
+                format!("{base}/roles/compiler/compiler-identity.stdout"),
+            ),
+            (
+                "acquisition-4.bin",
+                format!("{base}/roles/compiler/compiler-identity.stderr"),
+            ),
+        ] {
+            recovery_acquisition.insert(leaf.into(), custody.bytes(&artifact)?.to_vec());
+        }
+        let recovered_input = crate::validate_embedded_original_fixture_recovery(
+            &actual_invocation,
+            &actual_process,
+            &actual_capture,
+            &recovery_acquisition,
+        )?;
+        let original_operational = roles
+            .iter()
+            .find(|role| role["role"] == "operational")
+            .ok_or("original recovery operational harness role absent")?;
+        if actual_invocation["executable_sha256"] != original_operational["sha256"] {
+            return Err("component recovery substitutes original operational image".into());
+        }
+        let crate::original_fixture_recovery_contract::Context::Component {
+            recipe_id,
+            native_input,
+            boundary: original_boundary,
+            ownership: original_ownership,
+            journal: original_journal,
+            reference: original_reference,
+        } = &recovered_input.context
+        else {
+            return Err("component recovery substitutes another fixture context".into());
+        };
+        if recipe_id != &e.component_recipe_id
+            || recovered_input.scope_id
+                != format!(
+                    "original-native-components-v1:{}:{}",
+                    origin.job, origin.run_attempt
+                )
+            || recovered_input.identity.run_id != e.run_id
+            || recovered_input.identity.source_commit != e.source_commit
+            || recovered_input.identity.source_tree_sha256 != e.source_tree_sha256
+            || recovered_input.native_target != e.key.target
+            || recovered_input.work_deadline_unix_millis != work
+            || recovered_input.cleanup_deadline_unix_millis != cleanup
+            || native_input.sha256 != custody.hash(input_path)?
+            || original_boundary.sha256 != custody.hash(boundary_path)?
+            || original_ownership.sha256 != custody.hash(ownership_path)?
+            || original_journal.sha256 != custody.hash(text(&boundary, "journal")?)?
+            || original_reference.sha256 != custody.hash(text(&boundary, "reference")?)?
+        {
+            return Err(
+                "component recovery substitutes original source/account/input association".into(),
+            );
+        }
+    } else {
+        let invocation: LinuxRecoveryInvocation = wire::decode(custody.bytes(invocation_path)?)?;
+        let process: LinuxRecoveryCommandProcess = wire::decode(custody.bytes(process_path)?)?;
+        let capture: LinuxRecoveryCapture = wire::decode(custody.bytes(capture_path)?)?;
+        validate_linux_recovery_command_process(
+            &invocation,
+            &process,
+            &capture,
+            custody.bytes(invocation_path)?,
+            custody.bytes(owner_path)?,
+            &deadline["source"],
+            &identity,
+            &e.component_recipe_id,
+            &e.key.target,
+            admin,
+            custody.bytes(boundary_path)?,
+            custody.bytes(ownership_path)?,
+            work,
+            cleanup,
+        )?;
+    }
     let recovered: LinuxRecoveredOwnership = wire::decode(custody.bytes(recovered_path)?)?;
     validate_linux_recovered_ownership(
         &recovered,

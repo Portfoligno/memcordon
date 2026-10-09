@@ -3,6 +3,44 @@ use std::ffi::OsStr;
 use std::process::Command;
 use std::time::Duration;
 
+#[cfg(unix)]
+#[test]
+fn readonly_record_stdin_preserves_full_bound_and_refuses_writable_or_oversized_input() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    let bytes = vec![b'x'; 65_536];
+    std::fs::write(&path, &bytes).unwrap();
+    let input = std::fs::File::open(&path).unwrap();
+    let mut observed = false;
+    let output = CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+        .output_quiet_with_stdin_and_creation(&input, |child| {
+            assert!(child.id() > 0);
+            observed = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(observed && output.status.success());
+    assert_eq!(output.stdout, bytes);
+    let mut writable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(
+        CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+            .output_quiet_with_stdin_and_creation(&writable, |_| panic!("writable input spawned"))
+            .is_err()
+    );
+    writable.write_all(&[b'y'; 65_537]).unwrap();
+    let oversized = std::fs::File::open(&path).unwrap();
+    assert!(
+        CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+            .output_quiet_with_stdin_and_creation(&oversized, |_| panic!("oversized input spawned"))
+            .is_err()
+    );
+}
+
 #[test]
 fn command_excerpts_preserve_each_middle_libtest_failure_for_lf_and_crlf() {
     let limit = 64 * 1024;
