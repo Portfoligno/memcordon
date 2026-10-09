@@ -278,3 +278,41 @@ fn subprocesses_unconditionally_exclude_registry_and_actions_credentials() {
         );
     }
 }
+
+#[test]
+fn only_typed_cargo_tests_exclude_runner_observation_channels() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for subcommand in ["test", "build", "metadata"] {
+        let spec =
+            CommandSpec::cargo("rustup", root, "stable", Duration::from_secs(1)).arg(subcommand);
+        let command = spec.materialize().unwrap();
+        for channel in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"] {
+            let state = command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(channel))
+                .map(|(_, value)| value);
+            assert_eq!(
+                state,
+                if subcommand == "test" {
+                    Some(None)
+                } else {
+                    None
+                },
+                "{subcommand}: {channel}"
+            );
+        }
+    }
+    // Production children may emit early cache-quiescent=false observations;
+    // an argument named test alone does not confer Cargo-test identity.
+    let command = CommandSpec::new("memcordon-ci", root, Duration::from_secs(1))
+        .arg("test")
+        .materialize()
+        .unwrap();
+    for channel in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"] {
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new(channel))
+        );
+    }
+}

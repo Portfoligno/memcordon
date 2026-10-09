@@ -193,6 +193,18 @@ impl CommandSpec {
         command.env_remove("CARGO_REGISTRY_TOKEN");
         command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
         command.env_remove("GITHUB_TOKEN");
+        if matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+            && self
+                .arguments
+                .first()
+                .is_some_and(|argument| argument == OsStr::new("test"))
+        {
+            // Test fixtures can call real release emitters concurrently. Their
+            // observations must not enter the enclosing runner step's channels.
+            // Production children retain these channels for owner transitions.
+            command.env_remove("GITHUB_OUTPUT");
+            command.env_remove("GITHUB_STEP_SUMMARY");
+        }
     }
     pub fn cleared_environment(mut self) -> Self {
         self.clear_environment = true;
