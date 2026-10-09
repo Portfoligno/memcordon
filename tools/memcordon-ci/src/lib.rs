@@ -46,6 +46,8 @@ pub mod windows_readiness_components;
 pub mod windows_readiness_faults;
 pub mod windows_readiness_native_tests;
 pub mod windows_readiness_refusals;
+#[cfg(windows)]
+mod windows_receipt_identity;
 pub mod workflow_output;
 pub mod workflow_scope;
 

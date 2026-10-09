@@ -58,6 +58,23 @@ fn split_effective_and_inheritance_aces_preserve_both_ordered_sequences() {
 }
 
 #[test]
+fn inheritance_refusal_retains_bounded_ordered_authority_diagnostics() {
+    let expected: Vec<_> = (0..12).map(|rid| (0, 3, 0x1000_0000, rid)).collect();
+    let mut actual = expected.clone();
+    actual[0].1 = 1;
+    let error = verify_file_dacl(&acl(&expected, 0), &acl(&actual, 0), true).unwrap_err();
+    assert!(error.contains("ordered inheritance authority differs"));
+    assert!(error.contains("expected count=12"));
+    assert!(error.contains("actual count=12"));
+    assert!(error.contains("flags: 3"));
+    assert!(error.contains("flags: 1"));
+    assert!(error.contains("mask: 2032127"));
+    assert!(error.contains("sid:"));
+    assert_eq!(error.matches("truncated=true").count(), 2);
+    assert!(error.len() < 16 * 1024);
+}
+
+#[test]
 fn changed_principals_rights_order_inheritance_and_extra_entries_are_refused() {
     let expected = policy();
     let expected_bytes = acl(&expected, 0);

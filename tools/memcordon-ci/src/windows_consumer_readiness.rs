@@ -1740,8 +1740,17 @@ pub(crate) mod native {
             // SAFETY: GetNamedSecurityInfoW allocated this independent descriptor.
             unsafe { LocalFree(actual_security) };
             comparison.map_err(|detail| {
+                let bytes = path.as_os_str().as_encoded_bytes();
+                let object = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+                let object_type = match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_dir() => "directory",
+                    Ok(metadata) if metadata.is_file() => "file",
+                    Ok(_) => "other",
+                    Err(_) => "unavailable",
+                };
                 CiError::Message(format!(
-                    "native readiness directory DACL readback differs: {detail}"
+                    "native readiness directory DACL readback differs: {detail}; object={object:?}; object-path-truncated={}; object-type={object_type}",
+                    bytes.len() > 512,
                 ))
             })?;
             Ok(())

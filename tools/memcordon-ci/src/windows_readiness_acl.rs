@@ -83,6 +83,17 @@ fn projection(entries: &[Ace]) -> (Vec<Ace>, Vec<Ace>) {
     (effective, inheritance)
 }
 
+fn authority_detail(entries: &[Ace]) -> String {
+    // Native ACLs are bounded, but diagnostics retain at most eight ordered
+    // entries. Parsed SIDs contain at most fifteen subauthorities each.
+    format!(
+        "count={}; first-eight={:?}; truncated={}",
+        entries.len(),
+        &entries[..entries.len().min(8)],
+        entries.len() > 8,
+    )
+}
+
 pub(crate) fn verify_file_dacl(
     expected: &[u8],
     actual: &[u8],
@@ -94,10 +105,18 @@ pub(crate) fn verify_file_dacl(
     let expected = projection(&entries(expected)?);
     let actual = projection(&entries(actual)?);
     if expected.0 != actual.0 {
-        return Err("readiness DACL ordered effective authority differs".into());
+        return Err(format!(
+            "readiness DACL ordered effective authority differs; expected {}; actual {}",
+            authority_detail(&expected.0),
+            authority_detail(&actual.0),
+        ));
     }
     if expected.1 != actual.1 {
-        return Err("readiness DACL ordered inheritance authority differs".into());
+        return Err(format!(
+            "readiness DACL ordered inheritance authority differs; expected {}; actual {}",
+            authority_detail(&expected.1),
+            authority_detail(&actual.1),
+        ));
     }
     Ok(())
 }

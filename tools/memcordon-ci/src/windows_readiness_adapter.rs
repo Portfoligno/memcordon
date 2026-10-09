@@ -152,17 +152,28 @@ pub struct HeldWindowsArtifact {
 pub fn verify_named_artifact(held: &HeldWindowsArtifact, path: &Path) -> crate::Result<()> {
     use std::{fs::OpenOptions, io::Read, os::windows::fs::OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-    let ancestors = hold_ancestors(
-        path.parent()
-            .ok_or_else(|| crate::CiError::Message("held artifact parent absent".into()))?,
-    )?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::CiError::Message("held artifact parent absent".into()))?;
+    let ancestors = hold_ancestors(parent)?;
     if ancestors.len() != held._ancestors.len() {
         return Err(crate::CiError::Message(
             "held artifact ancestor count changed".into(),
         ));
     }
-    for (before, current) in held._ancestors.iter().zip(&ancestors) {
-        if native_file_identity(before, true)? != native_file_identity(current, true)? {
+    let ancestor_paths: Vec<_> = parent
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    for ((before, current), ancestor) in held
+        ._ancestors
+        .iter()
+        .zip(&ancestors)
+        .zip(ancestor_paths.into_iter().rev())
+    {
+        if native_file_identity(before, true, ancestor)?
+            != native_file_identity(current, true, ancestor)?
+        {
             return Err(crate::CiError::Message(
                 "held artifact named ancestor native identity changed".into(),
             ));
@@ -177,7 +188,7 @@ pub fn verify_named_artifact(held: &HeldWindowsArtifact, path: &Path) -> crate::
     (&named)
         .take(held.bytes.len() as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if native_file_identity(&held._file, false)? != native_file_identity(&named, false)?
+    if native_file_identity(&held._file, false, path)? != native_file_identity(&named, false, path)?
         || bytes != held.bytes
     {
         return Err(crate::CiError::Message(
@@ -208,7 +219,7 @@ pub fn hold_artifact(
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    let identity = native_file_identity(&file, false)?;
+    let identity = native_file_identity(&file, false, path)?;
     let mut bytes = Vec::new();
     (&file).take(maximum + 1).read_to_end(&mut bytes)?;
     let digest = crate::windows_causal_acceptance::sha256(&bytes);
@@ -221,8 +232,8 @@ pub fn hold_artifact(
     (&named).take(maximum + 1).read_to_end(&mut named_bytes)?;
     if bytes.len() as u64 > maximum
         || file.metadata()?.len() != bytes.len() as u64
-        || native_file_identity(&file, false)? != identity
-        || native_file_identity(&named, false)? != identity
+        || native_file_identity(&file, false, path)? != identity
+        || native_file_identity(&named, false, path)? != identity
         || named_bytes != bytes
         || expected.is_some_and(|expected| expected != digest)
     {
@@ -3798,25 +3809,26 @@ pub struct RecoveryCleanup {
 
 #[cfg(windows)]
 #[allow(unsafe_code)] // Query-only identity of an exact held native file handle.
-fn native_file_identity(file: &std::fs::File, directory: bool) -> std::io::Result<(u32, u64)> {
+fn native_file_identity(
+    file: &std::fs::File,
+    directory: bool,
+    path: &Path,
+) -> std::io::Result<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: held File owns the live handle and info is a correctly sized output.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
-        || (!directory && info.nNumberOfLinks != 1)
-    {
-        return Err(std::io::Error::other(
-            "Windows receipt custody rejects reparse, type or link alias",
-        ));
-    }
+    crate::windows_receipt_identity::validate(
+        path,
+        directory,
+        info.dwFileAttributes,
+        info.nNumberOfLinks,
+    )?;
     Ok((
         info.dwVolumeSerialNumber,
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -3849,7 +3861,7 @@ fn hold_ancestors(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(ancestor)?;
-        native_file_identity(&file, true)?;
+        native_file_identity(&file, true, ancestor)?;
         held.push(file);
     }
     Ok(held)
@@ -3877,7 +3889,7 @@ pub(crate) fn publish_receipt(path: &Path, bytes: &[u8]) -> std::io::Result<std:
         .open(&pending)?;
     held.write_all(bytes)?;
     held.sync_all()?;
-    let identity = native_file_identity(&held, false)?;
+    let identity = native_file_identity(&held, false, &pending)?;
     let source: Vec<_> = pending.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     if source[..source.len() - 1].contains(&0) || destination[..destination.len() - 1].contains(&0)
@@ -3900,8 +3912,8 @@ pub(crate) fn publish_receipt(path: &Path, bytes: &[u8]) -> std::io::Result<std:
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    if native_file_identity(&held, false)? != identity
-        || native_file_identity(&named, false)? != identity
+    if native_file_identity(&held, false, path)? != identity
+        || native_file_identity(&named, false, path)? != identity
     {
         return Err(std::io::Error::other(
             "Windows receipt named native identity differs",
@@ -3922,7 +3934,7 @@ pub(crate) fn publish_receipt(path: &Path, bytes: &[u8]) -> std::io::Result<std:
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    if native_file_identity(&protected, false)? != identity {
+    if native_file_identity(&protected, false, path)? != identity {
         return Err(std::io::Error::other(
             "Windows protected receipt identity differs",
         ));
