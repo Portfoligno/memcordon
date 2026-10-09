@@ -59,6 +59,8 @@ mod native_package_diagnostics;
 pub mod native_recipe_case;
 #[cfg(target_os = "linux")]
 mod native_source_identity;
+#[cfg(target_os = "linux")]
+mod native_toolchain_search;
 #[cfg(any(target_os = "linux", windows))]
 pub mod original_native_components;
 pub mod packages;

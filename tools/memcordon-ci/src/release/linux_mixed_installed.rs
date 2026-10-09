@@ -8958,6 +8958,7 @@ struct ImageBuilder {
     root: PathBuf,
     entries: BTreeMap<RootRelativePath, ImageEntryV1>,
     originals: BTreeMap<RootRelativePath, PathBuf>,
+    toolchain_searches: Vec<(RootRelativePath, String, String)>,
     total_bytes: u64,
     deadline: std::time::Instant,
 }
@@ -8974,6 +8975,7 @@ impl ImageBuilder {
             root,
             entries: BTreeMap::new(),
             originals: BTreeMap::new(),
+            toolchain_searches: Vec::new(),
             total_bytes: 0,
             deadline,
         })
@@ -9154,6 +9156,24 @@ impl ImageBuilder {
             else {
                 continue;
             };
+            if member.as_str().starts_with("toolchain/") {
+                for search in &elf.search_paths {
+                    if search.contains("$ORIGIN") || search.contains("${ORIGIN}") {
+                        let directory =
+                            super::native_toolchain_search::directory(member.as_str(), search)
+                                .map_err(CiError::Message)?;
+                        if self.toolchain_searches.len()
+                            >= memcordon_core::workload_registry_v3::IMAGE_ENTRIES
+                        {
+                            return Err(CiError::Message(
+                                "toolchain search evidence exceeds image inventory bound".into(),
+                            ));
+                        }
+                        self.toolchain_searches
+                            .push((member.clone(), search.clone(), directory));
+                    }
+                }
+            }
             if let Some(interpreter) = elf.interpreter {
                 self.host_member(Path::new(&interpreter))?;
             }
@@ -9455,6 +9475,56 @@ pub fn materialize_until(
             .join(&cell.target)
             .join("lib"),
     );
+    let mut declared = libraries
+        .iter()
+        .map(|directory| {
+            directory
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut search_evidence = Vec::new();
+    for (member, search, directory) in &runtime.toolchain_searches {
+        let copied = runtime.root.join(directory);
+        let present = match std::fs::symlink_metadata(&copied) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            _ => {
+                return Err(CiError::Message(
+                    "toolchain search aliases copied file authority".into(),
+                ));
+            }
+        };
+        let prefix = format!("{directory}/");
+        let contents = runtime
+            .entries
+            .values()
+            .filter(|entry| entry.path().as_str().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        if !present && !contents.is_empty() {
+            return Err(CiError::Message(
+                "absent toolchain search has copied members".into(),
+            ));
+        }
+        let entry = runtime
+            .entries
+            .get(member)
+            .expect("inspected copied ELF member");
+        search_evidence.push(serde_json::json!({"member":entry,"search":search,"directory":directory,"copied_directory_present":present,"member_count":contents.len(),"members_sha256":hex::encode(Sha256::digest(serde_json::to_vec(&contents)?))}));
+        super::native_toolchain_search::declare(&mut declared, directory.clone())
+            .map_err(CiError::Message)?;
+    }
+    retain(
+        &output.join("toolchain-loader-search.json"),
+        &serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.original-toolchain-loader-search","revision":1,"target":cell.target,"observations":search_evidence}),
+        )?,
+    )?;
+    libraries = declared
+        .into_iter()
+        .map(|directory| PathBuf::from(format!("/{directory}")))
+        .collect();
     let runtime = runtime.definition(
         "owned-readiness-runtime",
         &cell.target,

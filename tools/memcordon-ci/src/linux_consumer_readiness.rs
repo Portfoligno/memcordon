@@ -132,10 +132,13 @@ pub fn normalize_native_recovery_harness(
     }
     let executable_bytes = measured(&bundle.join(&build.executable), 512 * 1024 * 1024)?;
     let executable_sha256 = hex::encode(Sha256::digest(executable_bytes));
-    if source_artifact.length > 16 * 1024 * 1024 {
+    if source_artifact.length > crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64 {
         return Err("native recovery selected source archive exceeds measured bound".into());
     }
-    let source = measured(&bundle.join(&source_artifact.path), 16 * 1024 * 1024)?;
+    let source = measured(
+        &bundle.join(&source_artifact.path),
+        crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64,
+    )?;
     if source.len() as u64 != source_artifact.length
         || hex::encode(Sha256::digest(&source)) != source_artifact.sha256
         || source_artifact.sha256 != identity.source_tree_sha256
@@ -452,7 +455,10 @@ pub fn normalize_native_harness_with_fixture(
     };
     let executable_bytes = measured(&bundle.join(executable), 512 * 1024 * 1024)?;
     let executable_sha = hex::encode(Sha256::digest(executable_bytes));
-    let source = measured(&bundle.join(&source_artifact.path), 16 * 1024 * 1024)?;
+    let source = measured(
+        &bundle.join(&source_artifact.path),
+        crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64,
+    )?;
     if source.len() as u64 != source_artifact.length
         || hex::encode(Sha256::digest(&source)) != source_artifact.sha256
         || source_artifact.sha256 != identity.source_tree_sha256
