@@ -658,6 +658,10 @@ pub(crate) fn validate_owned_frontend_launch(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independently retained account files, acquisition intent, owner and lease evidence"
+)]
 fn validate_account(
     account: &Value,
     intent: &Value,
@@ -682,6 +686,10 @@ fn validate_account(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independently retained account files, acquisition intent, owner and lease evidence"
+)]
 pub(crate) fn validate_owned_account(
     account: &Value,
     intent: &Value,

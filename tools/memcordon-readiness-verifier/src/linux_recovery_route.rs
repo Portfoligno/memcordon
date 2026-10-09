@@ -936,6 +936,10 @@ pub(crate) fn decode_journal(bytes: &[u8], attempt: &str) -> VerificationResult<
     Ok(record)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare original recovery carrier, request, preparation and native observations independently"
+)]
 fn validate_completed(
     carrier: &Value,
     request: &Value,

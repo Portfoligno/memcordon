@@ -35,9 +35,9 @@ pub fn populate(
     let name = format!("mc-ready-{number:x}");
     let identity = serde_json::to_value(identity).unwrap();
     let cell = serde_json::to_value(cell).unwrap();
-    let directory = std::path::Path::new(artifact_root).join(prefix);
+    let directory = format!("{artifact_root}/{prefix}");
     let leaf = |name: &str| format!("{prefix}/{name}");
-    let account = json!({"name":name,"uid":61002,"gid":61002,"intent":directory.join("exclusive-account-intent.json"),"native_readback":directory.join("exclusive-account-getent.bin"),"group_readback":directory.join("exclusive-group-getent.bin")});
+    let account = json!({"name":name,"uid":61002,"gid":61002,"intent":format!("{directory}/exclusive-account-intent.json"),"native_readback":format!("{directory}/exclusive-account-getent.bin"),"group_readback":format!("{directory}/exclusive-group-getent.bin")});
     let intent = json!({"format":"memcordon.owned-readiness-account-intent","revision":2,"run_id":case.record.run_id,"cell":cell,"account_name":name,"native_absence_verified":true,"creation_attempted":true,"purpose":"other-attempt-abstract-peer"});
     let intent_bytes = serde_json::to_vec(&intent).unwrap();
     case.write(&leaf("exclusive-account-intent.json"), &intent_bytes);
@@ -60,16 +60,8 @@ pub fn populate(
     case.write(&leaf("exclusive-account-useradd-stdout.bin"), b"");
     case.write(&leaf("exclusive-account-useradd-stderr.bin"), b"");
     case.json(&leaf("exclusive-account-useradd-exit.json"),&json!({"format":"memcordon.owned-readiness-account-creation-exit","revision":1,"held":{"pid":880,"birth":birth,"parent_pid":null,"parent_birth":null,"retirement_observed":true},"raw_wait_status":0,"native_exit":0,"signal":null,"invocation_sha256":sha256(&bytes),"stdout_sha256":sha256(b""),"stderr_sha256":sha256(b"")}));
-    let retirement_parent = std::path::Path::new(prefix)
-        .parent()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let cwd = std::path::Path::new(artifact_root)
-        .join(retirement_parent)
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let retirement_parent = prefix.rsplit_once('/').unwrap().0;
+    let cwd = format!("{artifact_root}/{retirement_parent}");
     let census_leaf = "account-task-census-1.json";
     let status = b"Tgid:\t106\nPid:\t106\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nGroups:\t0\n";
     case.json(&format!("{retirement_parent}/{census_leaf}"),&json!({"format":"memcordon.linux-cross-account-task-census","revision":1,"uid":61002,"gid":61002,"tasks":[{"process_id":106,"task_id":106,"status":status.as_slice(),"credentials":[vec![0;4],vec![0;4],vec![0]]}]}));

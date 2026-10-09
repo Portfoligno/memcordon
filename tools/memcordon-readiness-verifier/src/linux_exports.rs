@@ -259,14 +259,13 @@ pub(crate) fn verify_export(
         "concurrent-writer" => Some("writer-held.json"),
         _ => None,
     };
-    if let Some(leaf) = controller_leaf {
-        if e.controller_setup.as_deref() != Some(format!("{prefix}/{leaf}").as_str())
-            || row["controller_setup"] != format!("{directory}/{leaf}")
-        {
-            return Err(
-                "export actual controller native/archive path crosses original scenario".into(),
-            );
-        }
+    if let Some(leaf) = controller_leaf
+        && (e.controller_setup.as_deref() != Some(format!("{prefix}/{leaf}").as_str())
+            || row["controller_setup"] != format!("{directory}/{leaf}"))
+    {
+        return Err(
+            "export actual controller native/archive path crosses original scenario".into(),
+        );
     }
     for (field, path) in &e.recovery_artifacts {
         let leaf = if field == "original_journal" {

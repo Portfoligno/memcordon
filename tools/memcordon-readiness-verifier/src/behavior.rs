@@ -672,12 +672,10 @@ fn validate_in_scope(
                 check_peer(&peers, "tcp-peer-received", &request, custody)?;
                 facts.operations.insert("http-exchange".into());
             }
-            "sentinel-handles-excluded" => {
-                if event.value == 1u32.to_le_bytes() {
-                    facts.operations.extend(
-                        ["frontend-sentinel-held", "sentinel-not-inherited"].map(String::from),
-                    );
-                }
+            "sentinel-handles-excluded" if event.value == 1u32.to_le_bytes() => {
+                facts
+                    .operations
+                    .extend(["frontend-sentinel-held", "sentinel-not-inherited"].map(String::from));
             }
             _ => {}
         }
@@ -1312,29 +1310,26 @@ fn linux(
             }
             facts.operations.insert("unix-abstract-exchange".into());
         }
-        if row["operation"] == "same-attempt-cooperation-held" {
-            if cooperation_held
+        if row["operation"] == "same-attempt-cooperation-held"
+            && cooperation_held
                 .replace(row["observation"].clone())
                 .is_some()
-            {
-                return Err("cooperation live barrier repeated".into());
-            }
+        {
+            return Err("cooperation live barrier repeated".into());
         }
-        if row["operation"] == "same-attempt-cooperation-complete" {
-            if cooperation_complete
+        if row["operation"] == "same-attempt-cooperation-complete"
+            && cooperation_complete
                 .replace(row["observation"].clone())
                 .is_some()
-            {
-                return Err("cooperation completion repeated".into());
-            }
+        {
+            return Err("cooperation completion repeated".into());
         }
-        if row["operation"] == "root-exiting-before-held-descendant" {
-            if root_first_child
+        if row["operation"] == "root-exiting-before-held-descendant"
+            && root_first_child
                 .replace(row["observation"].clone())
                 .is_some()
-            {
-                return Err("root-first fixture repeated its held descendant identity".into());
-            }
+        {
+            return Err("root-first fixture repeated its held descendant identity".into());
         }
         if row["operation"] == "private-unix-pair-positive"
             && private_unix_positive
@@ -1350,16 +1345,14 @@ fn linux(
         {
             return Err("native descriptor isolation probe repeated".into());
         }
-        if row["operation"] == "forbidden-tcp-denied"
+        if (row["operation"] == "forbidden-tcp-denied"
             || row["operation"] == "forbidden-abstract-denied"
-            || row["operation"] == "forbidden-unix-path-denied"
-        {
-            if host_denial
+            || row["operation"] == "forbidden-unix-path-denied")
+            && host_denial
                 .replace((row["operation"].clone(), row["observation"].clone()))
                 .is_some()
-            {
-                return Err("host authority probe repeated its native denial".into());
-            }
+        {
+            return Err("host authority probe repeated its native denial".into());
         }
         if row["operation"] == "native-argv-observed"
             && argv_observation

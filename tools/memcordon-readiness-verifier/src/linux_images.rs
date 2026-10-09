@@ -349,10 +349,8 @@ fn elf_startup(bytes: &[u8]) -> VerificationResult<ElfStartup> {
                     return Err("ELF has duplicate dynamic segment".into());
                 }
             }
-            3 => {
-                if interpreter.replace(string(number(offset)?)?).is_some() {
-                    return Err("ELF has duplicate interpreter".into());
-                }
+            3 if interpreter.replace(string(number(offset)?)?).is_some() => {
+                return Err("ELF has duplicate interpreter".into());
             }
             _ => {}
         }
@@ -424,6 +422,10 @@ fn elf_startup(bytes: &[u8]) -> VerificationResult<ElfStartup> {
 }
 
 /// Verify captured command bytes and native wait independently; exit alone is insufficient.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 pub fn validate_linux_image_command(
     command: &Value,
     native: &Value,
@@ -449,6 +451,10 @@ pub fn validate_linux_image_command(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 pub(crate) fn validate_linux_image_native_command(
     command: &Value,
     native: &Value,
@@ -710,10 +716,10 @@ pub fn validate_linux_image_mutation(
             {
                 return Err("native source member captured bytes differ".into());
             }
-            if let Some(before) = baseline_bytes {
-                if entry(baseline, path)?["sha256"] != crate::sha256(before) {
-                    return Err("captured baseline member differs from image".into());
-                }
+            if let Some(before) = baseline_bytes
+                && entry(baseline, path)?["sha256"] != crate::sha256(before)
+            {
+                return Err("captured baseline member differs from image".into());
             }
         } else if !member["bytes"].is_null() || !member["baseline_bytes"].is_null() {
             return Err("selected native source member bytes not retained".into());
@@ -1658,6 +1664,10 @@ pub(crate) fn owned_exclusive_declaration_reference(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 fn verify_preparation(
     record: &crate::CaseRecord,
     evidence: &LinuxImageImportEvidence,

@@ -437,6 +437,10 @@ fn known_requirement(kind: &str, linux: bool) -> bool {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep result bytes, public request, native observation and custody as independent comparison inputs"
+)]
 pub(crate) fn validate_result(
     bytes: &[u8],
     terminal: Option<&[u8]>,
@@ -711,10 +715,10 @@ pub(crate) fn validate_windows_loss(
         .ok_or("external loss artifact crosswalk absent")?;
     custody.bytes(&loss.stdout)?;
     custody.bytes(&loss.stderr)?;
-    if let Some(path) = &loss.capture_failure {
-        if custody.bytes(path)?.is_empty() {
-            return Err("empty loss capture failure".into());
-        }
+    if let Some(path) = &loss.capture_failure
+        && custody.bytes(path)?.is_empty()
+    {
+        return Err("empty loss capture failure".into());
     }
     let action = json(custody.bytes(&loss.action)?)?;
     object(
@@ -1527,14 +1531,13 @@ fn validate_loss_terminal(
         .and_then(|loss| loss.original_result.as_deref())
     {
         let original = json(custody.bytes(path)?)?;
-        if let Some(cause) = original.pointer("/diagnostics/original") {
-            if let Some(recovered_cause) = terminal.pointer("/payload/primary_failure") {
-                if cause != recovered_cause {
-                    return Err(
-                        "recovered closure replaced retained immutable original first cause".into(),
-                    );
-                }
-            }
+        if let Some(cause) = original.pointer("/diagnostics/original")
+            && let Some(recovered_cause) = terminal.pointer("/payload/primary_failure")
+            && cause != recovered_cause
+        {
+            return Err(
+                "recovered closure replaced retained immutable original first cause".into(),
+            );
         }
     }
     let provider_request = custody.bytes(
@@ -2403,7 +2406,7 @@ fn validate_windows_record_v4(record: &Value) -> VerificationResult<()> {
 }
 
 fn validate_windows_fixture_record(record: &Value) -> VerificationResult<()> {
-    if number(record, "record_revision")? != 0 || text(record, "integrity_sha256")? != "" {
+    if number(record, "record_revision")? != 0 || !text(record, "integrity_sha256")?.is_empty() {
         return Err("component fixture was promoted to durable native authority".into());
     }
     validate_windows_record_fields(record, false)
@@ -2938,10 +2941,10 @@ pub(crate) fn validate_windows_delivery_and_sample(
     if text(proof, "source")? == "guardian-recovery" {
         digest(text(proof, "guardian_receipt_sha256")?)?;
     }
-    if text(proof, "source")? == "prior-boot" {
-        if text(proof, "current_boot_id")? == text(proof, "original_boot_id")? {
-            return Err("prior-boot proof uses current original boot".into());
-        }
+    if text(proof, "source")? == "prior-boot"
+        && text(proof, "current_boot_id")? == text(proof, "original_boot_id")?
+    {
+        return Err("prior-boot proof uses current original boot".into());
     }
     let payload = terminal.get("payload").ok_or("terminal payload missing")?;
     match text(payload, "kind")? {
@@ -3575,21 +3578,24 @@ pub(crate) fn validate_original_failure(original: &Value) -> VerificationResult<
     if let Some(reference) = event
         .get("terminalization_reference")
         .filter(|value| !value.is_null())
+        && reference != "first-error"
     {
-        if reference != "first-error" {
-            object(reference, &["secondary-error"], &[])?;
-            let secondary = reference
-                .get("secondary-error")
-                .ok_or("unknown terminalization reference")?;
-            object(secondary, &["index"], &[])?;
-            if number(secondary, "index")? > u64::from(u8::MAX) {
-                return Err("terminalization reference index out of bounds".into());
-            }
+        object(reference, &["secondary-error"], &[])?;
+        let secondary = reference
+            .get("secondary-error")
+            .ok_or("unknown terminalization reference")?;
+        object(secondary, &["index"], &[])?;
+        if number(secondary, "index")? > u64::from(u8::MAX) {
+            return Err("terminalization reference index out of bounds".into());
         }
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep result bytes, public request, native observation and custody as independent comparison inputs"
+)]
 fn validate_linux_v2(
     result: &Value,
     request_bytes: &[u8],
@@ -4751,6 +4757,10 @@ pub(crate) fn validate_mixed_public_arguments_and_deadline(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep result bytes, public request, native observation and custody as independent comparison inputs"
+)]
 fn validate_mixed_arguments(
     bytes: &[u8],
     request_bytes: &[u8],

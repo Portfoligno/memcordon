@@ -3,6 +3,9 @@ use super::persisted_case::PersistedCase;
 use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
+// Wire evidence describes Linux acquisition; the host TempDir only stores bytes.
+pub const EVIDENCE_ROOT: &str = "/retained-linux-acquisition";
+
 pub fn installed(family: &str, scenario: &str) -> PersistedCase {
     let root = tempfile::tempdir().unwrap();
     let target = "x86_64-unknown-linux-gnu";
@@ -77,15 +80,12 @@ pub fn installed(family: &str, scenario: &str) -> PersistedCase {
         &json!({"format":"memcordon.sealed-runtime.manifest","revision":1}),
     );
     let identity = json!({"run_id":"decoder-run","source_commit":source,"source_tree_sha256":tree,"version":version});
-    let admin = format!("{}/original-admin", case.root.path().display());
-    let output = format!(
-        "{}/installed/mixed-cases/image-cases",
-        case.root.path().display()
-    );
+    let admin = format!("{EVIDENCE_ROOT}/original-admin");
+    let output = format!("{EVIDENCE_ROOT}/installed/mixed-cases/image-cases");
     let account = json!({"name":"original-account","uid":61001,"gid":61001,"intent":"original-account-intent","native_readback":"original-account-readback","group_readback":"original-group-readback"});
     let owner = json!({"format":"memcordon.linux-image-case-owner","revision":1,"identity":identity,"cell":cell,"lease_id":"original-lease","provider":{"generation":format!("{version}:{source}"),"source_commit":source,"runtime_manifest_sha256":sha256(&serde_json::to_vec(&json!({"format":"memcordon.sealed-runtime.manifest","revision":1})).unwrap())},"account":account,"expected_agent_sha256":sha256(b"original agent image"),"output":output,"admin_root":admin,"image_admin_root":format!("{admin}/image-cases/original-lease"),"admin_root_device":7,"admin_root_inode":8,"work_deadline_unix_millis":100,"cleanup_deadline_unix_millis":200});
     case.json("installed/mixed-cases/image-cases/owner.json", &owner);
-    case.json("installed/lease-owner.json",&json!({"format":"memcordon.consumer-readiness.linux-lease-owner","revision":1,"identity":identity,"cell":cell,"admin_root":admin,"device":7,"inode":8,"cleanup_agent":"/usr/libexec/memcordon-sealed-agent","cleanup_agent_sha256":sha256(b"original agent image"),"legacy":null,"lease_id":"original-lease","artifact_root":case.root.path(),"work_deadline_unix_millis":100,"cleanup_deadline_unix_millis":200}));
+    case.json("installed/lease-owner.json",&json!({"format":"memcordon.consumer-readiness.linux-lease-owner","revision":1,"identity":identity,"cell":cell,"admin_root":admin,"device":7,"inode":8,"cleanup_agent":"/usr/libexec/memcordon-sealed-agent","cleanup_agent_sha256":sha256(b"original agent image"),"legacy":null,"lease_id":"original-lease","artifact_root":EVIDENCE_ROOT,"work_deadline_unix_millis":100,"cleanup_deadline_unix_millis":200}));
     case.json(
         "installed/root-acquisition.json",
         &json!({"path":admin,"device":7,"inode":8}),

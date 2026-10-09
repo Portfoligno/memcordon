@@ -115,6 +115,51 @@ fn complete_original_three_hostile_input_imports() {
 }
 
 #[test]
+fn importer_rejects_rehashed_sibling_prefix_authority() {
+    let mut case = linux_import_case::baseline("input-socket");
+    let evidence = linux_installed_case::read(&case, "case-evidence.json");
+    let owner_path = evidence["owner"].as_str().unwrap();
+    let owner = linux_installed_case::read(&case, owner_path);
+    let authority = owner["admin_root"].as_str().unwrap();
+    // The submitted definition starts with this text, but is not its child.
+    let sibling_prefix = authority.strip_suffix("-admin").unwrap();
+    for field in ["owner", "original_lease", "acquisition"] {
+        case.mutate(evidence[field].as_str().unwrap(), |raw| {
+            raw["admin_root"] = json!(sibling_prefix);
+        });
+    }
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "isolation importer native source escapes original protected authority"
+    );
+}
+
+#[test]
+fn importer_rejects_rehashed_source_parent_traversal() {
+    let mut case = linux_import_case::baseline("input-socket");
+    let intent = linux_installed_case::read(&case, "import-intent.json");
+    let source = format!("{}/../foreign", intent["source_root"].as_str().unwrap());
+    case.mutate("import-intent.json", |raw| {
+        raw["source_root"] = json!(source)
+    });
+    let mut command = linux_installed_case::read(&case, "import/invocation.json");
+    command["argv"][7] = json!(source);
+    linux_import_case::command_graph(
+        &mut case,
+        "import",
+        command,
+        800,
+        900,
+        1,
+        json!({"error":"original native hostile source refused"}),
+    );
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "isolation importer native source escapes original protected authority"
+    );
+}
+
+#[test]
 fn complete_original_private_abstract_positive() {
     let mut case = linux_isolation_case::own_abstract();
     case.validate().unwrap();

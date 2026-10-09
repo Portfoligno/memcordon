@@ -305,6 +305,10 @@ pub struct LinuxRecoveryCommandProcess {
     pub retirement: LinuxRecoveryProcessRetirement,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare original recovery intent, native process, retained ownership and cleanup bounds independently"
+)]
 pub fn validate_linux_recovery_command_process(
     invocation: &LinuxRecoveryInvocation,
     process: &LinuxRecoveryCommandProcess,
@@ -482,6 +486,10 @@ pub struct LinuxRecoveredOwnership {
     pub tasks: Vec<LinuxRecoveryTask>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare original recovery intent, native process, retained ownership and cleanup bounds independently"
+)]
 pub fn validate_linux_recovered_ownership(
     recovered: &LinuxRecoveredOwnership,
     ownership: &LinuxRecoveryOwnership,
@@ -916,6 +924,10 @@ pub struct LinuxLostTerminalReceipt {
 
 /// This validates the actual failed write association, not completed execution
 /// or recovery. The original carrier and recovery obligations remain mandatory.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare original recovery intent, native process, retained ownership and cleanup bounds independently"
+)]
 pub fn validate_linux_lost_terminal_delivery(
     receipt: &LinuxLostTerminalReceipt,
     run_id: &str,
@@ -999,6 +1011,10 @@ pub struct LinuxCrashExit {
     pub caller_pidfd_retirements: Vec<LinuxRecoveryProcess>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare original recovery intent, native process, retained ownership and cleanup bounds independently"
+)]
 pub fn validate_linux_crash_controller(
     intent: &LinuxCrashIntent,
     exit: &LinuxCrashExit,

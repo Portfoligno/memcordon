@@ -2,6 +2,10 @@
 use crate::*;
 use serde_json::Value;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind refusal census to independent identity, cell, account, provider and request/result digests"
+)]
 pub(crate) fn validate_linux_refusal_census(
     census: &Value,
     identity: &Value,

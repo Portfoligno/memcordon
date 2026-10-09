@@ -62,7 +62,7 @@ pub fn inspect(
         || header[6] != 1
         || u16_at(&header, 18) != machine
         || u32_at(&header, 20) != 1
-        || !matches!(u16_at(&header, 16), 1 | 2 | 3)
+        || !matches!(u16_at(&header, 16), 1..=3)
         || u16_at(&header, 52) != 64
     {
         return Err("ELF native class/ABI/header differs".into());
@@ -115,7 +115,7 @@ pub fn inspect(
                 }
             }
             3 => {
-                if interpreter.is_some() || size < 2 || size > 4096 {
+                if interpreter.is_some() || !(2..=4096).contains(&size) {
                     return Err("ELF interpreter segment is duplicate or excessive".into());
                 }
                 let mut bytes = vec![0; size as usize];

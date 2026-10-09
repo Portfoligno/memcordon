@@ -165,7 +165,7 @@ fn validate_producer_bundle(
         }
     }
     let manifest_bytes = {
-        let mut member = archive
+        let member = archive
             .by_name("producer-manifest.json")
             .map_err(|_| "producer archive lacks immutable original manifest")?;
         if member.is_dir() || member.size() > MAX_INDEX_BYTES as u64 {
@@ -220,7 +220,7 @@ fn validate_producer_bundle(
         if expected.len() as u64 != artifact.length || sha256(expected) != artifact.sha256 {
             return Err("producer raw artifact table differs from assessed bytes".into());
         }
-        let mut member = archive
+        let member = archive
             .by_name(&artifact.path)
             .map_err(|_| "assessed raw artifact absent from actual producer ZIP")?;
         if member.is_dir() || member.size() != artifact.length {
@@ -1938,6 +1938,10 @@ pub fn validate_linux_endpoint_mismatch(
 /// sources; they do not imply a target, Job, guardian or terminal existed.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct typed refusal wire payloads and their public constructors"
+)]
 pub enum WindowsRefusalEvidence {
     AuthenticatedAdmission {
         provider_request: String,
@@ -2279,6 +2283,10 @@ pub struct WindowsNativeComponentReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct typed component wire payloads and their public constructors"
+)]
 pub enum WindowsNativeComponentPayload {
     CausalCapture {
         before_journal: String,
@@ -4297,17 +4305,13 @@ fn verify_linux_policy_refusal(
             .ok_or("discovery public contract path absent")?;
         let contract_path = std::str::from_utf8(contract_path)
             .map_err(|_| "discovery contract path is not UTF8")?;
-        let expected_path = std::path::Path::new(contract_path)
-            .parent()
+        // This is retained Linux command wire, independent of the verifier host.
+        let parent = contract_path
+            .rsplit_once('/')
             .ok_or("discovery contract parent absent")?
-            .join("discovery-contract.json");
-        if arguments.last().map(Vec::as_slice)
-            != Some(
-                expected_path
-                    .to_str()
-                    .ok_or("discovery path is not UTF8")?
-                    .as_bytes(),
-            )
+            .0;
+        let expected_path = format!("{parent}/discovery-contract.json");
+        if arguments.last().map(Vec::as_slice) != Some(expected_path.as_bytes())
             || decode(&discovery.contract)? != requested
         {
             return Err("discovery command does not address original exact contract".into());
@@ -4835,18 +4839,20 @@ fn verify_record(
                         && record.key.scenario == "argv-nul-rejection")
                         || (record.key.family == "W-STATUS"
                             && record.key.scenario == "admission-refusal"));
-                if frontend_refusal {
-                    if native.root_pid.is_some()
+                if frontend_refusal
+                    && (native.root_pid.is_some()
                         || native.root_birth.is_some()
                         || native.target_status.is_some()
                         || native.authenticated_provider_exchange
                         || native.attempt_id.is_some()
                         || native.attempt_nonce.is_some()
                         || evidence.authenticated_terminal.is_some()
-                        || evidence.provider_request.is_some()
-                    {
-                        return Err("preauthorization facade refusal invents released target/provider terminal".into());
-                    }
+                        || evidence.provider_request.is_some())
+                {
+                    return Err(
+                        "preauthorization facade refusal invents released target/provider terminal"
+                            .into(),
+                    );
                 }
                 let actual_request = if !frontend_refusal
                     && (record.key.target.ends_with("windows-msvc")
@@ -5477,12 +5483,11 @@ fn verify_semantic(
     }
     wire::validate_arguments(&input.target_argv, &evidence.key.target)?;
     let mut operations = BTreeSet::new();
-    if let Some(behavior) = &semantic.fixture_behavior {
-        if evidence.key.target.ends_with("linux-gnu")
-            && behavior.native_binding != evidence.prepared_native_receipt
-        {
-            return Err("Linux behavior root binding differs from independent preauthorization native observation".into());
-        }
+    if let Some(behavior) = &semantic.fixture_behavior
+        && evidence.key.target.ends_with("linux-gnu")
+        && behavior.native_binding != evidence.prepared_native_receipt
+    {
+        return Err("Linux behavior root binding differs from independent preauthorization native observation".into());
     }
     let behavior_facts = semantic
         .fixture_behavior

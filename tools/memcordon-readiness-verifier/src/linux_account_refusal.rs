@@ -321,12 +321,10 @@ fn validate_external(
             );
         }
     }
-    if let Some(path) = &e.external_at_refusal {
-        if decode(path)? != *held {
-            return Err(
-                "account occupied original process differs at actual admission refusal".into(),
-            );
-        }
+    if let Some(path) = &e.external_at_refusal
+        && decode(path)? != *held
+    {
+        return Err("account occupied original process differs at actual admission refusal".into());
     }
     closed(
         &retired,
@@ -616,6 +614,10 @@ fn validate_reservation(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent occupied account, held process, policy and custody evidence"
+)]
 fn validate_scenario(
     e: &LinuxAccountRefusalEvidence,
     owner: &Value,

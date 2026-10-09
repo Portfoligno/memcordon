@@ -867,6 +867,10 @@ pub(crate) fn validate(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent running policy, native behavior, owner and retained custody observations"
+)]
 fn validate_restart(
     behavior: &FixtureBehavior,
     semantic: &SemanticObservation,

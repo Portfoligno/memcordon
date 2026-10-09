@@ -6,7 +6,7 @@ use memcordon_readiness_verifier::{
 };
 use serde_json::{Value, json};
 
-fn command_graph(
+pub fn command_graph(
     case: &mut PersistedCase,
     prefix: &str,
     command: Value,
@@ -15,13 +15,7 @@ fn command_graph(
     status: i32,
     stdout: Value,
 ) {
-    let path = |leaf: &str| {
-        std::path::Path::new(prefix)
-            .join(leaf)
-            .to_str()
-            .unwrap()
-            .to_owned()
-    };
+    let path = |leaf: &str| format!("{prefix}/{leaf}");
     case.json(&path("invocation.json"), &command);
     case.json(&path("stdout.json"), &stdout);
     case.write(&path("stderr.bin"), b"");
@@ -66,7 +60,7 @@ pub fn baseline(scenario: &str) -> PersistedCase {
             include_bytes!("../../../../tests/fixtures/linux_readiness/tests/generated_child.rs"),
         ),
     ];
-    let entries=files.iter().map(|(path,bytes)|json!({"kind":"regular","path":std::path::Path::new("owned-source").join(path),"sha256":sha256(bytes),"size":bytes.len(),"executable":false})).collect::<Vec<_>>();
+    let entries=files.iter().map(|(path,bytes)|json!({"kind":"regular","path":format!("owned-source/{path}"),"sha256":sha256(bytes),"size":bytes.len(),"executable":false})).collect::<Vec<_>>();
     let input = json!({"format":"memcordon.runtime-image","revision":1,"image_id":"input","target":case.record.key.target,"entries":entries,"entrypoints":[],"library_directories":[],"startup_environment":[]});
     let (contract, registry, activation) = installed::activation(
         &mut case,
@@ -82,11 +76,15 @@ pub fn baseline(scenario: &str) -> PersistedCase {
     case.json(&original.owner, &owner);
     case.json(&original.activation, &activation);
     case.json("import-contract.json", &contract);
-    let directory = case.root.path().join("installed/mixed-cases/import-recipe");
-    let source_path = directory.join("isolation-input-source");
-    let definition_path = std::path::Path::new(lease["admin_root"].as_str().unwrap())
-        .join("isolation-input-recipe")
-        .join("definition.json");
+    let directory = format!(
+        "{}/installed/mixed-cases/import-recipe",
+        installed::EVIDENCE_ROOT
+    );
+    let source_path = format!("{directory}/isolation-input-source");
+    let definition_path = format!(
+        "{}/isolation-input-recipe/definition.json",
+        lease["admin_root"].as_str().unwrap()
+    );
     let mut definition = input;
     definition["image_id"] = json!(format!("isolation-{scenario}-recipe"));
     case.json("import-definition.json", &definition);
@@ -148,7 +146,7 @@ pub fn baseline(scenario: &str) -> PersistedCase {
         intent["definition"],
         "--json"
     ]);
-    retirement["cwd"] = json!(directory.join("definition-retirement"));
+    retirement["cwd"] = json!(format!("{directory}/definition-retirement"));
     command_graph(
         &mut case,
         "import-retirement",

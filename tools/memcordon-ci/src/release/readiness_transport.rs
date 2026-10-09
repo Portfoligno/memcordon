@@ -478,6 +478,11 @@ pub fn download_producer(
         version: manifest.version,
         manifest_sha256: manifest.manifest_sha256,
     };
+    // Unix supports syncing directory entries. Windows has no equivalent
+    // directory FlushFileBuffers operation; every retained file was synced
+    // above. This download directory is scratch transport custody, not a
+    // recovery journal or an installed publication boundary.
+    #[cfg(unix)]
     fs::File::open(destination)?.sync_all()?;
     Ok(DownloadedProducer {
         origin,

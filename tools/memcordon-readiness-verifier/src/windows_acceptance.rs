@@ -199,12 +199,11 @@ pub(crate) fn validate_authenticated_refusal_case(
     let readback = journal
         .events
         .iter()
-        .filter(|event| {
+        .rfind(|event| {
             event.phase == "upgrade"
                 && event.operation == "actual-installed-package-readback"
                 && event.succeeded
         })
-        .last()
         .ok_or("Windows installed upgrade readback absent")?;
     let actual = json(&readback.native_receipt)?;
     let binaries = actual["binaries"]
@@ -720,12 +719,11 @@ pub(crate) fn validate_preprovider_refusal_case(
     let readback = lifecycle
         .events
         .iter()
-        .filter(|event| {
+        .rfind(|event| {
             event.phase == "upgrade"
                 && event.operation == "actual-installed-package-readback"
                 && event.succeeded
         })
-        .last()
         .ok_or("preprovider installed readback absent")?;
     let actual = json(&readback.native_receipt)?;
     let agents = actual["binaries"]
@@ -1114,6 +1112,10 @@ fn fields(value: &Value, required: &[&str]) -> VerificationResult<()> {
 
 /// Validates actual administrative command observations without interpreting
 /// them as a provider launch or a terminal retirement authority.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent policy, process and captured invocation observations"
+)]
 pub fn validate_prior_activation_command(
     invocation_bytes: &[u8],
     exit: &Value,
@@ -1744,6 +1746,10 @@ fn activation(value: &Value, registry: &Value) -> VerificationResult<()> {
 /// Pins only the four actual policy-refusal transformations. The caller must
 /// also validate the selected native provider rejection/request association,
 /// actual native quiescence and protected artifact custody.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent policy, process and captured invocation observations"
+)]
 pub fn validate_policy_refusal_mutation(
     scenario: &str,
     baseline_policy: &Value,

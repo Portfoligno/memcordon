@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 pub fn baseline() -> PersistedCase {
     let mut case = linux_installed_case::installed("L-ID-01", "v1-preserve-caller");
     let prefix = "installed/installed/frozen-legacy";
-    let root = case.root.path().display().to_string();
+    let root = linux_installed_case::EVIDENCE_ROOT;
     let fixture = b"original installed fixture";
     let fixture_hash = sha256(fixture);
     let old = linux_installed_case::read(&case, "installed/lease-owner.json");

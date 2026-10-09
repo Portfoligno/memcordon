@@ -54,11 +54,11 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         case.record.key.target,
         case.record.key.channel.as_deref().unwrap()
     );
-    let directory = format!("{}/{prefix}", case.root.path().display());
+    let directory = format!("{}/{prefix}", installed::EVIDENCE_ROOT);
     let path = |name: &str| format!("{prefix}/{name}");
     let frontend_directory = format!(
         "{}/installed/mixed-cases/recipe-0",
-        case.root.path().display()
+        installed::EVIDENCE_ROOT
     );
     let challenge = vec![7u8; 32];
     let mut argv = vec![

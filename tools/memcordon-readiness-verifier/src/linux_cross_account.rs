@@ -291,6 +291,10 @@ pub(crate) fn validate_creation(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind command custody to the independent account identity, cell, argv and native lifetime"
+)]
 fn command(
     bundle: &Value,
     parent: &str,

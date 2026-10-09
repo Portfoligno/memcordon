@@ -37,6 +37,10 @@ fn closed(value: &Value, fields: &[&str]) -> VerificationResult<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub fn validate_linux_lifecycle_intervention(
     key: &CaseKey,
     intent: &Value,
@@ -280,6 +284,10 @@ impl LinuxLifecycleLossEvidence {
 
 /// Check the original held family after recovery, independently of whether the
 /// interrupted frontend managed to publish a result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub fn validate_linux_lifecycle_family_settlement(
     raw: &Value,
     prepared: &Value,
@@ -431,6 +439,10 @@ pub fn validate_linux_lifecycle_family_settlement(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub(crate) fn validate_native_recovery(
     invocation: &Value,
     process: &Value,
@@ -629,10 +641,9 @@ pub(crate) fn validate_installed_owner(
         if original["identity"] == owner["identity"]
             && original["cell"] == owner["cell"]
             && original["lease_id"] == e.lease_id
+            && original_lease.replace(original).is_some()
         {
-            if original_lease.replace(original).is_some() {
-                return Err("lifecycle original acquired lease is ambiguous".into());
-            }
+            return Err("lifecycle original acquired lease is ambiguous".into());
         }
     }
     if original_lease.as_ref() != Some(&lease) {
