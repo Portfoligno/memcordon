@@ -45,6 +45,8 @@ pub mod linux_readiness_policy_cases;
 pub mod native_component_harness;
 #[cfg(target_os = "linux")]
 mod native_executable;
+#[cfg(target_os = "linux")]
+mod native_package_diagnostics;
 #[cfg(any(target_os = "linux", windows))]
 pub mod original_native_components;
 pub mod packages;

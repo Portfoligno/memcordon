@@ -681,7 +681,7 @@ impl NativeLinuxPackageLease {
         let uninstall_issued = match read(&output.join("native-package-uninstall-intent.json")) {
             Ok(record) => {
                 if record
-                    != serde_json::json!({"cleanup_agent_sha256":agent_sha256,"native_recovery_complete":true})
+                    != serde_json::json!({"cleanup_agent_sha256":agent_sha256,"owned_attempts_and_resources_settled":true})
                 {
                     return Err(CiError::Message(
                         "original native uninstall intent differs".into(),
@@ -699,7 +699,9 @@ impl NativeLinuxPackageLease {
                     && fields.contains_key("status")
                     && fields.contains_key("stdout")
                     && fields.contains_key("stderr")
-            }) {
+            }) || serde_json::from_value::<Vec<u8>>(capture["stdout"].clone()).is_err()
+                || serde_json::from_value::<Vec<u8>>(capture["stderr"].clone()).is_err()
+            {
                 return Err(CiError::Message(
                     "original native uninstall capture shape differs".into(),
                 ));
@@ -741,32 +743,10 @@ impl NativeLinuxPackageLease {
         };
         value.verify_agent()?;
         if install_issued {
-            if !uninstall_succeeded {
-                let recovered = CommandSpec::new(&value.agent, workspace, Duration::from_secs(300))
-                    .args(["package", "policy", "recover", "--json"])
-                    .bounded_until(cleanup)
-                    .output_quiet()?;
-                if !recovered.status.success() {
-                    return Err(CiError::Message(
-                        "original component native recovery remains unresolved".into(),
-                    ));
-                }
-            } else {
-                let recovery = read(&output.join("native-package-recovery.json"))?;
-                if !recovery.as_object().is_some_and(|fields| {
-                    fields.len() == 3
-                        && fields.contains_key("status")
-                        && fields.contains_key("stdout")
-                        && fields.contains_key("stderr")
-                }) || recovery["status"] != 0
-                    || serde_json::from_value::<Vec<u8>>(recovery["stdout"].clone()).is_err()
-                    || serde_json::from_value::<Vec<u8>>(recovery["stderr"].clone()).is_err()
-                {
-                    return Err(CiError::Message(
-                        "post-uninstall continuation lacks original successful recovery".into(),
-                    ));
-                }
-            }
+            // Reconstruct original resource custody before finalization. A
+            // successful accepted uninstall already includes its locked journal
+            // and native recovery gates; no retired public recovery command or
+            // synthetic standalone recovery receipt is part of this boundary.
             let resources = output.join("resources");
             match fs::symlink_metadata(&resources) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -951,15 +931,38 @@ impl NativeLinuxPackageLease {
         }
         self.verify_agent()?;
         let payload = &self.payload;
+        // Installation snapshots current_exe and its complete selected sibling
+        // graph. The independent cleanup copy intentionally has no such graph.
+        let _source_ancestry =
+            super::linux_native_component::protected_directory(&payload.directory)?;
+        let source_agent = binary_path(
+            &payload.directory,
+            "memcordon-sealed-agent",
+            &payload.distribution.target,
+        );
+        let source_image = super::native_executable::pin_install_image(&source_agent)?;
+        let held = source_image.metadata()?;
+        let named = fs::symlink_metadata(&source_agent)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino())
+            || artifacts::checksum(
+                &crate::linux_consumer_readiness::measured(&source_agent, 512 * 1024 * 1024)
+                    .map_err(CiError::Message)?,
+            ) != self.agent_sha256
+        {
+            return Err(CiError::Message(
+                "native install source agent identity differs".into(),
+            ));
+        }
         super::source::write_json(
             &self.output.join("native-package-install-intent.json"),
             &serde_json::json!({"source":identity,"cell":cell,"cleanup_agent_sha256":self.agent_sha256,"uninstall_required":true}),
         )?;
         self.install_issued = true;
-        let observed = CommandSpec::new(&self.agent, workspace, Duration::from_secs(300))
+        let observed = CommandSpec::new(&source_agent, workspace, Duration::from_secs(300))
             .args(["package", "install"])
             .bounded_until(work)
             .output_quiet()?;
+        drop(source_image);
         let success = observed.status.success();
         super::source::write_json(
             &self.output.join("native-package-install.json"),
@@ -967,8 +970,11 @@ impl NativeLinuxPackageLease {
         )?;
         if !success {
             return Err(CiError::Message(
-                "native component selected package install failed; owner retains finalization"
-                    .into(),
+                super::native_package_diagnostics::install_failure(
+                    observed.status.code(),
+                    &observed.stdout,
+                    &observed.stderr,
+                ),
             ));
         }
         for binary in &payload.distribution.binaries {
@@ -1051,39 +1057,15 @@ impl NativeLinuxPackageLease {
         if let Err(error) = self.driver.finalize_owned_attempts(cleanup) {
             current.push(error.to_string());
         }
-        let agent_verified = match self.verify_agent() {
-            Ok(()) => true,
-            Err(error) => {
-                current.push(error.to_string());
-                false
-            }
-        };
+        if let Err(error) = self.verify_agent() {
+            current.push(error.to_string());
+        }
         let payload = &self.payload;
         if self.install_issued {
-            if agent_verified && !self.uninstall_succeeded {
-                match CommandSpec::new(&self.agent, workspace, Duration::from_secs(300))
-                    .args(["package", "policy", "recover", "--json"])
-                    .bounded_until(cleanup)
-                    .output_quiet()
-                {
-                    Ok(recovered) => {
-                        let success = recovered.status.success();
-                        if let Err(error) = super::source::write_json(
-                            &self.output.join("native-package-recovery.json"),
-                            &serde_json::json!({"status":recovered.status.code(),"stdout":recovered.stdout,"stderr":recovered.stderr}),
-                        ) {
-                            current.push(error.to_string());
-                        }
-                        if !success {
-                            current.push(
-                                "original native package recovery retains unresolved obligations"
-                                    .into(),
-                            );
-                        }
-                    }
-                    Err(error) => current.push(error.to_string()),
-                }
-            }
+            // Owned attempts and resources settle here. The accepted package
+            // uninstall performs locked journal/native recovery and refuses live
+            // or ambiguous attempts before removal; the public recover route is
+            // retired and cannot authorize this cleanup.
             if current.is_empty() && !self.resources_retired {
                 let resource_stage = (|| -> Result<()> {
                     match fs::symlink_metadata(self.output.join("resources")) {
@@ -1121,7 +1103,7 @@ impl NativeLinuxPackageLease {
                 let uninstall = (|| -> Result<()> {
                     super::source::write_json(
                         &self.output.join("native-package-uninstall-intent.json"),
-                        &serde_json::json!({"cleanup_agent_sha256":self.agent_sha256,"native_recovery_complete":true}),
+                        &serde_json::json!({"cleanup_agent_sha256":self.agent_sha256,"owned_attempts_and_resources_settled":true}),
                     )?;
                     self.uninstall_issued = true;
                     let observed =

@@ -73,3 +73,26 @@ fn read_only_handoff_refuses_replaced_inode_and_symlink() {
         }
     }
 }
+
+#[test]
+fn install_image_requires_exact_source_mode_and_single_regular_link() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected-agent");
+    std::fs::write(&path, b"selected original bytes").unwrap();
+    for mode in [0o555, 0o775, 0o4755] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(native_executable::pin_install_image(&path).is_err());
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pinned = native_executable::pin_install_image(&path).unwrap();
+    assert_eq!(
+        pinned.metadata().unwrap().ino(),
+        std::fs::metadata(&path).unwrap().ino()
+    );
+    let link = root.path().join("hard-link");
+    std::fs::hard_link(&path, &link).unwrap();
+    assert!(native_executable::pin_install_image(&path).is_err());
+    let symlink = root.path().join("symlink");
+    std::os::unix::fs::symlink(&path, &symlink).unwrap();
+    assert!(native_executable::pin_install_image(&symlink).is_err());
+}
