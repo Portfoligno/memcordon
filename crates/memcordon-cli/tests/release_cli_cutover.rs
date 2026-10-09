@@ -30,6 +30,35 @@ fn original_registry_restoration_uses_the_accepted_apply_boundary() {
 }
 
 #[test]
+fn linux_owned_image_retirement_reaches_only_its_exact_operational_dispatch() {
+    let arguments = [
+        "package",
+        "policy",
+        "image",
+        "retire",
+        "--definition",
+        "/protected/original-image.json",
+        "--json",
+    ];
+    assert!(!denied(ReleasePlatform::Linux, &arguments));
+    assert!(denied(ReleasePlatform::Windows, &arguments));
+    assert!(denied(ReleasePlatform::Other, &arguments));
+    assert!(denied(ReleasePlatform::Linux, &arguments[..6]));
+    for (index, replacement) in [(3, "recover"), (4, "--source-root"), (6, "--force")] {
+        let mut wrong = arguments;
+        wrong[index] = replacement;
+        assert!(denied(ReleasePlatform::Linux, &wrong));
+    }
+    let mut extra = arguments.to_vec();
+    extra.push("--force");
+    assert!(denied(ReleasePlatform::Linux, &extra));
+    assert!(denied(
+        ReleasePlatform::Linux,
+        &["package", "policy", "recover", "--json"]
+    ));
+}
+
+#[test]
 fn linux_protected_image_install_reaches_its_existing_operational_dispatch() {
     let arguments = [
         "package",
