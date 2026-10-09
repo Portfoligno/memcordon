@@ -38,6 +38,8 @@ pub mod windows_installed_cases;
 pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
+#[cfg(windows)]
+mod windows_readiness_acl;
 pub mod windows_readiness_adapter;
 pub mod windows_readiness_capacity;
 pub mod windows_readiness_components;

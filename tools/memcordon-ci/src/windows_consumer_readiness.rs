@@ -1649,8 +1649,8 @@ pub(crate) mod native {
             SE_FILE_OBJECT, SetNamedSecurityInfoW,
         };
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-            PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            IsValidAcl, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
         let sddl: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut security = std::ptr::null_mut();
@@ -1715,22 +1715,35 @@ pub(crate) mod native {
             if status != 0 {
                 return Err(io::Error::from_raw_os_error(status as i32).into());
             }
-            // SAFETY: both ACL pointers were returned by validated native descriptor APIs.
-            let equal = unsafe {
-                !actual_acl.is_null()
-                    && (*actual_acl).AclSize == (*acl).AclSize
-                    && std::slice::from_raw_parts(
-                        actual_acl.cast::<u8>(),
-                        (*actual_acl).AclSize as usize,
-                    ) == std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize)
+            let mut control = 0;
+            let mut revision = 0;
+            // SAFETY: descriptor/ACL pointers are owned API outputs, valid until
+            // LocalFree. Native validation precedes every bounded ACL slice.
+            let comparison = unsafe {
+                if actual_acl.is_null() || IsValidAcl(acl) == 0 || IsValidAcl(actual_acl) == 0 {
+                    Err("native readiness DACL is absent or malformed".to_owned())
+                } else if GetSecurityDescriptorControl(actual_security, &mut control, &mut revision)
+                    == 0
+                {
+                    Err(io::Error::last_os_error().to_string())
+                } else {
+                    crate::windows_readiness_acl::verify_file_dacl(
+                        std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize),
+                        std::slice::from_raw_parts(
+                            actual_acl.cast::<u8>(),
+                            (*actual_acl).AclSize as usize,
+                        ),
+                        control & SE_DACL_PROTECTED != 0,
+                    )
+                }
             };
             // SAFETY: GetNamedSecurityInfoW allocated this independent descriptor.
             unsafe { LocalFree(actual_security) };
-            if !equal {
-                return Err(CiError::Message(
-                    "native readiness directory DACL readback differs".into(),
-                ));
-            }
+            comparison.map_err(|detail| {
+                CiError::Message(format!(
+                    "native readiness directory DACL readback differs: {detail}"
+                ))
+            })?;
             Ok(())
         })();
         // SAFETY: conversion allocated this one security descriptor with LocalAlloc.
