@@ -1203,6 +1203,7 @@ pub fn run_cli_case(
 pub fn run_materialized_channel(
     root: &Path,
     payload: &MaterializedPayload,
+    predecessor: Option<&MaterializedPayload>,
     output: &Path,
 ) -> Result<()> {
     fs::create_dir(output)?;
@@ -1278,8 +1279,38 @@ pub fn run_materialized_channel(
             &installed,
             output.join("windows-installed"),
         )?;
-        crate::windows_consumer_readiness::provision_from_source(root, &config)?;
-        let assessment = crate::windows_installed_cases::run_cases_for_installed_payload(&config)?;
+        let predecessor = predecessor.ok_or_else(|| {
+            CiError::Message(
+                "installed Windows lifecycle requires its acquired rc19 predecessor".into(),
+            )
+        })?;
+        let older = crate::windows_installed_cases::InstalledWindowsPayload::from_materialized(
+            predecessor.channel,
+            &predecessor.source,
+            &predecessor.distribution,
+            predecessor.artifacts.clone(),
+            &predecessor.directory,
+            predecessor.fixture.clone(),
+            &installed,
+            output.join("windows-predecessor"),
+        )?;
+        fs::create_dir_all(&config.output_directory)?;
+        source::write_json(
+            &config
+                .output_directory
+                .join("windows-upgrade-predecessor.json"),
+            &crate::windows_installed_cases::WindowsUpgradePredecessor {
+                format: "memcordon.windows-upgrade-predecessor".into(),
+                revision: 1,
+                payload: older,
+            },
+        )?;
+        let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
+            root,
+            &config,
+            &mut |_| Ok(()),
+            crate::windows_installed_cases::WindowsLeaseDeadlines::finite_default(),
+        )?;
         source::write_json(&output.join("windows-assessment.json"), &assessment)?;
         if !assessment.accepted() {
             return Err(CiError::Message(format!(
@@ -1442,7 +1473,26 @@ pub fn run_channel_with_external(
                 )?
             }
         };
-        run_materialized_channel(root, &payload, &destination.join("cases"))?;
+        let predecessor = if payload.distribution.runtime_selection()?
+            == super::distribution::RuntimeSelection::WindowsSealed
+        {
+            Some(acquire_cargo_predecessor(
+                root,
+                target_directory,
+                &bundle,
+                destination,
+                &destination.join("predecessor"),
+                std::time::Instant::now() + Duration::from_secs(7200),
+            )?)
+        } else {
+            None
+        };
+        run_materialized_channel(
+            root,
+            &payload,
+            predecessor.as_ref(),
+            &destination.join("cases"),
+        )?;
         if let Some(input) = external_input {
             let spec = crate::external_consumer::ExternalConsumerSpec::parse(
                 &super::artifacts::read_file(input)?,

@@ -272,15 +272,8 @@ pub fn copy_compiler_artifact(
     destination: &Path,
     expected: &str,
 ) -> crate::Result<HeldWindowsArtifact> {
-    use std::{
-        fs::OpenOptions,
-        io::Read,
-        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        GetFileInformationByHandle,
-    };
+    use std::{fs::OpenOptions, io::Read, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
     if !source.is_absolute()
         || !build_root.is_absolute()
         || !source.starts_with(build_root)
@@ -310,25 +303,7 @@ pub fn copy_compiler_artifact(
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(source)
     };
-    let identity = |file: &std::fs::File| -> std::io::Result<(u32, u64, u32, u32, u64)> {
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: File owns the live handle and info is a valid sized output.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        crate::windows_receipt_identity::validate_compiler_source(
-            source,
-            info.dwFileAttributes,
-            info.nNumberOfLinks,
-        )?;
-        Ok((
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-            info.dwFileAttributes,
-            info.nNumberOfLinks,
-            (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
-        ))
-    };
+    let identity = |file: &std::fs::File| native_compiler_source_identity(file, source);
     let file = open()?;
     let before = identity(&file)?;
     if before.4 == 0 || before.4 > 512 * 1024 * 1024 {
@@ -3911,6 +3886,35 @@ pub struct RecoveryCleanup {
     pub deadline_exhausted: bool,
     pub recovery: std::result::Result<(), String>,
     pub native_quiescence: std::result::Result<(), String>,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Query-only metadata of the held compiler byte source.
+fn native_compiler_source_identity(
+    file: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<(u32, u64, u32, u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: File owns the live handle and info is a correctly sized output.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    crate::windows_receipt_identity::validate_compiler_source(
+        path,
+        info.dwFileAttributes,
+        info.nNumberOfLinks,
+    )?;
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        info.dwFileAttributes,
+        info.nNumberOfLinks,
+        (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+    ))
 }
 
 #[cfg(windows)]

@@ -319,7 +319,6 @@ pub fn run(
             payload: older.clone(),
         },
     )?;
-    crate::windows_consumer_readiness::provision_from_source_until(root, &current, deadlines.work)?;
     let lease_id = super::artifacts::checksum(&serde_json::to_vec(&(
         identity,
         key,
@@ -338,7 +337,8 @@ pub fn run(
     let mut recovery_complete = false;
     let mut removal = None;
     let mut failures = Vec::new();
-    let assessment = crate::windows_installed_cases::run_with_observer_until(
+    let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
+        root,
         &current,
         &mut |observed| {
             let (phase, operation) = match observed.phase {

@@ -113,6 +113,10 @@ windows-sys = { workspace = true, features = [
 memcordon-testkit = { path = "../memcordon-testkit" }
 toml.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hex.workspace = true
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [build-dependencies]
 serde.workspace = true
 serde_json.workspace = true
