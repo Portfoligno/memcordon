@@ -1900,10 +1900,10 @@ fn execute_transition(
             "preparation policy restoration remains owned: {error}"
         )),
     }
-    if outcome.is_ok() && !report.restoration_required {
-        if let Err(error) = persist_transition_census(context, report, index, scenario) {
-            outcome = Err(error);
-        }
+    if let Some(Err(error)) = (outcome.is_ok() && !report.restoration_required)
+        .then(|| persist_transition_census(context, report, index, scenario))
+    {
+        outcome = Err(error);
     }
     if let Err(error) = &outcome {
         report.observations[index].error = Some(error.to_string());

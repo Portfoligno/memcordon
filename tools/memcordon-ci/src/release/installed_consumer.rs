@@ -395,6 +395,10 @@ pub fn acquire_cargo_predecessor(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Public Cargo materialization binds original source, package, target, toolchain, roots, and deadline"
+)]
 pub fn materialize_public_cargo(
     root: &Path,
     target_directory: &Path,
@@ -1025,6 +1029,10 @@ fn retain_public_registry_graph(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Cargo install materialization retains independent source, package, target, toolchain, custody, and deadline"
+)]
 fn materialize_cargo_install(
     root: &Path,
     target_directory: &Path,

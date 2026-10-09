@@ -468,15 +468,9 @@ pub fn build(
     }
     match (package, test, features) {
         ("memcordon", "sealed_agent", Some("private-tcp,test-support"))
-            if target.ends_with("-unknown-linux-gnu") =>
-        {
-            ()
-        }
+            if target.ends_with("-unknown-linux-gnu") => {}
         ("memcordon", "sealed_agent", Some("windows-sealed-runtime,test-support"))
-            if target.ends_with("-pc-windows-msvc") =>
-        {
-            ()
-        }
+            if target.ends_with("-pc-windows-msvc") => {}
         ("memcordon-readiness-verifier", "contract", None) => (),
         _ => {
             return Err(CiError::Message(
@@ -537,16 +531,21 @@ pub fn build(
     for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
         let message = message
             .map_err(|error| CiError::Message(format!("component Cargo message: {error}")))?;
-        if let cargo_metadata::Message::CompilerArtifact(artifact) = message {
-            if artifact.target.name == test && artifact.profile.test {
-                if let Some(executable) = artifact.executable {
-                    if selected.replace(executable.into_std_path_buf()).is_some() {
-                        return Err(CiError::Message(
-                            "native Cargo emitted duplicate selected test harnesses".into(),
-                        ));
-                    }
-                }
+        let artifact = match message {
+            cargo_metadata::Message::CompilerArtifact(artifact)
+                if artifact.target.name == test && artifact.profile.test =>
+            {
+                artifact
             }
+            _ => continue,
+        };
+        let Some(executable) = artifact.executable else {
+            continue;
+        };
+        if selected.replace(executable.into_std_path_buf()).is_some() {
+            return Err(CiError::Message(
+                "native Cargo emitted duplicate selected test harnesses".into(),
+            ));
         }
     }
     let selected = selected.ok_or_else(|| {

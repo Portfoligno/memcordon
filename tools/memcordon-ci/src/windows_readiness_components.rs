@@ -1,5 +1,6 @@
 //! Native certification observations are collected from a separately measured
 //! test-support installation, never from the selected production distribution.
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

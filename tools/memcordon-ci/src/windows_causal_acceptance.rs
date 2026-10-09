@@ -75,15 +75,17 @@ pub fn validate_process_observation(
         // A killed observer cannot invent its final diagnostic accounting. The
         // caller separately validates authenticated retirement authority and
         // independently held process/guardian retirement; coverage stays unavailable.
-        if let Some(accounting) = &observation.final_accounting {
-            if !accounting.observed_after_target_retirement
-                || accounting.active_processes_native_u32 != 0
-                || accounting.counter_regression_observed
+        match &observation.final_accounting {
+            Some(accounting)
+                if !accounting.observed_after_target_retirement
+                    || accounting.active_processes_native_u32 != 0
+                    || accounting.counter_regression_observed =>
             {
                 return Err(CiError::Message(
                     "unavailable observer retained contradictory native accounting".into(),
                 ));
             }
+            _ => {}
         }
         return Ok(SamplingAssessment {
             capacity: None,

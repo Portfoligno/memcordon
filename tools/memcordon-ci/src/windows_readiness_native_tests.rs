@@ -1,5 +1,6 @@
 //! Exact native component test execution with explicit stdin receipt requests.
 //! Test harness success and native operation observations are separate facts.
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 

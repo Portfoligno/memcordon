@@ -1,9 +1,13 @@
 //! External native loss probes. Original failures and recovered retirement are
 //! separate observations; recovery never turns an interrupted workload into a
 //! naturally completed workload.
-use crate::windows_consumer_readiness::{CaseInput, CaseKey, SuiteInput};
+use crate::windows_consumer_readiness::CaseKey;
+#[cfg(windows)]
+use crate::windows_consumer_readiness::{CaseInput, SuiteInput};
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

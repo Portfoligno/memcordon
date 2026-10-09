@@ -13,6 +13,10 @@ use std::{
 
 /// Preserve the two actual recovery recipes without assigning a successful
 /// Rust-test count or exit code to the deliberately killed harness.
+#[expect(
+    clippy::type_complexity,
+    reason = "Recovery normalization returns associated case records and their original artifact bytes together"
+)]
 pub fn normalize_native_recovery_harness(
     identity: &SourceIdentity,
     build: &memcordon_readiness_verifier::ComponentBuild,
@@ -900,7 +904,7 @@ impl PreparedLinuxObserver {
             format: "memcordon.mixed-observer-acknowledgment".into(),
             revision: 2,
             attempt_id: self.observation.admission.attempt_id.clone(),
-            admission_nonce: self.observation.admission.admission_nonce.clone(),
+            admission_nonce: self.observation.admission.admission_nonce,
             target: self.observation.target.clone(),
             observer: memcordon_core::result_v2::NativeProcessV2 {
                 pid: observer_pid,
@@ -1518,9 +1522,7 @@ impl HeldLinuxProcess {
             .split_whitespace()
             .map(|value| value.parse::<u32>().map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
-        if namespace_pids.first() != Some(&self.process_id)
-            || namespace_pids.iter().any(|pid| *pid == 0)
-        {
+        if namespace_pids.first() != Some(&self.process_id) || namespace_pids.contains(&0) {
             return Err("native namespace PID tuple differs".into());
         }
         let snapshot = LinuxHeldSnapshot {

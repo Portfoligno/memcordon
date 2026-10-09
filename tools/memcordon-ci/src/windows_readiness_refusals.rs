@@ -1,5 +1,6 @@
 //! Genuine preauthorization refusals preserve the original public result and
 //! native argument diagnostics without inventing a target terminal receipt.
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 

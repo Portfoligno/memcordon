@@ -56,6 +56,10 @@ pub struct ReadinessLinuxLease<'a> {
     admin_retired: bool,
 }
 impl<'a> ReadinessLinuxLease<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Installed lease independently binds source, product generations, images, custody roots, and deadline"
+    )]
     pub fn new(
         identity: SourceIdentity,
         cell: ProductKey,

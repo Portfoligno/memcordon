@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memcordon_readiness_verifier::{Artifact, ComponentBuild, ProducerManifest, ProductKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::{artifacts, native_component_harness, source};
 use crate::consumer_readiness_ledger::{CellEvidence, SourceIdentity};
@@ -221,6 +221,13 @@ struct Selection {
     cleanup: Instant,
     records: Vec<OwnedRecord>,
     host: AcquiredHost,
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "The acquired fixture hash is consumed by the Windows native selection path"
+        )
+    )]
     fixture_sha256: Option<String>,
 }
 

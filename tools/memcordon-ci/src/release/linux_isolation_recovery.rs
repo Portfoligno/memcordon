@@ -45,6 +45,10 @@ fn remaining_deadline(deadline: Instant, cleanup_wall: u64) -> Result<Instant> {
 }
 
 /// Enroll only original finite import intents after native controller/attempt recovery.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recovery separately binds original lease, acquisition, import custody, account, and deadline"
+)]
 pub fn recover_imports(
     output: &Path,
     identity: &SourceIdentity,

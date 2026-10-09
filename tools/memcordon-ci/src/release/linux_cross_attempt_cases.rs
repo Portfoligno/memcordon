@@ -18,7 +18,6 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
@@ -1029,6 +1028,10 @@ fn retain_account_census(
 impl CrossAttemptReport {
     /// The caller first settles the original native attempts; this method never
     /// replaces their process observations with reconstructed journal claims.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Recovery binds original native attempts, selected cell, lease, acquisition, artifact roots, and cutoff"
+    )]
     pub fn recover_after_native_attempts(
         output: &Path,
         identity: &SourceIdentity,
@@ -1321,8 +1324,8 @@ impl CrossAttemptReport {
             .ok_or_else(|| error("cross bounded cleanup ordinal overflow"))?;
         for owner in &mut self.attempts {
             if !owner.launch.capture_owners_settled() {
-                if let Some(frontend) = &owner.frontend {
-                    if !frontend.exited().map_err(CiError::Message)? {
+                match &owner.frontend {
+                    Some(frontend) if !frontend.exited().map_err(CiError::Message)? => {
                         let signaled = frontend.signal_interrupt().map_err(CiError::Message)?;
                         if let Err(errno) = signaled {
                             return Err(CiError::Message(format!(
@@ -1330,6 +1333,7 @@ impl CrossAttemptReport {
                             )));
                         }
                     }
+                    _ => {}
                 }
                 owner
                     .launch

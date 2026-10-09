@@ -1,6 +1,8 @@
 //! Windows producer artifacts. Independent acceptance remains in the verifier.
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct WindowsAdapterContext {

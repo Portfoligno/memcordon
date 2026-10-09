@@ -927,6 +927,10 @@ impl NativeLinuxPackageLease {
     }
 
     /// Called only after this owner has been retained by the outer native job.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Installation binds exact source, product, admin, artifact and finite owner custody"
+    )]
     pub fn install_and_prepare(
         &mut self,
         workspace: &Path,

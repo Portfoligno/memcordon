@@ -335,6 +335,10 @@ impl NativeAdminScope {
 
     /// Reacquire only the original protected image namespace. This restores
     /// cleanup obligations, never lost captures, exit status, or test evidence.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retains the exact original image, source identity, recipe and finite cleanup custody together"
+    )]
     pub fn recover_owned_scope(
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
@@ -556,6 +560,10 @@ impl NativeAdminScope {
         Ok(scope)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retirement observation binds the complete original image and recipe custody"
+    )]
     pub fn observe_retired_scope(
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
@@ -799,6 +807,10 @@ impl NativeAdminScope {
         Ok(protected)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Native image execution keeps measured harnesses, original identity and finite owner deadlines explicit"
+    )]
     pub fn execute(
         &mut self,
         parser: &MeasuredHarness,
@@ -975,6 +987,10 @@ impl NativeAdminScope {
         &self.path
     }
     /// Retains the selected package/resource owner before the first install.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preparation binds selected source, target, artifact root and both finite owner deadlines"
+    )]
     pub fn prepare_operational_fixture(
         &mut self,
         workspace: &Path,
@@ -1311,20 +1327,18 @@ impl NativeAdminScope {
 
     pub fn settle(&mut self, deadline: Instant) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(batch) = &mut self.batch {
-            if let Err(error) = batch.settle(deadline) {
-                failures.push(error.to_string());
-            }
+        if let Some(Err(error)) = self.batch.as_mut().map(|batch| batch.settle(deadline)) {
+            failures.push(error.to_string());
         }
-        if let Some(package) = &mut self.component_package {
-            if let Err(error) = package.finalize(
+        if let Some(Err(error)) = self.component_package.as_mut().map(|package| {
+            package.finalize(
                 self.component_workspace
                     .as_deref()
                     .expect("retained original package workspace"),
                 deadline,
-            ) {
-                failures.push(error.to_string());
-            }
+            )
+        }) {
+            failures.push(error.to_string());
         }
         for descriptor in &self.recovered {
             use rustix::event::{PollFd, PollFlags, Timespec};
@@ -1351,13 +1365,14 @@ impl NativeAdminScope {
                 }
                 if !signal_attempted {
                     signal_attempted = true;
-                    if let Err(error) = rustix::process::pidfd_send_signal(
+                    match rustix::process::pidfd_send_signal(
                         descriptor,
                         rustix::process::Signal::KILL,
                     ) {
-                        if error != rustix::io::Errno::SRCH {
+                        Err(error) if error != rustix::io::Errno::SRCH => {
                             failures.push(format!("recovered native signal failed: {error}"));
                         }
+                        _ => {}
                     }
                 }
                 if Instant::now() >= deadline {
@@ -1557,6 +1572,10 @@ pub struct NativeRecipeBatch {
 }
 
 impl NativeRecipeBatch {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The native recipe retains every measured owner and independent finite phase bound"
+    )]
     pub fn execute(
         parser: &MeasuredHarness,
         operational: &MeasuredHarness,
@@ -1690,17 +1709,17 @@ impl NativeRecipeBatch {
             }
             if !owner.all_native_publications_settled() {
                 batch.owners.push((test.to_owned(), owner));
-            } else if matches!(
+            } else if let Some(Err(error)) = matches!(
                 test,
                 "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt"
                     | "native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt"
-            ) {
-                if let Err(error) = recover(&directory, cleanup_deadline) {
-                    batch
-                        .failures
-                        .push(format!("{test}: persisted native recovery: {error}"));
-                    break;
-                }
+            )
+            .then(|| recover(&directory, cleanup_deadline))
+            {
+                batch
+                    .failures
+                    .push(format!("{test}: persisted native recovery: {error}"));
+                break;
             }
         }
         Ok(batch)
@@ -1856,6 +1875,10 @@ pub fn protect_harness(harness: &MeasuredHarness, destination: &Path) -> Result<
 impl NativeTestOwner {
     /// The owner is returned even when setup fails after spawn. Its exact Child,
     /// pidfd and capture workers must remain with the outer phase owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure must return the original live Child, pidfd and capture owners for mandatory retirement"
+    )]
     pub fn spawn(
         harness: &MeasuredHarness,
         test: &str,
@@ -2212,15 +2235,13 @@ impl NativeTestOwner {
                     }),
                 )
                 .map_err(std::io::Error::from)?;
-                if !poll[0].revents().intersects(PollFlags::IN | PollFlags::HUP) {
-                    if let Err(error) = rustix::process::pidfd_send_signal(
-                        &*descriptor,
-                        rustix::process::Signal::KILL,
-                    ) {
-                        if error != rustix::io::Errno::SRCH {
-                            return Err(std::io::Error::from(error).into());
-                        }
+                match (!poll[0].revents().intersects(PollFlags::IN | PollFlags::HUP)).then(|| {
+                    rustix::process::pidfd_send_signal(&*descriptor, rustix::process::Signal::KILL)
+                }) {
+                    Some(Err(error)) if error != rustix::io::Errno::SRCH => {
+                        return Err(std::io::Error::from(error).into());
                     }
+                    _ => {}
                 }
                 loop {
                     let mut poll = [PollFd::new(&*descriptor, PollFlags::IN)];
@@ -2265,11 +2286,9 @@ impl NativeTestOwner {
             (&mut self.stdout, &mut self.stdout_bytes),
             (&mut self.stderr, &mut self.stderr_bytes),
         ] {
-            if let Some(worker) = handle.as_ref() {
-                if !worker.is_finished() {
-                    capture_outstanding = true;
-                    continue;
-                }
+            if handle.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                capture_outstanding = true;
+                continue;
             }
             if let Some(worker) = handle.take() {
                 match worker.join() {

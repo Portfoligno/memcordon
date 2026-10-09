@@ -376,6 +376,7 @@ pub fn public_command(
     public_command_observation(cli, fixture, directory, report, case, true, false)
 }
 
+#[cfg(windows)]
 pub(crate) fn public_refusal_command(
     cli: &Path,
     fixture: &Path,
@@ -386,6 +387,7 @@ pub(crate) fn public_refusal_command(
     public_command_observation(cli, fixture, directory, report, case, false, true)
 }
 
+#[cfg(windows)]
 pub(crate) fn public_component_command(
     cli: &Path,
     fixture: &Path,
@@ -485,16 +487,19 @@ fn events(bytes: &[u8]) -> Result<Vec<Event>> {
 
 // Only the native controller uses this while holding the transcript writer
 // alive. A partial final frame is a publication in progress, never evidence.
+#[cfg(windows)]
 fn live_events(bytes: &[u8]) -> Result<Vec<Event>> {
     decode_events(bytes, true)
 }
 
+#[cfg(windows)]
 pub(crate) fn live_capacity_completion(bytes: &[u8]) -> Result<bool> {
     Ok(live_events(bytes)?
         .iter()
         .any(|event| event.stage == "capacity-live-before-natural-completion"))
 }
 
+#[cfg(windows)]
 pub(crate) fn live_demand_child(
     bytes: &[u8],
     root_pid: u32,
@@ -717,12 +722,12 @@ pub fn assess(
                 ));
             }
         }
-        descriptor::Case::Toolchain => {
-            if !has("toolchain-compiled") || !has("toolchain-test-child-dll-complete") {
-                return Err(CiError::Message(
-                    "toolchain fixture omitted compile/child/DLL stage".into(),
-                ));
-            }
+        descriptor::Case::Toolchain
+            if !has("toolchain-compiled") || !has("toolchain-test-child-dll-complete") =>
+        {
+            return Err(CiError::Message(
+                "toolchain fixture omitted compile/child/DLL stage".into(),
+            ));
         }
         _ => {}
     }

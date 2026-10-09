@@ -353,6 +353,7 @@ impl WindowsLeaseDeadlines {
         }
         Ok(remaining)
     }
+    #[cfg(windows)]
     pub(crate) fn finite_default() -> Self {
         let start = std::time::Instant::now();
         let unix = u64::try_from(
@@ -386,6 +387,7 @@ pub struct WindowsLeaseEvent<'a> {
     pub stderr: Option<PathBuf>,
 }
 
+#[cfg(windows)]
 fn lease_event<'a>(
     phase: WindowsLeasePhase,
     subject: &'a InstalledWindowsPayload,

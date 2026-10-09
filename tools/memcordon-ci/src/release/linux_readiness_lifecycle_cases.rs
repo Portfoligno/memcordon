@@ -123,7 +123,7 @@ impl HeldControlConnection {
             }
             let before = socket.metadata()?;
             let expected = format!("socket:[{}]", before.ino());
-            if link != std::path::PathBuf::from(expected) || before.ino() == 0 {
+            if link != std::path::Path::new(&expected) || before.ino() == 0 {
                 return Err(CiError::Message(
                     "duplicated control socket differs from held native worker descriptor".into(),
                 ));
@@ -181,7 +181,7 @@ impl HeldControlConnection {
             worker.process_id, self.source_descriptor
         ))?;
         if (before.dev(), before.ino()) != (self.device, self.inode)
-            || named != std::path::PathBuf::from(format!("socket:[{}]", self.inode))
+            || named != std::path::Path::new(&format!("socket:[{}]", self.inode))
         {
             return Err(CiError::Message(
                 "native control socket was replaced before shutdown".into(),

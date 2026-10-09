@@ -366,25 +366,23 @@ impl PackageConsumer {
                     toml::Value::String(format!("={}", bundle.source.version())),
                 )])),
             );
-            if name == "memcordon" {
-                if let Some(distribution) = distribution {
-                    dependencies
-                        .get_mut(name)
-                        .expect("inserted CLI dependency")
-                        .as_table_mut()
-                        .expect("dependency table")
-                        .insert(
-                            "features".into(),
-                            toml::Value::Array(
-                                distribution
-                                    .features
-                                    .iter()
-                                    .cloned()
-                                    .map(toml::Value::String)
-                                    .collect(),
-                            ),
-                        );
-                }
+            if let ("memcordon", Some(distribution)) = (name, distribution) {
+                dependencies
+                    .get_mut(name)
+                    .expect("inserted CLI dependency")
+                    .as_table_mut()
+                    .expect("dependency table")
+                    .insert(
+                        "features".into(),
+                        toml::Value::Array(
+                            distribution
+                                .features
+                                .iter()
+                                .cloned()
+                                .map(toml::Value::String)
+                                .collect(),
+                        ),
+                    );
             }
         }
         let config = directory.path().join("package-overrides.toml");
@@ -932,14 +930,10 @@ fn resolved_graph(metadata: &cargo_metadata::Metadata) -> Result<serde_json::Val
                 let mut kinds = dependency
                     .dep_kinds
                     .iter()
-                    .map(|kind| serde_json::to_string(kind))
+                    .map(serde_json::to_string)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 kinds.sort();
-                Ok(serde_json::to_string(&(
-                    &dependency.name,
-                    &dependency.pkg,
-                    kinds,
-                ))?)
+                serde_json::to_string(&(&dependency.name, &dependency.pkg, kinds))
             })
             .collect::<std::result::Result<Vec<_>, serde_json::Error>>()?;
         edges.sort();

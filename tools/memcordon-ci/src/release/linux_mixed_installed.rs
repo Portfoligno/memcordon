@@ -331,6 +331,10 @@ struct AccountRefusalContext {
 impl InstalledMixedDriver {
     /// Reconstruct only the finite image import intents from this installation.
     /// Called after native attempt recovery and before policy/image retirement.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Recovery binds original image intent, lease, acquisition, policy, account, and cutoff separately"
+    )]
     pub fn recover_image_case_intents(
         &mut self,
         output: &Path,
@@ -498,6 +502,10 @@ impl InstalledMixedDriver {
     }
     /// Read-only convergence after administrative sources were already retired.
     /// This cannot reconstruct an execution owner or authorize any removal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retirement assessment retains independent native resource and original custody inputs"
+    )]
     pub fn assess_retired_resources(
         output: &Path,
         identity: &SourceIdentity,
@@ -773,6 +781,10 @@ impl InstalledMixedDriver {
     }
     /// Persists resource identity only; this document never proves native
     /// attempt retirement. Recovery must settle the provider journal first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Checkpoint binds actual native resources to independent original lease and acquisition custody"
+    )]
     pub fn persist_resource_checkpoint(
         &self,
         path: &Path,
@@ -1587,12 +1599,15 @@ impl InstalledMixedDriver {
                 records.push(record.clone());
             }
             for artifact in &report.artifacts {
-                if let Some(previous) = artifacts.insert(artifact.path.clone(), artifact.clone()) {
-                    if previous.sha256 != artifact.sha256 || previous.length != artifact.length {
-                        return Err(CiError::Message(
-                            "lifecycle artifact path carries conflicting original bytes".into(),
-                        ));
-                    }
+                if artifacts
+                    .insert(artifact.path.clone(), artifact.clone())
+                    .is_some_and(|previous| {
+                        previous.sha256 != artifact.sha256 || previous.length != artifact.length
+                    })
+                {
+                    return Err(CiError::Message(
+                        "lifecycle artifact path carries conflicting original bytes".into(),
+                    ));
                 }
             }
         }
@@ -1610,12 +1625,15 @@ impl InstalledMixedDriver {
                 ));
             }
             for artifact in &collection.persisted.artifacts {
-                if let Some(previous) = artifacts.insert(artifact.path.clone(), artifact.clone()) {
-                    if previous.sha256 != artifact.sha256 || previous.length != artifact.length {
-                        return Err(CiError::Message(
-                            "completed mixed artifact path has conflicting bytes".into(),
-                        ));
-                    }
+                if artifacts
+                    .insert(artifact.path.clone(), artifact.clone())
+                    .is_some_and(|previous| {
+                        previous.sha256 != artifact.sha256 || previous.length != artifact.length
+                    })
+                {
+                    return Err(CiError::Message(
+                        "completed mixed artifact path has conflicting bytes".into(),
+                    ));
                 }
             }
             let parent = Path::new(&collection.prepared_native_receipt.path)
@@ -1899,6 +1917,10 @@ impl InstalledMixedDriver {
         let mut index = 0;
         while index < self.active.len() {
             let owned = &mut self.active[index];
+            #[expect(
+                clippy::redundant_closure_call,
+                reason = "Fallible cleanup is captured per owned attempt so later owners are still finalized"
+            )]
             let settled = (|| -> Result<()> {
                 let mut errors = Vec::new();
                 match owned.launch.frontend.try_wait() {
@@ -3058,12 +3080,15 @@ fn normalize_malformed_ingress(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(&bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "malformed ingress custody conflict".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "malformed ingress custody conflict".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3157,7 +3182,6 @@ fn normalize_malformed_ingress(
         format!("{prefix}/group-getent.bin"),
         &account_source("group_readback")?,
     )?;
-    drop(persist);
     let original_bytes = read_policy_observation_file(
         &directory.join("original-provider-request.bin"),
         4 * 1024 * 1024,
@@ -3193,12 +3217,15 @@ fn normalize_malformed_ingress(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(&bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "original ingress acquisition custody conflict".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "original ingress acquisition custody conflict".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3309,12 +3336,15 @@ fn normalize_policy_refusal(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "policy artifact conflicts with retained bytes".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "policy artifact conflicts with retained bytes".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3960,7 +3990,7 @@ pub fn completed_case_base(
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
         attempt_nonce: Some(
-            serde_json::to_value(&admission.admission_nonce)?
+            serde_json::to_value(admission.admission_nonce)?
                 .as_str()
                 .ok_or_else(|| CiError::Message("completed nonce encoding differs".into()))?
                 .into(),
@@ -4233,7 +4263,7 @@ fn normalize_completed_case(
             "normalized executed row has no native execution".into(),
         ));
     };
-    if serde_json::to_value(execution.outcome_origin.clone())?
+    if serde_json::to_value(execution.outcome_origin)?
         != serde_json::Value::String("native-exit".into())
         || execution.native_wait_status & 0x7f != 0
     {
@@ -4376,7 +4406,7 @@ fn normalize_completed_case(
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
         attempt_nonce: Some(
-            serde_json::to_value(&admission.admission_nonce)?
+            serde_json::to_value(admission.admission_nonce)?
                 .as_str()
                 .ok_or_else(|| CiError::Message("actual admission nonce encoding differs".into()))?
                 .into(),
@@ -6610,26 +6640,38 @@ impl InstalledMixedLaunch {
                     }
                     let release = match row.operation.as_str() {
                         "offline-compiler-held" | "joint-generated-child-held" => {
-                            if row.operation == "offline-compiler-held" {
-                                if let Some(source) = &self.image_entrypoint_source {
-                                    let mut owner =
-                                        crate::linux_consumer_readiness::HeldLinuxProcess::acquire(
-                                            observer.target.process_id,
-                                            observer.target.birth,
-                                        )
-                                        .map_err(CiError::Message)?;
-                                    let executable = owner
-                                        .hold_executable_image(deadline)
-                                        .map_err(CiError::Message)?;
-                                    if executable["sha256"] != source["fixture_sha256"] {
-                                        return Err(CiError::Message("actual image entrypoint proc executable differs from approved fixture".into()));
-                                    }
-                                    let raw = serde_json::json!({"format":"memcordon.linux-image-entrypoint","revision":1,"source":source,
+                            if let ("offline-compiler-held", Some(source)) =
+                                (row.operation.as_str(), &self.image_entrypoint_source)
+                            {
+                                let mut owner =
+                                    crate::linux_consumer_readiness::HeldLinuxProcess::acquire(
+                                        observer.target.process_id,
+                                        observer.target.birth,
+                                    )
+                                    .map_err(CiError::Message)?;
+                                let executable = owner
+                                    .hold_executable_image(deadline)
+                                    .map_err(CiError::Message)?;
+                                if executable["sha256"] != source["fixture_sha256"] {
+                                    return Err(CiError::Message("actual image entrypoint proc executable differs from approved fixture".into()));
+                                }
+                                let raw = serde_json::json!({"format":"memcordon.linux-image-entrypoint","revision":1,"source":source,
                                         "challenge":row.challenge,"attempt_id":observer.observation.admission.attempt_id,
                                         "target":owner.live_snapshot().map_err(CiError::Message)?,"executable":executable});
-                                    self.image_entrypoint_owner = Some(owner);
-                                    retain(&self.stdout.parent().ok_or_else(||CiError::Message("owned image entrypoint capture directory absent".into()))?.join("image-entrypoint.json"),&serde_json::to_vec(&raw)?)?;
-                                }
+                                self.image_entrypoint_owner = Some(owner);
+                                retain(
+                                    &self
+                                        .stdout
+                                        .parent()
+                                        .ok_or_else(|| {
+                                            CiError::Message(
+                                                "owned image entrypoint capture directory absent"
+                                                    .into(),
+                                            )
+                                        })?
+                                        .join("image-entrypoint.json"),
+                                    &serde_json::to_vec(&raw)?,
+                                )?;
                             }
                             let tree = if row.operation == "offline-compiler-held" {
                                 &row.observation
@@ -6996,6 +7038,10 @@ impl InstalledMixedLaunch {
         Ok(self.frontend_status.expect("observed native frontend exit"))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completed evidence binds original invocation, native observations, image, policy, and artifact custody independently"
+    )]
     pub fn collect_completed(
         &mut self,
         observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
@@ -8041,6 +8087,10 @@ fn provision_account_for_original_lifetime(
 
 /// Captures native credentials and the provider's actual attempt namespace.
 /// This is read-only evidence; it never removes a process or cgroup by name.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Refusal census binds original policy, account, invocation, lease, acquisition, and artifact custody"
+)]
 pub fn persist_policy_refusal_census(
     account: &ExclusiveAccount,
     provider: &memcordon_core::PublicProviderBindingV1,
@@ -8456,6 +8506,10 @@ pub struct ActivatedMixedPolicy {
     pub activation_path: PathBuf,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Policy activation binds independent installed image, account, lease, source, and destination custody"
+)]
 pub fn activate_owned_policy(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -8479,6 +8533,10 @@ pub fn activate_owned_policy(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Policy activation additionally binds its original finite deadline"
+)]
 pub fn activate_owned_policy_until(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -8504,6 +8562,10 @@ pub fn activate_owned_policy_until(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Staged policy activation independently binds original lease, acquisition, image, account, stage, and deadline"
+)]
 pub fn activate_owned_policy_staged_until(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -9286,7 +9348,7 @@ pub fn materialize_until(
     if gcc.is_dir() {
         runtime.tree(
             &gcc,
-            &gcc.strip_prefix("/")
+            gcc.strip_prefix("/")
                 .map_err(|e| CiError::Message(e.to_string()))?,
             &cell.target,
         )?;

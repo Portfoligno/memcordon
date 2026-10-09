@@ -152,29 +152,31 @@ impl Descriptor {
         {
             return Err("descendant case requires a unique native controller event".into());
         }
-        if let Some(t) = &self.toolchain {
-            if ![
-                &t.rustc,
-                &t.native_linker,
-                &t.library_source,
-                &t.test_source,
-                &t.child_source,
-                &t.dll_source,
-                &t.loader_source,
-            ]
-            .iter()
-            .all(|p| p.is_absolute())
-                || t.native_library_directories.len() != 3
-                || t.native_library_directories
-                    .iter()
-                    .any(|path| !path.is_absolute())
-                || !matches!(
-                    t.target.as_str(),
-                    "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
-                )
+        match &self.toolchain {
+            Some(t)
+                if ![
+                    &t.rustc,
+                    &t.native_linker,
+                    &t.library_source,
+                    &t.test_source,
+                    &t.child_source,
+                    &t.dll_source,
+                    &t.loader_source,
+                ]
+                .iter()
+                .all(|p| p.is_absolute())
+                    || t.native_library_directories.len() != 3
+                    || t.native_library_directories
+                        .iter()
+                        .any(|path| !path.is_absolute())
+                    || !matches!(
+                        t.target.as_str(),
+                        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
+                    ) =>
             {
                 return Err("invalid Windows toolchain paths/target".into());
             }
+            _ => {}
         }
         Ok(())
     }

@@ -7,6 +7,10 @@ use memcordon_readiness_verifier::{Artifact, CaseKey, LinuxIsolationImportEviden
 use std::{collections::BTreeMap, path::Path};
 
 impl ImportRefusalReport {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Import normalization binds independent contract, lease, acquisition, and artifact custody"
+    )]
     pub fn normalize(
         &self,
         identity: &SourceIdentity,
@@ -68,12 +72,15 @@ impl ImportRefusalReport {
                 length: bytes.len() as u64,
                 sha256: super::artifacts::checksum(bytes),
             };
-            if let Some(prior) = artifacts.insert(relative.clone(), artifact.clone()) {
-                if prior.length != artifact.length || prior.sha256 != artifact.sha256 {
-                    return Err(CiError::Message(
-                        "importer original archive custody conflict".into(),
-                    ));
-                }
+            if artifacts
+                .insert(relative.clone(), artifact.clone())
+                .is_some_and(|prior| {
+                    prior.length != artifact.length || prior.sha256 != artifact.sha256
+                })
+            {
+                return Err(CiError::Message(
+                    "importer original archive custody conflict".into(),
+                ));
             }
             Ok(relative)
         };
@@ -106,7 +113,6 @@ impl ImportRefusalReport {
         } else {
             None
         };
-        drop(leaf);
         let mut retired = |name: &str| {
             capture(
                 Path::new("definition-retirement")
@@ -124,7 +130,6 @@ impl ImportRefusalReport {
         let retirement_exit = retired("exit.json")?;
         let retirement_stdout = retired("stdout.json")?;
         let retirement_stderr = retired("stderr.bin")?;
-        drop(retired);
         let acquired: serde_json::Value = serde_json::from_slice(&read_policy_observation_file(
             acquisition,
             32 * 1024 * 1024,
@@ -140,10 +145,7 @@ impl ImportRefusalReport {
         let account_intent = account_capture("intent", "account-intent.json")?;
         let account_readback = account_capture("native_readback", "account-getent.bin")?;
         let group_readback = account_capture("group_readback", "group-getent.bin")?;
-        drop(account_capture);
-        drop(capture);
         let owner_artifact = persist("owner.json", &serde_json::to_vec(owner)?)?;
-        drop(persist);
         let mut original_path = |path: &Path| -> Result<String> {
             let relative = path
                 .strip_prefix(artifact_root)
@@ -159,12 +161,15 @@ impl ImportRefusalReport {
                 length: bytes.len() as u64,
                 sha256: super::artifacts::checksum(&bytes),
             };
-            if let Some(prior) = artifacts.insert(relative.clone(), artifact.clone()) {
-                if prior.length != artifact.length || prior.sha256 != artifact.sha256 {
-                    return Err(CiError::Message(
-                        "importer original authority custody conflict".into(),
-                    ));
-                }
+            if artifacts
+                .insert(relative.clone(), artifact.clone())
+                .is_some_and(|prior| {
+                    prior.length != artifact.length || prior.sha256 != artifact.sha256
+                })
+            {
+                return Err(CiError::Message(
+                    "importer original authority custody conflict".into(),
+                ));
             }
             Ok(relative)
         };
