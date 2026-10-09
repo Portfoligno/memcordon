@@ -31,15 +31,7 @@ pub struct NativeLinuxPackageLease {
     failures: Vec<String>,
     native_settled: bool,
     resources_retired: bool,
-    recovery_processes: Vec<NativeRecoveryProcess>,
     recovery_observation_files: Vec<fs::File>,
-}
-
-struct NativeRecoveryProcess {
-    process_id: u32,
-    birth: u64,
-    pidfd: std::os::fd::OwnedFd,
-    image: Option<fs::File>,
 }
 
 fn observe_original_absence(
@@ -307,33 +299,6 @@ fn observe_recovery_credentials(
     }
     Ok(rows)
 }
-impl NativeRecoveryProcess {
-    fn exited(&self) -> Result<bool> {
-        let mut fds = [rustix::event::PollFd::new(
-            &self.pidfd,
-            rustix::event::PollFlags::IN,
-        )];
-        let count = rustix::event::poll(
-            &mut fds,
-            Some(&rustix::event::Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            }),
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        if fds[0]
-            .revents()
-            .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL)
-        {
-            return Err(CiError::Message("native recovery PIDFD poll failed".into()));
-        }
-        Ok(count > 0
-            && fds[0]
-                .revents()
-                .intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP))
-    }
-}
-
 impl NativeLinuxPackageLease {
     /// Replay persisted native cleanup after a fully retired component worker,
     /// before the next recipe may authenticate the same exclusive account.
@@ -657,7 +622,6 @@ impl NativeLinuxPackageLease {
             failures: Vec::new(),
             native_settled: false,
             resources_retired: false,
-            recovery_processes: Vec::new(),
             recovery_observation_files: Vec::new(),
         };
         value.verify_agent()?;
@@ -801,7 +765,6 @@ impl NativeLinuxPackageLease {
             failures: Vec::new(),
             native_settled: false,
             resources_retired: false,
-            recovery_processes: Vec::new(),
             recovery_observation_files: Vec::new(),
         };
         value.verify_agent()?;
@@ -969,17 +932,6 @@ impl NativeLinuxPackageLease {
     /// retained even when later readback observes that native owners settled.
     pub fn finalize(&mut self, workspace: &Path, cleanup: Instant) -> Result<()> {
         let mut current = Vec::new();
-        for process in &self.recovery_processes {
-            match process.exited() {
-                Ok(true) => {}
-                Ok(false) => {
-                    current.push("actual native recovery process remains held live".into())
-                }
-                Err(error) => current.push(format!(
-                    "native recovery process retirement uncertainty: {error}"
-                )),
-            }
-        }
         if let Err(error) = self.driver.finalize_owned_attempts(cleanup) {
             current.push(error.to_string());
         }

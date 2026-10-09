@@ -756,7 +756,6 @@ pub fn run_case(
     challenge: &str,
 ) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::process::ExitStatusExt;
     let root = context.artifact_root.join(prefix);
     let index = begin_case(report, context, &key, directory, prefix, challenge)?;
     let delivery = key.family == "L-LIFE-05";
