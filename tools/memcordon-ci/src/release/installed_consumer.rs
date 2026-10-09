@@ -1,4 +1,6 @@
 //! Execute consumers against the selected, measured distribution in both channels.
+#[path = "public_install_io.rs"]
+mod public_install_io;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -842,14 +844,23 @@ fn verify_public_install_artifacts(
             .get("manifest_path")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| CiError::Message("public Cargo source manifest absent".into()))?;
-        if !fs::canonicalize(manifest)?
-            .starts_with(fs::canonicalize(cargo_home.join("registry").join("src"))?)
-        {
+        let manifest_path = Path::new(manifest);
+        let manifest = public_install_io::contextualize(
+            "canonicalize emitted source manifest",
+            manifest_path,
+            fs::canonicalize(manifest_path),
+        )?;
+        let registry_source = cargo_home.join("registry").join("src");
+        let registry_source = public_install_io::contextualize(
+            "canonicalize isolated registry source root",
+            &registry_source,
+            fs::canonicalize(&registry_source),
+        )?;
+        if !manifest.starts_with(registry_source) {
             return Err(CiError::Message(
                 "public Cargo artifact came from outside measured registry source".into(),
             ));
         }
-        let manifest = fs::canonicalize(manifest)?;
         if selected_manifest
             .as_ref()
             .is_some_and(|selected| selected != &manifest)
@@ -859,15 +870,26 @@ fn verify_public_install_artifacts(
             ));
         }
         selected_manifest = Some(manifest);
-        let built = artifacts::read_file(Path::new(executable))?;
+        let executable = Path::new(executable);
+        let built = artifacts::read_file(executable).map_err(|error| match error {
+            CiError::Io(error) => CiError::Io(public_install_io::error(
+                "read emitted build executable",
+                executable,
+                error,
+            )),
+            error => error,
+        })?;
         target::validate_executable(&built, &distribution.target)?;
-        if artifacts::read_file(&binary_path(
-            &install.join("bin"),
-            name,
-            &distribution.target,
-        ))? != built
-            || !binaries.insert(name.to_owned())
-        {
+        let installed_path = binary_path(&install.join("bin"), name, &distribution.target);
+        let installed = artifacts::read_file(&installed_path).map_err(|error| match error {
+            CiError::Io(error) => CiError::Io(public_install_io::error(
+                "read installed executable",
+                &installed_path,
+                error,
+            )),
+            error => error,
+        })?;
+        if installed != built || !binaries.insert(name.to_owned()) {
             return Err(CiError::Message(
                 "public Cargo installed executable differs or has duplicate build origins".into(),
             ));
