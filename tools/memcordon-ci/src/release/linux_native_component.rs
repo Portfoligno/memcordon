@@ -817,6 +817,7 @@ impl NativeAdminScope {
         operational: &MeasuredHarness,
         run_id: &str,
         recipe_id: &str,
+        allocation_recipe_id: &str,
         target: &str,
         prefix: &str,
         work: Instant,
@@ -844,13 +845,17 @@ impl NativeAdminScope {
             .map_err(CiError::Message)?;
         let intent: serde_json::Value = serde_json::from_slice(&intent_bytes)?;
         if artifacts::checksum(&intent_bytes) != name
-            || intent["identity"]["run_id"] != run_id
-            || intent["target"] != target
-            || intent["recipe_id"] != recipe_id
-            || intent["artifact_prefix"] != prefix
-            || intent["work_deadline_unix_millis"] != work_unix
-            || intent["cleanup_deadline_unix_millis"] != cleanup_unix
-            || work_unix >= cleanup_unix
+            || !super::native_execution_association::matches(
+                &intent,
+                &super::native_execution_association::Allocation {
+                    run_id,
+                    recipe_id: allocation_recipe_id,
+                    target,
+                    artifact_prefix: prefix,
+                    work_deadline: work_unix,
+                    cleanup_deadline: cleanup_unix,
+                },
+            )
             || Instant::now() >= work
         {
             return Err(CiError::Message(

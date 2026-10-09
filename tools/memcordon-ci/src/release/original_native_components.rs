@@ -646,6 +646,25 @@ fn retain_file(
     expected: Option<&str>,
     limit: u64,
 ) -> Result<Artifact> {
+    retain_file_with_alias(
+        source,
+        bundle,
+        relative,
+        expected,
+        limit,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+fn retain_file_with_alias(
+    source: &Path,
+    bundle: &Path,
+    relative: &Path,
+    expected: Option<&str>,
+    limit: u64,
+    #[cfg(target_os = "linux")] alias: Option<&super::native_cargo_aliases::SourceState>,
+) -> Result<Artifact> {
     if relative.is_absolute()
         || relative
             .components()
@@ -672,14 +691,22 @@ fn retain_file(
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(source)?;
         let before = file.metadata()?;
-        super::native_source_identity::validate(
-            source,
-            before.is_file(),
-            before.nlink(),
-            before.len(),
-            limit,
-        )
-        .map_err(CiError::Message)?;
+        if let Some(alias) = alias {
+            if source_state(&before) != *alias || !before.is_file() || before.len() > limit {
+                return Err(CiError::Message(
+                    "native recovery held source differs from closed alias inventory".into(),
+                ));
+            }
+        } else {
+            super::native_source_identity::validate(
+                source,
+                before.is_file(),
+                before.nlink(),
+                before.len(),
+                limit,
+            )
+            .map_err(CiError::Message)?;
+        }
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut file)
             .take(limit + 1)
@@ -691,6 +718,9 @@ fn retain_file(
             || after.len() != before.len()
             || after.mtime() != before.mtime()
             || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+            || after.nlink() != before.nlink()
             || bytes.len() as u64 != before.len()
         {
             return Err(CiError::Message(
@@ -737,6 +767,9 @@ fn retain_file(
             || after.len() != source_identity.len()
             || after.mtime() != source_identity.mtime()
             || after.mtime_nsec() != source_identity.mtime_nsec()
+            || after.ctime() != source_identity.ctime()
+            || after.ctime_nsec() != source_identity.ctime_nsec()
+            || after.nlink() != source_identity.nlink()
         {
             return Err(CiError::Message(
                 "native source custody changed before projection completed".into(),
@@ -933,6 +966,7 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
                 &operational,
                 &selection.identity.run_id,
                 recipe_id,
+                &scope_recipe,
                 &selection.target,
                 prefix_text,
                 selection.work,
@@ -2753,6 +2787,58 @@ fn publish_linux_retirement(root: &Path, destination: &Path, bytes: &[u8]) -> Re
 }
 
 #[cfg(target_os = "linux")]
+fn source_state(metadata: &std::fs::Metadata) -> super::native_cargo_aliases::SourceState {
+    use std::os::unix::fs::MetadataExt;
+    super::native_cargo_aliases::SourceState {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+        length: metadata.len(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_inventory(
+    root: &Path,
+    deadline: Instant,
+) -> Result<Vec<(PathBuf, super::native_cargo_aliases::SourceState)>> {
+    let mut files = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), PathBuf::new())];
+    let mut visited = 0usize;
+    while let Some((directory, relative)) = pending.pop() {
+        let custody = DirectoryCustody::acquire(&directory)?;
+        for entry in std::fs::read_dir(&directory)? {
+            if Instant::now() >= deadline {
+                return Err(CiError::Message("original native cleanup cutoff exhausted during alias inventory; scope retained".into()));
+            }
+            let entry = entry?;
+            visited += 1;
+            if visited > 8192 {
+                return Err(CiError::Message(
+                    "native recovery artifact inventory exceeds bound; scope retained".into(),
+                ));
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            let relative = relative.join(entry.file_name());
+            if metadata.is_dir() {
+                pending.push((entry.path(), relative));
+            } else if metadata.is_file() {
+                files.push((relative, source_state(&metadata)));
+            } else {
+                return Err(CiError::Message(
+                    "native recovery source contains unresolved unsafe object; scope retained"
+                        .into(),
+                ));
+            }
+        }
+        custody.verify()?;
+    }
+    Ok(files)
+}
+
+#[cfg(target_os = "linux")]
 fn cleanup_linux(root: &Path, destination: &Path, selection: &Selection) -> Result<()> {
     use super::linux_native_component::NativeAdminScope;
     let prefix = Path::new(&selection.target)
@@ -2801,55 +2887,35 @@ fn cleanup_linux(root: &Path, destination: &Path, selection: &Selection) -> Resu
         })?;
     let _recovery_custody = DirectoryCustody::create_fresh(&recovery)?;
     let mut copied = Vec::new();
-    let mut pending = vec![(scope.outputs().to_path_buf(), PathBuf::new())];
-    let mut visited = 0usize;
-    while let Some((directory, relative)) = pending.pop() {
+    let inventory = recovery_inventory(scope.outputs(), selection.cleanup)?;
+    let aliases = super::native_cargo_aliases::ClosedInventory::acquire(inventory.clone())
+        .map_err(CiError::Message)?;
+    for (relative, _) in &inventory {
         if Instant::now() >= selection.cleanup {
-            errors.push(
-                "original native cleanup cutoff exhausted while copying retained evidence".into(),
-            );
-            break;
+            return Err(CiError::Message("original native cleanup cutoff exhausted while copying retained evidence; scope retained".into()));
         }
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())?;
-            let relative = relative.join(entry.file_name());
-            visited = visited
-                .checked_add(1)
-                .ok_or_else(|| CiError::Message("native recovery inventory overflow".into()))?;
-            if visited > 8192 {
-                return Err(CiError::Message(
-                    "native recovery artifact inventory exceeds bound; scope retained".into(),
-                ));
-            }
-            if metadata.is_dir() {
-                pending.push((entry.path(), relative));
-            } else if metadata.is_file() {
-                copied.push(retain_file(
-                    &entry.path(),
-                    &recovery,
-                    &relative,
-                    None,
-                    512 * 1024 * 1024,
-                )?);
-            } else {
-                return Err(CiError::Message(
-                    "native recovery source contains unresolved unsafe object; scope retained"
-                        .into(),
-                ));
-            }
-        }
+        copied.push(retain_file_with_alias(
+            &scope.outputs().join(relative),
+            &recovery,
+            relative,
+            None,
+            512 * 1024 * 1024,
+            Some(aliases.source(relative).map_err(CiError::Message)?),
+        )?);
     }
+    aliases
+        .verify(recovery_inventory(scope.outputs(), selection.cleanup)?)
+        .map_err(CiError::Message)?;
     persist(
         &recovery.join("recovery-observation.json"),
         &serde_json::to_vec(&serde_json::json!({
         "format":"memcordon.consumer-readiness.native-recovery-observation","revision":1,
         "identity":selection.identity,"native_target":selection.target,"recipe_id":"original-native-components-v1",
-        "reconstructed_capture":false,"artifacts":copied,"errors":errors}))?,
+        "reconstructed_capture":false,"artifacts":copied,"source_aliases":inventory,"errors":errors}))?,
     )?;
     // Missing native capture can be recorded but cannot be repaired into a passed test.
     // Preserve the privileged scope until all retained bytes have been copied.
-    if !settled || !pending.is_empty() || Instant::now() >= selection.cleanup {
+    if !settled || Instant::now() >= selection.cleanup {
         return Err(CiError::Message(errors.join("; ")));
     }
     let retired = scope.retire(selection.cleanup)?;

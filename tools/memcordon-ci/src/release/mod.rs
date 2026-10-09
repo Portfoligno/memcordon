@@ -42,9 +42,13 @@ pub mod linux_readiness_lifecycle_cases;
 pub mod linux_readiness_limits_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_readiness_policy_cases;
+#[cfg(target_os = "linux")]
+mod native_cargo_aliases;
 pub mod native_component_harness;
 #[cfg(target_os = "linux")]
 mod native_executable;
+#[cfg(target_os = "linux")]
+mod native_execution_association;
 #[cfg(target_os = "linux")]
 mod native_package_diagnostics;
 #[cfg(target_os = "linux")]
