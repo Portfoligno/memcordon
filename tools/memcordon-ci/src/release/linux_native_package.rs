@@ -1019,7 +1019,6 @@ impl NativeLinuxPackageLease {
             &serde_json::json!({"source":identity,"cell":cell,"resource_setup_required":true}),
         )?;
         let resources = self.output.join("resources");
-        fs::create_dir(&resources)?;
         self.driver
             .prepare_native_component_fixture(InstalledMixedDriverInput {
                 payload,

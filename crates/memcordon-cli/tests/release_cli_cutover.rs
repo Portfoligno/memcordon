@@ -11,6 +11,25 @@ fn denied(platform: ReleasePlatform, arguments: &[&str]) -> bool {
 }
 
 #[test]
+fn original_registry_restoration_uses_the_accepted_apply_boundary() {
+    let accepted = [
+        "package",
+        "policy",
+        "apply",
+        "--file",
+        "original-policy.json",
+    ];
+    assert!(!denied(ReleasePlatform::Linux, &accepted));
+    let mut unsupported = accepted.to_vec();
+    unsupported.push("--json");
+    assert!(denied(ReleasePlatform::Linux, &unsupported));
+    assert!(denied(
+        ReleasePlatform::Linux,
+        &["package", "policy", "recover", "--json"]
+    ));
+}
+
+#[test]
 fn linux_protected_image_install_reaches_its_existing_operational_dispatch() {
     let arguments = [
         "package",

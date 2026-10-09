@@ -1213,7 +1213,6 @@ impl InstalledMixedDriver {
                     .bounded_until(deadline)
                     .args(["package", "policy", "apply", "--file"])
                     .arg(&path)
-                    .arg("--json")
                     .output()?;
             retain_attempt(
                 "policy",
