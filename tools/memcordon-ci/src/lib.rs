@@ -30,6 +30,8 @@ pub mod standard_contract;
 pub mod standard_runner;
 pub mod stress;
 pub mod target_shard;
+#[cfg(windows)]
+mod windows_caller_snapshot_diagnostic;
 pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
 pub mod windows_consumer_readiness;

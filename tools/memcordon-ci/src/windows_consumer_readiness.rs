@@ -1840,9 +1840,32 @@ pub(crate) mod native {
             let output =
                 memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 16 * 1024)
                     .map_err(|error| CiError::Message(error.to_string()))?;
+            crate::release::source::write_diagnostic_json(
+                &config.output_directory.join(if restricted {
+                    "windows-restricted-token-capture.json"
+                } else {
+                    "windows-ordinary-token-capture.json"
+                }),
+                &serde_json::json!({
+                    "format":"memcordon.windows-caller-token-capture",
+                    "revision":1,
+                    "restricted":restricted,
+                    "program_debug":format!("{:?}",command.get_program()),
+                    "arguments_debug":command.get_args().map(|argument|format!("{argument:?}")).collect::<Vec<_>>(),
+                    "status":output.status.code(),
+                    "success":output.status.success(),
+                    "stdout":output.stdout,
+                    "stderr":output.stderr,
+                }),
+            )?;
             if !output.status.success() || !output.stderr.is_empty() {
                 return Err(CiError::Message(
-                    "native caller-envelope provisioning failed".into(),
+                    crate::windows_caller_snapshot_diagnostic::failure(
+                        restricted,
+                        output.status.code(),
+                        &output.stdout,
+                        &output.stderr,
+                    ),
                 ));
             }
             let token: TokenObservation = serde_json::from_slice(&output.stdout)?;
