@@ -165,6 +165,17 @@ pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_record(path, value, false)
+}
+
+/// Diagnostic snapshots are retained by the ordinary runner even when the
+/// measured operation runs as administrator. Private authority records continue
+/// to use `write_json`; only this explicit diagnostic publication is readable.
+pub fn write_diagnostic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_record(path, value, true)
+}
+
+fn write_json_record(path: &Path, value: &impl Serialize, readable_diagnostic: bool) -> Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -178,6 +189,15 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(&bytes)?;
+    #[cfg(unix)]
+    if readable_diagnostic {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    #[cfg(not(unix))]
+    let _ = readable_diagnostic;
     temporary.as_file().sync_all()?;
     temporary
         .persist(path)

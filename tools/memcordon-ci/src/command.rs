@@ -390,7 +390,7 @@ impl CommandSpec {
             std::fs::create_dir_all(&directory)?;
             let temporary = directory.join(phase.name()).with_extension("tmp");
             let path = directory.join(phase.name()).with_extension("json");
-            crate::release::source::write_json(&temporary, &value)?;
+            crate::release::source::write_diagnostic_json(&temporary, &value)?;
             std::fs::rename(temporary, path)?;
             Ok(())
         };

@@ -845,12 +845,26 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
     let root = std::path::absolute(root)?;
     let selection = select(&root, args)?;
     if !rustix::process::geteuid().is_root() {
+        let mut native_path = std::ffi::OsString::from("PATH=");
+        native_path.push(
+            std::env::var_os("PATH")
+                .ok_or_else(|| CiError::Message("native toolchain PATH absent".into()))?,
+        );
+        let rustup_home = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+            .ok_or_else(|| CiError::Message("native Rust toolchain home absent".into()))?;
+        let mut rustup_environment = std::ffi::OsString::from("RUSTUP_HOME=");
+        rustup_environment.push(rustup_home);
         let mut command = crate::command::CommandSpec::new(
             "sudo",
             &root,
             selection.cleanup.saturating_duration_since(Instant::now()),
         )
         .args(["-n", "--"])
+        .arg("/usr/bin/env")
+        .arg(native_path)
+        .arg(rustup_environment)
         .arg(std::env::current_exe()?)
         .arg("consumer-readiness-native-components")
         .arg("--identity")
