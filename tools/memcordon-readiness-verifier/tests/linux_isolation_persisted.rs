@@ -27,6 +27,28 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn cross_attempt_rejects_rehashed_protected_output_scope_aliases() {
+    for mutation in ["sibling", "windows-separator"] {
+        let mut case = linux_cross_attempt_case::baseline();
+        case.validate().unwrap();
+        let lease = linux_installed_case::read(&case, "installed/lease-owner.json");
+        let admin = lease["admin_root"].as_str().unwrap();
+        case.mutate("cross/owner.json", |owner| {
+            owner["protected_output"] = json!(match mutation {
+                "sibling" => format!("{admin}-sibling/cross-attempt-abstract"),
+                "windows-separator" => format!("{admin}\\cross-attempt-abstract"),
+                _ => unreachable!(),
+            });
+        });
+        assert_eq!(
+            case.validate().unwrap_err(),
+            "cross original lease/acquisition/native account scope differs",
+            "{mutation} escaped original Linux administrator custody"
+        );
+    }
+}
+
+#[test]
 fn cross_account_rejects_rehashed_windows_separator_source_aliases() {
     for field in ["native_readback", "group_readback"] {
         let mut case = linux_cross_attempt_case::baseline();

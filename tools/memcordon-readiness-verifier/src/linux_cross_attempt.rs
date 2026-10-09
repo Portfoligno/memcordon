@@ -499,9 +499,9 @@ pub(crate) fn validate(
             "stderr_sha256",
         ],
     )?;
-    let peer_root = std::path::Path::new(path("peer_collection_root")?);
-    let stdout = peer_root.join("stdout.bin");
-    let stderr = peer_root.join("stderr.bin");
+    let peer_root = path("peer_collection_root")?;
+    let stdout = crate::linux_path::join(peer_root, "stdout.bin");
+    let stderr = crate::linux_path::join(peer_root, "stderr.bin");
     if frontend_exit["format"] != "memcordon.linux-policy-frontend-exit"
         || frontend_exit["revision"] != 1
         || frontend_exit["process_id"] != peer_binding["caller"]["process_id"]
@@ -510,18 +510,8 @@ pub(crate) fn validate(
         || frontend_exit["native_exit"] != 0
         || !frontend_exit["signal"].is_null()
         || frontend_exit["invocation_sha256"] != custody.hash(path("peer_frontend_invocation")?)?
-        || frontend_exit["stdout_sha256"]
-            != custody.hash(
-                stdout
-                    .to_str()
-                    .ok_or("cross-attempt peer stdout path nonUTF8")?,
-            )?
-        || frontend_exit["stderr_sha256"]
-            != custody.hash(
-                stderr
-                    .to_str()
-                    .ok_or("cross-attempt peer stderr path nonUTF8")?,
-            )?
+        || frontend_exit["stdout_sha256"] != custody.hash(&stdout)?
+        || frontend_exit["stderr_sha256"] != custody.hash(&stderr)?
     {
         return Err("cross-attempt original peer Child wait/captures differ".into());
     }
@@ -563,13 +553,11 @@ pub(crate) fn validate(
     let initial = decode("prior_activation")?;
     let lease = decode("original_lease")?;
     let acquisition = decode("original_acquisition")?;
-    let artifact_root = std::path::Path::new(
-        lease["artifact_root"]
-            .as_str()
-            .ok_or("cross original artifact root absent")?,
-    );
+    let artifact_root = lease["artifact_root"]
+        .as_str()
+        .ok_or("cross original artifact root absent")?;
     for field in ["original_lease", "original_acquisition"] {
-        if owner[field] != json!(artifact_root.join(path(field)?)) {
+        if owner[field] != json!(crate::linux_path::join(artifact_root, path(field)?)) {
             return Err("cross original owner source authority file differs".into());
         }
     }
@@ -578,10 +566,9 @@ pub(crate) fn validate(
             return Err("cross original owner cutoff copy differs".into());
         }
     }
-    let account_parent = std::path::Path::new(path("peer_account_intent")?)
-        .parent()
+    let account_parent = crate::linux_path::parent(path("peer_account_intent")?)
         .ok_or("cross archived account parent absent")?;
-    let native_account_parent = artifact_root.join(account_parent);
+    let native_account_parent = crate::linux_path::join(artifact_root, &account_parent);
     if lease["format"] != "memcordon.consumer-readiness.linux-lease-owner"
         || lease["identity"] != owner["identity"]
         || lease["cell"] != owner["cell"]
@@ -590,24 +577,26 @@ pub(crate) fn validate(
         || acquisition["cell"] != owner["cell"]
         || acquisition["account"] != owner["primary_account"]
         || acquisition["admin_root"] != lease["admin_root"]
-        || owner["acquisition_output"].as_str() != native_account_parent.to_str()
-        || std::path::Path::new(
+        || owner["acquisition_output"].as_str() != Some(native_account_parent.as_str())
+        || !crate::linux_path::parent(
             canary["peer_account"]["intent"]
                 .as_str()
                 .ok_or("cross native account intent absent")?,
         )
-        .parent()
-            != Some(native_account_parent.as_path())
-        || !std::path::Path::new(
-            owner["protected_output"]
+        .is_some_and(|parent| crate::linux_path::equivalent(&parent, &native_account_parent))
+        || !{
+            let ancestors = crate::linux_path::ancestors(
+                owner["protected_output"]
+                    .as_str()
+                    .ok_or("cross protected output absent")?,
+            );
+            let admin_root = lease["admin_root"]
                 .as_str()
-                .ok_or("cross protected output absent")?,
-        )
-        .starts_with(
-            lease["admin_root"]
-                .as_str()
-                .ok_or("cross original admin root absent")?,
-        )
+                .ok_or("cross original admin root absent")?;
+            ancestors
+                .iter()
+                .any(|ancestor| crate::linux_path::equivalent(ancestor, admin_root))
+        }
     {
         return Err("cross original lease/acquisition/native account scope differs".into());
     }
@@ -760,12 +749,12 @@ pub(crate) fn validate(
             return Err("cross-attempt original policy command changes unrelated authority".into());
         }
         let command = decode(&invocation_field)?;
-        let protected = std::path::Path::new(
+        let protected = crate::linux_path::join(
             owner["protected_output"]
                 .as_str()
                 .ok_or("cross protected source directory absent")?,
-        )
-        .join(format!("{stem}.policy.json"));
+            &format!("{stem}.policy.json"),
+        );
         let cutoff = lease[if stem == "activation" {
             "work_deadline_unix_millis"
         } else {
@@ -785,7 +774,7 @@ pub(crate) fn validate(
         {
             return Err("cross policy refreshes original deadline authority".into());
         }
-        if command["arguments"][4] != json!(protected.as_os_str().as_encoded_bytes()) {
+        if command["arguments"][4] != json!(protected.as_bytes()) {
             return Err("cross policy command substitutes original protected source file".into());
         }
         policy_command(
