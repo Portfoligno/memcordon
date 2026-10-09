@@ -998,8 +998,11 @@ pub(crate) mod native {
         let sid = sid_text(&token.user_sid)?;
         let input_acl = format!("D:P(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)");
         set_directory_acl(&directory, &input_acl)?;
+        // Executable files have effective authority but no child inheritance.
+        // Keep the same ordered principals and rights as the input directory.
+        let image_acl = format!("D:P(A;;GA;;;{sid})(A;;GRGX;;;RC)(A;;GA;;;SY)");
         for image in [&config.cli.path, &config.fixture.path] {
-            set_directory_acl(image, &input_acl)?;
+            set_directory_acl(image, &image_acl)?;
         }
         let owned_inputs = directory.join("locked-inputs");
         fs::create_dir(&owned_inputs)?;

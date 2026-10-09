@@ -48,6 +48,47 @@ fn file_generic_mapping_and_allocation_padding_preserve_exact_authority() {
 }
 
 #[test]
+fn executable_file_policy_keeps_exact_authority_without_directory_inheritance() {
+    let directory = [
+        (0, 3, 0x1000_0000, 1001),
+        (0, 3, 0xa000_0000, 12),
+        (0, 3, 0x1000_0000, 18),
+    ];
+    let file: Vec<_> = directory
+        .iter()
+        .map(|&(kind, _, mask, rid)| (kind, 0, mask, rid))
+        .collect();
+    let actual: Vec<_> = file
+        .iter()
+        .map(|&(kind, flags, mask, rid)| (kind, flags, mapped(mask), rid))
+        .collect();
+    let expected = acl(&file, 0);
+    verify_file_dacl(&expected, &acl(&actual, 16), true).unwrap();
+    assert!(verify_file_dacl(&expected, &acl(&actual, 0), false).is_err());
+    assert!(
+        verify_file_dacl(&acl(&directory, 0), &acl(&actual, 0), true)
+            .unwrap_err()
+            .contains("ordered inheritance authority differs")
+    );
+    assert!(
+        verify_file_dacl(&expected, &acl(&directory, 0), true)
+            .unwrap_err()
+            .contains("ordered inheritance authority differs")
+    );
+    for mutation in ["trustee", "rights", "order", "kind"] {
+        let mut changed = actual.clone();
+        match mutation {
+            "trustee" => changed[1].3 = 1002,
+            "rights" => changed[1].2 = mapped(0x1000_0000),
+            "order" => changed.swap(0, 1),
+            "kind" => changed[1].0 = 1,
+            _ => unreachable!(),
+        }
+        assert!(verify_file_dacl(&expected, &acl(&changed, 0), true).is_err());
+    }
+}
+
+#[test]
 fn split_effective_and_inheritance_aces_preserve_both_ordered_sequences() {
     let expected = policy();
     let actual: Vec<_> = expected
