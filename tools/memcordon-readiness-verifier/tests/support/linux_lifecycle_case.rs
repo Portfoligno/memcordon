@@ -6,18 +6,34 @@ use super::{
 use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
+#[allow(
+    dead_code,
+    reason = "Image integration targets reuse only the executed result constructor"
+)]
 pub fn allocation_case(actor: &str) -> PersistedCase {
     loss_case(actor, "allocation")
 }
 
+#[allow(
+    dead_code,
+    reason = "Image integration targets reuse only the executed result constructor"
+)]
 pub fn loss_case(actor: &str, phase: &str) -> PersistedCase {
     case_graph(actor, phase, false)
 }
 
+#[allow(
+    dead_code,
+    reason = "Image integration targets reuse only the executed result constructor"
+)]
 pub fn delivery_case() -> PersistedCase {
     case_graph("frontend", "allocation", true)
 }
 
+#[allow(
+    dead_code,
+    reason = "Image integration targets reuse only the executed result constructor"
+)]
 fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
     assert!(["frontend", "worker", "guardian", "control"].contains(&actor));
     assert!(["allocation", "release", "drain"].contains(&phase));

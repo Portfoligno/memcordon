@@ -172,7 +172,6 @@ pub fn baseline(scenario: &str) -> PersistedCase {
     ] {
         put(&mut case, role, &value);
     }
-    drop(put);
     let request_path = "running/policy-fresh-08080808080808080808080808080808.provider-request.bin";
     case.json(request_path, &fresh_graph.request);
     peers.push(BehaviorArtifact {
@@ -352,7 +351,6 @@ fn restart() -> PersistedCase {
         "policy-fresh-family-retirement.json",
         &json!({"format":"memcordon.linux-policy-restarted-family-retirement","revision":1,"prepared":graph.prepared,"native_family_retired":true,"target_retirement":prepared::held(403,902,true),"namespace_init_retirement":prepared::held(404,903,true),"guardian_retirement":prepared::held(405,904,true),"old_control_retired":true,"new_control_live":true}),
     );
-    drop(put);
     let tool = b"original systemctl image";
     let toolpath = "running/systemctl.bin";
     case.write(toolpath, tool);

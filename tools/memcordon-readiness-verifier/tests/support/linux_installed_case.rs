@@ -109,6 +109,10 @@ pub fn read(case: &PersistedCase, path: &str) -> Value {
 
 /// Original owned registry peers. This only constructs encoded vectors; it does not
 /// stand in for native acquisition, preparation, execution, or retirement.
+#[allow(
+    dead_code,
+    reason = "Frozen legacy integration targets use installed custody without a mixed activation"
+)]
 pub fn activation(
     case: &mut PersistedCase,
     runtime: Value,

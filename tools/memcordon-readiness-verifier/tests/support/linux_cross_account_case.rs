@@ -134,6 +134,10 @@ pub fn populate(
     json!({"peer_account":account,"peer_account_intent":leaf("exclusive-account-intent.json"),"peer_account_passwd":leaf("exclusive-account-getent.bin"),"peer_account_group":leaf("exclusive-group-getent.bin"),"peer_account_creation":leaf("exclusive-account-useradd-creation.json"),"peer_account_retirement":retired_path})
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind original account identity, cell, executable, argv, cwd, exit, output, ordinal and process birth independently"
+)]
 fn command(
     case: &mut PersistedCase,
     parent: &str,

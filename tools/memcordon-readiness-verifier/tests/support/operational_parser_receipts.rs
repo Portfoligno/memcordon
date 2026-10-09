@@ -3,6 +3,10 @@ mod committed_protocol_fixture;
 
 use serde_json::{Value, json};
 
+#[expect(
+    clippy::type_complexity,
+    reason = "parser vectors independently retain family, scenario, original bytes, hostile bytes and exact diagnostic"
+)]
 fn vectors() -> Vec<(&'static str, &'static str, Vec<u8>, Vec<u8>, String)> {
     let base = json!({"format":"memcordon.result","revision":2,
         "tool":{"name":"memcordon","version":env!("CARGO_PKG_VERSION"),"os":"linux","architecture":"x86_64","runtime_features":[]},

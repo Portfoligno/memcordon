@@ -5,9 +5,7 @@ use super::{
 };
 use memcordon_core::workload_contract::LogicalId;
 use memcordon_core::workload_contract_v3::{DeniedOperationV3, RequirementV3, WorkloadContractV3};
-use memcordon_core::workload_registry_v3::{
-    ExclusiveIdentityDefinitionV3, RuntimePrivatePolicyRegistryV3,
-};
+use memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3;
 use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
@@ -65,19 +63,18 @@ fn move_peer_identity(value: &mut Value, key: &str) {
                     && n >= 300
                 {
                     *value = json!(n - 100);
-                } else if key == "inode" && (100..=104).contains(&n)
-                    || (key == "inode" && (1100..=1104).contains(&n))
+                } else if (key == "inode"
+                    && ((100..=104).contains(&n) || (1100..=1104).contains(&n)))
+                    || key == "root_inode"
                 {
-                    *value = json!(n + 5000);
-                } else if key == "root_inode" {
                     *value = json!(n + 5000);
                 }
             }
         }
-        Value::String(text) => {
-            if key == "attempt_id" && text == "07070707070707070707070707070707" {
-                *text = "08080808080808080808080808080808".into();
-            }
+        Value::String(text)
+            if key == "attempt_id" && text == "07070707070707070707070707070707" =>
+        {
+            *text = "08080808080808080808080808080808".into();
         }
         _ => {}
     }
@@ -117,10 +114,8 @@ fn copy_peer(case: &mut PersistedCase, peer: &PersistedCase) {
                     rekey(value, names)
                 }
             }
-            Value::String(text) => {
-                if names.contains(&text.as_str()) {
-                    *text = format!("peer/{text}");
-                }
+            Value::String(text) if names.contains(&text.as_str()) => {
+                *text = format!("peer/{text}");
             }
             _ => {}
         }

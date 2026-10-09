@@ -27,6 +27,10 @@ pub struct MalformedMixedIngressEvidence {
 /// Exercise the installed parser with a bounded request which the current
 /// request codec itself rejects. This exchange can never carry a valid launch.
 #[doc(hidden)]
+#[expect(
+    clippy::type_complexity,
+    reason = "the accepted ingress probe API returns response and exact provider/attempt bindings together"
+)]
 pub fn probe_malformed_mixed_ingress(
     payload: &[u8],
 ) -> Result<
@@ -373,6 +377,10 @@ enum NativeContract<'a> {
     Legacy(&'a memcordon_core::workload_contract::WorkloadContractV2),
     Mixed(&'a memcordon_core::workload_contract_v3::WorkloadContractV3),
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded terminal evidence stays fully owned inline across the native custody boundary"
+)]
 enum NativeTerminal {
     Legacy(memcordon_core::private_runtime::PrivateRuntimeTerminal),
     Mixed(memcordon_core::result_v2::MixedRuntimeCarrierV2),
@@ -417,6 +425,10 @@ pub(crate) fn mixed_run_at(
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "the backend boundary preserves the public categorized Error contract"
+)]
 pub(crate) fn mixed_backend_run(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,

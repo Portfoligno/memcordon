@@ -3,6 +3,10 @@ use serde_json::{Value, json};
 #[path = "support/persisted_case.rs"]
 mod persisted_actor_support;
 
+#[expect(
+    clippy::type_complexity,
+    reason = "the fixture returns actor evidence together with its independent native command bindings"
+)]
 fn persist_actor_effect(
     case: &mut persisted_actor_support::PersistedCase,
     ordinal: usize,
@@ -178,6 +182,10 @@ fn persist_actor_effect(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "late actor evidence independently binds selector, attempt, nonce, digest and provider"
+)]
 fn persist_actor_late_effect(
     case: &mut persisted_actor_support::PersistedCase,
     actor: &mut memcordon_readiness_verifier::ComponentActor,
@@ -1643,7 +1651,7 @@ fn capacity_constituent(
                 }
             }
             Value::Number(number) => {
-                if [
+                if ([
                     "pid",
                     "process_id",
                     "root_pid",
@@ -1661,11 +1669,10 @@ fn capacity_constituent(
                         "parent_birth",
                         "target_creation_time_100ns",
                     ]
-                    .contains(&field)
+                    .contains(&field))
+                    && let Some(original) = number.as_u64()
                 {
-                    if let Some(original) = number.as_u64() {
-                        *value = json!(original + offset);
-                    }
+                    *value = json!(original + offset);
                 }
             }
             Value::Object(object) => {
@@ -2291,7 +2298,6 @@ fn preprovider_refusal_case(
         "lease_id":"vector-lease","fixture":"fixture.bin","fixture_source":"source.tar","fixture_sha256":fixture_sha,"fixture_source_sha256":sha256(b"selected source vector"),"input":"input.json","input_sha256":sha256(&input),
         "invocation":"invocation.json","request":"contract.json","raw_result":"case/result.json","native_observation":"native.json","retirement":"retirement.json","semantic_observation":"semantic.json"})).unwrap();
     write("case.json", &serde_json::to_vec(&evidence).unwrap());
-    drop(write);
     let product:ProductObservation=serde_json::from_value(json!({"key":cell,"source_commit":source,"source_tree_sha256":tree,"version":version,"host":{"kernel":"windows","native_target":target,"executable_target":target,
         "emulated":false,"toolchain_identity":"vector","toolchain_sha256":"1".repeat(64),"lockfile_sha256":"2".repeat(64)},"features":["windows-sealed-runtime"],"components":[{"role":"public-cli","artifact":"cli.bin","installed_sha256":cli_sha},{"role":"sealed-agent","artifact":"agent.bin","installed_sha256":agent_sha}],
         "materialization":"vector","runtime_manifest":"manifest.json","package_sha256":"3".repeat(64),"request_revision":1,"result_revision":1,"runtime_profile":"windows-host-network-external",
@@ -2444,7 +2450,7 @@ fn authenticated_refusal_case(
     index.products[0].lifecycle.journal = "lifetime/journal.json".into();
     index.products[0].lifecycle.receipt = "lifetime/journal.json".into();
     let mut invocation: NativeInvocation = serde_json::from_value(read("invocation.json")).unwrap();
-    let argv = vec![
+    let argv = [
         "C:\\owned\\fixture.exe",
         "consumer-readiness-windows",
         "C:\\owned\\input.json",

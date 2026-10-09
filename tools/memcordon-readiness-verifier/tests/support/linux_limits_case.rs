@@ -7,6 +7,10 @@ use memcordon_readiness_verifier::*;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+#[allow(
+    dead_code,
+    reason = "Some integration targets reuse limit graph helpers without the standalone baseline"
+)]
 pub fn baseline(family: &str, scenario: &str) -> PersistedCase {
     let mut case = if family == "L-LIFE-03" {
         image::baseline()
@@ -309,9 +313,17 @@ pub fn baseline(family: &str, scenario: &str) -> PersistedCase {
     case
 }
 
+#[allow(
+    dead_code,
+    reason = "Transcript rows are needed only by the standalone limit baseline"
+)]
 fn row(sequence: usize, token: &str, operation: &str, observation: Value) -> Value {
     json!({"format":"memcordon.linux-readiness-transcript","revision":1,"sequence":sequence,"challenge":token,"root_pid":2,"root_birth":302,"operation":operation,"observation":observation})
 }
+#[allow(
+    dead_code,
+    reason = "Transcript decoding is needed only by the standalone limit baseline"
+)]
 fn read_transcript(case: &PersistedCase) -> Vec<Value> {
     std::fs::read(case.root.path().join("transcript.bin"))
         .unwrap()
@@ -451,6 +463,10 @@ pub fn rebind_activation(
     (graph, native)
 }
 
+#[allow(
+    dead_code,
+    reason = "Memory action graphs are needed only by the standalone limit baseline"
+)]
 fn memory_actions(
     case: &PersistedCase,
     graph: &prepared::PreparedGraph,

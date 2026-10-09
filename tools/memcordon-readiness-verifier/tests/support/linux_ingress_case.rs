@@ -2,7 +2,7 @@
 use super::{linux_installed_case as installed, persisted_case::PersistedCase};
 use memcordon_readiness_verifier::*;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 pub fn baseline() -> PersistedCase {
     let mut case = installed::installed("L-ID-01", "v3-preserve-caller");

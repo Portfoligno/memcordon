@@ -1456,7 +1456,7 @@ pub fn inherit_test_descriptor_at(
     destination: i32,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    if descriptor.as_raw_fd() < 3 || destination < 3 || destination > 4096 {
+    if descriptor.as_raw_fd() < 3 || !(3..=4096).contains(&destination) {
         return Err(io::Error::other(
             "test descriptor slot outside finite nonstandard bound",
         ));
