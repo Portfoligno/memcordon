@@ -306,6 +306,10 @@ pub fn ingest(
 
 pub fn persist(index: &EvidenceIndex, path: &Path) -> LedgerResult<()> {
     let bytes = serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?;
+    // Include the trailing newline in the verifier's independent input bound.
+    if bytes.len() >= memcordon_readiness_verifier::MAX_INDEX_BYTES {
+        return Err("consumer readiness evidence exceeds index byte bound".into());
+    }
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)

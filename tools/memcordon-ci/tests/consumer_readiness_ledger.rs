@@ -33,6 +33,44 @@ fn plan_keeps_all_channels_and_component_rows_without_claiming_observation() {
 }
 
 #[test]
+fn full_manifest_evidence_uses_verifier_bound_and_refuses_oversize_before_creation() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ci/consumer-readiness-v1.toml");
+    let mut index = initialize(&manifest, identity()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let evidence = directory.path().join("evidence.json");
+    memcordon_ci::consumer_readiness_ledger::persist(&index, &evidence).unwrap();
+    let bytes = std::fs::read(&evidence).unwrap();
+    assert!(bytes.len() > 1024 * 1024);
+    let restored: memcordon_readiness_verifier::EvidenceIndex =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(restored.records.len(), index.records.len());
+    assert!(
+        restored
+            .records
+            .iter()
+            .all(|row| row.state == CaseState::NotRun)
+    );
+    // Exercise the exact reader boundary, including the persisted newline.
+    index.assessment_failures.push(String::new());
+    let base = serde_json::to_vec_pretty(&index).unwrap().len() + 1;
+    index.assessment_failures[0] = "x".repeat(memcordon_readiness_verifier::MAX_INDEX_BYTES - base);
+    let boundary = directory.path().join("boundary.json");
+    memcordon_ci::consumer_readiness_ledger::persist(&index, &boundary).unwrap();
+    assert_eq!(
+        std::fs::metadata(boundary).unwrap().len(),
+        memcordon_readiness_verifier::MAX_INDEX_BYTES as u64
+    );
+    index.assessment_failures[0].push('x');
+    let oversized = directory.path().join("oversized.json");
+    assert_eq!(
+        memcordon_ci::consumer_readiness_ledger::persist(&index, &oversized).unwrap_err(),
+        "consumer readiness evidence exceeds index byte bound"
+    );
+    assert!(!oversized.exists());
+}
+
+#[test]
 fn wrong_source_and_channel_cannot_reassociate_existing_plan() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../ci/consumer-readiness-v1.toml");
