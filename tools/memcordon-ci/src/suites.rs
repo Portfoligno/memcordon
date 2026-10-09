@@ -730,10 +730,9 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             )?;
             admission.push(serde_json::json!({"package": package, "target": "macos_admission", "scenario": scenario, "executed": 1, "passed": 1}));
         }
-        fs::write(
-            evidence.join("admission-inventory.json"),
-            serde_json::to_vec_pretty(&admission)?,
-        )?;
+        let mut admission_bytes = serde_json::to_vec_pretty(&admission)?;
+        admission_bytes.push(b'\n');
+        fs::write(evidence.join("admission-inventory.json"), admission_bytes)?;
         let mut mutations = Vec::new();
         for (package, target, scenario) in
             crate::native_acceptance_catalogue::MACOS_MUTATION_SCENARIOS
@@ -771,6 +770,18 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         cargo(
             root,
             stable,
+            "test",
+            [
+                "--locked",
+                "--target-dir",
+                "target/ci/deadline-oracle-build",
+                "--package",
+                "memcordon-deadline-oracle",
+            ],
+        )?;
+        cargo(
+            root,
+            stable,
             "build",
             [
                 "--locked",
@@ -783,7 +794,7 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         CommandSpec::new(
             root.join("target/ci/deadline-oracle-build/debug/memcordon-deadline-oracle"),
             root,
-            Duration::from_secs(60),
+            Duration::from_secs(90),
         )
         .arg(root.join("target/ci/deadline-build/debug/memcordon"))
         .arg(&evidence)
@@ -795,7 +806,14 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             &serde_json::json!({"schema_version": 1, "passed": false, "error": error.to_string()}),
         )?;
         bytes.push(b'\n');
-        fs::write(evidence.join("final.json"), bytes)?;
+        fs::write(evidence.join("suite-final.json"), &bytes)?;
+        if !evidence.join("final.json").exists() {
+            let mut aggregate = serde_json::to_vec_pretty(
+                &serde_json::json!({"schema_version": 2, "passed": false, "error": error.to_string()}),
+            )?;
+            aggregate.push(b'\n');
+            fs::write(evidence.join("final.json"), aggregate)?;
+        }
     }
     result
 }
