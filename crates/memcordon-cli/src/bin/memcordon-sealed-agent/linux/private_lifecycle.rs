@@ -1580,6 +1580,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         streams: [OwnedFd; 3],
         work: Instant,
         cleanup: Instant,
+        frontend_observer: &mut dyn FnMut(bool) -> Result<(), String>,
         callback: &mut dyn FnMut(
             &Self,
             &super::mixed_admission::MixedOperationalAdmission,
@@ -1638,8 +1639,20 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             ) {
                 return Err("component native exec not observed".into());
             }
+            let frontend = admission
+                .frontend_pidfd
+                .try_clone()
+                .map_err(|error| error.to_string())?;
             if !matches!(
-                self.monitor_mixed(admission, Some(work), &control)?,
+                self.monitor_native(
+                    frontend.as_fd(),
+                    Some(work),
+                    || {
+                        frontend_observer(false)?;
+                        admission.revoked()
+                    },
+                    &control
+                )?,
                 PrivateMonitorOutcome::Completed
             ) {
                 return Err("component workload did not complete naturally".into());
@@ -1647,7 +1660,10 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             let retired = self.retire_mixed_before_account_for_component(
                 admission,
                 cleanup,
-                &mut |owner, admission| callback(owner, admission, &snapshot),
+                &mut |owner, admission| {
+                    frontend_observer(true)?;
+                    callback(owner, admission, &snapshot)
+                },
             )?;
             let execution = self.mixed_execution_after_retirement(
                 admission,

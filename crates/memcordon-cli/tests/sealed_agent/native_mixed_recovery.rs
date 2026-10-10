@@ -4,6 +4,9 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+#[path = "native_recovery_streams.rs"]
+mod native_recovery_streams;
+
 #[test]
 #[ignore = "original native administrator fixture and retained crash parent required"]
 fn native_account_retirement_boundary_emit_actual_receipt() {
@@ -240,21 +243,8 @@ fn run_recovery_component(lost_terminal: bool) {
             &input.challenge,
             work,
         )?;
-        let stdin: OwnedFd = std::fs::File::open("/dev/null")
-            .map_err(|e| e.to_string())?
-            .into();
-        let stdout: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(input.artifact_root.join("target-stdout.bin"))
-            .map_err(|e| e.to_string())?
-            .into();
-        let stderr: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(input.artifact_root.join("target-stderr.bin"))
-            .map_err(|e| e.to_string())?
-            .into();
+        let (mut frontend_capture, [stdin, stdout, stderr]) =
+            native_recovery_streams::Capture::acquire(&input.artifact_root, work)?;
         let fixture_artifact = retain("recovery-fixture.json", &fixture_bytes)?;
         let cwd = std::fs::File::open("/").map_err(|e| e.to_string())?;
         let caller = crate::linux::envelope::capture(
@@ -374,7 +364,7 @@ fn run_recovery_component(lost_terminal: bool) {
             journal.take().ok_or("actual native journal absent")?,
         )?;
         let metadata = admission.component_metadata().clone();
-        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,provider.clone(),attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |owner,admission,prepared|{
+        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,provider.clone(),attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |finished| frontend_capture.observe(finished),&mut |owner,admission,prepared|{
                 retain("native-prepared.json",&serde_json::to_vec(prepared).map_err(|e|e.to_string())?)?;
                 let native=owner.component_pre_account_observation(admission)?;
                 let export_path=native["export_path"].as_str().ok_or("native boundary export owner path absent")?;
