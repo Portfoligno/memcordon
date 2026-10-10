@@ -1963,9 +1963,41 @@ fn remove_uninstalled_directory(path: &str) -> Result<(), String> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "provider uninstall found residual state in {path}: {error}"
-        )),
+        Err(error) => {
+            use std::os::unix::fs::MetadataExt;
+            let mut members = Vec::new();
+            let mut truncated = false;
+            let observation = match std::fs::read_dir(path) {
+                Ok(mut entries) => {
+                    for entry in entries.by_ref().take(16) {
+                        match entry {
+                            Ok(entry) => {
+                                let name = entry.file_name();
+                                let displayed: String =
+                                    name.to_string_lossy().chars().take(128).collect();
+                                let name_truncated = name.to_string_lossy().chars().count() > 128;
+                                match std::fs::symlink_metadata(entry.path()) {
+                                    Ok(metadata) => members.push(format!(
+                                        "name={displayed:?},name-truncated={name_truncated},device={},inode={},mode={},uid={},length={}",
+                                        metadata.dev(), metadata.ino(), metadata.mode(), metadata.uid(), metadata.len()
+                                    )),
+                                    Err(cause) => members.push(format!(
+                                        "name={displayed:?},name-truncated={name_truncated},metadata-error={cause}"
+                                    )),
+                                }
+                            }
+                            Err(cause) => members.push(format!("entry-error={cause}")),
+                        }
+                    }
+                    truncated = entries.next().is_some();
+                    "observed".to_owned()
+                }
+                Err(cause) => format!("unavailable: {cause}"),
+            };
+            Err(format!(
+                "provider uninstall found residual state in {path}: {error}; residual-observation={observation}; members={members:?}; members-truncated={truncated}"
+            ))
+        }
     }
 }
 
