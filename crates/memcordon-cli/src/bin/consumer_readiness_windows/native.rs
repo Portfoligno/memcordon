@@ -171,7 +171,11 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
     // SAFETY: sizing query does not read a buffer.
     unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length) };
     if length == 0 || length > 64 * 1024 {
-        return Err(io::Error::other("token field exceeds bound"));
+        let cause = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "token-snapshot GetTokenInformation sizing; class={class}; length={length}; raw-os-error={:?}; cause={cause}; token field exceeds bound",
+            cause.raw_os_error()
+        )));
     }
     let slots = (length as usize).div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0usize; slots];
@@ -186,7 +190,11 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        let cause = frontend_os_error("token-snapshot GetTokenInformation read");
+        return Err(io::Error::new(
+            cause.kind(),
+            format!("{cause}; class={class}"),
+        ));
     }
     Ok(buffer)
 }
@@ -199,7 +207,9 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     let mut token = std::ptr::null_mut();
     // SAFETY: pseudo current process handle and output token pointer are valid.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error(
+            "token-snapshot OpenProcessToken(TOKEN_QUERY)",
+        ));
     }
     // SAFETY: newly opened token handle transfers to OwnedHandle once.
     let owned = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
@@ -266,7 +276,7 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     drop(owned);
     serde_json::to_vec(&serde_json::json!({"user_sid":sid,"restricted":restricted,
         "integrity_rid":level,"elevated":elevated,"restricting_sids":restricting_sids}))
-    .map_err(io::Error::other)
+    .map_err(|error| io::Error::other(format!("token-snapshot serialize observation: {error}")))
 }
 
 pub fn nested_job() -> io::Result<()> {
