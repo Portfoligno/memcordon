@@ -1,6 +1,8 @@
 //! Execute consumers against the selected, measured distribution in both channels.
 #[path = "public_install_io.rs"]
 mod public_install_io;
+#[path = "public_registry_location.rs"]
+mod public_registry_location;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -325,7 +327,8 @@ pub fn acquire_cargo_predecessor(
     super::packages::PackageBundle::load(&packages_directory)?;
     let acquisition = tempfile::Builder::new()
         .prefix("older-cargo-runtime-")
-        .tempdir_in(std::path::absolute(temporary_parent)?)?;
+        .tempdir()?;
+    public_registry_location::require_independent(acquisition.path()).map_err(CiError::Message)?;
     let home = acquisition.path().join("cargo-home");
     fs::create_dir(&home)?;
     let install = acquisition.path().join("install");
@@ -464,7 +467,8 @@ pub fn materialize_public_cargo(
     )?;
     let acquisition = tempfile::Builder::new()
         .prefix("public-registry-install-")
-        .tempdir_in(std::path::absolute(temporary_parent)?)?;
+        .tempdir()?;
+    public_registry_location::require_independent(acquisition.path()).map_err(CiError::Message)?;
     let home = acquisition.path().join("cargo-home");
     fs::create_dir(&home)?;
     let install = acquisition.path().join("install");
