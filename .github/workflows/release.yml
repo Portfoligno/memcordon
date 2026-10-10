@@ -75,7 +75,7 @@ jobs:
       - name: Package the rehearsal helper
         run: ./target/ci/release/memcordon-ci release rehearsal-tool
       - id: rehearsal-tool
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz
@@ -86,7 +86,7 @@ jobs:
         run: ./target/ci/release/memcordon-ci release publication-tool
       - id: selection
         if: steps.source.outputs.recovery-mode == 'reprepare'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: selected-source-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -97,7 +97,7 @@ jobs:
           overwrite: false
       - id: tool
         if: steps.source.outputs.recovery-mode == 'reprepare'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: preparation-tool-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/tool
@@ -116,7 +116,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: &diagnostic-paths |
@@ -164,7 +164,7 @@ jobs:
       - id: packages
         run: ./target/ci/release/memcordon-ci release packages --build-source .release/build-source.json
       - id: payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: packages-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/packages
@@ -180,7 +180,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -271,7 +271,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -337,7 +337,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -407,7 +407,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -465,7 +465,7 @@ jobs:
       - id: build
         run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json
       - id: payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/target
@@ -491,7 +491,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -621,7 +621,7 @@ jobs:
         run: ./target/ci/release/memcordon-ci release installed-consumers --channel cargo --destination .release/installed-results/cargo
       - if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: installed-results-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/installed-results
@@ -647,7 +647,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ matrix.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -806,7 +806,7 @@ jobs:
       - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json
       - id: candidate
         if: needs.select.outputs.preparation-kind == 'candidate'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/prepared-candidate
@@ -816,7 +816,7 @@ jobs:
           overwrite: false
       - id: prepared
         if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: prepared-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/prepared
@@ -825,7 +825,7 @@ jobs:
           overwrite: false
       - id: publication-tool
         if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: publication-tool-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/tool/memcordon-publication-tool.tar.gz
@@ -836,7 +836,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -894,7 +894,7 @@ jobs:
       - name: Retain rehearsal diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/rehearsal-results
@@ -933,7 +933,7 @@ jobs:
       - name: Retain bounded preparation diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: *diagnostic-paths
@@ -982,7 +982,7 @@ jobs:
       - name: Retain recovery rehearsal diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: recovery-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
           path: .release/rehearsal-results
@@ -1116,7 +1116,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: ./.release/tool/memcordon-ci release public-consumer
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: public-consumer-${{ github.run_id }}
           path: .release/prepared/public-consumer-results
