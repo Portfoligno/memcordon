@@ -3605,7 +3605,8 @@ pub fn validate_acquisition_payload_shape(original: &serde_json::Value) -> Verif
         if rows.is_empty()
             || rows.len() > 64
             || rows.iter().any(|row| !artifact(row))
-            || field != "artifacts" && rows.len() != 4
+            || field == "components" && rows.len() != 4
+            || field == "installed_components" && rows.len() != 3
         {
             return Err("acquisition artifact array shape differs".into());
         }
@@ -3753,6 +3754,16 @@ fn verify_acquisition_case(
         .map(|component| component.installed_sha256.as_str())
         .collect::<BTreeSet<_>>();
     for field in ["components", "installed_components"] {
+        let expected = if field == "installed_components" {
+            product
+                .components
+                .iter()
+                .filter(|component| component.role != "public-cli")
+                .map(|component| component.installed_sha256.as_str())
+                .collect::<BTreeSet<_>>()
+        } else {
+            expected_hashes.clone()
+        };
         let rows = original[field]
             .as_array()
             .ok_or("acquisition full component table absent")?;
@@ -3760,8 +3771,13 @@ fn verify_acquisition_case(
             .iter()
             .map(|row| row["sha256"].as_str().ok_or("component hash absent"))
             .collect::<Result<BTreeSet<_>, _>>()?;
-        if rows.len() != 4
-            || hashes != expected_hashes
+        if rows.len()
+            != if field == "installed_components" {
+                3
+            } else {
+                4
+            }
+            || hashes != expected
             || rows.iter().any(|row| {
                 row.as_object().is_none_or(|object| {
                     object.len() != 2
@@ -3770,7 +3786,10 @@ fn verify_acquisition_case(
                 }) || row["path"].as_str().is_none_or(str::is_empty)
             })
         {
-            return Err("acquisition omitted/substituted selected four-component bytes".into());
+            return Err(
+                "acquisition omitted/substituted selected components or installed provider bytes"
+                    .into(),
+            );
         }
     }
     digest(&evidence.fixture_sha256)?;

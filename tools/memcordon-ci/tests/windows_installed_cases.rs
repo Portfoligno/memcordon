@@ -123,6 +123,24 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
         )
     };
     let payload = construct(&source).unwrap();
+    assert_eq!(payload.components.len(), 4);
+    assert_eq!(payload.cli.path, directory.path().join("memcordon.exe"));
+    assert_eq!(payload.installed_components.len(), 3);
+    let installed_names: std::collections::BTreeSet<_> = payload
+        .installed_components
+        .iter()
+        .map(|artifact| artifact.path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(
+        installed_names,
+        [
+            "memcordon-sealed-agent.exe",
+            "memcordon-target-desktop-bootstrap.exe",
+            "memcordon-session-broker.exe"
+        ]
+        .into_iter()
+        .collect()
+    );
     assert_eq!(
         payload.provider,
         manifest.public_binding(&manifest_bytes).unwrap()

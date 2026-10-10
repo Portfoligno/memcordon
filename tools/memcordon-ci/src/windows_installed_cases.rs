@@ -529,10 +529,14 @@ impl InstalledWindowsPayload {
                 path: payload_directory.join(&name),
                 sha256: component.sha256.clone(),
             };
-            installed_components.push(SelectedArtifact {
-                path: installed_directory.join(&name),
-                sha256: component.sha256.clone(),
-            });
+            // The Windows package installs the provider roles. The public CLI
+            // remains the independently measured client in the channel payload.
+            if component.role != RuntimeComponentRole::PublicCli {
+                installed_components.push(SelectedArtifact {
+                    path: installed_directory.join(&name),
+                    sha256: component.sha256.clone(),
+                });
+            }
             components.push(artifact.clone());
             match component.role {
                 RuntimeComponentRole::PublicCli => cli = Some(artifact),
@@ -744,7 +748,7 @@ mod native {
                 != config.installed_manifest.sha256
             || config.installed_agent.sha256 != config.agent.sha256
             || config.components.len() != 4
-            || config.installed_components.len() != 4
+            || config.installed_components.len() != 3
         {
             return Err(CiError::Message(
                 "selected installed channel identity differs".to_owned(),
