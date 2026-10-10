@@ -707,6 +707,14 @@ fn run(operation: Operation) -> Result<(), String> {
     }
 }
 fn main() -> ExitCode {
+    match memcordon_ci::public_install_capture::run_if_wrapper() {
+        Ok(Some(status)) => memcordon_ci::public_install_capture::exit_wrapper(status),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("memcordon-ci compiler capture: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     match run(Arguments::parse().command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

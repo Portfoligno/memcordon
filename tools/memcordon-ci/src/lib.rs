@@ -18,6 +18,7 @@ pub mod native_results;
 pub mod native_test_plan;
 pub mod policy;
 pub mod preparation;
+pub mod public_install_capture;
 pub mod public_reads;
 pub mod rehearsal_support;
 pub mod release;

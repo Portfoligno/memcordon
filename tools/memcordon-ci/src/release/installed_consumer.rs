@@ -330,6 +330,24 @@ pub fn acquire_cargo_predecessor(
     fs::create_dir(&home)?;
     let install = acquisition.path().join("install");
     let stable = crate::config::toolchains(root)?.stable;
+    // A fresh target scope requires every selected executable to originate in
+    // this install's synchronous compiler capture, including on cache hits.
+    let cache = root.join("target/ci-predecessor");
+    fs::create_dir_all(&cache)?;
+    let install_target = tempfile::Builder::new()
+        .prefix("public-install-target-")
+        .tempdir_in(std::path::absolute(&cache)?)?;
+    let capture = prepare_public_install_capture(
+        root,
+        acquisition.path(),
+        install_target.path(),
+        &home,
+        receipts,
+        &stable,
+        &current.distribution,
+        &packages.source,
+        deadline,
+    )?;
     let mut command = crate::command::rustup_cargo(
         acquisition.path(),
         &stable,
@@ -349,7 +367,17 @@ pub fn acquire_cargo_predecessor(
     .arg("--root")
     .arg(&install)
     .arg("--target-dir")
-    .arg(root.join("target/ci-predecessor"))
+    .arg(install_target.path())
+    .arg("--config")
+    .arg(format!(
+        "build.rustc-wrapper={}",
+        serde_json::to_string(&capture.wrapper)?
+    ))
+    .arg("--config")
+    .arg(format!(
+        "build.rustc={}",
+        serde_json::to_string(&capture.descriptor.compiler)?
+    ))
     .arg("--message-format=json")
     .isolated_cargo(&home)
     .bounded_until(deadline);
@@ -383,6 +411,7 @@ pub fn acquire_cargo_predecessor(
         &install,
         &current.distribution,
         &packages.source,
+        &capture.descriptor,
     )?;
     verify_cached_public_packages(&home, &packages, receipts)?;
     retain_public_registry_graph(
@@ -394,7 +423,7 @@ pub fn acquire_cargo_predecessor(
         receipts,
         deadline,
     )?;
-    materialize_cargo_install(
+    let mut payload = materialize_cargo_install(
         root,
         current_target,
         &packages_directory,
@@ -403,7 +432,9 @@ pub fn acquire_cargo_predecessor(
         &install,
         temporary_parent,
         true,
-    )
+    )?;
+    retain_public_install_capture(&mut payload, &capture.descriptor, receipts)?;
+    Ok(payload)
 }
 
 #[expect(
@@ -438,6 +469,21 @@ pub fn materialize_public_cargo(
     fs::create_dir(&home)?;
     let install = acquisition.path().join("install");
     let stable = crate::config::toolchains(root)?.stable;
+    fs::create_dir_all(cache)?;
+    let install_target = tempfile::Builder::new()
+        .prefix("public-install-target-")
+        .tempdir_in(std::path::absolute(cache)?)?;
+    let capture = prepare_public_install_capture(
+        root,
+        acquisition.path(),
+        install_target.path(),
+        &home,
+        receipts,
+        &stable,
+        &bundle.distribution,
+        &bundle.source,
+        deadline,
+    )?;
     let mut command = crate::command::rustup_cargo(
         acquisition.path(),
         &stable,
@@ -457,7 +503,17 @@ pub fn materialize_public_cargo(
     .arg("--root")
     .arg(&install)
     .arg("--target-dir")
-    .arg(cache)
+    .arg(install_target.path())
+    .arg("--config")
+    .arg(format!(
+        "build.rustc-wrapper={}",
+        serde_json::to_string(&capture.wrapper)?
+    ))
+    .arg("--config")
+    .arg(format!(
+        "build.rustc={}",
+        serde_json::to_string(&capture.descriptor.compiler)?
+    ))
     .arg("--message-format=json")
     .isolated_cargo(&home)
     .bounded_until(deadline);
@@ -490,6 +546,7 @@ pub fn materialize_public_cargo(
         &install,
         &bundle.distribution,
         &bundle.source,
+        &capture.descriptor,
     )?;
     let cached_packages = verify_cached_public_packages(&home, &packages, receipts)?;
     retain_public_registry_graph(
@@ -512,6 +569,7 @@ pub fn materialize_public_cargo(
         false,
     )?;
     payload.artifacts.extend(cached_packages);
+    retain_public_install_capture(&mut payload, &capture.descriptor, receipts)?;
     for (name, bytes) in [
         ("public-cargo-install.stdout.jsonl", observed.stdout),
         ("public-cargo-install.stderr.bin", observed.stderr),
@@ -789,12 +847,148 @@ fn verify_cached_public_packages(
     Ok(result)
 }
 
+struct PublicInstallCapture {
+    wrapper: PathBuf,
+    descriptor: crate::public_install_capture::Descriptor,
+}
+
+fn retain_public_install_capture(
+    payload: &mut MaterializedPayload,
+    capture: &crate::public_install_capture::Descriptor,
+    receipts: &Path,
+) -> Result<()> {
+    for binary in &capture.binaries {
+        for suffix in ["json", "bin", "stdout.bin", "stderr.bin"] {
+            let path = capture.capture_directory.join(format!("{binary}.{suffix}"));
+            let bytes = artifacts::read_file(&path)?;
+            payload.artifacts.push(SelectedArtifact {
+                path,
+                sha256: artifacts::checksum(&bytes),
+            });
+        }
+    }
+    for name in [
+        "public-install-capture-descriptor.json",
+        "public-install-compiler-path.stdout",
+        "public-install-compiler-path.stderr",
+    ] {
+        let path = receipts.join(name);
+        let bytes = artifacts::read_file(&path)?;
+        payload.artifacts.push(SelectedArtifact {
+            path,
+            sha256: artifacts::checksum(&bytes),
+        });
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Original capture binds compiler, source, target, owned scopes and deadline"
+)]
+fn prepare_public_install_capture(
+    root: &Path,
+    acquisition: &Path,
+    target_directory: &Path,
+    cargo_home: &Path,
+    receipts: &Path,
+    toolchain: &str,
+    distribution: &TargetDistribution,
+    source: &BuildSourceIdentity,
+    deadline: std::time::Instant,
+) -> Result<PublicInstallCapture> {
+    let located = CommandSpec::new("rustup", root, Duration::from_secs(30))
+        .args(["which", "--toolchain", toolchain, "rustc"])
+        .bounded_until(deadline)
+        .output_quiet()?;
+    if !located.status.success() {
+        return Err(CiError::Message(
+            "public install compiler selection failed".into(),
+        ));
+    }
+    let compiler = fs::canonicalize(Path::new(
+        std::str::from_utf8(&located.stdout)
+            .map_err(|_| CiError::Message("public install compiler path encoding differs".into()))?
+            .trim(),
+    ))?;
+    let compiler_bytes = artifacts::read_file(&compiler)?;
+    let driver_bytes = artifacts::read_file(&std::env::current_exe()?)?;
+    let wrapper = binary_path(
+        acquisition,
+        "memcordon-public-install-capture",
+        native_target()?,
+    );
+    let capture_directory = std::path::absolute(receipts)?.join("public-install-capture");
+    fs::create_dir(&capture_directory)?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or_else(|| CiError::Message("public install capture deadline expired".into()))?;
+    let deadline_unix_millis = std::time::SystemTime::now()
+        .checked_add(remaining)
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or_else(|| CiError::Message("public install capture deadline overflow".into()))?;
+    let descriptor = crate::public_install_capture::Descriptor {
+        format: "memcordon.public-install-capture".into(),
+        revision: 1,
+        compiler,
+        compiler_sha256: artifacts::checksum(&compiler_bytes),
+        wrapper_sha256: artifacts::checksum(&driver_bytes),
+        target: distribution.target.clone(),
+        registry_source: std::path::absolute(cargo_home)?
+            .join("registry")
+            .join("src"),
+        target_directory: target_directory.to_owned(),
+        capture_directory,
+        package: "memcordon".into(),
+        version: source.version().to_string(),
+        binaries: distribution.binaries.clone(),
+        deadline_unix_millis,
+    };
+    use std::io::Write;
+    for (path, bytes) in [
+        (wrapper.clone(), driver_bytes),
+        (
+            acquisition.join("capture-descriptor.json"),
+            serde_json::to_vec(&descriptor)?,
+        ),
+    ] {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    executable(&wrapper)?;
+    for (name, bytes) in [
+        (
+            "public-install-capture-descriptor.json",
+            serde_json::to_vec(&descriptor)?,
+        ),
+        ("public-install-compiler-path.stdout", located.stdout),
+        ("public-install-compiler-path.stderr", located.stderr),
+    ] {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(receipts.join(name))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    Ok(PublicInstallCapture {
+        wrapper,
+        descriptor,
+    })
+}
+
 fn verify_public_install_artifacts(
     messages: &[u8],
     cargo_home: &Path,
     install: &Path,
     distribution: &TargetDistribution,
     source: &BuildSourceIdentity,
+    capture: &crate::public_install_capture::Descriptor,
 ) -> Result<PathBuf> {
     let mut binaries = std::collections::BTreeSet::new();
     let mut selected_manifest = None;
@@ -869,16 +1063,28 @@ fn verify_public_install_artifacts(
                 "public Cargo selected executables came from distinct manifests".into(),
             ));
         }
-        selected_manifest = Some(manifest);
+        selected_manifest = Some(manifest.clone());
         let executable = Path::new(executable);
-        let built = artifacts::read_file(executable).map_err(|error| match error {
-            CiError::Io(error) => CiError::Io(public_install_io::error(
-                "read emitted build executable",
-                executable,
-                error,
-            )),
-            error => error,
-        })?;
+        let receipt = crate::public_install_capture::load_receipt(capture, name)?;
+        let target_source = value
+            .get("target")
+            .and_then(|target| target.get("src_path"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CiError::Message("public Cargo target source absent".into()))?;
+        if receipt.cargo_output != executable
+            || receipt.manifest != manifest
+            || receipt.source != fs::canonicalize(target_source)?
+        {
+            return Err(CiError::Message(
+                "public Cargo artifact differs from synchronous compiler origin".into(),
+            ));
+        }
+        let built = artifacts::read_file(&receipt.retained_output)?;
+        if built.len() as u64 != receipt.length || artifacts::checksum(&built) != receipt.sha256 {
+            return Err(CiError::Message(
+                "public Cargo retained compiler bytes changed".into(),
+            ));
+        }
         target::validate_executable(&built, &distribution.target)?;
         let installed_path = binary_path(&install.join("bin"), name, &distribution.target);
         let installed = artifacts::read_file(&installed_path).map_err(|error| match error {
