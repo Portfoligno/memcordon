@@ -576,7 +576,20 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             layout,
             root_identity,
             &entry,
-        )?;
+        )
+        .map_err(|root_error| {
+            let startup = self.startup.as_ref().ok_or_else(|| "mixed startup channel absent".to_owned())
+                .and_then(|startup| startup.receive(init.host_pid, deadline));
+            match startup {
+                Ok(observed) => format!(
+                    "{root_error}; authenticated namespace startup after root-transfer failure: {:?}",
+                    observed.observation
+                ),
+                Err(startup_error) => format!(
+                    "{root_error}; authenticated namespace startup unavailable: {startup_error}"
+                ),
+            }
+        })?;
         self.mixed_root = Some(root);
         self.expected_descriptors
             .as_mut()
@@ -1561,6 +1574,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     pub(crate) fn component_execute_to_pre_account(
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        provider: memcordon_core::PublicProviderBindingV1,
         attempt: [u8; 16],
         worker: BorrowedFd<'_>,
         streams: [OwnedFd; 3],
@@ -1613,10 +1627,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             self.capture_mixed_gated_facts(admission, &observed)?;
             self.prepare_relay(streams)?;
             self.prepare_operational_release(&observed)?;
-            let snapshot = self.mixed_prepared_observation(
-                admission,
-                super::runtime_manifest::installed_binding()?,
-            )?;
+            let snapshot = self.mixed_prepared_observation(admission, provider)?;
             let mut released = None;
             let mut clock = None;
             self.release_mixed(admission, &observed, &mut released, &mut clock)

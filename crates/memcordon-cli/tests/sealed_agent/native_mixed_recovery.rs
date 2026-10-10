@@ -374,7 +374,7 @@ fn run_recovery_component(lost_terminal: bool) {
             journal.take().ok_or("actual native journal absent")?,
         )?;
         let metadata = admission.component_metadata().clone();
-        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |owner,admission,prepared|{
+        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,provider.clone(),attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |owner,admission,prepared|{
                 retain("native-prepared.json",&serde_json::to_vec(prepared).map_err(|e|e.to_string())?)?;
                 let native=owner.component_pre_account_observation(admission)?;
                 let export_path=native["export_path"].as_str().ok_or("native boundary export owner path absent")?;
