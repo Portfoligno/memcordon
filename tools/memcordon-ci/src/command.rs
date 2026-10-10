@@ -333,7 +333,7 @@ impl CommandSpec {
         input: &std::fs::File,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
-        use std::io::{Seek, SeekFrom};
+        use std::io::{Read, Seek, SeekFrom};
         let metadata = input.metadata()?;
         let flags = rustix::fs::fcntl_getfl(input).map_err(std::io::Error::from)?;
         if !metadata.is_file()
@@ -347,9 +347,11 @@ impl CommandSpec {
         let mut supplied = input.try_clone()?;
         supplied.seek(SeekFrom::Start(0))?;
         let mut command = self.materialize()?;
-        command.stdin(std::process::Stdio::from(supplied));
+        command.stdin(std::process::Stdio::piped());
         let mut observation_error = None;
-        let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
+        let deliver_input = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_creation = std::sync::Arc::clone(&deliver_input);
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
             command,
             self.available_budget()?,
             self.output_limit,
@@ -357,10 +359,24 @@ impl CommandSpec {
                 let child = command.spawn()?;
                 if let Err(error) = observe_creation(&child) {
                     observation_error = Some(error);
+                } else {
+                    observed_creation.store(true, std::sync::atomic::Ordering::Release);
                 }
                 Ok(child)
             },
-            |_| Ok(()),
+            move |_, stdin, _| {
+                let mut stdin = stdin
+                    .ok_or_else(|| std::io::Error::other("native recovery input pipe absent"))?;
+                if deliver_input.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut bounded = supplied.take(metadata.len() + 1);
+                    if std::io::copy(&mut bounded, &mut stdin)? != metadata.len() {
+                        return Err(std::io::Error::other(
+                            "native recovery input length changed during delivery",
+                        ));
+                    }
+                }
+                Ok(())
+            },
         );
         match (output, observation_error) {
             (Ok(output), None) => Ok(output),

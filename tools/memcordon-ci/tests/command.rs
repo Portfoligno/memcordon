@@ -22,6 +22,18 @@ fn readonly_record_stdin_preserves_full_bound_and_refuses_writable_or_oversized_
         .unwrap();
     assert!(observed && output.status.success());
     assert_eq!(output.stdout, bytes);
+    let refused = CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+        .output_quiet_with_stdin_and_creation(&input, |_| {
+            Err(memcordon_ci::CiError::Message(
+                "creation refused before delivery".into(),
+            ))
+        })
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("creation refused before delivery")
+    );
     let mut writable = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
