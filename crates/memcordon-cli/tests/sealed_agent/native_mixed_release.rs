@@ -3,6 +3,25 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+fn release_failure(scenario: &str, operation: &str, cause: impl std::fmt::Display) -> String {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the whole structure on success and opens no descriptor.
+    let limits = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } == 0 {
+        // SAFETY: the successful call initialized this value.
+        let limit = unsafe { limit.assume_init() };
+        format!("soft={}; hard={}", limit.rlim_cur, limit.rlim_max)
+    } else {
+        format!(
+            "limit-observation-unavailable={}",
+            std::io::Error::last_os_error()
+        )
+    };
+    format!(
+        "native release scenario={scenario}; operation={operation}; observer-pid={}; failure-observation-{limits}; cause={cause}",
+        std::process::id()
+    )
+}
+
 pub(super) struct HeldHelper {
     pub(super) child: std::process::Child,
     pub(super) pidfd: Option<OwnedFd>,
@@ -328,10 +347,13 @@ fn native_leased_release_emit_actual_component_receipt() {
     let mut helpers = Vec::<HeldHelper>::new();
     let mut observations = Vec::new();
     let result = (|| -> Result<(), String> {
-        HeldHelper::start(&mut helpers, 65534, 65534, &input.challenge, work)?;
-        let cwd = std::fs::File::open("/").map_err(|e| e.to_string())?;
+        HeldHelper::start(&mut helpers, 65534, 65534, &input.challenge, work)
+            .map_err(|error| release_failure("setup", "start caller helper", error))?;
+        let cwd = std::fs::File::open("/")
+            .map_err(|error| release_failure("setup", "open caller cwd", error))?;
         let mut contract = fixture.contract.clone();
         for stale in [true, false] {
+            let scenario = if stale { "stale" } else { "current" };
             use sha2::{Digest, Sha256};
             let mut hash = Sha256::new();
             hash.update(input.challenge);
@@ -345,7 +367,8 @@ fn native_leased_release_emit_actual_component_receipt() {
                 65534,
                 &[],
                 cwd.as_fd(),
-            )?;
+            )
+            .map_err(|error| release_failure(scenario, "capture caller envelope", error))?;
             let frontend = crate::linux::private_attempt::ProcessIdentityV4::observe(
                 helpers[0].child.id() as i32,
                 helpers[0]
@@ -353,19 +376,25 @@ fn native_leased_release_emit_actual_component_receipt() {
                     .as_ref()
                     .ok_or("caller PIDFD absent")?
                     .as_fd(),
-            )?;
+            )
+            .map_err(|error| release_failure(scenario, "observe frontend identity", error))?;
             let worker_pid = std::process::id();
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, worker_pid, 0) } as i32;
             if raw < 0 {
-                return Err(std::io::Error::last_os_error().to_string());
+                return Err(release_failure(
+                    scenario,
+                    "open worker PIDFD",
+                    std::io::Error::last_os_error(),
+                ));
             }
             let worker_fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let worker = crate::linux::private_attempt::ProcessIdentityV4::observe(
                 worker_pid as i32,
                 worker_fd.as_fd(),
-            )?;
+            )
+            .map_err(|error| release_failure(scenario, "observe worker identity", error))?;
             let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| release_failure(scenario, "read boot identity", error))?;
             let mut record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
                 memcordon_core::BoundedText::new(&hex(&attempt)).map_err(str::to_owned)?,
                 memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
@@ -408,27 +437,43 @@ fn native_leased_release_emit_actual_component_receipt() {
                         record.mixed_admission_metadata = Some(metadata.clone());
                         record.mixed_worker = Some(worker);
                         journal = Some(
-                            crate::linux::private_attempt::DurablePrivateAttempt::create(record)?,
+                            crate::linux::private_attempt::DurablePrivateAttempt::create(record)
+                                .map_err(|error| {
+                                    release_failure(scenario, "publish ownership journal", error)
+                                })?,
                         );
                         Ok(())
                     },
-                )?;
+                )
+                .map_err(|error| release_failure(scenario, "authenticate admission", error))?;
             let metadata = admission.component_metadata().clone();
             let uid = admission.component_target_uid();
             let suffix = if stale { "stale" } else { "current" };
             let effective_invocation = retain(
                 &format!("{suffix}-effective-invocation.bin"),
-                &admission.component_effective_invocation()?,
-            )?;
+                &admission
+                    .component_effective_invocation()
+                    .map_err(|error| {
+                        release_failure(scenario, "encode effective invocation", error)
+                    })?,
+            )
+            .map_err(|error| release_failure(scenario, "retain effective invocation", error))?;
             let journal_before = journal
                 .as_ref()
                 .ok_or("actual ownership journal absent")?
-                .component_native_bytes()?;
-            let reference_before = admission.component_reference_bytes()?;
-            let reference_native_before = admission.component_reference_observation()?;
+                .component_native_bytes()
+                .map_err(|error| release_failure(scenario, "read original journal", error))?;
+            let reference_before = admission
+                .component_reference_bytes()
+                .map_err(|error| release_failure(scenario, "read admission reference", error))?;
+            let reference_native_before = admission
+                .component_reference_observation()
+                .map_err(|error| release_failure(scenario, "observe admission reference", error))?;
             let journal_before_path =
-                retain(&format!("{suffix}-journal-before.bin"), &journal_before)?;
-            let reference_path = retain(&format!("{suffix}-reference.json"), &reference_before)?;
+                retain(&format!("{suffix}-journal-before.bin"), &journal_before)
+                    .map_err(|error| release_failure(scenario, "retain original journal", error))?;
+            let reference_path = retain(&format!("{suffix}-reference.json"), &reference_before)
+                .map_err(|error| release_failure(scenario, "retain admission reference", error))?;
             let account = fixture
                 .registry
                 .execution_identities
@@ -437,16 +482,23 @@ fn native_leased_release_emit_actual_component_receipt() {
                 .find(|a| a.uid.get() == uid)
                 .ok_or("actual exclusive account definition absent")?;
             let target =
-                HeldHelper::start(&mut helpers, uid, account.gid.get(), &input.challenge, work)?;
-            let before = crate::policy_registry::native::Lease::acquire()?
-                .read_v3()?
+                HeldHelper::start(&mut helpers, uid, account.gid.get(), &input.challenge, work)
+                    .map_err(|error| release_failure(scenario, "start target helper", error))?;
+            let before = crate::policy_registry::native::Lease::acquire()
+                .map_err(|error| release_failure(scenario, "acquire policy lease", error))?
+                .read_v3()
+                .map_err(|error| release_failure(scenario, "read policy activation", error))?
                 .ok_or("actual V3 activation absent")?;
             if before.registry != fixture.registry || before.epoch != metadata.epoch {
                 return Err("actual native setup activation differs".into());
             }
             let after = if stale {
-                crate::policy_registry::native::Lease::acquire()?
-                    .activate_v3(fixture.registry.clone(), None)?
+                crate::policy_registry::native::Lease::acquire()
+                    .map_err(|error| {
+                        release_failure(scenario, "acquire stale policy lease", error)
+                    })?
+                    .activate_v3(fixture.registry.clone(), None)
+                    .map_err(|error| release_failure(scenario, "activate stale policy", error))?
             } else {
                 before.clone()
             };
@@ -469,7 +521,14 @@ fn native_leased_release_emit_actual_component_receipt() {
                     || error.detail != "mixed epoch/grant changed before release"
                     || callbacks != 0
                 {
-                    return Err("stale native release first cause/callback differs".into());
+                    return Err(release_failure(
+                        scenario,
+                        "validate stale release refusal",
+                        format!(
+                            "reason={:?}; detail={}; callbacks={callbacks}",
+                            error.reason, error.detail
+                        ),
+                    ));
                 }
                 let mut poll = libc::pollfd {
                     fd: helpers[target]
@@ -485,8 +544,12 @@ fn native_leased_release_emit_actual_component_receipt() {
                 }
                 serde_json::json!({"refusal":error.detail,"received":[],"callbacks":callbacks})
             } else {
-                release.map_err(|failure| failure.detail)?;
-                let observed = helpers[target].message("MC-NATIVE-RELEASE-GATE ", work)?;
+                release.map_err(|failure| {
+                    release_failure(scenario, "release target gate", failure.detail)
+                })?;
+                let observed = helpers[target]
+                    .message("MC-NATIVE-RELEASE-GATE ", work)
+                    .map_err(|error| release_failure(scenario, "observe target gate", error))?;
                 if callbacks != 1
                     || observed["pid"] != helpers[target].child.id()
                     || observed["birth"] != helpers[target].birth
@@ -500,21 +563,30 @@ fn native_leased_release_emit_actual_component_receipt() {
             let journal_after = journal
                 .as_ref()
                 .ok_or("actual ownership journal absent")?
-                .component_native_bytes()?;
-            if journal_after != journal_before
-                || admission.component_reference_bytes() != Ok(reference_before)
-            {
+                .component_native_bytes()
+                .map_err(|error| release_failure(scenario, "read post-release journal", error))?;
+            let reference_after = admission
+                .component_reference_bytes()
+                .map_err(|error| release_failure(scenario, "read post-release reference", error))?;
+            if journal_after != journal_before || reference_after != reference_before {
                 return Err("inner leased callback changed ownership evidence".into());
             }
-            let journal_after_path =
-                retain(&format!("{suffix}-journal-after.bin"), &journal_after)?;
-            helpers[target].settle(cleanup)?;
-            admission.retire_component_admission()?;
-            let reference_native_after = admission.component_reference_observation()?;
+            let journal_after_path = retain(&format!("{suffix}-journal-after.bin"), &journal_after)
+                .map_err(|error| release_failure(scenario, "retain post-release journal", error))?;
+            helpers[target]
+                .settle(cleanup)
+                .map_err(|error| release_failure(scenario, "settle target helper", error))?;
+            admission
+                .retire_component_admission()
+                .map_err(|error| release_failure(scenario, "retire admission", error))?;
+            let reference_native_after = admission
+                .component_reference_observation()
+                .map_err(|error| release_failure(scenario, "observe retired reference", error))?;
             journal
                 .take()
                 .ok_or("actual ownership journal absent")?
-                .retire_unallocated()?;
+                .retire_unallocated()
+                .map_err(|error| release_failure(scenario, "retire unallocated journal", error))?;
             observations.push(serde_json::json!({"scenario":if stale{"stale-epoch-refused"}else{"current-epoch-released"},"metadata":metadata,"effective_invocation":effective_invocation,"journal_before":journal_before_path,"journal_after":journal_after_path,"reference":reference_path,"reference_native_before":reference_native_before,"reference_native_after":reference_native_after,"activation_before":before,"activation_after":after,"target_pid":helpers[target].child.id(),"target_birth":helpers[target].birth,"target_retirement":helpers[target].retirement,"gate":gate,"private_root_materialized":false}));
             contract.expected_epoch = after.epoch;
         }

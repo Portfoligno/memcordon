@@ -500,17 +500,18 @@ impl MixedOperationalAdmission {
         let image_capacity = super::image_fd_budget::ensure(
             regular_count(resolved.image),
             regular_count(resolved.input),
-        )?;
+        )
+        .map_err(|error| format!("prepare image descriptor capacity: {error}"))?;
         let runtime = super::runtime_image::open_installed(resolved.image).map_err(|error| {
             MixedAdmissionFailure::because(
                 memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                error,
+                format!("open runtime image: {error}"),
             )
         })?;
         let input = super::runtime_image::open_installed(resolved.input).map_err(|error| {
             MixedAdmissionFailure::because(
                 memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                error,
+                format!("open input image: {error}"),
             )
         })?;
         drop(image_capacity);
@@ -518,7 +519,7 @@ impl MixedOperationalAdmission {
             super::image_elf_closure::validate(&runtime, &input).map_err(|error| {
                 MixedAdmissionFailure::because(
                     memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                    error,
+                    format!("validate image ELF closure: {error}"),
                 )
             })?
         {
