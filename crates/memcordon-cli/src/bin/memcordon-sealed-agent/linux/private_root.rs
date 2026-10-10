@@ -292,7 +292,7 @@ impl NativeExportDirectory {
         if !metadata.is_file()
             || metadata.uid() != 0
             || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
+            || metadata.mode() & 0o7777 != 0o400
             || metadata.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
         {
             return Err("component export receipt custody differs".into());
