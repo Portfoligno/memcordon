@@ -144,7 +144,7 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
@@ -199,7 +199,7 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
@@ -294,7 +294,7 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
@@ -360,7 +360,7 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
@@ -436,7 +436,7 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
@@ -581,13 +581,13 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs[matrix.native-job].outputs.artifact-id }}
           path: .release/target
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.packages.outputs.artifact-id }}
           path: .release/packages
@@ -748,56 +748,56 @@ jobs:
           ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
       - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.packages.outputs.artifact-id }}
           path: .release/packages
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-linux-x64.outputs.artifact-id }}
           path: .release/targets/linux-x64
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-linux-arm64.outputs.artifact-id }}
           path: .release/targets/linux-arm64
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-macos-x64.outputs.artifact-id }}
           path: .release/targets/macos-x64
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-macos-arm64.outputs.artifact-id }}
           path: .release/targets/macos-arm64
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-windows-x64.outputs.artifact-id }}
           path: .release/targets/windows-x64
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.native-windows-arm64.outputs.artifact-id }}
           path: .release/targets/windows-arm64
@@ -853,35 +853,35 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.rehearsal-tool-artifact-id }}
           path: .release/rehearsal-tool
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.preparation-kind == 'candidate'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.preparation-kind == 'candidate'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.candidate-artifact-id }}
           path: .release/rehearsal-input
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
           path: .release/rehearsal-input
@@ -951,13 +951,13 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.select.outputs.rehearsal-tool-artifact-id }}
           path: .release/rehearsal-tool
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
@@ -966,7 +966,7 @@ jobs:
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
@@ -1004,7 +1004,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
           run-id: ${{ github.run_id }}
@@ -1012,7 +1012,7 @@ jobs:
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
           run-id: ${{ github.run_id }}
@@ -1042,7 +1042,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
@@ -1051,7 +1051,7 @@ jobs:
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
@@ -1079,21 +1079,21 @@ jobs:
       actions: read
     steps:
       - if: needs.select.outputs.recovery-mode == 'reprepare'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.recovery-mode == 'reprepare'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
           path: .release/prepared
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.recovery-mode == 'publication-only'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.tool-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
@@ -1103,7 +1103,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - if: needs.select.outputs.recovery-mode == 'publication-only'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.recovery-inputs.outputs.prepared-artifact-id }}
           run-id: ${{ needs.recovery-inputs.outputs.original-run-id }}
