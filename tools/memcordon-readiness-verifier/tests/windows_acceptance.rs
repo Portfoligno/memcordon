@@ -2437,14 +2437,18 @@ fn authenticated_refusal_case(
         "C:\\owned\\fixture.exe",
         &sha256(b"selected-vector-fixture"),
     );
-    let components = json!([
+    let installed_components = json!([
         selected_agent,
         selected_artifact("C:\\owned\\bootstrap.exe", &"8".repeat(64)),
-        selected_artifact("C:\\owned\\broker.exe", &"9".repeat(64)),
-        selected_artifact("C:\\owned\\desktop.exe", &"a".repeat(64))
+        selected_artifact("C:\\owned\\broker.exe", &"9".repeat(64))
     ]);
+    let mut components = installed_components.clone();
+    components
+        .as_array_mut()
+        .unwrap()
+        .push(selected_cli.clone());
     replacements.insert("lifetime/selected-current.json".into(),json!({"channel":"candidate-native","source_commit":index.source_commit,"version":index.version,"target":record.key.target,
-        "artifacts":[selected_cli.clone(),selected_agent.clone(),selected_fixture.clone()],"cli":selected_cli,"agent":selected_agent,"components":components,"installed_components":components,
+        "artifacts":[selected_cli.clone(),selected_agent.clone(),selected_fixture.clone()],"cli":selected_cli,"agent":selected_agent,"components":components,"installed_components":installed_components,
         "fixture":selected_fixture,"installed_agent":selected_agent,"installed_manifest":selected_artifact("C:\\owned\\runtime-manifest.json",provider["runtime_manifest_sha256"].as_str().unwrap()),"provider":provider,"output_directory":output}));
     replacements.insert("lifetime/journal.json".into(), read("journal.json"));
     index.products[0].lifecycle.journal = "lifetime/journal.json".into();
