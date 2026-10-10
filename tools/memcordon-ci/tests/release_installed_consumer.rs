@@ -19,6 +19,40 @@ fn directory() -> tempfile::TempDir {
     }
 }
 
+#[test]
+fn installed_case_selection_preserves_and_checks_auxiliary_capture_evidence() {
+    use memcordon_ci::{
+        release::installed_consumer::installed_case_artifacts,
+        windows_installed_cases::SelectedArtifact,
+    };
+    let owner = directory();
+    let mut records = Vec::new();
+    // Four original crate artifacts and the complete four-bin auxiliary bound.
+    for index in 0..29 {
+        let path = owner.path().join(format!("artifact-{index}"));
+        let bytes = format!("actual retained artifact {index}").into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        records.push(SelectedArtifact {
+            path,
+            sha256: artifacts::checksum(&bytes),
+        });
+    }
+    let selected = installed_case_artifacts(&records, 4, 4).unwrap();
+    assert_eq!(selected.len(), 4);
+    assert_eq!(selected[3].path, records[3].path);
+    assert_eq!(records.len(), 29);
+    assert!(installed_case_artifacts(&records, 0, 4).is_err());
+    assert!(installed_case_artifacts(&records, 17, 4).is_err());
+    assert!(installed_case_artifacts(&records, 4, 3).is_err());
+    let mut duplicate = records.clone();
+    duplicate[28] = duplicate[0].clone();
+    assert!(installed_case_artifacts(&duplicate, 4, 4).is_err());
+    std::fs::write(&records[28].path, b"changed auxiliary capture").unwrap();
+    assert!(installed_case_artifacts(&records, 4, 4).is_err());
+    std::fs::write(&records[0].path, b"changed selected crate").unwrap();
+    assert!(installed_case_artifacts(&records[..4], 4, 4).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn selected_cli_paths_reach_actual_fixture_and_report_after_child_changes_directory() {

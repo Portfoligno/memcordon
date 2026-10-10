@@ -34,8 +34,57 @@ pub struct MaterializedPayload {
     pub distribution: TargetDistribution,
     pub directory: PathBuf,
     pub artifacts: Vec<SelectedArtifact>,
+    selected_artifact_count: usize,
     pub fixture: SelectedArtifact,
     _owner: tempfile::TempDir,
+}
+
+impl MaterializedPayload {
+    pub fn selected_case_artifacts(&self) -> Result<Vec<SelectedArtifact>> {
+        installed_case_artifacts(
+            &self.artifacts,
+            self.selected_artifact_count,
+            self.distribution.binaries.len(),
+        )
+    }
+}
+
+/// Verify the complete retained acquisition before selecting its original channel
+/// inventory for installed cases. Compiler captures remain retained evidence.
+pub fn installed_case_artifacts(
+    all: &[SelectedArtifact],
+    selected_count: usize,
+    binary_count: usize,
+) -> Result<Vec<SelectedArtifact>> {
+    if selected_count == 0
+        || selected_count > 16
+        || selected_count > all.len()
+        || binary_count == 0
+        || binary_count > 16
+    {
+        return Err(CiError::Message(
+            "installed channel artifact inventory is invalid".into(),
+        ));
+    }
+    // Four actual compiler capture files per bin, three acquisition records,
+    // two install streams and at most the four verified public registry crates.
+    let auxiliary_bound = binary_count * 4 + 5 + source::PUBLIC_PACKAGES.len();
+    if all.len() - selected_count > auxiliary_bound {
+        return Err(CiError::Message(
+            "installed auxiliary artifact inventory exceeds its capture contract".into(),
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for artifact in all {
+        if !paths.insert(&artifact.path)
+            || artifacts::checksum(&artifacts::read_file(&artifact.path)?) != artifact.sha256
+        {
+            return Err(CiError::Message(
+                "installed acquisition artifact is duplicated or changed".into(),
+            ));
+        }
+    }
+    Ok(all[..selected_count].to_vec())
 }
 
 pub fn binary_path(directory: &Path, binary: &str, target: &str) -> PathBuf {
@@ -161,6 +210,7 @@ pub fn materialize_native(
             path: target_directory.join(&bundle.archive.name),
             sha256: bundle.archive.sha256,
         }],
+        selected_artifact_count: 1,
         fixture,
         _owner: owner,
     })
@@ -1338,7 +1388,7 @@ fn materialize_cargo_install(
         }
     }
     let fixture = fixture(bundle, target_directory, owner.path())?;
-    let artifacts = packages
+    let artifacts: Vec<_> = packages
         .files
         .iter()
         .map(|file| SelectedArtifact {
@@ -1346,12 +1396,14 @@ fn materialize_cargo_install(
             sha256: file.sha256.clone(),
         })
         .collect();
+    let selected_artifact_count = artifacts.len();
     Ok(MaterializedPayload {
         channel: InstalledChannel::CargoPackage,
         source: packages.source.clone(),
         distribution: bundle.distribution.clone(),
         directory,
         artifacts,
+        selected_artifact_count,
         fixture,
         _owner: owner,
     })
@@ -1514,7 +1566,11 @@ pub fn run_materialized_channel(
             payload.channel,
             &payload.source,
             &payload.distribution,
-            payload.artifacts.clone(),
+            installed_case_artifacts(
+                &payload.artifacts,
+                payload.selected_artifact_count,
+                payload.distribution.binaries.len(),
+            )?,
             &payload.directory,
             payload.fixture.clone(),
             &installed,
@@ -1529,7 +1585,11 @@ pub fn run_materialized_channel(
             predecessor.channel,
             &predecessor.source,
             &predecessor.distribution,
-            predecessor.artifacts.clone(),
+            installed_case_artifacts(
+                &predecessor.artifacts,
+                predecessor.selected_artifact_count,
+                predecessor.distribution.binaries.len(),
+            )?,
             &predecessor.directory,
             predecessor.fixture.clone(),
             &installed,

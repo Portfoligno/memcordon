@@ -39,6 +39,7 @@ pub(crate) fn retain_payload(
     crate::windows_installed_cases::SelectedArtifact,
     Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
 )> {
+    let selected_count = payload.selected_case_artifacts()?.len();
     fs::create_dir(destination)?;
     let mut held = Vec::new();
     let mut copy = |source: &Path, destination: &Path, expected: Option<&str>| -> Result<String> {
@@ -54,7 +55,7 @@ pub(crate) fn retain_payload(
         Ok(hash)
     };
     let mut artifacts = Vec::new();
-    for selected in &payload.artifacts {
+    for (index, selected) in payload.artifacts.iter().enumerate() {
         let path = destination.join(
             selected
                 .path
@@ -62,10 +63,12 @@ pub(crate) fn retain_payload(
                 .ok_or_else(|| CiError::Message("selected artifact filename missing".into()))?,
         );
         copy(&selected.path, &path, Some(&selected.sha256))?;
-        artifacts.push(crate::windows_installed_cases::SelectedArtifact {
-            path,
-            sha256: selected.sha256.clone(),
-        });
+        if index < selected_count {
+            artifacts.push(crate::windows_installed_cases::SelectedArtifact {
+                path,
+                sha256: selected.sha256.clone(),
+            });
+        }
     }
     let manifest = destination.join("runtime-manifest.json");
     if !manifest.exists() {
