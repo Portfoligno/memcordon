@@ -226,8 +226,159 @@ pub(super) struct NativeExportDirectory {
     held: Option<File>,
     created: bool,
     published: bool,
+    #[cfg(test)]
+    component_empty_publication: bool,
 }
 impl NativeExportDirectory {
+    #[cfg(test)]
+    pub(super) fn component_retire_empty(
+        &mut self,
+        attempt: &str,
+        original_receipt: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<serde_json::Value, String> {
+        use std::os::unix::fs::MetadataExt;
+        self.verify()?;
+        if !self.published
+            || !self.component_empty_publication
+            || Self::intended(attempt)?.path != self.path
+        {
+            return Err("component export publication/attempt differs".into());
+        }
+        let receipt: serde_json::Value =
+            serde_json::from_slice(original_receipt).map_err(|e| e.to_string())?;
+        if receipt["format"] != "memcordon.private-export"
+            || receipt["revision"] != 1
+            || receipt["attempt_id"] != attempt
+            || receipt["files"]
+                .as_array()
+                .is_none_or(|files| !files.is_empty())
+        {
+            return Err("component export is not the original empty publication".into());
+        }
+        let held = self.held.as_ref().ok_or("component export owner absent")?;
+        let before = held.metadata().map_err(io)?;
+        let entries = rustix::fs::Dir::read_from(held).map_err(|e| e.to_string())?;
+        let mut names = Vec::new();
+        for entry in entries {
+            if std::time::Instant::now() >= deadline {
+                return Err("component export enumeration cutoff exhausted".into());
+            }
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if names.len() == 1 || name != b"export-receipt.json" {
+                return Err("component empty export contains an unexpected member".into());
+            }
+            names.push(name.to_vec());
+        }
+        if names.len() != 1 {
+            return Err("component export receipt absent".into());
+        }
+        let flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        let file = File::from(
+            rustix::fs::openat(
+                held,
+                "export-receipt.json",
+                flags,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
+        {
+            return Err("component export receipt custody differs".into());
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(metadata.len() + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io)?;
+        if bytes != original_receipt {
+            return Err("component export receipt bytes changed".into());
+        }
+        let after = file.metadata().map_err(io)?;
+        if (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mode(),
+            metadata.uid(),
+            metadata.nlink(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mode(),
+            after.uid(),
+            after.nlink(),
+            after.ctime(),
+            after.ctime_nsec(),
+            after.mtime(),
+            after.mtime_nsec(),
+        ) {
+            return Err("component export receipt changed through readback".into());
+        }
+        let named = rustix::fs::statat(
+            held,
+            "export-receipt.json",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| e.to_string())?;
+        if (named.st_dev, named.st_ino, named.st_nlink) != (metadata.dev(), metadata.ino(), 1) {
+            return Err("component export receipt identity changed".into());
+        }
+        self.verify()?;
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/run/memcordon")
+            .map_err(io)?;
+        super::runtime_image::protected_directory(&parent)?;
+        let name = self
+            .path
+            .file_name()
+            .ok_or("component export basename absent")?;
+        let named = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| e.to_string())?;
+        if (named.st_dev, named.st_ino) != (before.dev(), before.ino())
+            || std::time::Instant::now() >= deadline
+        {
+            return Err("component export owner/cutoff changed".into());
+        }
+        rustix::fs::unlinkat(held, "export-receipt.json", rustix::fs::AtFlags::empty())
+            .map_err(|e| e.to_string())?;
+        held.sync_all().map_err(io)?;
+        rustix::fs::unlinkat(&parent, name, rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(|e| e.to_string())?;
+        parent.sync_all().map_err(io)?;
+        match rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => return Err("component export pathname remains present".into()),
+        }
+        if held.metadata().map_err(io)?.nlink() != 0
+            || file.metadata().map_err(io)?.nlink() != 0
+            || std::time::Instant::now() >= deadline
+        {
+            return Err("component export retirement/cutoff differs".into());
+        }
+        Ok(
+            serde_json::json!({"attempt_id":attempt,"path":self.path,"device":before.dev(),"inode":before.ino(),"receipt_sha256":memcordon_core::workload_codec::hash_bytes(original_receipt),"named_absent":true}),
+        )
+    }
     pub(super) fn intended(attempt: &str) -> Result<Self, String> {
         if !super::cgroup::valid_attempt_identity(attempt) {
             return Err("invalid export attempt identity".into());
@@ -237,6 +388,8 @@ impl NativeExportDirectory {
             held: None,
             created: false,
             published: false,
+            #[cfg(test)]
+            component_empty_publication: false,
         })
     }
     pub(super) fn path(&self) -> &Path {
@@ -818,6 +971,11 @@ impl MountedPrivateRoot {
         parent.sync_all().map_err(io)?;
         drop(output_root);
         destination.published = true;
+        #[cfg(test)]
+        {
+            destination.component_empty_publication =
+                self.layout.output_files.as_slice().is_empty();
+        }
         Ok(destination.path.clone())
     }
     pub fn as_fd(&self) -> BorrowedFd<'_> {

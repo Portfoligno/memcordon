@@ -149,6 +149,7 @@ fn run_recovery_component(lost_terminal: bool) {
         Ok(format!("{}/{name}", input.artifact_prefix))
     };
     let mut helpers = Vec::new();
+    let mut completed_export = None;
     let outcome = (|| -> Result<(), String> {
         // The measured libtest image is not the installed package authority.
         // Ask the genuine, protected installed executable to verify itself
@@ -370,6 +371,7 @@ fn run_recovery_component(lost_terminal: bool) {
             journal.take().ok_or("actual native journal absent")?,
         )?;
         let metadata = admission.component_metadata().clone();
+        let mut retained_export_receipt = None;
         let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,provider.clone(),attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |finished| frontend_capture.observe(finished),&mut |owner,admission,prepared|{
                 retain("native-prepared.json",&serde_json::to_vec(prepared).map_err(|e|e.to_string())?)?;
                 let native=owner.component_pre_account_observation(admission)?;
@@ -377,6 +379,7 @@ fn run_recovery_component(lost_terminal: bool) {
                 let export_bytes=crate::linux::protected_read::read_protected_absolute(
                     &std::path::Path::new(export_path).join("export-receipt.json"),16*1024*1024,None)?;
                 retain("export-receipt.json",&export_bytes)?;
+                retained_export_receipt=Some(export_bytes);
                 let ownership=owner.component_account_ownership(admission)?;
                 retain("account-ownership.json",&serde_json::to_vec(&ownership).map_err(|error|error.to_string())?)?;
                 let journal=retain("boundary-journal.bin",&owner.component_native_journal_bytes()?)?;let reference=retain("boundary-reference.json",&admission.component_reference_bytes()?)?;
@@ -389,6 +392,7 @@ fn run_recovery_component(lost_terminal: bool) {
             return Err("crash boundary unexpectedly returned".into());
         }
         let request_bytes = terminal_request;
+        let export_retirement = retirement.clone();
         let request = crate::protocol::Frame {
             kind: crate::protocol::MessageKind::MixedLaunch,
             nonce: input.challenge[..16]
@@ -443,6 +447,11 @@ fn run_recovery_component(lost_terminal: bool) {
             .errno
             .ok_or("terminal protocol failed without actual native write errno")?;
         retain("lost-terminal-native-receipt.json",&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-lost-terminal-component","revision":1,"run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,"test_name":"native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt","worker":worker,"challenge_sha256":hex(&Sha256::digest(input.challenge)),"carrier":carrier,"request":request_path,"delivery_error":format!("{error:?}"),"native_errno":native_errno,"work_deadline_unix_millis":input.work_deadline_unix_millis,"cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis})).map_err(|e|e.to_string())?)?;
+        completed_export = Some((
+            owner,
+            export_retirement,
+            retained_export_receipt.ok_or("original retained export receipt absent")?,
+        ));
         Ok(())
     })();
     let mut failures = Vec::new();
@@ -455,6 +464,24 @@ fn run_recovery_component(lost_terminal: bool) {
         }
     }
     if lost_terminal {
+        if failures.is_empty() {
+            match completed_export.as_mut() {
+                Some((owner, retirement, receipt)) => {
+                    match owner.component_retire_empty_export(retirement, receipt, cleanup) {
+                        Ok(observation) => match serde_json::to_vec(&observation) {
+                            Ok(bytes) => {
+                                if let Err(error) = retain("empty-export-retirement.json", &bytes) {
+                                    failures.push(error);
+                                }
+                            }
+                            Err(error) => failures.push(error.to_string()),
+                        },
+                        Err(error) => failures.push(error),
+                    }
+                }
+                None => failures.push("original completed export owner absent".into()),
+            }
+        }
         if failures.is_empty() {
             let retirements = helpers
                 .iter()

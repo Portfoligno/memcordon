@@ -1521,6 +1521,33 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     }
 
     #[cfg(test)]
+    pub(crate) fn component_retire_empty_export(
+        &mut self,
+        retirement: &memcordon_core::result_v2::MixedRetirementV2,
+        original_receipt: &[u8],
+        deadline: Instant,
+    ) -> Result<serde_json::Value, String> {
+        if self.record.is_some()
+            || !self.native_exec_observed
+            || self.mixed_root_retired.is_none()
+            || self.cgroup.is_some()
+            || self.namespace_init.is_some()
+            || self.guardian.is_some()
+            || self.target_pidfd.is_some()
+            || self.mixed_root.is_some()
+            || self.mixed_staging.is_some()
+            || retirement.export_receipt_sha256
+                != memcordon_core::workload_codec::hash_bytes(original_receipt)
+        {
+            return Err("component export cleanup lacks completed original retirement".into());
+        }
+        self.mixed_export_destination
+            .as_mut()
+            .ok_or("component original export owner absent")?
+            .component_retire_empty(retirement.attempt_id.as_str(), original_receipt, deadline)
+    }
+
+    #[cfg(test)]
     pub(crate) fn component_pre_account_observation(
         &self,
         admission: &super::mixed_admission::MixedOperationalAdmission,
