@@ -6,8 +6,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsTokenRestricted, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
-    TokenUser,
+    GetTokenInformation, IsTokenRestricted, TokenElevation, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -204,15 +203,11 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{
         TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenRestrictedSids,
     };
-    let mut token = std::ptr::null_mut();
-    // SAFETY: pseudo current process handle and output token pointer are valid.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(frontend_os_error(
-            "token-snapshot OpenProcessToken(TOKEN_QUERY)",
-        ));
-    }
-    // SAFETY: newly opened token handle transfers to OwnedHandle once.
-    let owned = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
+    // GetCurrentProcessToken is an inline Windows SDK function returning -4.
+    // Its pseudo-handle queries this process's actual token without reopening
+    // the token object through its DACL. It grants only query access, cannot be
+    // inherited or duplicated, and must not be treated as an owned handle.
+    let token = -4isize as windows_sys::Win32::Foundation::HANDLE;
     let user = token_bytes(token, TokenUser)?;
     let integrity = token_bytes(token, TokenIntegrityLevel)?;
     let elevation = token_bytes(token, TokenElevation)?;
@@ -234,7 +229,7 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
             level,
         )
     };
-    // SAFETY: IsTokenRestricted only observes the live held token.
+    // SAFETY: IsTokenRestricted only observes this process's token pseudo-handle.
     let restricted = unsafe { IsTokenRestricted(token) } != 0;
     let groups = token_bytes(token, TokenRestrictedSids)?;
     // SAFETY: native TokenRestrictedSids result is an aligned TOKEN_GROUPS
@@ -273,7 +268,6 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     }
     restricting_sids.sort();
     let elevated = elevation.first().copied().unwrap_or(0) & u32::MAX as usize != 0;
-    drop(owned);
     serde_json::to_vec(&serde_json::json!({"user_sid":sid,"restricted":restricted,
         "integrity_rid":level,"elevated":elevated,"restricting_sids":restricting_sids}))
     .map_err(|error| io::Error::other(format!("token-snapshot serialize observation: {error}")))
