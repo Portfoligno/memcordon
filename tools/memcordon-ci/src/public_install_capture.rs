@@ -140,7 +140,16 @@ fn private_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
 fn bounded_mode(path: &Path, limit: u64, exclusive: bool) -> Result<Vec<u8>> {
     let before = std::fs::symlink_metadata(path)?;
     if !before.is_file() || before.len() > limit {
-        return Err(refuse("input is not bounded ordinary regular custody"));
+        let encoded = path.as_os_str().as_encoded_bytes();
+        let prefix = &encoded[..encoded.len().min(512)];
+        return Err(refuse(&format!(
+            "input is not bounded ordinary regular custody; path={:?}; path-truncated={}; regular={}; symlink={}; length={}; limit={limit}; exclusive={exclusive}",
+            String::from_utf8_lossy(prefix),
+            encoded.len() > prefix.len(),
+            before.is_file(),
+            before.file_type().is_symlink(),
+            before.len(),
+        )));
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
