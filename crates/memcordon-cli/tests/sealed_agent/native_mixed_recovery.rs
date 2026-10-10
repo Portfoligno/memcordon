@@ -277,7 +277,7 @@ fn run_recovery_component(lost_terminal: bool) {
         let attempt_text = hex(&attempt);
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|e| e.to_string())?;
-        let mut record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
+        let record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
             memcordon_core::BoundedText::new(&attempt_text).map_err(str::to_owned)?,
             memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
             frontend,
@@ -353,10 +353,16 @@ fn run_recovery_component(lost_terminal: bool) {
                 caller,
                 attempt,
                 |metadata| {
-                    record.mixed_admission_metadata = Some(metadata.clone());
-                    record.mixed_worker = Some(worker.clone());
                     journal =
                         Some(crate::linux::private_attempt::DurablePrivateAttempt::create(record)?);
+                    journal
+                        .as_mut()
+                        .expect("original native journal retained")
+                        .attach_mixed_admission_metadata(metadata.clone())?;
+                    journal
+                        .as_mut()
+                        .expect("original native journal retained")
+                        .record_mixed_worker(worker.clone())?;
                     Ok(())
                 },
             )?;
