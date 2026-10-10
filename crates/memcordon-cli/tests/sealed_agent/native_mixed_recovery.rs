@@ -147,6 +147,92 @@ fn run_recovery_component(lost_terminal: bool) {
     };
     let mut helpers = Vec::new();
     let outcome = (|| -> Result<(), String> {
+        // The measured libtest image is not the installed package authority.
+        // Ask the genuine, protected installed executable to verify itself
+        // before creating any admission or account reservation.
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let agent_path = std::path::Path::new("/usr/libexec/memcordon-sealed-agent");
+        let agent_handle = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(agent_path)
+            .map_err(|error| error.to_string())?;
+        let agent_identity = agent_handle.metadata().map_err(|error| error.to_string())?;
+        let agent = crate::linux::protected_read::read_protected_absolute(
+            agent_path,
+            128 * 1024 * 1024,
+            Some(0o755),
+        )?;
+        let before = std::fs::symlink_metadata(agent_path).map_err(|error| error.to_string())?;
+        if !agent_identity.is_file()
+            || !before.is_file()
+            || (
+                agent_identity.dev(),
+                agent_identity.ino(),
+                agent_identity.nlink(),
+            ) != (before.dev(), before.ino(), 1)
+        {
+            return Err("installed provider pin differs before genuine verification".into());
+        }
+        let mut command = std::process::Command::new(agent_path);
+        command.args(["package", "verify", "--json"]);
+        let verified = memcordon_testkit::run_with_deadline_output_limit(
+            &mut command,
+            work.saturating_duration_since(Instant::now()),
+            1024 * 1024,
+        )
+        .map_err(|error| format!("installed provider verification: {error}"))?;
+        retain("installed-provider-verify-stdout.bin", &verified.stdout)?;
+        retain("installed-provider-verify-stderr.bin", &verified.stderr)?;
+        retain(
+            "installed-provider-verify-status.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "code": verified.status.code(),
+                "success": verified.status.success(),
+            }))
+            .map_err(|error| error.to_string())?,
+        )?;
+        if !verified.status.success() || !verified.stderr.is_empty() {
+            return Err(
+                "genuine installed provider verification failed; actual capture retained".into(),
+            );
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&verified.stdout)?;
+        let inspection: crate::inspection_schema::InstalledProviderInspection =
+            serde_json::from_slice(&verified.stdout).map_err(|error| error.to_string())?;
+        let current = std::fs::symlink_metadata(agent_path).map_err(|error| error.to_string())?;
+        let held = agent_handle.metadata().map_err(|error| error.to_string())?;
+        if (
+            agent_identity.dev(),
+            agent_identity.ino(),
+            agent_identity.nlink(),
+        ) != (held.dev(), held.ino(), held.nlink())
+            || (held.dev(), held.ino(), held.nlink()) != (current.dev(), current.ino(), 1)
+            || agent
+                != crate::linux::protected_read::read_protected_absolute(
+                    agent_path,
+                    128 * 1024 * 1024,
+                    Some(0o755),
+                )?
+        {
+            return Err("installed provider image changed during genuine verification".into());
+        }
+        let manifest_bytes = crate::linux::runtime_manifest::source(agent_path, &agent)?;
+        let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&manifest_bytes)?;
+        let agent_digest = hex(&Sha256::digest(&agent));
+        if !inspection.installed_artifacts_valid
+            || !inspection.agent.compiled_metadata_valid
+            || inspection.agent.executable_sha256 != agent_digest
+            || inspection.installed_executable_sha256 != agent_digest
+            || inspection.agent.version != manifest.version
+            || inspection.agent.source_commit != manifest.source_commit
+        {
+            return Err(
+                "genuine installed provider inspection differs from protected image/manifest"
+                    .into(),
+            );
+        }
+        let provider = manifest.public_binding(&manifest_bytes)?;
         super::native_mixed_release::HeldHelper::start(
             &mut helpers,
             65534,
@@ -288,7 +374,6 @@ fn run_recovery_component(lost_terminal: bool) {
             journal.take().ok_or("actual native journal absent")?,
         )?;
         let metadata = admission.component_metadata().clone();
-        let provider = crate::linux::runtime_manifest::installed_binding()?;
         let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |owner,admission,prepared|{
                 retain("native-prepared.json",&serde_json::to_vec(prepared).map_err(|e|e.to_string())?)?;
                 let native=owner.component_pre_account_observation(admission)?;
