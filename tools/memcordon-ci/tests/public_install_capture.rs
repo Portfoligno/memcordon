@@ -273,6 +273,16 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
         descriptor.compiler = std::fs::canonicalize(root.path().join("aborting_compiler")).unwrap();
         descriptor.compiler_sha256 =
             hex::encode(Sha256::digest(std::fs::read(&descriptor.compiler).unwrap()));
+        // This independently compiled signal fixture is a new acquisition;
+        // the original Cargo capture keeps its original absolute deadline.
+        descriptor.deadline_unix_millis = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            + 60_000;
         std::fs::write(
             wrapper
                 .parent()
@@ -285,6 +295,16 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
             .arg(&descriptor.compiler)
             .output()
             .unwrap();
-        assert_eq!(terminated.status.signal(), Some(libc::SIGABRT));
+        assert_eq!(
+            terminated.status.signal(),
+            Some(libc::SIGABRT),
+            "actual wrapper status={:?}; stderr-bytes={}; stderr-prefix={:?}",
+            terminated.status,
+            terminated.stderr.len(),
+            String::from_utf8_lossy(&terminated.stderr)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        );
     }
 }
