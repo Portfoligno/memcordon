@@ -20,6 +20,9 @@ use std::{
 #[path = "native_artifact_reference.rs"]
 mod native_artifact_reference;
 
+#[path = "native_unit_retirement.rs"]
+mod native_unit_retirement;
+
 fn component_record_path(
     directory: &Path,
     input: &serde_json::Value,
@@ -1063,6 +1066,14 @@ impl NativeLinuxPackageLease {
                             Err(error) => current.push(format!("{}: {error}", path.display())),
                             Ok(_) => remaining.push(path),
                         }
+                        match native_unit_retirement::selected_unit_kind(unit) {
+                            Ok(native_unit_retirement::SelectedUnitKind::Configuration) => continue,
+                            Ok(_) => {}
+                            Err(error) => {
+                                current.push(format!("{unit}: {error}"));
+                                continue;
+                            }
+                        }
                         let observed = match CommandSpec::new(
                             "/usr/bin/systemctl",
                             workspace,
@@ -1091,8 +1102,7 @@ impl NativeLinuxPackageLease {
                             }
                         };
                         if !observed.status.success()
-                            || !text.lines().any(|line| line == "ActiveState=inactive")
-                            || !text.lines().any(|line| line == "MainPID=0")
+                            || native_unit_retirement::verify_inactive(unit, text).is_err()
                         {
                             current
                                 .push(format!("original native unit remains unresolved: {unit}"));
