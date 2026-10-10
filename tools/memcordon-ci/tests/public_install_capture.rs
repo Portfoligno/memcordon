@@ -62,6 +62,29 @@ fn maps_actual_compiler_output_to_cargo_uplift_with_distinct_bin_spelling() {
             .join(&descriptor.target)
             .join("release/some-tool.exe")
     );
+    let mut local_msvc = args.clone();
+    local_msvc.pop();
+    let (_, _, original, uplift) = selected_output(&descriptor, &local_msvc).unwrap().unwrap();
+    assert_eq!(
+        original,
+        descriptor
+            .target_directory
+            .join(&descriptor.target)
+            .join("release/deps/some_tool.exe")
+    );
+    assert_eq!(uplift, cargo);
+    let mut other = descriptor.clone();
+    other.target = "x86_64-unknown-linux-gnu".into();
+    local_msvc[4] = format!("--target={}", other.target).into();
+    local_msvc[6] = other
+        .target_directory
+        .join(&other.target)
+        .join("release/deps")
+        .into_os_string();
+    assert!(selected_output(&other, &local_msvc).is_err());
+    let mut explicit_empty = args.clone();
+    *explicit_empty.last_mut().unwrap() = "-Cextra-filename=".into();
+    assert!(selected_output(&descriptor, &explicit_empty).is_err());
     assert!(
         selected_output(&descriptor, &["-vV".into()])
             .unwrap()

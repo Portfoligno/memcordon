@@ -380,11 +380,20 @@ fn selected_output_in(
             return Err(refuse("duplicate output suffix"));
         }
     }
-    let extra = extra.ok_or_else(|| refuse("selected output suffix absent"))?;
-    if extra.len() < 2
-        || !extra.starts_with('-')
-        || !extra[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
-        || extra.len() > 65
+    // Cargo omits this suffix for local MSVC executables so their embedded
+    // PDB paths do not contain a hash. The actual link notification must still
+    // equal the exact derived output before any successful receipt is written.
+    let extra = match extra {
+        Some(extra) if !extra.is_empty() => extra,
+        Some(_) => return Err(refuse("selected output suffix differs")),
+        None if descriptor.target.ends_with("-pc-windows-msvc") => String::new(),
+        None => return Err(refuse("selected output suffix absent")),
+    };
+    if !extra.is_empty()
+        && (extra.len() < 2
+            || !extra.starts_with('-')
+            || !extra[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || extra.len() > 65)
     {
         return Err(refuse("selected output suffix differs"));
     }
