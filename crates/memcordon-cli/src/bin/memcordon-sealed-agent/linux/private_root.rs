@@ -9,6 +9,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[path = "image_copy.rs"]
+mod image_copy;
+
 fn io(error: std::io::Error) -> String {
     error.to_string()
 }
@@ -926,22 +929,14 @@ impl MountedPrivateRoot {
                     size, executable, ..
                 } = entry
                 {
-                    let mut source = File::from(
+                    let source = File::from(
                         image
                             .object(entry.path())?
                             .try_clone_to_owned()
                             .map_err(io)?,
                     );
                     let mut destination = open_relative(root.as_fd(), entry.path(), true)?;
-                    let count = std::io::copy(
-                        &mut std::io::Read::by_ref(&mut source)
-                            .take(size.checked_add(1).ok_or("image copy bound overflow")?),
-                        &mut destination,
-                    )
-                    .map_err(io)?;
-                    if count != *size {
-                        return Err("held image changed during root copy".into());
-                    }
+                    image_copy::copy_exact(&source, &mut destination, *size).map_err(io)?;
                     destination
                         .set_permissions(std::fs::Permissions::from_mode(if *executable {
                             0o555
