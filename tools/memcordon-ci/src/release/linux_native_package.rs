@@ -17,6 +17,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "native_artifact_reference.rs"]
+mod native_artifact_reference;
+
+fn component_record_path(
+    directory: &Path,
+    input: &serde_json::Value,
+    boundary: &serde_json::Value,
+    field: &str,
+    leaf: &str,
+) -> Result<PathBuf> {
+    let prefix = input["artifact_prefix"]
+        .as_str()
+        .ok_or_else(|| CiError::Message("original component artifact prefix absent".into()))?;
+    let reference = boundary[field]
+        .as_str()
+        .ok_or_else(|| CiError::Message("original component artifact reference absent".into()))?;
+    native_artifact_reference::resolve_case_reference(directory, prefix, reference, leaf)
+        .map_err(CiError::Message)
+}
+
 pub struct NativeLinuxPackageLease {
     pub driver: InstalledMixedDriver,
     payload: MaterializedPayload,
@@ -393,16 +413,20 @@ impl NativeLinuxPackageLease {
                 ownership: linux_original_recovery::record(
                     &directory.join("account-ownership.json"),
                 )?,
-                journal: linux_original_recovery::record(Path::new(
-                    boundary["journal"].as_str().ok_or_else(|| {
-                        CiError::Message("original boundary journal absent".into())
-                    })?,
-                ))?,
-                reference: linux_original_recovery::record(Path::new(
-                    boundary["reference"].as_str().ok_or_else(|| {
-                        CiError::Message("original boundary reference absent".into())
-                    })?,
-                ))?,
+                journal: linux_original_recovery::record(&component_record_path(
+                    directory,
+                    &input,
+                    &boundary,
+                    "journal",
+                    "boundary-journal.bin",
+                )?)?,
+                reference: linux_original_recovery::record(&component_record_path(
+                    directory,
+                    &input,
+                    &boundary,
+                    "reference",
+                    "boundary-reference.json",
+                )?)?,
             },
         };
         let observed = linux_original_recovery::run(recovery_harness, &recovery_input, deadline)?;
