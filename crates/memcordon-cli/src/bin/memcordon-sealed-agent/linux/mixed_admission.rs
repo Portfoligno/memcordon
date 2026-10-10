@@ -483,25 +483,6 @@ impl MixedOperationalAdmission {
         launch
             .environment
             .sort_by(|left, right| left.0.cmp(&right.0));
-        let regular_count =
-            |image: &memcordon_core::workload_registry_v3::RuntimeImageDefinitionV1| {
-                image
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .filter(|entry| {
-                        matches!(
-                            entry,
-                            memcordon_core::workload_registry_v3::ImageEntryV1::Regular { .. }
-                        )
-                    })
-                    .count()
-            };
-        let image_capacity = super::image_fd_budget::ensure(
-            regular_count(resolved.image),
-            regular_count(resolved.input),
-        )
-        .map_err(|error| format!("prepare image descriptor capacity: {error}"))?;
         let runtime = super::runtime_image::open_installed(resolved.image).map_err(|error| {
             MixedAdmissionFailure::because(
                 memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
@@ -514,7 +495,6 @@ impl MixedOperationalAdmission {
                 format!("open input image: {error}"),
             )
         })?;
-        drop(image_capacity);
         if let Some(search) =
             super::image_elf_closure::validate(&runtime, &input).map_err(|error| {
                 MixedAdmissionFailure::because(

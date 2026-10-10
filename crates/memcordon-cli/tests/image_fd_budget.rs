@@ -46,6 +46,21 @@ fn child_limit_adjustment() {
     let after = unsafe { after.assume_init() };
     assert_eq!(after.rlim_max, original.rlim_max);
     assert!(after.rlim_cur >= 216);
+    // A later policy image acquisition must count the first graph's live
+    // handles rather than reuse only its original admission budget.
+    let held = (0..96)
+        .map(|_| std::fs::File::open("/dev/null").unwrap())
+        .collect::<Vec<_>>();
+    drop(budget::ensure(200, 0).unwrap());
+    let mut later = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, later.as_mut_ptr()) },
+        0
+    );
+    let later = unsafe { later.assume_init() };
+    assert!(later.rlim_cur >= 96 + 200 + 16);
+    assert_eq!(later.rlim_max, original.rlim_max);
+    drop(held);
     assert!(budget::ensure(usize::try_from(after.rlim_max).unwrap(), 1).is_err());
     assert!(
         budget::target(
