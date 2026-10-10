@@ -538,6 +538,17 @@ pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32
     }
 }
 
+fn frontend_os_error(operation: &'static str) -> io::Error {
+    let cause = io::Error::last_os_error();
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "native frontend {operation}: raw-os-error={:?}; {cause}",
+            cause.raw_os_error()
+        ),
+    )
+}
+
 /// Trusted test launcher only: it changes the frontend caller envelope and waits
 /// for that frontend. The installed provider remains the workload supervisor.
 pub fn restricted_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
@@ -593,7 +604,7 @@ fn launch_frontend(
     let mut primary = std::ptr::null_mut();
     // SAFETY: current process pseudo-handle and writable output are valid.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("OpenProcessToken"));
     }
     // SAFETY: successful OpenProcessToken transfers one token reference.
     let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
@@ -611,7 +622,7 @@ fn launch_frontend(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("CreateWellKnownSid"));
     }
     let restricting = SID_AND_ATTRIBUTES {
         Sid: restricting_sid.as_mut_ptr().cast(),
@@ -635,7 +646,7 @@ fn launch_frontend(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("CreateRestrictedToken"));
     }
     // SAFETY: newly returned restricted token reference transfers once.
     let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
@@ -697,11 +708,12 @@ fn launch_frontend(
             ));
         }
         // SAFETY: query and scoped flag change on the three owned frontend streams.
-        if unsafe { GetHandleInformation(*handle, &mut original[index]) } == 0
-            || unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
-                == 0
-        {
-            return Err(io::Error::last_os_error());
+        if unsafe { GetHandleInformation(*handle, &mut original[index]) } == 0 {
+            return Err(frontend_os_error("GetHandleInformation standard stream"));
+        }
+        // SAFETY: scoped flag change on the same borrowed frontend stream.
+        if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(frontend_os_error("SetHandleInformation standard stream"));
         }
     }
     let mut size = 0usize;
@@ -711,7 +723,7 @@ fn launch_frontend(
     let attributes = storage.as_mut_ptr().cast();
     // SAFETY: aligned storage covers the complete native attribute-list size.
     if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("InitializeProcThreadAttributeList"));
     }
     let operation = (|| -> io::Result<i32> {
         // SAFETY: explicit borrowed standard-handle list lives through creation.
@@ -727,7 +739,7 @@ fn launch_frontend(
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("UpdateProcThreadAttribute handle list"));
         }
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -764,14 +776,14 @@ fn launch_frontend(
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("CreateProcessAsUserW measured frontend"));
         }
         // SAFETY: returned process/thread references transfer exactly once.
         let process_owned = unsafe { OwnedHandle::from_raw_handle(process.hProcess.cast()) };
         let thread_owned = unsafe { OwnedHandle::from_raw_handle(process.hThread.cast()) };
         // SAFETY: only this launcher owns the frontend's initial suspended thread.
         if unsafe { ResumeThread(thread_owned.as_raw_handle()) } == u32::MAX {
-            let cause = io::Error::last_os_error();
+            let cause = frontend_os_error("ResumeThread");
             terminate_frontend(&process_owned)?;
             return Err(cause);
         }
@@ -785,7 +797,7 @@ fn launch_frontend(
         let mut code = 0;
         // SAFETY: process is held and has reached a terminal state.
         if unsafe { GetExitCodeProcess(process_owned.as_raw_handle(), &mut code) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("GetExitCodeProcess"));
         }
         Ok(code as i32)
     })();
