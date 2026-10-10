@@ -125,6 +125,21 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
         std::env::consts::EXE_SUFFIX
     ));
     std::fs::copy(env!("CARGO_BIN_EXE_memcordon-ci"), &wrapper).unwrap();
+    // Exercise the actual driver without carrying its unrelated debug sections
+    // into the bounded executable fixture. Never modify Cargo's original image.
+    #[cfg(target_os = "linux")]
+    {
+        let stripped = std::process::Command::new("strip")
+            .arg("--strip-debug")
+            .arg(&wrapper)
+            .output()
+            .unwrap();
+        assert!(
+            stripped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stripped.stderr)
+        );
+    }
     descriptor.wrapper_sha256 = hex::encode(Sha256::digest(std::fs::read(&wrapper).unwrap()));
     descriptor.compiler_sha256 =
         hex::encode(Sha256::digest(std::fs::read(&descriptor.compiler).unwrap()));
