@@ -1,7 +1,9 @@
 //! MemCordon-owned workload behavior; provider evidence remains independently checked.
 pub mod descriptor;
+mod fixture_environment;
 mod native;
 mod toolchain;
+mod toolchain_debug;
 
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
@@ -163,7 +165,8 @@ fn binary_files(descriptor: &Descriptor, transcript: &mut Transcript) -> io::Res
 }
 
 fn joint(descriptor: &Descriptor, transcript: &mut Transcript, churn: bool) -> io::Result<()> {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let listener =
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(native::tcp_bind_failure)?;
     let address = listener.local_addr()?;
     // The original socket stays held until every IPC/churn/descendant stage completes.
     let conflicting_bind = match TcpListener::bind(address) {
@@ -524,6 +527,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
             return Ok(0);
         }
         Some("restricted-frontend") => return native::restricted_frontend(args),
+        Some("system-frontend") => return native::system_frontend(args),
+        Some("system-restricted-frontend") => return native::system_restricted_frontend(args),
+        Some("system-sentinel-frontend") => return native::system_sentinel_frontend(args),
         Some("sentinel-frontend") => return native::sentinel_frontend(args),
         Some("tcp-peer") => {
             let port = args

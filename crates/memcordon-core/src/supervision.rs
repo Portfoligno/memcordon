@@ -168,6 +168,9 @@ pub struct WindowsSealedEvidenceV2 {
     /// This is not a provider-native containment or retirement claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_delivery: Option<crate::WindowsTerminalDeliveryEvidenceV1>,
+    /// Exact authenticated provider/attempt/request retained by the frontend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_provider_association: Option<crate::result_v1::ProviderAttemptAssociationV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

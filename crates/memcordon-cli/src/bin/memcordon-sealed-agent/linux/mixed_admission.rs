@@ -486,20 +486,20 @@ impl MixedOperationalAdmission {
         let runtime = super::runtime_image::open_installed(resolved.image).map_err(|error| {
             MixedAdmissionFailure::because(
                 memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                error,
+                format!("open runtime image: {error}"),
             )
         })?;
         let input = super::runtime_image::open_installed(resolved.input).map_err(|error| {
             MixedAdmissionFailure::because(
                 memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                error,
+                format!("open input image: {error}"),
             )
         })?;
         if let Some(search) =
             super::image_elf_closure::validate(&runtime, &input).map_err(|error| {
                 MixedAdmissionFailure::because(
                     memcordon_core::result_v2::MixedAdmissionRejectionV2::ImageCustodyMismatch,
-                    error,
+                    format!("validate image ELF closure: {error}"),
                 )
             })?
         {

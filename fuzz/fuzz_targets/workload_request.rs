@@ -3,9 +3,8 @@ use libfuzzer_sys::fuzz_target;
 use memcordon_core::workload_codec::{
     decode_contract, decode_contract_v2, encode_contract, encode_contract_v2,
 };
-use memcordon_core::workload_contract::{
-    WorkloadContract, WorkloadContractV1, WorkloadContractV2,
-};
+use memcordon_core::workload_contract::{WorkloadContract, WorkloadContractV1, WorkloadContractV2};
+use memcordon_core::workload_contract_v3::WorkloadContractV3;
 
 fuzz_target!(|data: &[u8]| {
     match WorkloadContract::parse(data) {
@@ -16,6 +15,11 @@ fuzz_target!(|data: &[u8]| {
         Ok(WorkloadContract::V2(request)) => {
             assert_eq!(WorkloadContractV2::parse(data).unwrap(), request);
             assert!(WorkloadContractV1::parse(data).is_err());
+        }
+        Ok(WorkloadContract::V3(request)) => {
+            assert_eq!(WorkloadContractV3::parse(data).unwrap(), request);
+            assert!(WorkloadContractV1::parse(data).is_err());
+            assert!(WorkloadContractV2::parse(data).is_err());
         }
         Err(_) => {}
     }
@@ -37,6 +41,17 @@ fuzz_target!(|data: &[u8]| {
         let json = serde_json::to_vec_pretty(&request).unwrap();
         if json.len() <= memcordon_core::workload_limits::CONTRACT_BYTES {
             assert_eq!(WorkloadContractV2::parse(&json).unwrap(), request);
+        }
+    }
+    if let Ok(request) = WorkloadContractV3::parse(data) {
+        assert!(request.validate().is_ok());
+        let canonical = request.canonical_bytes().unwrap();
+        let json = serde_json::to_vec_pretty(&request).unwrap();
+        if json.len() <= memcordon_core::workload_limits::CONTRACT_BYTES {
+            let decoded = WorkloadContractV3::parse(&json).unwrap();
+            assert_eq!(decoded, request);
+            assert_eq!(decoded.canonical_bytes().unwrap(), canonical);
+            assert_eq!(decoded.digest().unwrap(), request.digest().unwrap());
         }
     }
 });

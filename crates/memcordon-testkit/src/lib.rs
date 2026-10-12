@@ -2,6 +2,11 @@
 
 pub mod harness_budget;
 
+#[cfg(target_os = "linux")]
+pub use memcordon_platform::test_support::{
+    NativeExecObservation, configure_native_exec_observation,
+};
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use memcordon_platform::test_support::unsearchable_directory;
 
@@ -9,8 +14,9 @@ pub use memcordon_platform::test_support::unsearchable_directory;
 pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
 #[cfg(windows)]
 pub use memcordon_platform::test_support::{
-    ProcessIdentity, WindowsImageProcess, windows_available_memory_bytes,
-    windows_processes_for_image,
+    ProcessIdentity, WindowsHeldFileIdentity, WindowsImageProcess, windows_available_memory_bytes,
+    windows_console_host_path, windows_held_file_identity, windows_native_work_cutoff,
+    windows_performance_counter, windows_processes_for_image, windows_processes_for_image_until,
 };
 
 use std::fmt;
@@ -49,6 +55,15 @@ pub struct TimeoutObservation {
 pub enum ProcessTestError {
     Spawn(io::Error),
     Wait(io::Error),
+    Callback {
+        error: io::Error,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        capture_complete: bool,
+        observed_status: Option<ExitStatus>,
+        termination: Option<ExitStatus>,
+        cleanup: Result<(), String>,
+    },
     Output(io::Error),
     OutputLimit {
         stdout: Vec<u8>,
@@ -70,6 +85,16 @@ impl fmt::Display for ProcessTestError {
         match self {
             Self::Spawn(error) => write!(formatter, "test command failed to spawn: {error}"),
             Self::Wait(error) => write!(formatter, "test command wait failed: {error}"),
+            Self::Callback {
+                error,
+                observed_status,
+                termination,
+                cleanup,
+                ..
+            } => write!(
+                formatter,
+                "test command callback failed: {error}; observed-status={observed_status:?}; termination={termination:?}; cleanup={cleanup:?}"
+            ),
             Self::Output(error) => write!(formatter, "test output reader failed: {error}"),
             Self::OutputLimit {
                 stdout,
@@ -358,13 +383,31 @@ fn observe_deadline_child(
             if cleanup.is_err() {
                 let _ = child.kill();
             }
-            let _ = child.wait();
+            let wait = child.wait();
+            let mut stdout = stdout_reader.snapshot();
+            let mut stderr = stderr_reader.snapshot();
+            let mut capture_complete = false;
             if cleanup.is_ok() {
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let out = stdout_reader.join();
+                let err = stderr_reader.join();
+                if let (Ok(Ok(out)), Ok(Ok(err))) = (out, err) {
+                    stdout = out;
+                    stderr = err;
+                    capture_complete = true;
+                }
             }
             let _ = callback.join();
-            return Err(ProcessTestError::Wait(error));
+            return Err(ProcessTestError::Callback {
+                error,
+                stdout,
+                stderr,
+                capture_complete,
+                observed_status,
+                termination: wait.as_ref().ok().copied(),
+                cleanup: cleanup
+                    .map_err(|error| error.to_string())
+                    .and(wait.map(|_| ()).map_err(|error| error.to_string())),
+            });
         }
         if observed_status.is_none() {
             match child.try_wait() {

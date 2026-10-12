@@ -65,6 +65,7 @@ pub struct NativeAdminScope {
     component_package: Option<super::linux_native_package::NativeLinuxPackageLease>,
     component_workspace: Option<PathBuf>,
     component_fixture: Option<(PathBuf, String, File)>,
+    recovery_harness: Option<super::linux_recovery_harness::HeldRecoveryHarness>,
 }
 
 /// Read-only loans of the original acquired account records. The caller keeps
@@ -330,11 +331,16 @@ impl NativeAdminScope {
             component_package: None,
             component_workspace: None,
             component_fixture: None,
+            recovery_harness: None,
         })
     }
 
     /// Reacquire only the original protected image namespace. This restores
     /// cleanup obligations, never lost captures, exit status, or test evidence.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retains the exact original image, source identity, recipe and finite cleanup custody together"
+    )]
     pub fn recover_owned_scope(
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
@@ -556,6 +562,10 @@ impl NativeAdminScope {
         Ok(scope)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retirement observation binds the complete original image and recipe custody"
+    )]
     pub fn observe_retired_scope(
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
@@ -799,12 +809,17 @@ impl NativeAdminScope {
         Ok(protected)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Native image execution keeps measured harnesses, original identity and finite owner deadlines explicit"
+    )]
     pub fn execute(
         &mut self,
         parser: &MeasuredHarness,
         operational: &MeasuredHarness,
         run_id: &str,
         recipe_id: &str,
+        allocation_recipe_id: &str,
         target: &str,
         prefix: &str,
         work: Instant,
@@ -832,13 +847,17 @@ impl NativeAdminScope {
             .map_err(CiError::Message)?;
         let intent: serde_json::Value = serde_json::from_slice(&intent_bytes)?;
         if artifacts::checksum(&intent_bytes) != name
-            || intent["identity"]["run_id"] != run_id
-            || intent["target"] != target
-            || intent["recipe_id"] != recipe_id
-            || intent["artifact_prefix"] != prefix
-            || intent["work_deadline_unix_millis"] != work_unix
-            || intent["cleanup_deadline_unix_millis"] != cleanup_unix
-            || work_unix >= cleanup_unix
+            || !super::native_execution_association::matches(
+                &intent,
+                &super::native_execution_association::Allocation {
+                    run_id,
+                    recipe_id: allocation_recipe_id,
+                    target,
+                    artifact_prefix: prefix,
+                    work_deadline: work_unix,
+                    cleanup_deadline: cleanup_unix,
+                },
+            )
             || Instant::now() >= work
         {
             return Err(CiError::Message(
@@ -965,7 +984,16 @@ impl NativeAdminScope {
             work_unix,
             cleanup_unix,
             |directory, cutoff| {
-                package.recover_component(workspace, directory, cutoff, work_unix, cleanup_unix)
+                package.recover_component(
+                    workspace,
+                    directory,
+                    cutoff,
+                    work_unix,
+                    cleanup_unix,
+                    self.recovery_harness.as_ref().ok_or_else(|| {
+                        CiError::Message("original recovery harness owner absent".into())
+                    })?,
+                )
             },
         )?);
         Ok(())
@@ -975,8 +1003,14 @@ impl NativeAdminScope {
         &self.path
     }
     /// Retains the selected package/resource owner before the first install.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preparation binds selected source, target, artifact root and both finite owner deadlines"
+    )]
     pub fn prepare_operational_fixture(
         &mut self,
+        operational: &MeasuredHarness,
+        scope_id: &str,
         workspace: &Path,
         identity: &crate::consumer_readiness_ledger::SourceIdentity,
         target: &str,
@@ -993,6 +1027,19 @@ impl NativeAdminScope {
                 "original operational fixture package cannot be reacquired".into(),
             ));
         }
+        let cell = memcordon_readiness_verifier::ProductKey {
+            target: target.into(),
+            channel: "candidate-native".into(),
+        };
+        self.recovery_harness = Some(super::linux_recovery_harness::HeldRecoveryHarness::acquire(
+            operational,
+            identity,
+            &cell,
+            scope_id,
+            work_unix,
+            cleanup_unix,
+            &self.path.join("recovery-harness-owner.json"),
+        )?);
         let admin = self.path.join("component-package-admin");
         fs::DirBuilder::new().mode(0o700).create(&admin)?;
         self.root.sync_all()?;
@@ -1011,7 +1058,12 @@ impl NativeAdminScope {
         let output = admin.join("native-package-evidence");
         self.component_package = Some(
             super::linux_native_package::NativeLinuxPackageLease::acquire(
-                payload, &admin, &output,
+                self.recovery_harness.as_ref().ok_or_else(|| {
+                    CiError::Message("original recovery harness owner absent".into())
+                })?,
+                payload,
+                &admin,
+                &output,
             )?,
         );
         self.component_workspace = Some(workspace.to_path_buf());
@@ -1032,6 +1084,9 @@ impl NativeAdminScope {
                 cleanup,
                 work_unix,
                 cleanup_unix,
+                self.recovery_harness.as_ref().ok_or_else(|| {
+                    CiError::Message("original recovery harness owner absent".into())
+                })?,
             )?;
         let bytes = serde_json::to_vec(
             &serde_json::json!({"contract":activated.contract,"registry":activated.registry}),
@@ -1311,20 +1366,18 @@ impl NativeAdminScope {
 
     pub fn settle(&mut self, deadline: Instant) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(batch) = &mut self.batch {
-            if let Err(error) = batch.settle(deadline) {
-                failures.push(error.to_string());
-            }
+        if let Some(Err(error)) = self.batch.as_mut().map(|batch| batch.settle(deadline)) {
+            failures.push(error.to_string());
         }
-        if let Some(package) = &mut self.component_package {
-            if let Err(error) = package.finalize(
+        if let Some(Err(error)) = self.component_package.as_mut().map(|package| {
+            package.finalize(
                 self.component_workspace
                     .as_deref()
                     .expect("retained original package workspace"),
                 deadline,
-            ) {
-                failures.push(error.to_string());
-            }
+            )
+        }) {
+            failures.push(error.to_string());
         }
         for descriptor in &self.recovered {
             use rustix::event::{PollFd, PollFlags, Timespec};
@@ -1351,13 +1404,14 @@ impl NativeAdminScope {
                 }
                 if !signal_attempted {
                     signal_attempted = true;
-                    if let Err(error) = rustix::process::pidfd_send_signal(
+                    match rustix::process::pidfd_send_signal(
                         descriptor,
                         rustix::process::Signal::KILL,
                     ) {
-                        if error != rustix::io::Errno::SRCH {
+                        Err(error) if error != rustix::io::Errno::SRCH => {
                             failures.push(format!("recovered native signal failed: {error}"));
                         }
+                        _ => {}
                     }
                 }
                 if Instant::now() >= deadline {
@@ -1557,6 +1611,10 @@ pub struct NativeRecipeBatch {
 }
 
 impl NativeRecipeBatch {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The native recipe retains every measured owner and independent finite phase bound"
+    )]
     pub fn execute(
         parser: &MeasuredHarness,
         operational: &MeasuredHarness,
@@ -1574,7 +1632,6 @@ impl NativeRecipeBatch {
         cleanup_unix: u64,
         mut recover: impl FnMut(&Path, Instant) -> Result<()>,
     ) -> Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
         if run_id.is_empty()
             || recipe_id.is_empty()
             || target != super::distribution::native_target()?
@@ -1643,9 +1700,6 @@ impl NativeRecipeBatch {
         let mut prepared = Vec::new();
         for (harness, test, name) in recipes {
             let directory = output.join(name);
-            fs::create_dir(&directory)?;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-            File::open(output)?.sync_all()?;
             let mut challenge = [0u8; 32];
             File::open("/dev/urandom")?.read_exact(&mut challenge)?;
             let mut value = serde_json::json!({"run_id":run_id,"recipe_id":recipe_id,
@@ -1690,17 +1744,17 @@ impl NativeRecipeBatch {
             }
             if !owner.all_native_publications_settled() {
                 batch.owners.push((test.to_owned(), owner));
-            } else if matches!(
+            } else if let Some(Err(error)) = matches!(
                 test,
                 "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt"
                     | "native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt"
-            ) {
-                if let Err(error) = recover(&directory, cleanup_deadline) {
-                    batch
-                        .failures
-                        .push(format!("{test}: persisted native recovery: {error}"));
-                    break;
-                }
+            )
+            .then(|| recover(&directory, cleanup_deadline))
+            {
+                batch
+                    .failures
+                    .push(format!("{test}: persisted native recovery: {error}"));
+                break;
             }
         }
         Ok(batch)
@@ -1773,37 +1827,7 @@ fn capture(reader: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec
 }
 
 pub(crate) fn protected_directory(path: &Path) -> Result<Vec<File>> {
-    if !path.is_absolute() {
-        return Err(CiError::Message(
-            "native component controller path must be absolute".into(),
-        ));
-    }
-    let mut current = PathBuf::from("/");
-    let mut held = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => (),
-            std::path::Component::Normal(name) => current.push(name),
-            _ => {
-                return Err(CiError::Message(
-                    "native component controller path is not normalized".into(),
-                ));
-            }
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&current)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(CiError::Message(
-                "native component controller ancestry is not protected administrator custody"
-                    .into(),
-            ));
-        }
-        held.push(file);
-    }
-    Ok(held)
+    super::linux_recovery_harness::protected_directory(path)
 }
 
 /// Copy only measured bytes into the administrator's protected native scope;
@@ -1856,6 +1880,10 @@ pub fn protect_harness(harness: &MeasuredHarness, destination: &Path) -> Result<
 impl NativeTestOwner {
     /// The owner is returned even when setup fails after spawn. Its exact Child,
     /// pidfd and capture workers must remain with the outer phase owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure must return the original live Child, pidfd and capture owners for mandatory retirement"
+    )]
     pub fn spawn(
         harness: &MeasuredHarness,
         test: &str,
@@ -1863,14 +1891,7 @@ impl NativeTestOwner {
         output: &Path,
     ) -> std::result::Result<Self, OwnedNativeTestFailure> {
         let before = (|| -> Result<_> {
-            if !matches!(
-                test,
-                "native_index_mutations_emit_actual_parser_receipts"
-                    | "operational_parser_receipts::native_operational_parser_mutations_emit_actual_receipts"
-                    | "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts"
-                    | "native_versions::native_version_vectors_emit_actual_component_receipts"
-                    | "private_attempt::durable_journal_barriers_emit_actual_component_receipts"
-            ) {
+            if !super::native_recipe_case::admitted(test) {
                 return Err(CiError::Message(
                     "root-only native component recipe is not frozen".into(),
                 ));
@@ -1890,7 +1911,7 @@ impl NativeTestOwner {
             ancestry.extend(protected_directory(output.parent().ok_or_else(|| {
                 CiError::Message("native component output parent absent".into())
             })?)?);
-            fs::create_dir(output)?;
+            super::native_recipe_case::create(output)?;
             ancestry.extend(protected_directory(output)?);
             let image = OpenOptions::new()
                 .read(true)
@@ -2212,15 +2233,13 @@ impl NativeTestOwner {
                     }),
                 )
                 .map_err(std::io::Error::from)?;
-                if !poll[0].revents().intersects(PollFlags::IN | PollFlags::HUP) {
-                    if let Err(error) = rustix::process::pidfd_send_signal(
-                        &*descriptor,
-                        rustix::process::Signal::KILL,
-                    ) {
-                        if error != rustix::io::Errno::SRCH {
-                            return Err(std::io::Error::from(error).into());
-                        }
+                match (!poll[0].revents().intersects(PollFlags::IN | PollFlags::HUP)).then(|| {
+                    rustix::process::pidfd_send_signal(&*descriptor, rustix::process::Signal::KILL)
+                }) {
+                    Some(Err(error)) if error != rustix::io::Errno::SRCH => {
+                        return Err(std::io::Error::from(error).into());
                     }
+                    _ => {}
                 }
                 loop {
                     let mut poll = [PollFd::new(&*descriptor, PollFlags::IN)];
@@ -2265,11 +2284,9 @@ impl NativeTestOwner {
             (&mut self.stdout, &mut self.stdout_bytes),
             (&mut self.stderr, &mut self.stderr_bytes),
         ] {
-            if let Some(worker) = handle.as_ref() {
-                if !worker.is_finished() {
-                    capture_outstanding = true;
-                    continue;
-                }
+            if handle.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                capture_outstanding = true;
+                continue;
             }
             if let Some(worker) = handle.take() {
                 match worker.join() {

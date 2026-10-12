@@ -19,6 +19,40 @@ fn directory() -> tempfile::TempDir {
     }
 }
 
+#[test]
+fn installed_case_selection_preserves_and_checks_auxiliary_capture_evidence() {
+    use memcordon_ci::{
+        release::installed_consumer::installed_case_artifacts,
+        windows_installed_cases::SelectedArtifact,
+    };
+    let owner = directory();
+    let mut records = Vec::new();
+    // Four original crate artifacts and the complete four-bin auxiliary bound.
+    for index in 0..29 {
+        let path = owner.path().join(format!("artifact-{index}"));
+        let bytes = format!("actual retained artifact {index}").into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        records.push(SelectedArtifact {
+            path,
+            sha256: artifacts::checksum(&bytes),
+        });
+    }
+    let selected = installed_case_artifacts(&records, 4, 4).unwrap();
+    assert_eq!(selected.len(), 4);
+    assert_eq!(selected[3].path, records[3].path);
+    assert_eq!(records.len(), 29);
+    assert!(installed_case_artifacts(&records, 0, 4).is_err());
+    assert!(installed_case_artifacts(&records, 17, 4).is_err());
+    assert!(installed_case_artifacts(&records, 4, 3).is_err());
+    let mut duplicate = records.clone();
+    duplicate[28] = duplicate[0].clone();
+    assert!(installed_case_artifacts(&duplicate, 4, 4).is_err());
+    std::fs::write(&records[28].path, b"changed auxiliary capture").unwrap();
+    assert!(installed_case_artifacts(&records, 4, 4).is_err());
+    std::fs::write(&records[0].path, b"changed selected crate").unwrap();
+    assert!(installed_case_artifacts(&records[..4], 4, 4).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn selected_cli_paths_reach_actual_fixture_and_report_after_child_changes_directory() {
@@ -273,7 +307,14 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
     let SealedRuntime::Included { profiles, .. } = private.sealed else {
         panic!("selected runtime missing");
     };
-    assert_eq!(profiles, ["linux-unix-create-v1", "linux-tcp4-private-v1"]);
+    assert_eq!(
+        profiles,
+        [
+            "linux-unix-create-v1",
+            "linux-tcp4-private-v1",
+            "linux-tcp4-unix-private-v1"
+        ]
+    );
 }
 
 fn retained_component(
@@ -348,21 +389,39 @@ fn runtime_inventory_matches_retained_linux_source_contract_in_both_channels() {
                 native.push(runtime_component(role, path.into(), &bytes));
                 retained.push(retained_component(owner.path(), role, id, path));
             }
-            let expected = RuntimeManifest::linux_selected(
-                "1.2.3".into(),
-                source().commit().into(),
-                target.into(),
-                retained,
-                private,
-            )
+            let expected = if private {
+                RuntimeManifest::linux_combined(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    retained,
+                )
+            } else {
+                RuntimeManifest::linux_selected(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    retained,
+                    private,
+                )
+            }
             .unwrap();
-            let produced = RuntimeManifest::linux_selected(
-                "1.2.3".into(),
-                source().commit().into(),
-                target.into(),
-                native,
-                private,
-            )
+            let produced = if private {
+                RuntimeManifest::linux_combined(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    native,
+                )
+            } else {
+                RuntimeManifest::linux_selected(
+                    "1.2.3".into(),
+                    source().commit().into(),
+                    target.into(),
+                    native,
+                    private,
+                )
+            }
             .unwrap();
             assert_eq!(
                 RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),

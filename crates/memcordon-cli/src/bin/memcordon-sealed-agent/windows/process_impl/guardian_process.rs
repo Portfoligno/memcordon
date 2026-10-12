@@ -561,6 +561,37 @@ impl GuardianProcess {
         self.process.raw()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn terminate_for_certification(&self, exit_code: u32) -> Result<(), String> {
+        use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+        let original = process_identity(self.process.raw())?;
+        // SAFETY: the original process stays held, preventing PID reuse. This
+        // temporary capability belongs only to the authenticated fault path.
+        let mut termination = OwnedHandle::new(unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+                0,
+                original.process_id,
+            )
+        })
+        .map_err(|detail| format!("certification guardian OpenProcess(TERMINATE): {detail}"))?;
+        if process_identity(termination.raw())? != original {
+            return Err(
+                "certification guardian termination identity differs from held original".into(),
+            );
+        }
+        // SAFETY: the temporary handle has terminate authority and its native
+        // identity was joined to the still-held original immediately above.
+        if unsafe { TerminateProcess(termination.raw(), exit_code) } == 0 {
+            let error = io::Error::last_os_error();
+            return Err(format!(
+                "certification guardian TerminateProcess: raw-os-error={:?}; {error}",
+                error.raw_os_error()
+            ));
+        }
+        termination.close_checked()
+    }
+
     pub fn close_for_retirement(mut self) -> Result<(), String> {
         // SAFETY: this instance owns the exact guardian process handle.
         if unsafe { WaitForSingleObject(self.process.raw(), 0) } != WAIT_OBJECT_0 {

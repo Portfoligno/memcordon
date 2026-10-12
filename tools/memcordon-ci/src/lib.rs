@@ -18,6 +18,7 @@ pub mod native_results;
 pub mod native_test_plan;
 pub mod policy;
 pub mod preparation;
+pub mod public_install_capture;
 pub mod public_reads;
 pub mod rehearsal_support;
 pub mod release;
@@ -30,6 +31,8 @@ pub mod standard_contract;
 pub mod standard_runner;
 pub mod stress;
 pub mod target_shard;
+#[cfg(windows)]
+mod windows_caller_snapshot_diagnostic;
 pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
 pub mod windows_consumer_readiness;
@@ -38,12 +41,16 @@ pub mod windows_installed_cases;
 pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
+#[cfg(windows)]
+mod windows_readiness_acl;
 pub mod windows_readiness_adapter;
 pub mod windows_readiness_capacity;
 pub mod windows_readiness_components;
 pub mod windows_readiness_faults;
 pub mod windows_readiness_native_tests;
 pub mod windows_readiness_refusals;
+#[cfg(windows)]
+mod windows_receipt_identity;
 pub mod workflow_output;
 pub mod workflow_scope;
 

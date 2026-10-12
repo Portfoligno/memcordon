@@ -13,6 +13,31 @@ use std::time::Duration;
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/descriptor.rs"]
 pub mod descriptor;
 
+#[cfg(windows)]
+#[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/fixture_environment.rs"]
+pub(crate) mod fixture_environment;
+
+/// PID ancestry is meaningful only for processes that can belong to this
+/// original root lifetime. A preexisting process cannot become its descendant
+/// when an intermediate parent PID is reused in a later snapshot.
+pub fn rooted_process_depth(
+    candidate: (u32, u128),
+    root: (u32, u128),
+    parents: &std::collections::BTreeMap<u32, u32>,
+) -> Option<usize> {
+    if candidate.1 < root.1 || (candidate.0 == root.0 && candidate.1 != root.1) {
+        return None;
+    }
+    let mut current = candidate.0;
+    for depth in 0..=16 {
+        if current == root.0 {
+            return Some(depth);
+        }
+        current = *parents.get(&current)?;
+    }
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseKey {
@@ -376,6 +401,7 @@ pub fn public_command(
     public_command_observation(cli, fixture, directory, report, case, true, false)
 }
 
+#[cfg(windows)]
 pub(crate) fn public_refusal_command(
     cli: &Path,
     fixture: &Path,
@@ -386,6 +412,7 @@ pub(crate) fn public_refusal_command(
     public_command_observation(cli, fixture, directory, report, case, false, true)
 }
 
+#[cfg(windows)]
 pub(crate) fn public_component_command(
     cli: &Path,
     fixture: &Path,
@@ -445,7 +472,12 @@ fn public_command_observation(
     if case.expected_token.restricted {
         let mut restricted: Vec<OsString> = vec![
             "consumer-readiness-windows".into(),
-            "restricted-frontend".into(),
+            if terminal_observation {
+                "system-restricted-frontend"
+            } else {
+                "restricted-frontend"
+            }
+            .into(),
             cli.into_os_string(),
         ];
         restricted.extend(args);
@@ -458,7 +490,12 @@ fn public_command_observation(
     } else if case.key.scenario == "sentinel-handles" {
         let mut sentinel: Vec<OsString> = vec![
             "consumer-readiness-windows".into(),
-            "sentinel-frontend".into(),
+            if terminal_observation {
+                "system-sentinel-frontend"
+            } else {
+                "sentinel-frontend"
+            }
+            .into(),
             case.descriptor_path.clone().into_os_string(),
             cli.into_os_string(),
         ];
@@ -469,6 +506,19 @@ fn public_command_observation(
             Duration::from_secs(660),
         )
         .args(sentinel))
+    } else if terminal_observation {
+        let mut ordinary: Vec<OsString> = vec![
+            "consumer-readiness-windows".into(),
+            "system-frontend".into(),
+            cli.into_os_string(),
+        ];
+        ordinary.extend(args);
+        Ok(crate::command::CommandSpec::new(
+            std::path::absolute(fixture)?,
+            &std::path::absolute(directory)?,
+            Duration::from_secs(660),
+        )
+        .args(ordinary))
     } else {
         Ok(crate::command::CommandSpec::new(
             cli,
@@ -485,16 +535,19 @@ fn events(bytes: &[u8]) -> Result<Vec<Event>> {
 
 // Only the native controller uses this while holding the transcript writer
 // alive. A partial final frame is a publication in progress, never evidence.
+#[cfg(windows)]
 fn live_events(bytes: &[u8]) -> Result<Vec<Event>> {
     decode_events(bytes, true)
 }
 
+#[cfg(windows)]
 pub(crate) fn live_capacity_completion(bytes: &[u8]) -> Result<bool> {
     Ok(live_events(bytes)?
         .iter()
         .any(|event| event.stage == "capacity-live-before-natural-completion"))
 }
 
+#[cfg(windows)]
 pub(crate) fn live_demand_child(
     bytes: &[u8],
     root_pid: u32,
@@ -717,12 +770,12 @@ pub fn assess(
                 ));
             }
         }
-        descriptor::Case::Toolchain => {
-            if !has("toolchain-compiled") || !has("toolchain-test-child-dll-complete") {
-                return Err(CiError::Message(
-                    "toolchain fixture omitted compile/child/DLL stage".into(),
-                ));
-            }
+        descriptor::Case::Toolchain
+            if !has("toolchain-compiled") || !has("toolchain-test-child-dll-complete") =>
+        {
+            return Err(CiError::Message(
+                "toolchain fixture omitted compile/child/DLL stage".into(),
+            ));
         }
         _ => {}
     }
@@ -856,6 +909,50 @@ pub(crate) mod native {
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
+    struct HeldConsoleImage {
+        _file: fs::File,
+        path: PathBuf,
+        sha256: String,
+        identity: serde_json::Value,
+    }
+
+    fn hold_console_image() -> io::Result<HeldConsoleImage> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let path = memcordon_testkit::windows_console_host_path()?;
+        // Deny write/delete sharing while the original measured image is held.
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || metadata.len() > 16 * 1024 * 1024
+        {
+            return Err(io::Error::other(
+                "native console image is not a bounded ordinary file",
+            ));
+        }
+        let information = memcordon_testkit::windows_held_file_identity(&file)?;
+        if information.length != metadata.len() {
+            return Err(io::Error::other(
+                "held native console file identity length differs",
+            ));
+        }
+        let mut bytes = Vec::new();
+        (&file).take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(io::Error::other("held native console image length changed"));
+        }
+        Ok(HeldConsoleImage {
+            _file: file,
+            path,
+            sha256: crate::windows_causal_acceptance::sha256(&bytes),
+            identity: serde_json::to_value(information).map_err(io::Error::other)?,
+        })
+    }
+
     fn provision_budget(deadline: Instant) -> Result<Duration> {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -943,7 +1040,11 @@ pub(crate) mod native {
             .join("tests")
             .join("fixtures")
             .join("windows_readiness");
+        let (native_work_cutoff_ticks, native_work_frequency) =
+            memcordon_testkit::windows_native_work_cutoff(work_deadline)?;
         let mut toolchain = descriptor::Toolchain {
+            native_work_cutoff_ticks,
+            native_work_frequency,
             rustc: compiler,
             native_linker: PathBuf::new(),
             native_library_directories: Vec::new(),
@@ -993,8 +1094,11 @@ pub(crate) mod native {
         let sid = sid_text(&token.user_sid)?;
         let input_acl = format!("D:P(A;OICI;GA;;;{sid})(A;OICI;GRGX;;;RC)(A;OICI;GA;;;SY)");
         set_directory_acl(&directory, &input_acl)?;
+        // Executable files have effective authority but no child inheritance.
+        // Keep the same ordered principals and rights as the input directory.
+        let image_acl = format!("D:P(A;;GA;;;{sid})(A;;GRGX;;;RC)(A;;GA;;;SY)");
         for image in [&config.cli.path, &config.fixture.path] {
-            set_directory_acl(image, &input_acl)?;
+            set_directory_acl(image, &image_acl)?;
         }
         let owned_inputs = directory.join("locked-inputs");
         fs::create_dir(&owned_inputs)?;
@@ -1644,8 +1748,8 @@ pub(crate) mod native {
             SE_FILE_OBJECT, SetNamedSecurityInfoW,
         };
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-            PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            IsValidAcl, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
         let sddl: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut security = std::ptr::null_mut();
@@ -1710,22 +1814,44 @@ pub(crate) mod native {
             if status != 0 {
                 return Err(io::Error::from_raw_os_error(status as i32).into());
             }
-            // SAFETY: both ACL pointers were returned by validated native descriptor APIs.
-            let equal = unsafe {
-                !actual_acl.is_null()
-                    && (*actual_acl).AclSize == (*acl).AclSize
-                    && std::slice::from_raw_parts(
-                        actual_acl.cast::<u8>(),
-                        (*actual_acl).AclSize as usize,
-                    ) == std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize)
+            let mut control = 0;
+            let mut revision = 0;
+            // SAFETY: descriptor/ACL pointers are owned API outputs, valid until
+            // LocalFree. Native validation precedes every bounded ACL slice.
+            let comparison = unsafe {
+                if actual_acl.is_null() || IsValidAcl(acl) == 0 || IsValidAcl(actual_acl) == 0 {
+                    Err("native readiness DACL is absent or malformed".to_owned())
+                } else if GetSecurityDescriptorControl(actual_security, &mut control, &mut revision)
+                    == 0
+                {
+                    Err(io::Error::last_os_error().to_string())
+                } else {
+                    crate::windows_readiness_acl::verify_file_dacl(
+                        std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize),
+                        std::slice::from_raw_parts(
+                            actual_acl.cast::<u8>(),
+                            (*actual_acl).AclSize as usize,
+                        ),
+                        control & SE_DACL_PROTECTED != 0,
+                    )
+                }
             };
             // SAFETY: GetNamedSecurityInfoW allocated this independent descriptor.
             unsafe { LocalFree(actual_security) };
-            if !equal {
-                return Err(CiError::Message(
-                    "native readiness directory DACL readback differs".into(),
-                ));
-            }
+            comparison.map_err(|detail| {
+                let bytes = path.as_os_str().as_encoded_bytes();
+                let object = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+                let object_type = match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_dir() => "directory",
+                    Ok(metadata) if metadata.is_file() => "file",
+                    Ok(_) => "other",
+                    Err(_) => "unavailable",
+                };
+                CiError::Message(format!(
+                    "native readiness directory DACL readback differs: {detail}; object={object:?}; object-path-truncated={}; object-type={object_type}",
+                    bytes.len() > 512,
+                ))
+            })?;
             Ok(())
         })();
         // SAFETY: conversion allocated this one security descriptor with LocalAlloc.
@@ -1810,9 +1936,32 @@ pub(crate) mod native {
             let output =
                 memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 16 * 1024)
                     .map_err(|error| CiError::Message(error.to_string()))?;
+            crate::release::source::write_diagnostic_json(
+                &config.output_directory.join(if restricted {
+                    "windows-restricted-token-capture.json"
+                } else {
+                    "windows-ordinary-token-capture.json"
+                }),
+                &serde_json::json!({
+                    "format":"memcordon.windows-caller-token-capture",
+                    "revision":1,
+                    "restricted":restricted,
+                    "program_debug":format!("{:?}",command.get_program()),
+                    "arguments_debug":command.get_args().map(|argument|format!("{argument:?}")).collect::<Vec<_>>(),
+                    "status":output.status.code(),
+                    "success":output.status.success(),
+                    "stdout":output.stdout,
+                    "stderr":output.stderr,
+                }),
+            )?;
             if !output.status.success() || !output.stderr.is_empty() {
                 return Err(CiError::Message(
-                    "native caller-envelope provisioning failed".into(),
+                    crate::windows_caller_snapshot_diagnostic::failure(
+                        restricted,
+                        output.status.code(),
+                        &output.stdout,
+                        &output.stderr,
+                    ),
                 ));
             }
             let token: TokenObservation = serde_json::from_slice(&output.stdout)?;
@@ -2306,23 +2455,23 @@ pub(crate) mod native {
         Ok(parents)
     }
 
-    fn descendant_depth(
-        pid: u32,
-        root: u32,
-        parents: &std::collections::BTreeMap<u32, u32>,
-    ) -> Option<usize> {
-        let mut current = pid;
-        for depth in 0..=16 {
-            if current == root {
-                return Some(depth);
-            }
-            current = *parents.get(&current)?;
-        }
-        None
+    fn toolchain_observation_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+        let displayed = path.to_string_lossy();
+        let excerpt: String = displayed.chars().take(256).collect();
+        io::Error::new(
+            error.kind(),
+            format!(
+                "native toolchain observer {operation}; path={excerpt:?}; path-truncated={}; raw-os-error={:?}; {error}",
+                displayed.chars().count() > 256,
+                error.raw_os_error(),
+            ),
+        )
     }
 
     fn observe_toolchain_descendants(
         directory: &Path,
+        output_root: &Path,
+        challenge: &[u8],
         transcript: &Path,
         root_pid: u32,
         family: &Arc<Mutex<Vec<WindowsImageProcess>>>,
@@ -2333,7 +2482,11 @@ pub(crate) mod native {
         let mut ordinal = 0u32;
         loop {
             for image in images {
-                let processes = memcordon_testkit::windows_processes_for_image(&image.path)?;
+                let processes =
+                    memcordon_testkit::windows_processes_for_image_until(&image.path, deadline)
+                        .map_err(|error| {
+                            toolchain_observation_error("image census", &image.path, error)
+                        })?;
                 for process in processes {
                     if process.has_exited()? {
                         continue;
@@ -2387,20 +2540,103 @@ pub(crate) mod native {
                     let mut file = OpenOptions::new()
                         .write(true)
                         .create_new(true)
-                        .open(&path)?;
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                    if read(&path, 16 * 1024).map_err(io::Error::other)? != bytes {
+                        .open(&path)
+                        .map_err(|error| {
+                            toolchain_observation_error(
+                                "create exclusive descendant record",
+                                &path,
+                                error,
+                            )
+                        })?;
+                    file.write_all(&bytes).map_err(|error| {
+                        toolchain_observation_error("write descendant record", &path, error)
+                    })?;
+                    file.sync_all().map_err(|error| {
+                        toolchain_observation_error("sync descendant record", &path, error)
+                    })?;
+                    if read(&path, 16 * 1024)
+                        .map_err(io::Error::other)
+                        .map_err(|error| {
+                            toolchain_observation_error("read descendant record", &path, error)
+                        })?
+                        != bytes
+                    {
                         return Err(io::Error::other(
                             "native compiler descendant named readback differs",
                         ));
                     }
+                    let child_identity = process.identity;
                     held.push(process);
+                    if Instant::now() >= deadline
+                        || !held.iter().any(|owner| {
+                            owner.identity == child_identity
+                                && matches!(owner.has_exited(), Ok(false))
+                        })
+                        || !held.iter().any(|owner| {
+                            owner.identity.pid == parent_pid
+                                && owner.identity.birth == parent_birth
+                                && matches!(owner.has_exited(), Ok(false))
+                        })
+                    {
+                        return Err(io::Error::other(
+                            "toolchain creation acknowledgment lost live ownership or original cutoff",
+                        ));
+                    }
+                    let descendant: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                    let ack = serde_json::to_vec(&serde_json::json!({
+                        "format":"memcordon.windows-toolchain-creation-ack","revision":1,
+                        "challenge":challenge,"descendant":descendant,
+                    }))
+                    .map_err(io::Error::other)?;
+                    if ack.len() > 16 * 1024 {
+                        return Err(io::Error::other(
+                            "toolchain creation acknowledgment exceeds finite bound",
+                        ));
+                    }
+                    let ack_path = output_root.join(format!(
+                        "native-toolchain-{}-{}.ack.json",
+                        child_identity.pid, child_identity.birth
+                    ));
+                    let mut ack_file = tempfile::NamedTempFile::new_in(output_root)?;
+                    ack_file.write_all(&ack)?;
+                    ack_file.as_file().sync_all()?;
+                    if read(ack_file.path(), 16 * 1024).map_err(io::Error::other)? != ack {
+                        return Err(io::Error::other(
+                            "staged toolchain acknowledgment named readback differs",
+                        ));
+                    }
+                    // Close the writable handle before the atomic no-clobber
+                    // publication so the child never opens partial bytes or
+                    // conflicts with the publisher's write-sharing access.
+                    ack_file
+                        .into_temp_path()
+                        .persist_noclobber(&ack_path)
+                        .map_err(io::Error::other)?;
+                    if read(&ack_path, 16 * 1024).map_err(io::Error::other)? != ack {
+                        return Err(io::Error::other(
+                            "toolchain creation acknowledgment named readback differs",
+                        ));
+                    }
+                    // Publish the sequencing hint only after the atomic rename
+                    // and final ACK readback have both released their handles.
+                    // The child still validates the complete original ACK.
+                    drop(
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(ack_path.with_extension("published"))?,
+                    );
                 }
             }
-            let published =
-                super::live_events(&read(transcript, 16 * 1024 * 1024).map_err(io::Error::other)?)
-                    .map_err(io::Error::other)?;
+            let published = super::live_events(
+                &read(transcript, 16 * 1024 * 1024)
+                    .map_err(io::Error::other)
+                    .map_err(|error| {
+                        toolchain_observation_error("read fixture transcript", transcript, error)
+                    })?,
+            )
+            .map_err(io::Error::other)?;
             if published.iter().any(|event| {
                 event.pid == root_pid && event.stage == "toolchain-test-child-dll-complete"
             }) {
@@ -2585,6 +2821,14 @@ pub(crate) mod native {
             .map(|name| event_create(name))
             .transpose()?;
         let family = Arc::new(Mutex::new(Vec::<WindowsImageProcess>::new()));
+        let console_owners = Arc::new(Mutex::new(Vec::<WindowsImageProcess>::new()));
+        let held_console_owners = Arc::clone(&console_owners);
+        let console_image = if input.descriptor.case == descriptor::Case::Churn {
+            Some(Arc::new(hold_console_image()?))
+        } else {
+            None
+        };
+        let held_console_image = console_image.clone();
         let association = Arc::new(Mutex::new(None));
         let held_family = Arc::clone(&family);
         let held_association = Arc::clone(&association);
@@ -2646,6 +2890,7 @@ pub(crate) mod native {
         use std::os::windows::ffi::OsStrExt;
         let invocation = serde_json::json!({
             "format":"memcordon.windows-positive-invocation","revision":1,
+            "frontend_environment":fixture_environment::entries()?,
             "target":config.target,
             "executable_sha256":execution_sha256,
             "public_executable_sha256":config.cli.sha256,
@@ -2673,6 +2918,8 @@ pub(crate) mod native {
         }
         let fixture = config.fixture.path.clone();
         let transcript = input.descriptor.transcript.clone();
+        let toolchain_output_root = input.descriptor.output_root.clone();
+        let toolchain_challenge = input.descriptor.challenge.clone();
         let cli = config.cli.path.clone();
         let directory = report.parent().expect("case report has parent").to_owned();
         let expected_provider = config.provider.clone();
@@ -2940,6 +3187,8 @@ pub(crate) mod native {
                     signal(&toolchain_event)?;
                     observe_toolchain_descendants(
                         &directory,
+                        &toolchain_output_root,
+                        &toolchain_challenge,
                         &transcript,
                         root_pid,
                         &held_family,
@@ -2977,12 +3226,26 @@ pub(crate) mod native {
                                 let mut family = held_family
                                     .lock()
                                     .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
+                                let root = family
+                                    .iter()
+                                    .find(|held| held.identity.pid == root_pid)
+                                    .ok_or_else(|| {
+                                        io::Error::other("original churn root owner absent")
+                                    })?;
+                                if root.has_exited()? {
+                                    return Err(io::Error::other(
+                                        "original churn root retired before barrier",
+                                    ));
+                                }
+                                let root_identity = (root.identity.pid, root.identity.birth);
                                 let mut generation_depths = std::collections::BTreeSet::new();
                                 let mut live_children = 0usize;
                                 for process in active {
-                                    let Some(depth) =
-                                        descendant_depth(process.identity.pid, root_pid, &parents)
-                                    else {
+                                    let Some(depth) = rooted_process_depth(
+                                        (process.identity.pid, process.identity.birth),
+                                        root_identity,
+                                        &parents,
+                                    ) else {
                                         continue;
                                     };
                                     if process.has_exited()? {
@@ -3018,9 +3281,9 @@ pub(crate) mod native {
                                         .iter()
                                         .filter(|process| !process.has_exited().unwrap_or(true))
                                     {
-                                        let Some(depth) = descendant_depth(
-                                            process.identity.pid,
-                                            root_pid,
+                                        let Some(depth) = rooted_process_depth(
+                                            (process.identity.pid, process.identity.birth),
+                                            root_identity,
                                             &parents,
                                         ) else {
                                             continue;
@@ -3033,7 +3296,21 @@ pub(crate) mod native {
                                                 || io::Error::other("held ancestor edge missing"),
                                             )?;
                                         let parent = family.iter().find(|parent| parent.identity.pid == parent_pid && !parent.has_exited().unwrap_or(true))
-                                            .ok_or_else(|| io::Error::other("generation ancestor was not independently held live"))?;
+                                            .ok_or_else(|| {
+                                                let candidates = family.iter().filter(|held| held.identity.pid == parent_pid);
+                                                let candidate_count = candidates.clone().count();
+                                                let candidates: Vec<_> = candidates.take(8).map(|held| {
+                                                    let state = match held.has_exited() {
+                                                        Ok(exited) => format!("exited={exited}"),
+                                                        Err(error) => format!("unavailable-kind={:?}; raw-os-error={:?}", error.kind(), error.raw_os_error()),
+                                                    };
+                                                    (held.identity.birth, state)
+                                                }).collect();
+                                                io::Error::other(format!(
+                                                    "generation ancestor was not independently held live; stage={}; ordinal={:?}; root-pid={root_pid}; child-pid={}; child-birth={}; depth={depth}; parent-pid={parent_pid}; held-parent-count={candidate_count}; held-parent-observations={candidates:?}; observations-truncated={}",
+                                                    event.stage, event.ordinal, process.identity.pid, process.identity.birth, candidate_count > 8,
+                                                ))
+                                            })?;
                                         if parent.identity.birth > process.identity.birth {
                                             return Err(io::Error::other(
                                                 "ToolHelp parent PID was reused after child creation",
@@ -3105,8 +3382,12 @@ pub(crate) mod native {
                                     .iter()
                                     .filter(|process| !process.has_exited().unwrap_or(true))
                                 {
-                                    if descendant_depth(member.identity.pid, root_pid, &parents)
-                                        .is_none()
+                                    if rooted_process_depth(
+                                        (member.identity.pid, member.identity.birth),
+                                        root_identity,
+                                        &parents,
+                                    )
+                                    .is_none()
                                     {
                                         continue;
                                     }
@@ -3159,6 +3440,152 @@ pub(crate) mod native {
                                 if read(&path, 128 * 1024).map_err(io::Error::other)? != bytes {
                                     return Err(io::Error::other(
                                         "native churn ancestry named readback differs",
+                                    ));
+                                }
+                                let root = family
+                                    .iter()
+                                    .find(|held| {
+                                        (held.identity.pid, held.identity.birth) == root_identity
+                                    })
+                                    .ok_or_else(|| {
+                                        io::Error::other("original diagnostic root owner absent")
+                                    })?;
+                                let console_image =
+                                    held_console_image.as_ref().ok_or_else(|| {
+                                        io::Error::other("held native console image absent")
+                                    })?;
+                                let candidates = root.direct_children_for_image_until(
+                                    &console_image.path,
+                                    deadline,
+                                )?;
+                                let mut console = held_console_owners.lock().map_err(|_| {
+                                    io::Error::other("native console ownership poisoned")
+                                })?;
+                                for candidate in candidates {
+                                    if candidate.has_exited()? {
+                                        continue;
+                                    }
+                                    if family
+                                        .iter()
+                                        .any(|held| held.identity == candidate.identity)
+                                    {
+                                        return Err(io::Error::other(
+                                            "console identity overlaps fixture ownership",
+                                        ));
+                                    }
+                                    if console.iter().any(|held| {
+                                        held.identity.pid == candidate.identity.pid
+                                            && held.identity.birth != candidate.identity.birth
+                                    }) {
+                                        return Err(io::Error::other(
+                                            "console PID differs from original held birth",
+                                        ));
+                                    }
+                                    if !console
+                                        .iter()
+                                        .any(|held| held.identity == candidate.identity)
+                                    {
+                                        if console.len() >= 8 {
+                                            return Err(io::Error::other(
+                                                "native console owners exceed finite bound",
+                                            ));
+                                        }
+                                        console.push(candidate);
+                                    }
+                                }
+                                if root.has_exited()? {
+                                    return Err(io::Error::other(
+                                        "original console parent retired before publication",
+                                    ));
+                                }
+                                let owners = console
+                                    .iter()
+                                    .map(|owner| {
+                                        Ok(serde_json::json!({
+                                            "pid":owner.identity.pid,"birth":owner.identity.birth,
+                                            "native_parent_pid":owner.native_parent_process_id()?,
+                                            "exited":owner.has_exited()?,
+                                        }))
+                                    })
+                                    .collect::<io::Result<Vec<_>>>()?;
+                                let console_bytes = serde_json::to_vec(&serde_json::json!({
+                                    "format":"memcordon.windows-native-console-owners","revision":1,
+                                    "root_pid":root_identity.0,"root_birth":root_identity.1,
+                                    "root_held_live":true,"job_membership_established":false,
+                                    "image_utf16":console_image.path.as_os_str().encode_wide().collect::<Vec<_>>(),
+                                    "image_sha256":console_image.sha256,"image_file_identity":console_image.identity,
+                                    "owners":owners,
+                                })).map_err(io::Error::other)?;
+                                if console_bytes.len() > 256 * 1024 {
+                                    return Err(io::Error::other(
+                                        "native console ownership exceeds finite bound",
+                                    ));
+                                }
+                                let console_path = directory.join(format!(
+                                    "native-console-owners-{}-{}.json",
+                                    event.stage,
+                                    event.ordinal.expect("controller ordinal"),
+                                ));
+                                let mut console_file = OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&console_path)?;
+                                console_file.write_all(&console_bytes)?;
+                                console_file.sync_all()?;
+                                if read(&console_path, 256 * 1024).map_err(io::Error::other)?
+                                    != console_bytes
+                                {
+                                    return Err(io::Error::other(
+                                        "native console ownership named readback differs",
+                                    ));
+                                }
+                                drop(console);
+                                let known: Vec<_> =
+                                    family.iter().map(|held| held.identity).collect();
+                                let diagnostic = match root
+                                    .diagnose_unheld_direct_children(&known, deadline)
+                                {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        let detail = error.to_string();
+                                        serde_json::json!({"format":"memcordon.windows-unheld-direct-child-diagnostic","revision":1,
+                                            "root_pid":root_identity.0,"root_birth":root_identity.1,
+                                            "job_membership_established":false,"accepted_family_modified":false,
+                                            "unavailable_kind":format!("{:?}",error.kind()),"raw_os_error":error.raw_os_error(),
+                                            "detail":detail.chars().take(512).collect::<String>(),"detail_truncated":detail.chars().count()>512})
+                                    }
+                                };
+                                let bytes =
+                                    serde_json::to_vec(&diagnostic).map_err(io::Error::other)?;
+                                if bytes.len() > 256 * 1024 {
+                                    return Err(io::Error::other(
+                                        "native child diagnostic exceeds finite bound",
+                                    ));
+                                }
+                                let path = directory.join(format!(
+                                    "native-unheld-children-{}-{}.json",
+                                    event.stage,
+                                    event.ordinal.expect("controller ordinal"),
+                                ));
+                                let mut file = OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&path)?;
+                                file.write_all(&bytes)?;
+                                file.sync_all()?;
+                                if read(&path, 256 * 1024).map_err(io::Error::other)? != bytes {
+                                    return Err(io::Error::other(
+                                        "native child diagnostic named readback differs",
+                                    ));
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(io::Error::other(
+                                        "original churn cutoff exhausted before release",
+                                    ));
+                                }
+                                if root.has_exited()? {
+                                    return Err(io::Error::other(
+                                        "original console parent retired before barrier release",
                                     ));
                                 }
                                 drop(family);
@@ -3325,6 +3752,50 @@ pub(crate) mod native {
             },
         );
         let collection = (|| -> Result<()> {
+            if let Err(memcordon_testkit::ProcessTestError::Callback {
+                stdout,
+                stderr,
+                capture_complete,
+                observed_status,
+                termination,
+                cleanup,
+                error,
+            }) = &output
+            {
+                let retention = (|| -> Result<()> {
+                    let diagnostic = serde_json::to_vec(&serde_json::json!({
+                        "format":"memcordon.windows-positive-callback-failure", "revision":1,
+                        "error":error.to_string(), "capture_complete":capture_complete,
+                        "observed_status":observed_status.map(|status| status.code()),
+                        "termination":termination.map(|status| status.code()), "cleanup":cleanup,
+                    }))?;
+                    for (extension, bytes) in [
+                        ("stdout.bin", stdout.as_slice()),
+                        ("stderr.bin", stderr.as_slice()),
+                        ("callback-failure.json", diagnostic.as_slice()),
+                    ] {
+                        let path = report.with_extension(extension);
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)?;
+                        file.write_all(bytes)?;
+                        file.sync_all()?;
+                        if read(&path, 16 * 1024 * 1024)? != bytes {
+                            return Err(CiError::Message(
+                                "callback capture named readback differs".into(),
+                            ));
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(retention) = retention {
+                    return Err(CiError::Message(format!(
+                        "{}; callback diagnostic retention failed: {retention}",
+                        output.as_ref().expect_err("callback failure was matched")
+                    )));
+                }
+            }
             let output = output.map_err(|error| CiError::Message(error.to_string()))?;
             let exit_bytes = serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-positive-exit","revision":1,
@@ -3446,17 +3917,21 @@ pub(crate) mod native {
                 || request.expected_provider_binding != held.provider
                 || request.nonce != terminal.terminal.nonce
                 || request.workload_contract.as_ref() != Some(&contract)
-                || !request.environment.is_empty()
+                || request.environment != fixture_environment::entries()?
             {
-                return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or empty workload environment".into()));
+                return Err(CiError::Message("exact observed launch request differs from held binding, declared contract or native system prerequisite environment".into()));
             }
             if input.descriptor.case == descriptor::Case::Churn {
                 let observation = &terminal.terminal.process_observation;
                 let native_family = family
                     .lock()
                     .map_err(|_| CiError::Message("fixture ownership poisoned".into()))?;
+                let native_console = console_owners
+                    .lock()
+                    .map_err(|_| CiError::Message("native console ownership poisoned".into()))?;
                 let identities: Vec<_> = native_family
                     .iter()
+                    .chain(native_console.iter())
                     .map(|process| {
                         Ok(memcordon_core::WindowsProcessIdentityV1 {
                             process_id: process.identity.pid,
@@ -3552,7 +4027,7 @@ pub(crate) mod native {
                 .first()
                 .ok_or_else(|| CiError::Message("native retirement root hold absent".into()))?
                 .identity;
-            let identities: Vec<_> = held.iter().map(|process|->Result<serde_json::Value> {
+            let mut identities: Vec<_> = held.iter().map(|process|->Result<serde_json::Value> {
                 let (parent_pid,parent_birth)=if process.identity==root {(None,None)} else {
                     let parent_pid=process.native_parent_process_id()?;
                     let parent=held.iter().find(|parent|parent.identity.pid==parent_pid&&parent.identity.birth<=process.identity.birth)
@@ -3562,6 +4037,25 @@ pub(crate) mod native {
                 Ok(serde_json::json!({"pid":process.identity.pid,"birth":process.identity.birth,
                     "parent_pid":parent_pid,"parent_birth":parent_birth,"retirement_observed":true}))
             }).collect::<Result<Vec<_>>>()?;
+            let console = console_owners
+                .lock()
+                .map_err(|_| CiError::Message("native console ownership poisoned".into()))?;
+            for process in console.iter() {
+                if !process.has_exited()?
+                    || process.native_parent_process_id()? != root.pid
+                    || process.identity.birth < root.birth
+                    || held.iter().any(|owner| owner.identity == process.identity)
+                {
+                    return Err(CiError::Message(
+                        "original held console child retirement differs".into(),
+                    ));
+                }
+                identities.push(serde_json::json!({
+                    "pid":process.identity.pid,"birth":process.identity.birth,
+                    "parent_pid":root.pid,"parent_birth":root.birth,"retirement_observed":true,
+                }));
+            }
+            drop(console);
             drop(held);
             let guardian = guardian_owner
                 .lock()

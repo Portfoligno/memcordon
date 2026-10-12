@@ -6,8 +6,16 @@ pub struct PreparedGraph {
     pub request: Value,
     pub prepared: Value,
     pub native: Value,
+    #[allow(
+        dead_code,
+        reason = "Worker custody is consumed by lifecycle and image targets, not every prepared graph consumer"
+    )]
     pub worker: Value,
     pub journal: Value,
+    #[allow(
+        dead_code,
+        reason = "Only lifecycle and export integration targets consume the retained journal bytes directly"
+    )]
     pub journal_bytes: Vec<u8>,
 }
 
@@ -19,12 +27,20 @@ pub fn durable_journal(record: &Value) -> Vec<u8> {
     format!("{body}digest={}\n", sha256(body.as_bytes())).into_bytes()
 }
 
+#[allow(
+    dead_code,
+    reason = "Held process identities are needed only by some prepared graph integration targets"
+)]
 pub fn held(pid: u32, birth: u64, retired: bool) -> Value {
     json!({"pid":pid,"birth":birth,"parent_pid":null,"parent_birth":null,"retirement_observed":retired})
 }
 
 /// Match the public Attempt codec: the original frontend carries the total
 /// attempt duration separately, so the native absolute deadline is absent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind independent contract, activation, provider, run, argv, memory, deadline and executable evidence"
+)]
 pub fn prepared_graph(
     contract: &Value,
     activation: &Value,

@@ -126,6 +126,18 @@ fn failed_observed(
     false
 }
 
+pub(super) fn runtime_initialization_failed(error: &io::Error) {
+    // The caller uses fixed valid default limits and CurrentProcess; the
+    // remaining initialization failure is creation of the bounded owner thread.
+    failed_observed(
+        FailureStage::OwnerThread,
+        Some(error),
+        None,
+        #[cfg(feature = "test-fixtures")]
+        None,
+    );
+}
+
 fn now() -> io::Result<u64> {
     memcordon_platform::macos_continuous_nanos()
 }

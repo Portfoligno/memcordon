@@ -2,6 +2,15 @@ fn semantic_lines(value: &str) -> Vec<&str> {
     value.lines().collect()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn package_cleanup_cutoff_rejects_invalid_values_before_mutation() {
+    for value in ["", "0", "-1", "1.5", "18446744073709551616"] {
+        let error = crate::package::uninstall_until(std::ffi::OsStr::new(value)).unwrap_err();
+        assert_eq!(error, "invalid original package cleanup monotonic cutoff");
+    }
+}
+
 #[test]
 fn installed_provider_digest_must_match_the_invoked_package() {
     let invoked = "current-package-digest";
@@ -136,7 +145,7 @@ fn optional_network_launcher_is_package_owned_but_not_an_active_profile() {
     assert!(semantic_lines(network_service).contains(&"NoNewPrivileges=no"));
     assert!(semantic_lines(network_service).contains(&"AmbientCapabilities="));
     assert!(semantic_lines(network_service).contains(
-        &"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN"
+        &"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN CAP_MKNOD"
     ));
     assert!(
         semantic_lines(network_service)

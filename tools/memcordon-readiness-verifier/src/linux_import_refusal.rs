@@ -659,35 +659,36 @@ pub(crate) fn verify(
     {
         return Err("isolation importer original provider/cleanup executable differs".into());
     }
-    let admin = std::path::Path::new(
-        owner["admin_root"]
-            .as_str()
-            .ok_or("isolation importer original admin root absent")?,
-    );
+    let admin = owner["admin_root"]
+        .as_str()
+        .ok_or("isolation importer original admin root absent")?;
     for field in ["definition", "source_root"] {
         let authority = if field == "definition" {
             admin
         } else {
-            std::path::Path::new(
-                lease["artifact_root"]
-                    .as_str()
-                    .ok_or("isolation importer original artifact root absent")?,
-            )
-        };
-        let path = std::path::Path::new(
-            intent[field]
+            lease["artifact_root"]
                 .as_str()
-                .ok_or("isolation importer native source path absent")?,
-        );
-        if !path.is_absolute()
-            || !path.starts_with(authority)
-            || path == authority
-            || path.components().any(|part| {
-                matches!(
-                    part,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
+                .ok_or("isolation importer original artifact root absent")?
+        };
+        let path = intent[field]
+            .as_str()
+            .ok_or("isolation importer native source path absent")?;
+        // Retained Linux-native scope is independent of the verifier host OS.
+        // Match Unix Path components: repeated separators and interior `.`
+        // normalize, while `..` remains an explicit forbidden component.
+        let path_parts: Vec<_> = path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        let authority_parts: Vec<_> = authority
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        if !path.starts_with('/')
+            || !authority.starts_with('/')
+            || !path_parts.starts_with(&authority_parts)
+            || path_parts.len() == authority_parts.len()
+            || path_parts.contains(&"..")
         {
             return Err(
                 "isolation importer native source escapes original protected authority".into(),

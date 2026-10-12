@@ -2038,10 +2038,8 @@ fn validate_actor_execution_outcome(outcome: &Value) -> VerificationResult<()> {
                 return Err("actor native interruption malformed".into());
             }
         }
-        Some("monitor-failed") => {
-            if outcome["error"].as_str().is_none_or(str::is_empty) {
-                return Err("actor native monitor cause absent".into());
-            }
+        Some("monitor-failed") if outcome["error"].as_str().is_none_or(str::is_empty) => {
+            return Err("actor native monitor cause absent".into());
         }
         _ => {}
     }

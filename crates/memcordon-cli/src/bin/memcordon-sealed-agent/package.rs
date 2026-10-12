@@ -19,7 +19,7 @@ const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control s
 const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 // The optional private broker requires its socket and refuses manual starts.
-const NETWORK_LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed private IPv4 launch broker\nRequires=memcordon-sealed-network-launcher.socket\nAfter=local-fs.target\nRefuseManualStart=yes\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent network-launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nCapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN\nRestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const NETWORK_LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed private IPv4 launch broker\nRequires=memcordon-sealed-network-launcher.socket\nAfter=local-fs.target\nRefuseManualStart=yes\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent network-launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nCapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN CAP_MKNOD\nRestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const NETWORK_LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed private IPv4 launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-network-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 const TMPFILES: &str = "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n";
 
@@ -309,7 +309,7 @@ pub fn run(operation: &OsStr, json: bool) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        linux_mutation(operation)
+        linux_mutation(operation, None)
     }
     #[cfg(target_os = "windows")]
     {
@@ -319,6 +319,16 @@ pub fn run(operation: &OsStr, json: bool) -> Result<(), String> {
     {
         Err("provider package mutation is unavailable on this platform".to_owned())
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn uninstall_until(deadline: &OsStr) -> Result<(), String> {
+    let cutoff = deadline
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|cutoff| *cutoff != 0)
+        .ok_or_else(|| "invalid original package cleanup monotonic cutoff".to_owned())?;
+    linux_mutation(OsStr::new("uninstall"), Some(cutoff))
 }
 
 pub(crate) fn verify() -> Result<(), String> {
@@ -644,7 +654,7 @@ fn verify_compiled_metadata() -> Result<(), String> {
         && !NETWORK_LAUNCHER_SERVICE.contains("RuntimeDirectoryMode=")
         && network_launcher_capabilities
             == [
-                "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN",
+                "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN CAP_MKNOD",
             ]
         && network_launcher_ambient == ["AmbientCapabilities="]
         && NETWORK_LAUNCHER_SOCKET
@@ -1647,7 +1657,7 @@ impl PackageFileTransaction {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_mutation(operation: &OsStr) -> Result<(), String> {
+fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), String> {
     use std::fs;
     use std::path::Path;
 
@@ -1658,17 +1668,27 @@ fn linux_mutation(operation: &OsStr) -> Result<(), String> {
     if operation != "install" && operation != "upgrade" && operation != "uninstall" {
         return Err("unknown package operation".to_owned());
     }
-    let _package_lease = crate::linux::service::acquire_package_lease().map_err(|error| {
+    let acquire = || {
+        if let Some(deadline) = lease_deadline {
+            return crate::linux::service::acquire_package_lease_until(deadline);
+        }
+        crate::linux::service::acquire_package_lease()
+    };
+    let _package_lease = acquire().map_err(|error| {
         format!("refusing package mutation while a sealed provider attempt is active: {error}")
     })?;
     prepare_runtime_directory()?;
-    let _legacy_package_lease = crate::linux::service::acquire_legacy_package_lease().map_err(
-        |error| {
-            format!(
-                "refusing package mutation while a legacy sealed provider attempt is active: {error}"
-            )
-        },
-    )?;
+    let acquire_legacy = || {
+        if let Some(deadline) = lease_deadline {
+            return crate::linux::service::acquire_legacy_package_lease_until(deadline);
+        }
+        crate::linux::service::acquire_legacy_package_lease()
+    };
+    let _legacy_package_lease = acquire_legacy().map_err(|error| {
+        format!(
+            "refusing package mutation while a legacy sealed provider attempt is active: {error}"
+        )
+    })?;
     // An already installed generation must not lose its epoch merely because
     // a caller used install instead of the quiesced upgrade.
     // A pending journal is a separate fail-closed state for install; upgrade
@@ -1963,9 +1983,41 @@ fn remove_uninstalled_directory(path: &str) -> Result<(), String> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "provider uninstall found residual state in {path}: {error}"
-        )),
+        Err(error) => {
+            use std::os::unix::fs::MetadataExt;
+            let mut members = Vec::new();
+            let mut truncated = false;
+            let observation = match std::fs::read_dir(path) {
+                Ok(mut entries) => {
+                    for entry in entries.by_ref().take(16) {
+                        match entry {
+                            Ok(entry) => {
+                                let name = entry.file_name();
+                                let displayed: String =
+                                    name.to_string_lossy().chars().take(128).collect();
+                                let name_truncated = name.to_string_lossy().chars().count() > 128;
+                                match std::fs::symlink_metadata(entry.path()) {
+                                    Ok(metadata) => members.push(format!(
+                                        "name={displayed:?},name-truncated={name_truncated},device={},inode={},mode={},uid={},length={}",
+                                        metadata.dev(), metadata.ino(), metadata.mode(), metadata.uid(), metadata.len()
+                                    )),
+                                    Err(cause) => members.push(format!(
+                                        "name={displayed:?},name-truncated={name_truncated},metadata-error={cause}"
+                                    )),
+                                }
+                            }
+                            Err(cause) => members.push(format!("entry-error={cause}")),
+                        }
+                    }
+                    truncated = entries.next().is_some();
+                    "observed".to_owned()
+                }
+                Err(cause) => format!("unavailable: {cause}"),
+            };
+            Err(format!(
+                "provider uninstall found residual state in {path}: {error}; residual-observation={observation}; members={members:?}; members-truncated={truncated}"
+            ))
+        }
     }
 }
 

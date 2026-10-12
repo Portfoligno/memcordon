@@ -858,6 +858,12 @@ fn handle_read_only_query(public: HANDLE, request: WindowsProviderRequestV3) -> 
                     {
                         Ok(Reply::Recovery(inventory))
                     }
+                    WindowsLauncherResponseV3::ReadOnlyQueryFailure(failure) => Err(failure
+                        .error_for(
+                            Operation::RecoveryConvergence,
+                            challenge.as_str(),
+                            &provider,
+                        )?),
                     _ => Err("launcher recovery inventory was not bound".into()),
                 }
             }
@@ -1917,7 +1923,9 @@ fn validate_certification_binding(
 }
 
 fn exercise_control_fault(public: HANDLE, fault: WindowsSealedFault) -> Result<(), String> {
-    let result = match fault {
+    // The caller binds only the exact selected operation's original refusal.
+    // Converting that refusal to success would discard its genuine authority.
+    match fault {
         WindowsSealedFault::PublicPipeCreate => {
             let listener = PipeListener::new(
                 WINDOWS_CONTROL_PIPE,
@@ -1988,14 +1996,7 @@ fn exercise_control_fault(public: HANDLE, fault: WindowsSealedFault) -> Result<(
             )
             .map(drop)
         }
-        _ => return Err("requested fault is not a control-service operation".to_owned()),
-    };
-    match result {
-        Err(error) if error.contains("MCSEALED-WINDOWS-CERTIFICATION-FAULT") => Ok(()),
-        Err(error) => Err(error),
-        Ok(()) => Err(format!(
-            "fault {fault:?} did not fail at its named operation"
-        )),
+        _ => Err("requested fault is not a control-service operation".to_owned()),
     }
 }
 
@@ -2229,37 +2230,39 @@ fn relay_protocol(
                     WindowsSealedFault::ControlWorkerKilledAfterAuthorization
                         | WindowsSealedFault::ControlServiceKilledAfterAuthorization
                 )
-            ) && let WindowsProviderResponseV3::TargetAuthorized { child_pid, .. } =
-                &public_response
-            {
-                use std::os::windows::ffi::OsStringExt;
-                let descriptor = certification_arguments
-                    .get(1)
-                    .ok_or("owned control actor descriptor absent")?;
-                let descriptor =
-                    std::path::PathBuf::from(std::ffi::OsString::from_wide(descriptor));
-                if !descriptor.is_absolute() {
-                    return Err("owned control actor descriptor must be absolute".into());
-                }
-                let path = descriptor.with_file_name("control-worker-native.json");
-                if path.try_exists().map_err(|error| error.to_string())? {
-                    return Err("owned control actor worker observation already exists".into());
-                }
-                // SAFETY: the pseudo process handle is used only to observe
-                // this measured support service's actual native identity.
-                let process = super::process::process_identity(unsafe {
-                    windows_sys::Win32::System::Threading::GetCurrentProcess()
-                })?;
-                let thread = super::record::current_worker_thread_identity()?;
-                let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-component-control-worker-site","revision":1,
+            ) {
+                if let WindowsProviderResponseV3::TargetAuthorized { child_pid, .. } =
+                    &public_response
+                {
+                    use std::os::windows::ffi::OsStringExt;
+                    let descriptor = certification_arguments
+                        .get(1)
+                        .ok_or("owned control actor descriptor absent")?;
+                    let descriptor =
+                        std::path::PathBuf::from(std::ffi::OsString::from_wide(descriptor));
+                    if !descriptor.is_absolute() {
+                        return Err("owned control actor descriptor must be absolute".into());
+                    }
+                    let path = descriptor.with_file_name("control-worker-native.json");
+                    if path.try_exists().map_err(|error| error.to_string())? {
+                        return Err("owned control actor worker observation already exists".into());
+                    }
+                    // SAFETY: the pseudo process handle is used only to observe
+                    // this measured support service's actual native identity.
+                    let process = super::process::process_identity(unsafe {
+                        windows_sys::Win32::System::Threading::GetCurrentProcess()
+                    })?;
+                    let thread = super::record::current_worker_thread_identity()?;
+                    let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-component-control-worker-site","revision":1,
                     "fault":certification_fault,"process":process,"thread":thread,"target_pid":child_pid,
                     "target_authorization_observed":true})).map_err(|error|error.to_string())?;
-                memcordon_core::write_report_bytes_atomic(&path, &bytes)
-                    .map_err(|error| error.to_string())?;
-                super::launcher_service::wait_for_certification_release_marker(
-                    certification_arguments,
-                    *child_pid,
-                )?;
+                    memcordon_core::write_report_bytes_atomic(&path, &bytes)
+                        .map_err(|error| error.to_string())?;
+                    super::launcher_service::wait_for_certification_release_marker(
+                        certification_arguments,
+                        *child_pid,
+                    )?;
+                }
             }
             if certification_fault
                 == Some(WindowsSealedFault::ControlServiceKilledAfterAuthorization)

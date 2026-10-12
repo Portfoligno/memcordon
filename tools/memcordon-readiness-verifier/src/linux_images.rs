@@ -349,10 +349,8 @@ fn elf_startup(bytes: &[u8]) -> VerificationResult<ElfStartup> {
                     return Err("ELF has duplicate dynamic segment".into());
                 }
             }
-            3 => {
-                if interpreter.replace(string(number(offset)?)?).is_some() {
-                    return Err("ELF has duplicate interpreter".into());
-                }
+            3 if interpreter.replace(string(number(offset)?)?).is_some() => {
+                return Err("ELF has duplicate interpreter".into());
             }
             _ => {}
         }
@@ -424,6 +422,10 @@ fn elf_startup(bytes: &[u8]) -> VerificationResult<ElfStartup> {
 }
 
 /// Verify captured command bytes and native wait independently; exit alone is insufficient.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 pub fn validate_linux_image_command(
     command: &Value,
     native: &Value,
@@ -449,6 +451,10 @@ pub fn validate_linux_image_command(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 pub(crate) fn validate_linux_image_native_command(
     command: &Value,
     native: &Value,
@@ -710,10 +716,10 @@ pub fn validate_linux_image_mutation(
             {
                 return Err("native source member captured bytes differ".into());
             }
-            if let Some(before) = baseline_bytes {
-                if entry(baseline, path)?["sha256"] != crate::sha256(before) {
-                    return Err("captured baseline member differs from image".into());
-                }
+            if let Some(before) = baseline_bytes
+                && entry(baseline, path)?["sha256"] != crate::sha256(before)
+            {
+                return Err("captured baseline member differs from image".into());
             }
         } else if !member["bytes"].is_null() || !member["baseline_bytes"].is_null() {
             return Err("selected native source member bytes not retained".into());
@@ -1658,6 +1664,10 @@ pub(crate) fn owned_exclusive_declaration_reference(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
+)]
 fn verify_preparation(
     record: &crate::CaseRecord,
     evidence: &LinuxImageImportEvidence,
@@ -1797,7 +1807,11 @@ fn verify_preparation(
     {
         return Err("loader request/activated grant/catalogue/layout/exclusive identity crosses original acquired objects".into());
     }
-    let command = &receipt["frontend_invocation"];
+    let resolved_command = crate::linux_frontend_access::resolve(
+        &receipt["frontend_invocation"],
+        Some(custody.bytes(&probe.contract)?),
+    )?;
+    let command = &resolved_command;
     closed(
         command,
         &[
@@ -1831,7 +1845,6 @@ fn verify_preparation(
         (1, "65534"),
         (2, "--regid"),
         (3, "65534"),
-        (4, "--clear-groups"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
         (7, "+512M"),
@@ -1862,20 +1875,13 @@ fn verify_preparation(
             return Err("loader actual native frontend file operands differ".into());
         }
     }
-    let result_parent = std::path::Path::new(
+    let result_parent = crate::linux_path::parent(
         receipt["result"]
             .as_str()
             .ok_or("loader result path absent")?,
     )
-    .parent()
     .ok_or("loader result parent absent")?;
-    if arguments[17]
-        != result_parent
-            .join("observations")
-            .to_str()
-            .ok_or("loader observation path not UTF8")?
-            .as_bytes()
-    {
+    if arguments[17] != crate::linux_path::join(&result_parent, "observations").as_bytes() {
         return Err("loader actual frontend observation scope differs".into());
     }
     let deadline = std::str::from_utf8(&arguments[8]).map_err(|_| "loader deadline is not UTF8")?;
@@ -1932,7 +1938,10 @@ fn verify_preparation(
         || !wait["signal"].is_null()
         || wait["raw_wait_status"] != status * 256
         || wait["invocation_sha256"]
-            != crate::sha256(&serde_json::to_vec(command).map_err(|error| error.to_string())?)
+            != crate::sha256(
+                &serde_json::to_vec(&receipt["frontend_invocation"])
+                    .map_err(|error| error.to_string())?,
+            )
         || wait["stdout_sha256"] != custody.hash(&probe.stdout)?
         || wait["stderr_sha256"] != custody.hash(&probe.stderr)?
     {

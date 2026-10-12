@@ -4,6 +4,9 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+#[path = "native_recovery_streams.rs"]
+mod native_recovery_streams;
+
 #[test]
 #[ignore = "original native administrator fixture and retained crash parent required"]
 fn native_account_retirement_boundary_emit_actual_receipt() {
@@ -146,7 +149,94 @@ fn run_recovery_component(lost_terminal: bool) {
         Ok(format!("{}/{name}", input.artifact_prefix))
     };
     let mut helpers = Vec::new();
+    let mut completed_export = None;
     let outcome = (|| -> Result<(), String> {
+        // The measured libtest image is not the installed package authority.
+        // Ask the genuine, protected installed executable to verify itself
+        // before creating any admission or account reservation.
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let agent_path = std::path::Path::new("/usr/libexec/memcordon-sealed-agent");
+        let agent_handle = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(agent_path)
+            .map_err(|error| error.to_string())?;
+        let agent_identity = agent_handle.metadata().map_err(|error| error.to_string())?;
+        let agent = crate::linux::protected_read::read_protected_absolute(
+            agent_path,
+            128 * 1024 * 1024,
+            Some(0o755),
+        )?;
+        let before = std::fs::symlink_metadata(agent_path).map_err(|error| error.to_string())?;
+        if !agent_identity.is_file()
+            || !before.is_file()
+            || (
+                agent_identity.dev(),
+                agent_identity.ino(),
+                agent_identity.nlink(),
+            ) != (before.dev(), before.ino(), 1)
+        {
+            return Err("installed provider pin differs before genuine verification".into());
+        }
+        let mut command = std::process::Command::new(agent_path);
+        command.args(["package", "verify", "--json"]);
+        let verified = memcordon_testkit::run_with_deadline_output_limit(
+            &mut command,
+            work.saturating_duration_since(Instant::now()),
+            1024 * 1024,
+        )
+        .map_err(|error| format!("installed provider verification: {error}"))?;
+        retain("installed-provider-verify-stdout.bin", &verified.stdout)?;
+        retain("installed-provider-verify-stderr.bin", &verified.stderr)?;
+        retain(
+            "installed-provider-verify-status.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "code": verified.status.code(),
+                "success": verified.status.success(),
+            }))
+            .map_err(|error| error.to_string())?,
+        )?;
+        if !verified.status.success() || !verified.stderr.is_empty() {
+            return Err(
+                "genuine installed provider verification failed; actual capture retained".into(),
+            );
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&verified.stdout)?;
+        let inspection: crate::inspection_schema::InstalledProviderInspection =
+            serde_json::from_slice(&verified.stdout).map_err(|error| error.to_string())?;
+        let current = std::fs::symlink_metadata(agent_path).map_err(|error| error.to_string())?;
+        let held = agent_handle.metadata().map_err(|error| error.to_string())?;
+        if (
+            agent_identity.dev(),
+            agent_identity.ino(),
+            agent_identity.nlink(),
+        ) != (held.dev(), held.ino(), held.nlink())
+            || (held.dev(), held.ino(), held.nlink()) != (current.dev(), current.ino(), 1)
+            || agent
+                != crate::linux::protected_read::read_protected_absolute(
+                    agent_path,
+                    128 * 1024 * 1024,
+                    Some(0o755),
+                )?
+        {
+            return Err("installed provider image changed during genuine verification".into());
+        }
+        let manifest_bytes = crate::linux::runtime_manifest::source(agent_path, &agent)?;
+        let manifest = memcordon_core::runtime_manifest::RuntimeManifest::parse(&manifest_bytes)?;
+        let agent_digest = hex(&Sha256::digest(&agent));
+        if !inspection.installed_artifacts_valid
+            || !inspection.agent.compiled_metadata_valid
+            || inspection.agent.executable_sha256 != agent_digest
+            || inspection.installed_executable_sha256 != agent_digest
+            || inspection.agent.version != manifest.version
+            || inspection.agent.source_commit != manifest.source_commit
+        {
+            return Err(
+                "genuine installed provider inspection differs from protected image/manifest"
+                    .into(),
+            );
+        }
+        let provider = manifest.public_binding(&manifest_bytes)?;
         super::native_mixed_release::HeldHelper::start(
             &mut helpers,
             65534,
@@ -154,21 +244,8 @@ fn run_recovery_component(lost_terminal: bool) {
             &input.challenge,
             work,
         )?;
-        let stdin: OwnedFd = std::fs::File::open("/dev/null")
-            .map_err(|e| e.to_string())?
-            .into();
-        let stdout: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(input.artifact_root.join("target-stdout.bin"))
-            .map_err(|e| e.to_string())?
-            .into();
-        let stderr: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(input.artifact_root.join("target-stderr.bin"))
-            .map_err(|e| e.to_string())?
-            .into();
+        let (mut frontend_capture, [stdin, stdout, stderr]) =
+            native_recovery_streams::Capture::acquire(&input.artifact_root, work)?;
         let fixture_artifact = retain("recovery-fixture.json", &fixture_bytes)?;
         let cwd = std::fs::File::open("/").map_err(|e| e.to_string())?;
         let caller = crate::linux::envelope::capture(
@@ -201,7 +278,7 @@ fn run_recovery_component(lost_terminal: bool) {
         let attempt_text = hex(&attempt);
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|e| e.to_string())?;
-        let mut record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
+        let record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
             memcordon_core::BoundedText::new(&attempt_text).map_err(str::to_owned)?,
             memcordon_core::BoundedText::new(boot.trim()).map_err(str::to_owned)?,
             frontend,
@@ -277,10 +354,16 @@ fn run_recovery_component(lost_terminal: bool) {
                 caller,
                 attempt,
                 |metadata| {
-                    record.mixed_admission_metadata = Some(metadata.clone());
-                    record.mixed_worker = Some(worker.clone());
                     journal =
                         Some(crate::linux::private_attempt::DurablePrivateAttempt::create(record)?);
+                    journal
+                        .as_mut()
+                        .expect("original native journal retained")
+                        .attach_mixed_admission_metadata(metadata.clone())?;
+                    journal
+                        .as_mut()
+                        .expect("original native journal retained")
+                        .record_mixed_worker(worker.clone())?;
                     Ok(())
                 },
             )?;
@@ -288,14 +371,15 @@ fn run_recovery_component(lost_terminal: bool) {
             journal.take().ok_or("actual native journal absent")?,
         )?;
         let metadata = admission.component_metadata().clone();
-        let provider = crate::linux::runtime_manifest::installed_binding()?;
-        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |owner,admission,prepared|{
+        let mut retained_export_receipt = None;
+        let (execution,retirement)=owner.component_execute_to_pre_account(&mut admission,provider.clone(),attempt,worker_fd.as_fd(),[stdin,stdout,stderr],work,cleanup,&mut |finished| frontend_capture.observe(finished),&mut |owner,admission,prepared|{
                 retain("native-prepared.json",&serde_json::to_vec(prepared).map_err(|e|e.to_string())?)?;
                 let native=owner.component_pre_account_observation(admission)?;
                 let export_path=native["export_path"].as_str().ok_or("native boundary export owner path absent")?;
                 let export_bytes=crate::linux::protected_read::read_protected_absolute(
                     &std::path::Path::new(export_path).join("export-receipt.json"),16*1024*1024,None)?;
                 retain("export-receipt.json",&export_bytes)?;
+                retained_export_receipt=Some(export_bytes);
                 let ownership=owner.component_account_ownership(admission)?;
                 retain("account-ownership.json",&serde_json::to_vec(&ownership).map_err(|error|error.to_string())?)?;
                 let journal=retain("boundary-journal.bin",&owner.component_native_journal_bytes()?)?;let reference=retain("boundary-reference.json",&admission.component_reference_bytes()?)?;
@@ -308,6 +392,7 @@ fn run_recovery_component(lost_terminal: bool) {
             return Err("crash boundary unexpectedly returned".into());
         }
         let request_bytes = terminal_request;
+        let export_retirement = retirement.clone();
         let request = crate::protocol::Frame {
             kind: crate::protocol::MessageKind::MixedLaunch,
             nonce: input.challenge[..16]
@@ -362,6 +447,11 @@ fn run_recovery_component(lost_terminal: bool) {
             .errno
             .ok_or("terminal protocol failed without actual native write errno")?;
         retain("lost-terminal-native-receipt.json",&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-lost-terminal-component","revision":1,"run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,"test_name":"native_mixed_recovery::native_lost_terminal_response_emit_actual_receipt","worker":worker,"challenge_sha256":hex(&Sha256::digest(input.challenge)),"carrier":carrier,"request":request_path,"delivery_error":format!("{error:?}"),"native_errno":native_errno,"work_deadline_unix_millis":input.work_deadline_unix_millis,"cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis})).map_err(|e|e.to_string())?)?;
+        completed_export = Some((
+            owner,
+            export_retirement,
+            retained_export_receipt.ok_or("original retained export receipt absent")?,
+        ));
         Ok(())
     })();
     let mut failures = Vec::new();
@@ -374,6 +464,24 @@ fn run_recovery_component(lost_terminal: bool) {
         }
     }
     if lost_terminal {
+        if failures.is_empty() {
+            match completed_export.as_mut() {
+                Some((owner, retirement, receipt)) => {
+                    match owner.component_retire_empty_export(retirement, receipt, cleanup) {
+                        Ok(observation) => match serde_json::to_vec(&observation) {
+                            Ok(bytes) => {
+                                if let Err(error) = retain("empty-export-retirement.json", &bytes) {
+                                    failures.push(error);
+                                }
+                            }
+                            Err(error) => failures.push(error.to_string()),
+                        },
+                        Err(error) => failures.push(error),
+                    }
+                }
+                None => failures.push("original completed export owner absent".into()),
+            }
+        }
         if failures.is_empty() {
             let retirements = helpers
                 .iter()

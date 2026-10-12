@@ -3,8 +3,58 @@ use std::ffi::OsStr;
 use std::process::Command;
 use std::time::Duration;
 
+#[cfg(unix)]
 #[test]
-fn command_excerpts_preserve_first_middle_libtest_failure_for_lf_and_crlf() {
+fn readonly_record_stdin_preserves_full_bound_and_refuses_writable_or_oversized_input() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    let bytes = vec![b'x'; 65_536];
+    std::fs::write(&path, &bytes).unwrap();
+    let input = std::fs::File::open(&path).unwrap();
+    let mut observed = false;
+    let output = CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+        .output_quiet_with_stdin_and_creation(&input, |child| {
+            assert!(child.id() > 0);
+            observed = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(observed && output.status.success());
+    assert_eq!(output.stdout, bytes);
+    let refused = CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+        .output_quiet_with_stdin_and_creation(&input, |_| {
+            Err(memcordon_ci::CiError::Message(
+                "creation refused before delivery".into(),
+            ))
+        })
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("creation refused before delivery")
+    );
+    let mut writable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(
+        CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+            .output_quiet_with_stdin_and_creation(&writable, |_| panic!("writable input spawned"))
+            .is_err()
+    );
+    writable.write_all(&[b'y'; 65_537]).unwrap();
+    let oversized = std::fs::File::open(&path).unwrap();
+    assert!(
+        CommandSpec::new("/bin/cat", directory.path(), Duration::from_secs(5))
+            .output_quiet_with_stdin_and_creation(&oversized, |_| panic!("oversized input spawned"))
+            .is_err()
+    );
+}
+
+#[test]
+fn command_excerpts_preserve_each_middle_libtest_failure_for_lf_and_crlf() {
     let limit = 64 * 1024;
     let failure = "failures:\n\n---- actual_asset_loss stdout ----\nthread 'actual_asset_loss' panicked at release_rehearsal_loss.rs:387:\nactual first failure observation\n\nfailures:\n    actual_asset_loss\n\ntest result: FAILED. 0 passed; 1 failed\n";
     let later = b"failures:\n\n---- another_case stdout ----\nsecond failure observation\n\nfailures:\n    another_case\n\ntest result: FAILED. 0 passed; 1 failed\n";
@@ -29,8 +79,8 @@ fn command_excerpts_preserve_first_middle_libtest_failure_for_lf_and_crlf() {
         assert!(excerpt.starts_with(std::str::from_utf8(beginning).unwrap()));
         assert!(excerpt.ends_with(std::str::from_utf8(terminal).unwrap()));
         assert!(excerpt.contains(&failure));
-        assert!(!excerpt.contains("second failure observation"));
-        assert!(excerpt.contains("first libtest failure section"));
+        assert!(excerpt.contains("second failure observation"));
+        assert!(excerpt.contains("libtest failure sections"));
     }
 }
 
@@ -74,7 +124,7 @@ fn command_excerpts_ignore_incidental_failure_headings_and_reset_after_success()
         bytes.extend(vec![b'y'; limit]);
         let excerpt = memcordon_ci::command::bounded_excerpt(&bytes);
         assert!(excerpt.len() <= limit);
-        assert!(!excerpt.contains("first libtest failure section"));
+        assert!(!excerpt.contains("libtest failure sections"));
     }
 
     let mut bytes = vec![b'x'; limit];
@@ -275,6 +325,44 @@ fn subprocesses_unconditionally_exclude_registry_and_actions_credentials() {
             environment_state(credential),
             Some(None),
             "{credential} must be excluded"
+        );
+    }
+}
+
+#[test]
+fn only_typed_cargo_tests_exclude_runner_observation_channels() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for subcommand in ["test", "build", "metadata"] {
+        let spec =
+            CommandSpec::cargo("rustup", root, "stable", Duration::from_secs(1)).arg(subcommand);
+        let command = spec.materialize().unwrap();
+        for channel in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"] {
+            let state = command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(channel))
+                .map(|(_, value)| value);
+            assert_eq!(
+                state,
+                if subcommand == "test" {
+                    Some(None)
+                } else {
+                    None
+                },
+                "{subcommand}: {channel}"
+            );
+        }
+    }
+    // Production children may emit early cache-quiescent=false observations;
+    // an argument named test alone does not confer Cargo-test identity.
+    let command = CommandSpec::new("memcordon-ci", root, Duration::from_secs(1))
+        .arg("test")
+        .materialize()
+        .unwrap();
+    for channel in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"] {
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new(channel))
         );
     }
 }

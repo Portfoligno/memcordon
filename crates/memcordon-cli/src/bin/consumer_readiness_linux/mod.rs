@@ -895,9 +895,7 @@ fn memory_pressure() -> Result<()> {
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     loop {
         let mut chunk = vec![0u8; 1048576];
-        for byte in &mut chunk {
-            *byte = 0xa5;
-        }
+        chunk.fill(0xa5);
         std::hint::black_box(&chunk);
         chunks.push(chunk);
         std::hint::black_box(&chunks);
@@ -977,7 +975,7 @@ fn announce_child(members: Vec<serde_json::Value>) -> Result<()> {
 fn wait_release() -> Result<()> {
     let mut byte = [0];
     io::stdin().read_exact(&mut byte)?;
-    if byte != [b'R'] {
+    if byte != *b"R" {
         return Err("native child release marker differs".into());
     }
     Ok(())
@@ -1041,7 +1039,7 @@ fn export_object(transcript: &mut Transcript, scenario: &str) -> Result<()> {
         if let Some(child) = writer.as_mut() {
             let mut stop = [0];
             io::stdin().read_exact(&mut stop)?;
-            if stop != [b'S'] {
+            if stop != *b"S" {
                 return Err("export writer stop marker differs".into());
             }
             release_and_wait(child)?;
@@ -1284,7 +1282,7 @@ fn unix_rights(transcript: &mut Transcript, directory: &std::path::Path) -> Resu
     let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let endpoint = tcp.local_addr()?;
     let descriptors = [file.as_raw_fd(), tcp.as_raw_fd()];
-    let mut marker = [b'R'];
+    let mut marker = *b"R";
     let mut vector = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: marker.len(),
@@ -1321,7 +1319,7 @@ fn unix_rights(transcript: &mut Transcript, directory: &std::path::Path) -> Resu
         unsafe { libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
     if count != 1
         || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
-        || marker != [b'R']
+        || marker != *b"R"
     {
         return Err("SCM_RIGHTS transfer truncated or malformed".into());
     }

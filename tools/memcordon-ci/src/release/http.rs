@@ -275,7 +275,11 @@ pub fn download(
                     )
                     .map_err(|_| CiError::Message("invalid HTTPS redirect".into()))?;
             }
-            _ => return Err(CiError::Message("HTTPS artifact unavailable".into())),
+            status => {
+                return Err(CiError::Message(format!(
+                    "HTTPS artifact unavailable; status={status}; redirect-index={redirect}"
+                )));
+            }
         }
     }
     Err(CiError::Message("HTTPS redirect limit exceeded".into()))

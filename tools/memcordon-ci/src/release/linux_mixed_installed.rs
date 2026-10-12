@@ -16,10 +16,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[path = "admin_link_inventory.rs"]
+mod admin_link_inventory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixtureBarrierDecision {
@@ -42,6 +45,7 @@ pub struct InstalledMixedLaunch {
     frontend_birth: Option<u64>,
     frontend_invocation_owner: File,
     frontend_invocation_bytes: Vec<u8>,
+    file_access: FrontendFileAccess,
     capture_failures: Vec<String>,
     image_entrypoint_source: Option<serde_json::Value>,
     image_entrypoint_owner: Option<crate::linux_consumer_readiness::HeldLinuxProcess>,
@@ -233,6 +237,7 @@ pub fn reconstruct_effective_invocation(
 /// Data from the outer selected installation lifetime. The root controller
 /// observes native owners; the public frontend runs under the separate caller.
 pub struct InstalledMixedDriverInput<'a> {
+    pub recovery_harness: &'a super::linux_recovery_harness::HeldRecoveryHarness,
     pub lease_id: String,
     pub admin_root: &'a Path,
     pub payload: &'a MaterializedPayload,
@@ -331,6 +336,10 @@ struct AccountRefusalContext {
 impl InstalledMixedDriver {
     /// Reconstruct only the finite image import intents from this installation.
     /// Called after native attempt recovery and before policy/image retirement.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Recovery binds original image intent, lease, acquisition, policy, account, and cutoff separately"
+    )]
     pub fn recover_image_case_intents(
         &mut self,
         output: &Path,
@@ -498,6 +507,10 @@ impl InstalledMixedDriver {
     }
     /// Read-only convergence after administrative sources were already retired.
     /// This cannot reconstruct an execution owner or authorize any removal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retirement assessment retains independent native resource and original custody inputs"
+    )]
     pub fn assess_retired_resources(
         output: &Path,
         identity: &SourceIdentity,
@@ -773,6 +786,10 @@ impl InstalledMixedDriver {
     }
     /// Persists resource identity only; this document never proves native
     /// attempt retirement. Recovery must settle the provider journal first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Checkpoint binds actual native resources to independent original lease and acquisition custody"
+    )]
     pub fn persist_resource_checkpoint(
         &self,
         path: &Path,
@@ -1201,7 +1218,6 @@ impl InstalledMixedDriver {
                     .bounded_until(deadline)
                     .args(["package", "policy", "apply", "--file"])
                     .arg(&path)
-                    .arg("--json")
                     .output()?;
             retain_attempt(
                 "policy",
@@ -1587,12 +1603,15 @@ impl InstalledMixedDriver {
                 records.push(record.clone());
             }
             for artifact in &report.artifacts {
-                if let Some(previous) = artifacts.insert(artifact.path.clone(), artifact.clone()) {
-                    if previous.sha256 != artifact.sha256 || previous.length != artifact.length {
-                        return Err(CiError::Message(
-                            "lifecycle artifact path carries conflicting original bytes".into(),
-                        ));
-                    }
+                if artifacts
+                    .insert(artifact.path.clone(), artifact.clone())
+                    .is_some_and(|previous| {
+                        previous.sha256 != artifact.sha256 || previous.length != artifact.length
+                    })
+                {
+                    return Err(CiError::Message(
+                        "lifecycle artifact path carries conflicting original bytes".into(),
+                    ));
                 }
             }
         }
@@ -1610,12 +1629,15 @@ impl InstalledMixedDriver {
                 ));
             }
             for artifact in &collection.persisted.artifacts {
-                if let Some(previous) = artifacts.insert(artifact.path.clone(), artifact.clone()) {
-                    if previous.sha256 != artifact.sha256 || previous.length != artifact.length {
-                        return Err(CiError::Message(
-                            "completed mixed artifact path has conflicting bytes".into(),
-                        ));
-                    }
+                if artifacts
+                    .insert(artifact.path.clone(), artifact.clone())
+                    .is_some_and(|previous| {
+                        previous.sha256 != artifact.sha256 || previous.length != artifact.length
+                    })
+                {
+                    return Err(CiError::Message(
+                        "completed mixed artifact path has conflicting bytes".into(),
+                    ));
                 }
             }
             let parent = Path::new(&collection.prepared_native_receipt.path)
@@ -1899,6 +1921,10 @@ impl InstalledMixedDriver {
         let mut index = 0;
         while index < self.active.len() {
             let owned = &mut self.active[index];
+            #[expect(
+                clippy::redundant_closure_call,
+                reason = "Fallible cleanup is captured per owned attempt so later owners are still finalized"
+            )]
             let settled = (|| -> Result<()> {
                 let mut errors = Vec::new();
                 match owned.launch.frontend.try_wait() {
@@ -2284,6 +2310,14 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained original lifecycle report");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        lease_owner_path: &input
+                            .output
+                            .parent()
+                            .ok_or_else(|| {
+                                CiError::Message("original installed lease parent absent".into())
+                            })?
+                            .join("lease-owner.json"),
+                        recovery_harness: input.recovery_harness,
                         identity: &input.identity,
                         cell: &input.cell,
                         provider: input.provider,
@@ -2345,6 +2379,14 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained limits report owner");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        lease_owner_path: &input
+                            .output
+                            .parent()
+                            .ok_or_else(|| {
+                                CiError::Message("original installed lease parent absent".into())
+                            })?
+                            .join("lease-owner.json"),
+                        recovery_harness: input.recovery_harness,
                         identity: &input.identity,
                         cell: &input.cell,
                         provider: input.provider,
@@ -3058,12 +3100,15 @@ fn normalize_malformed_ingress(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(&bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "malformed ingress custody conflict".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "malformed ingress custody conflict".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3157,7 +3202,6 @@ fn normalize_malformed_ingress(
         format!("{prefix}/group-getent.bin"),
         &account_source("group_readback")?,
     )?;
-    drop(persist);
     let original_bytes = read_policy_observation_file(
         &directory.join("original-provider-request.bin"),
         4 * 1024 * 1024,
@@ -3193,12 +3237,15 @@ fn normalize_malformed_ingress(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(&bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "original ingress acquisition custody conflict".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "original ingress acquisition custody conflict".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3309,12 +3356,15 @@ fn normalize_policy_refusal(
             length: bytes.len() as u64,
             sha256: hex::encode(Sha256::digest(bytes)),
         };
-        if let Some(previous) = artifacts.insert(relative.clone(), artifact.clone()) {
-            if previous.length != artifact.length || previous.sha256 != artifact.sha256 {
-                return Err(CiError::Message(
-                    "policy artifact conflicts with retained bytes".into(),
-                ));
-            }
+        if artifacts
+            .insert(relative.clone(), artifact.clone())
+            .is_some_and(|previous| {
+                previous.length != artifact.length || previous.sha256 != artifact.sha256
+            })
+        {
+            return Err(CiError::Message(
+                "policy artifact conflicts with retained bytes".into(),
+            ));
         }
         Ok(relative)
     };
@@ -3960,7 +4010,7 @@ pub fn completed_case_base(
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
         attempt_nonce: Some(
-            serde_json::to_value(&admission.admission_nonce)?
+            serde_json::to_value(admission.admission_nonce)?
                 .as_str()
                 .ok_or_else(|| CiError::Message("completed nonce encoding differs".into()))?
                 .into(),
@@ -4233,7 +4283,7 @@ fn normalize_completed_case(
             "normalized executed row has no native execution".into(),
         ));
     };
-    if serde_json::to_value(execution.outcome_origin.clone())?
+    if serde_json::to_value(execution.outcome_origin)?
         != serde_json::Value::String("native-exit".into())
         || execution.native_wait_status & 0x7f != 0
     {
@@ -4376,7 +4426,7 @@ fn normalize_completed_case(
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
         attempt_nonce: Some(
-            serde_json::to_value(&admission.admission_nonce)?
+            serde_json::to_value(admission.admission_nonce)?
                 .as_str()
                 .ok_or_else(|| CiError::Message("actual admission nonce encoding differs".into()))?
                 .into(),
@@ -5299,6 +5349,50 @@ pub(super) fn retire_admin_children(
     depth: usize,
     count: &mut usize,
 ) -> Result<()> {
+    let mut links = admin_link_inventory::Inventory::default();
+    let mut census_count = 0;
+    visit_admin_children(
+        parent,
+        device,
+        deadline,
+        depth,
+        &mut census_count,
+        Path::new(""),
+        &mut AdminVisit {
+            links: &mut links,
+            census: true,
+        },
+    )?;
+    links.verify_complete().map_err(CiError::Message)?;
+    visit_admin_children(
+        parent,
+        device,
+        deadline,
+        depth,
+        count,
+        Path::new(""),
+        &mut AdminVisit {
+            links: &mut links,
+            census: false,
+        },
+    )?;
+    links.verify_retired().map_err(CiError::Message)
+}
+
+struct AdminVisit<'a> {
+    links: &'a mut admin_link_inventory::Inventory,
+    census: bool,
+}
+
+fn visit_admin_children(
+    parent: &File,
+    device: u64,
+    deadline: std::time::Instant,
+    depth: usize,
+    count: &mut usize,
+    prefix: &Path,
+    visit: &mut AdminVisit<'_>,
+) -> Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     if depth > 128 {
         return Err(CiError::Message(
@@ -5309,6 +5403,7 @@ pub(super) fn retire_admin_children(
     // caller-provided symlink or a reopened pathname of a detached owner.
     for entry in std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd()))? {
         let name = entry?.file_name();
+        let original_name = prefix.join(&name);
         *count += 1;
         if *count > 131_072 || std::time::Instant::now() >= deadline {
             return Err(CiError::Message(
@@ -5362,29 +5457,78 @@ pub(super) fn retire_admin_children(
                     "admin directory changed before recursive native retirement".into(),
                 ));
             }
-            retire_admin_children(&directory, device, deadline, depth + 1, count)?;
+            visit
+                .links
+                .directory(&original_name, &metadata, visit.census)
+                .map_err(CiError::Message)?;
+            visit_admin_children(
+                &directory,
+                device,
+                deadline,
+                depth + 1,
+                count,
+                &original_name,
+                visit,
+            )?;
+            if visit.census {
+                require_admin_named_inode(parent, &name, &held)?;
+                continue;
+            }
             directory.sync_all()?;
             rustix::fs::AtFlags::REMOVEDIR
         } else {
-            if (!metadata.is_file() && !metadata.file_type().is_symlink()) || metadata.nlink() != 1
+            if (!metadata.is_file() && !metadata.file_type().is_symlink())
+                || metadata.file_type().is_symlink() && metadata.nlink() != 1
             {
-                return Err(CiError::Message(
-                    "admin member is special or aliased; exact tree owner retained".into(),
-                ));
+                let parent_identity = match parent.metadata() {
+                    Ok(value) => format!("device={}; inode={}", value.dev(), value.ino()),
+                    Err(_) => "unavailable".to_owned(),
+                };
+                let displayed = name.to_string_lossy();
+                let excerpt: String = displayed.chars().take(128).collect();
+                return Err(CiError::Message(format!(
+                    "admin member is special or aliased; exact tree owner retained; name={excerpt:?}; name-truncated={}; parent={parent_identity}; device={}; inode={}; mode={}; links={}",
+                    displayed.chars().count() > 128,
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.nlink()
+                )));
             }
+            if visit.census {
+                require_admin_named_inode(parent, &name, &held)?;
+                visit
+                    .links
+                    .observe(&original_name, &metadata)
+                    .map_err(CiError::Message)?;
+                continue;
+            }
+            visit
+                .links
+                .before_unlink(&original_name, &metadata)
+                .map_err(CiError::Message)?;
             rustix::fs::AtFlags::empty()
         };
         require_admin_named_inode(parent, &name, &held)?;
         rustix::fs::unlinkat(parent.as_fd(), &name, flags)
             .map_err(|e| CiError::Message(e.to_string()))?;
-        if held.metadata()?.nlink() != 0 {
+        let after = held.metadata()?;
+        if metadata.is_dir() && after.nlink() != 0 {
             return Err(CiError::Message(
                 "admin member remains linked after owned unlink".into(),
             ));
         }
+        if !metadata.is_dir() {
+            visit
+                .links
+                .after_unlink(&original_name, &after)
+                .map_err(CiError::Message)?;
+        }
         parent.sync_all()?;
     }
-    parent.sync_all()?;
+    if !visit.census {
+        parent.sync_all()?;
+    }
     Ok(())
 }
 
@@ -5500,17 +5644,15 @@ pub fn owned_fixture_recipes(cell: &ProductKey) -> Result<Vec<InstalledMixedReci
             "300s",
         );
     }
-    for scenario in ["deadline", "memory"] {
-        add(
-            "C-STATUS",
-            scenario,
-            "population-deadline",
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "300s",
-        );
-    }
+    add(
+        "C-STATUS",
+        "memory",
+        "population-deadline",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "300s",
+    );
     add(
         "L-MIX-02",
         "endpoint-mismatch",
@@ -5969,6 +6111,175 @@ fn capture_native_stream(
     output.sync_all()
 }
 
+struct FrontendFileAccess {
+    endpoint_owner: File,
+    endpoint_parent_owner: File,
+    endpoint_root_owner: File,
+    endpoint_stamp: (u64, u64, u32, u32, u32, u64),
+    endpoint_parent_stamp: (u64, u64, u32, u32, u32),
+    endpoint_root_stamp: (u64, u64, u32, u32, u32),
+    runtime_contract_owner: File,
+    runtime_contract_path: PathBuf,
+    frontend_contract_owner: File,
+    frontend_contract_path: PathBuf,
+    frontend_contract_bytes: Vec<u8>,
+    frontend_directory_owner: File,
+    frontend_directory_path: PathBuf,
+    caller_uid: u32,
+    caller_gid: u32,
+    contract_stamp: (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64),
+    directory_stamp: (u64, u64, u32, u32, u32),
+}
+impl FrontendFileAccess {
+    fn observe_endpoint(&self) -> Result<serde_json::Value> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new("/run/memcordon/sealed-agent.sock");
+        let socket = self.endpoint_owner.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        let parent = self.endpoint_parent_owner.metadata()?;
+        let named_parent = std::fs::symlink_metadata("/run/memcordon")?;
+        let root = self.endpoint_root_owner.metadata()?;
+        let named_root = std::fs::symlink_metadata("/run")?;
+        let stamp =
+            |m: &std::fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode(), m.nlink());
+        let directory_stamp =
+            |m: &std::fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode());
+        let searchable = |m: &std::fs::Metadata| {
+            if m.gid() == self.caller_gid || m.gid() == socket.gid() {
+                m.mode() & 0o010 != 0
+            } else {
+                m.mode() & 0o001 != 0
+            }
+        };
+        if !socket.file_type().is_socket()
+            || socket.uid() != 0
+            || socket.gid() == 0
+            || socket.mode() & 0o7777 != 0o660
+            || socket.nlink() != 1
+            || stamp(&socket) != self.endpoint_stamp
+            || stamp(&socket) != stamp(&named)
+            || !parent.is_dir()
+            || parent.uid() != 0
+            || parent.mode() & 0o022 != 0
+            || !searchable(&parent)
+            || directory_stamp(&parent) != directory_stamp(&named_parent)
+            || directory_stamp(&parent) != self.endpoint_parent_stamp
+            || !root.is_dir()
+            || root.uid() != 0
+            || root.mode() & 0o022 != 0
+            || !searchable(&root)
+            || directory_stamp(&root) != directory_stamp(&named_root)
+            || directory_stamp(&root) != self.endpoint_root_stamp
+        {
+            return Err(CiError::Message(
+                "installed frontend endpoint access custody differs".into(),
+            ));
+        }
+        let argument = format!("--groups={}", socket.gid());
+        Ok(serde_json::json!({
+            "format":"memcordon.linux-owned-frontend-endpoint-access","revision":1,
+            "path":path.as_os_str().as_bytes(),"device":socket.dev(),"inode":socket.ino(),
+            "uid":socket.uid(),"gid":socket.gid(),"mode":socket.mode(),"links":socket.nlink(),
+            "supplementary_groups":[socket.gid()],"group_argument":argument.as_bytes(),
+        }))
+    }
+    fn observe(&self) -> Result<serde_json::Value> {
+        use std::os::unix::ffi::OsStrExt;
+        let contract = self.frontend_contract_owner.metadata()?;
+        let named_contract = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.frontend_contract_path)?;
+        let stamp = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.uid(),
+                m.gid(),
+                m.mode(),
+                m.nlink(),
+                m.len(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mtime(),
+                m.mtime_nsec(),
+            )
+        };
+        let mut bytes = vec![0; self.frontend_contract_bytes.len()];
+        self.frontend_contract_owner.read_exact_at(&mut bytes, 0)?;
+        let mut named_bytes = vec![0; bytes.len()];
+        named_contract.read_exact_at(&mut named_bytes, 0)?;
+        if !contract.is_file()
+            || contract.uid() != 0
+            || contract.nlink() != 1
+            || contract.mode() & 0o022 != 0
+            || contract.len() != bytes.len() as u64
+            || bytes != self.frontend_contract_bytes
+            || named_bytes != bytes
+            || stamp(&contract) != stamp(&named_contract.metadata()?)
+            || stamp(&contract) != stamp(&self.frontend_contract_owner.metadata()?)
+            || stamp(&contract) != self.contract_stamp
+        {
+            return Err(CiError::Message(
+                "original frontend contract descriptor custody/bytes differs".into(),
+            ));
+        }
+        let runtime = self.runtime_contract_owner.metadata()?;
+        let runtime_named = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.runtime_contract_path)?;
+        let mut runtime_bytes = vec![0; bytes.len()];
+        self.runtime_contract_owner
+            .read_exact_at(&mut runtime_bytes, 0)?;
+        let mut runtime_named_bytes = vec![0; bytes.len()];
+        runtime_named.read_exact_at(&mut runtime_named_bytes, 0)?;
+        if !runtime.is_file()
+            || runtime.uid() != 0
+            || runtime.nlink() != 1
+            || runtime.mode() & 0o777 != 0o444
+            || runtime.len() != bytes.len() as u64
+            || runtime_bytes != bytes
+            || runtime_named_bytes != bytes
+            || stamp(&runtime) != stamp(&runtime_named.metadata()?)
+            || stamp(&runtime) != stamp(&self.runtime_contract_owner.metadata()?)
+        {
+            return Err(CiError::Message(
+                "frontend readable contract capability custody/bytes differs".into(),
+            ));
+        }
+        let directory = self.frontend_directory_owner.metadata()?;
+        let named_directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open(&self.frontend_directory_path)?
+            .metadata()?;
+        let directory_stamp =
+            |m: &std::fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode());
+        if !directory.is_dir()
+            || directory.mode() & 0o777 != 0o700
+            || directory.uid() != self.caller_uid
+            || directory.gid() != self.caller_gid
+            || directory_stamp(&directory) != directory_stamp(&named_directory)
+            || directory_stamp(&directory) != self.directory_stamp
+        {
+            return Err(CiError::Message(
+                "original frontend output directory descriptor custody differs".into(),
+            ));
+        }
+        Ok(
+            serde_json::json!({"format":"memcordon.linux-frontend-file-access","revision":1,
+            "contract":{"descriptor":129,"path":self.frontend_contract_path.as_os_str().as_bytes(),
+                "device":contract.dev(),"inode":contract.ino(),"uid":contract.uid(),"gid":contract.gid(),"mode":contract.mode(),
+                "links":contract.nlink(),"length":contract.len(),"sha256":hex::encode(Sha256::digest(&bytes)),
+                "runtime":{"path":self.runtime_contract_path.as_os_str().as_bytes(),"device":runtime.dev(),"inode":runtime.ino(),
+                    "uid":runtime.uid(),"gid":runtime.gid(),"mode":runtime.mode(),"links":runtime.nlink(),"length":runtime.len(),
+                    "sha256":hex::encode(Sha256::digest(&runtime_bytes))}},
+            "output_directory":{"descriptor":130,"path":self.frontend_directory_path.as_os_str().as_bytes(),
+                "device":directory.dev(),"inode":directory.ino(),"uid":directory.uid(),"gid":directory.gid(),"mode":directory.mode()}}),
+        )
+    }
+}
 impl InstalledMixedLaunch {
     pub fn retained_frontend_wait(&self) -> Result<serde_json::Value> {
         use std::os::unix::process::ExitStatusExt;
@@ -5999,6 +6310,16 @@ impl InstalledMixedLaunch {
     /// Read the exact controller command retained before spawn. A replacement
     /// with identical bytes still fails the named native identity check.
     pub fn retained_frontend_invocation(&self) -> Result<Vec<u8>> {
+        let access = self.file_access.observe()?;
+        let invocation: serde_json::Value =
+            serde_json::from_slice(&self.frontend_invocation_bytes)?;
+        if invocation["file_access"] != access
+            || invocation["endpoint_access"] != self.file_access.observe_endpoint()?
+        {
+            return Err(CiError::Message(
+                "retained frontend file access differs from original held objects".into(),
+            ));
+        }
         let file = &self.frontend_invocation_owner;
         let before = file.metadata()?;
         if before.len() != self.frontend_invocation_bytes.len() as u64 || before.len() > 65536 {
@@ -6089,6 +6410,47 @@ impl InstalledMixedLaunch {
                 "installed mixed caller paths/identity invalid".into(),
             ));
         }
+        let endpoint_root_owner = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open("/run")?;
+        let endpoint_parent_owner = File::from(
+            rustix::fs::openat(
+                &endpoint_root_owner,
+                "memcordon",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| CiError::Message(error.to_string()))?,
+        );
+        let endpoint_owner = File::from(
+            rustix::fs::openat(
+                &endpoint_parent_owner,
+                "sealed-agent.sock",
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| CiError::Message(error.to_string()))?,
+        );
+        let endpoint_metadata = endpoint_owner.metadata()?;
+        if !endpoint_metadata.file_type().is_socket()
+            || endpoint_metadata.uid() != 0
+            || endpoint_metadata.gid() == 0
+            || endpoint_metadata.mode() & 0o7777 != 0o660
+            || endpoint_metadata.nlink() != 1
+        {
+            return Err(CiError::Message(
+                "installed public socket group access is not exact".into(),
+            ));
+        }
+        let endpoint_gid = endpoint_metadata.gid();
+        let endpoint_parent_metadata = endpoint_parent_owner.metadata()?;
+        let endpoint_root_metadata = endpoint_root_owner.metadata()?;
         std::fs::create_dir(input.directory)?;
         std::fs::set_permissions(input.directory, std::fs::Permissions::from_mode(0o700))?;
         let uid = rustix::process::Uid::from_raw(input.caller_uid);
@@ -6118,20 +6480,20 @@ impl InstalledMixedLaunch {
             .arg(input.caller_uid.to_string())
             .arg("--regid")
             .arg(input.caller_gid.to_string())
-            .arg("--clear-groups")
+            .arg(format!("--groups={endpoint_gid}"))
             .arg("--")
             .arg("/usr/libexec/memcordon")
             .arg(input.memory)
             .arg(input.deadline)
             .arg("--sealed")
             .arg("--workload-contract")
-            .arg(input.contract)
+            .arg("/proc/self/fd/129")
             .arg("--report-format")
             .arg("result-v2")
             .arg("--report")
-            .arg(&result)
+            .arg("/proc/self/fd/130/result.json")
             .arg("--mixed-observation-directory")
-            .arg(&observation_directory)
+            .arg("/proc/self/fd/130/observations")
             .arg("--image-entrypoint")
             .arg("owned-readiness")
             .arg("--")
@@ -6140,6 +6502,76 @@ impl InstalledMixedLaunch {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let frontend_contract_owner = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(input.contract)?;
+        let frontend_contract_bytes = read_owned_resource(input.contract, 4 * 1024 * 1024)?;
+        // The original evidence remains private. Only this exact immutable
+        // contract copy is readable by the frontend through its inherited FD.
+        let runtime_contract_path = input.directory.join("workload-contract.json");
+        let mut runtime_writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&runtime_contract_path)?;
+        runtime_writer.write_all(&frontend_contract_bytes)?;
+        runtime_writer.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+        runtime_writer.sync_all()?;
+        let runtime_contract_owner = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&runtime_contract_path)?;
+        let written = runtime_writer.metadata()?;
+        let reopened = runtime_contract_owner.metadata()?;
+        if (written.dev(), written.ino()) != (reopened.dev(), reopened.ino()) {
+            return Err(CiError::Message(
+                "readable frontend contract creation identity differs".into(),
+            ));
+        }
+        drop(runtime_writer);
+        let frontend_directory_owner = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open(input.directory)?;
+        // Occupy vacant fixed destinations before std creates its spawn pipes.
+        // F_DUPFD_CLOEXEC never replaces another parent's owned descriptor.
+        use std::os::fd::AsRawFd;
+        let mut destination_reservations = Vec::new();
+        for _ in 0..4 {
+            let reservation = rustix::io::fcntl_dupfd_cloexec(&runtime_contract_owner, 128)
+                .map_err(|error| CiError::Message(error.to_string()))?;
+            if reservation.as_raw_fd() > 130 {
+                break;
+            }
+            destination_reservations.push(reservation);
+        }
+        // Keep colliding duplicates owned until spawn. Every setup source must
+        // survive all three fixed-slot dup2 operations, regardless of parent FD layout.
+        let mut reserved_slots = Vec::new();
+        let mut safe_source = |source: &File| -> Result<std::os::fd::OwnedFd> {
+            for _ in 0..4 {
+                let duplicate = source.try_clone()?;
+                if ![128, 129, 130].contains(&duplicate.as_raw_fd()) {
+                    return Ok(duplicate.into());
+                }
+                reserved_slots.push(duplicate);
+            }
+            Err(CiError::Message(
+                "frontend descriptor source relocation exhausted finite slots".into(),
+            ))
+        };
+        memcordon_platform::test_support::inherit_test_descriptor_at(
+            &mut command,
+            safe_source(&runtime_contract_owner)?,
+            129,
+        )?;
+        memcordon_platform::test_support::inherit_test_descriptor_at(
+            &mut command,
+            safe_source(&frontend_directory_owner)?,
+            130,
+        )?;
         if let Some(stdin) = host_stdin {
             command.stdin(std::process::Stdio::from(stdin));
         }
@@ -6149,9 +6581,10 @@ impl InstalledMixedLaunch {
                     "hostile original descriptor handoff differs from finite probe".into(),
                 ));
             }
+            let source = File::from(source);
             memcordon_platform::test_support::inherit_test_descriptor_at(
                 &mut command,
-                source,
+                safe_source(&source)?,
                 destination,
             )?;
         }
@@ -6159,12 +6592,73 @@ impl InstalledMixedLaunch {
         // boundary. This receipt describes the controller's invocation; it
         // does not substitute for the frontend's public association digest.
         use std::os::unix::ffi::OsStrExt;
+        let contract_metadata = frontend_contract_owner.metadata()?;
+        let directory_metadata = frontend_directory_owner.metadata()?;
+        let file_access = FrontendFileAccess {
+            endpoint_owner,
+            endpoint_parent_owner,
+            endpoint_root_owner,
+            endpoint_stamp: (
+                endpoint_metadata.dev(),
+                endpoint_metadata.ino(),
+                endpoint_metadata.uid(),
+                endpoint_metadata.gid(),
+                endpoint_metadata.mode(),
+                endpoint_metadata.nlink(),
+            ),
+            endpoint_parent_stamp: (
+                endpoint_parent_metadata.dev(),
+                endpoint_parent_metadata.ino(),
+                endpoint_parent_metadata.uid(),
+                endpoint_parent_metadata.gid(),
+                endpoint_parent_metadata.mode(),
+            ),
+            endpoint_root_stamp: (
+                endpoint_root_metadata.dev(),
+                endpoint_root_metadata.ino(),
+                endpoint_root_metadata.uid(),
+                endpoint_root_metadata.gid(),
+                endpoint_root_metadata.mode(),
+            ),
+            runtime_contract_owner,
+            runtime_contract_path,
+            frontend_contract_owner,
+            frontend_contract_path: input.contract.to_owned(),
+            frontend_contract_bytes,
+            frontend_directory_owner,
+            frontend_directory_path: input.directory.to_owned(),
+            caller_uid: input.caller_uid,
+            caller_gid: input.caller_gid,
+            contract_stamp: (
+                contract_metadata.dev(),
+                contract_metadata.ino(),
+                contract_metadata.uid(),
+                contract_metadata.gid(),
+                contract_metadata.mode(),
+                contract_metadata.nlink(),
+                contract_metadata.len(),
+                contract_metadata.ctime(),
+                contract_metadata.ctime_nsec(),
+                contract_metadata.mtime(),
+                contract_metadata.mtime_nsec(),
+            ),
+            directory_stamp: (
+                directory_metadata.dev(),
+                directory_metadata.ino(),
+                directory_metadata.uid(),
+                directory_metadata.gid(),
+                directory_metadata.mode(),
+            ),
+        };
+        let access = file_access.observe()?;
         let command_receipt = serde_json::json!({
             "format":"memcordon.linux-owned-frontend-invocation","revision":1,
             "program":command.get_program().as_bytes(),
             "arguments":command.get_args().map(|argument|argument.as_bytes().to_vec()).collect::<Vec<_>>(),
             "environment_cleared":true,"caller_uid":input.caller_uid,"caller_gid":input.caller_gid,
             "selected_cli_sha256":hex::encode(Sha256::digest(read_owned_resource(Path::new("/usr/libexec/memcordon"),512*1024*1024)?)),
+            "file_access":access,
+            "endpoint_access":file_access.observe_endpoint()?,
         });
         let frontend_invocation_bytes = serde_json::to_vec(&command_receipt)?;
         let frontend_invocation_path = input.directory.join("frontend-invocation.json");
@@ -6239,6 +6733,7 @@ impl InstalledMixedLaunch {
             frontend_birth,
             frontend_invocation_owner,
             frontend_invocation_bytes,
+            file_access,
             capture_failures,
             image_entrypoint_source: None,
             image_entrypoint_owner: None,
@@ -6365,7 +6860,7 @@ impl InstalledMixedLaunch {
     }
 
     pub fn acquire_prepared(
-        &self,
+        &mut self,
         provider: &memcordon_core::PublicProviderBindingV1,
         request: &memcordon_core::workload_contract_v3::WorkloadContractV3,
         destination: &Path,
@@ -6409,7 +6904,81 @@ impl InstalledMixedLaunch {
                 .map_err(CiError::Message);
             }
             if std::time::Instant::now() >= deadline {
-                return Err(CiError::Message("no authenticated prepared observation before native timeout; launch owner retained".into()));
+                let status = match self.frontend.try_wait() {
+                    Ok(status) => {
+                        if status.is_some() {
+                            self.frontend_status = status;
+                        }
+                        match status {
+                            Some(status) => format!("exited({status:?})"),
+                            None => "running-at-observation".into(),
+                        }
+                    }
+                    Err(error) => format!(
+                        "unavailable(kind={:?},raw-os-error={:?})",
+                        error.kind(),
+                        error.raw_os_error()
+                    ),
+                };
+                let snapshot = |path: &Path| {
+                    let observed = (|| -> std::io::Result<(u64, Vec<u8>)> {
+                        let file = OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                            .open(path)?;
+                        let metadata = file.metadata()?;
+                        if !metadata.is_file()
+                            || metadata.uid() != 0
+                            || metadata.nlink() != 1
+                            || metadata.mode() & 0o7777 != 0o600
+                        {
+                            return Err(std::io::Error::other("capture source custody differs"));
+                        }
+                        let named = std::fs::symlink_metadata(path)?;
+                        if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
+                            return Err(std::io::Error::other("capture source name differs"));
+                        }
+                        let length = metadata.len();
+                        let mut bytes =
+                            vec![0; usize::try_from(length.min(4096)).expect("bounded tail")];
+                        file.read_exact_at(&mut bytes, length.saturating_sub(4096))?;
+                        let after = file.metadata()?;
+                        let named = std::fs::symlink_metadata(path)?;
+                        if after.dev() != metadata.dev()
+                            || after.ino() != metadata.ino()
+                            || after.uid() != 0
+                            || after.nlink() != 1
+                            || after.mode() & 0o7777 != 0o600
+                            || named.dev() != after.dev()
+                            || named.ino() != after.ino()
+                        {
+                            return Err(std::io::Error::other(
+                                "capture source changed during snapshot",
+                            ));
+                        }
+                        Ok((length, bytes))
+                    })();
+                    let name: String = path.to_string_lossy().chars().take(256).collect();
+                    match observed {
+                        Ok((length, bytes)) => format!(
+                            "path={name:?}; path-truncated={}; snapshot-complete=false; observed-bytes={length}; tail-truncated={}; tail={:?}",
+                            path.to_string_lossy().chars().count() > 256,
+                            length > bytes.len() as u64,
+                            String::from_utf8_lossy(&bytes),
+                        ),
+                        Err(error) => format!(
+                            "path={name:?}; snapshot-complete=false; unavailable(kind={:?},raw-os-error={:?})",
+                            error.kind(),
+                            error.raw_os_error(),
+                        ),
+                    }
+                };
+                return Err(CiError::Message(format!(
+                    "no authenticated prepared observation before native timeout; launch owner retained; frontend-pid={}; observed-status={status}; stdout=[{}]; stderr=[{}]",
+                    self.frontend.id(),
+                    snapshot(&self.stdout),
+                    snapshot(&self.stderr),
+                )));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -6610,26 +7179,38 @@ impl InstalledMixedLaunch {
                     }
                     let release = match row.operation.as_str() {
                         "offline-compiler-held" | "joint-generated-child-held" => {
-                            if row.operation == "offline-compiler-held" {
-                                if let Some(source) = &self.image_entrypoint_source {
-                                    let mut owner =
-                                        crate::linux_consumer_readiness::HeldLinuxProcess::acquire(
-                                            observer.target.process_id,
-                                            observer.target.birth,
-                                        )
-                                        .map_err(CiError::Message)?;
-                                    let executable = owner
-                                        .hold_executable_image(deadline)
-                                        .map_err(CiError::Message)?;
-                                    if executable["sha256"] != source["fixture_sha256"] {
-                                        return Err(CiError::Message("actual image entrypoint proc executable differs from approved fixture".into()));
-                                    }
-                                    let raw = serde_json::json!({"format":"memcordon.linux-image-entrypoint","revision":1,"source":source,
+                            if let ("offline-compiler-held", Some(source)) =
+                                (row.operation.as_str(), &self.image_entrypoint_source)
+                            {
+                                let mut owner =
+                                    crate::linux_consumer_readiness::HeldLinuxProcess::acquire(
+                                        observer.target.process_id,
+                                        observer.target.birth,
+                                    )
+                                    .map_err(CiError::Message)?;
+                                let executable = owner
+                                    .hold_executable_image(deadline)
+                                    .map_err(CiError::Message)?;
+                                if executable["sha256"] != source["fixture_sha256"] {
+                                    return Err(CiError::Message("actual image entrypoint proc executable differs from approved fixture".into()));
+                                }
+                                let raw = serde_json::json!({"format":"memcordon.linux-image-entrypoint","revision":1,"source":source,
                                         "challenge":row.challenge,"attempt_id":observer.observation.admission.attempt_id,
                                         "target":owner.live_snapshot().map_err(CiError::Message)?,"executable":executable});
-                                    self.image_entrypoint_owner = Some(owner);
-                                    retain(&self.stdout.parent().ok_or_else(||CiError::Message("owned image entrypoint capture directory absent".into()))?.join("image-entrypoint.json"),&serde_json::to_vec(&raw)?)?;
-                                }
+                                self.image_entrypoint_owner = Some(owner);
+                                retain(
+                                    &self
+                                        .stdout
+                                        .parent()
+                                        .ok_or_else(|| {
+                                            CiError::Message(
+                                                "owned image entrypoint capture directory absent"
+                                                    .into(),
+                                            )
+                                        })?
+                                        .join("image-entrypoint.json"),
+                                    &serde_json::to_vec(&raw)?,
+                                )?;
                             }
                             let tree = if row.operation == "offline-compiler-held" {
                                 &row.observation
@@ -6996,6 +7577,10 @@ impl InstalledMixedLaunch {
         Ok(self.frontend_status.expect("observed native frontend exit"))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completed evidence binds original invocation, native observations, image, policy, and artifact custody independently"
+    )]
     pub fn collect_completed(
         &mut self,
         observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
@@ -8041,6 +8626,10 @@ fn provision_account_for_original_lifetime(
 
 /// Captures native credentials and the provider's actual attempt namespace.
 /// This is read-only evidence; it never removes a process or cgroup by name.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Refusal census binds original policy, account, invocation, lease, acquisition, and artifact custody"
+)]
 pub fn persist_policy_refusal_census(
     account: &ExclusiveAccount,
     provider: &memcordon_core::PublicProviderBindingV1,
@@ -8456,6 +9045,10 @@ pub struct ActivatedMixedPolicy {
     pub activation_path: PathBuf,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Policy activation binds independent installed image, account, lease, source, and destination custody"
+)]
 pub fn activate_owned_policy(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -8479,6 +9072,10 @@ pub fn activate_owned_policy(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Policy activation additionally binds its original finite deadline"
+)]
 pub fn activate_owned_policy_until(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -8504,6 +9101,10 @@ pub fn activate_owned_policy_until(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Staged policy activation independently binds original lease, acquisition, image, account, stage, and deadline"
+)]
 pub fn activate_owned_policy_staged_until(
     legacy: memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
     images: &MixedImages,
@@ -8880,6 +9481,7 @@ struct ImageBuilder {
     root: PathBuf,
     entries: BTreeMap<RootRelativePath, ImageEntryV1>,
     originals: BTreeMap<RootRelativePath, PathBuf>,
+    toolchain_searches: Vec<(RootRelativePath, String, String)>,
     total_bytes: u64,
     deadline: std::time::Instant,
 }
@@ -8896,6 +9498,7 @@ impl ImageBuilder {
             root,
             entries: BTreeMap::new(),
             originals: BTreeMap::new(),
+            toolchain_searches: Vec::new(),
             total_bytes: 0,
             deadline,
         })
@@ -9076,6 +9679,24 @@ impl ImageBuilder {
             else {
                 continue;
             };
+            if member.as_str().starts_with("toolchain/") {
+                for search in &elf.search_paths {
+                    if search.contains("$ORIGIN") || search.contains("${ORIGIN}") {
+                        let directory =
+                            super::native_toolchain_search::directory(member.as_str(), search)
+                                .map_err(CiError::Message)?;
+                        if self.toolchain_searches.len()
+                            >= memcordon_core::workload_registry_v3::IMAGE_ENTRIES
+                        {
+                            return Err(CiError::Message(
+                                "toolchain search evidence exceeds image inventory bound".into(),
+                            ));
+                        }
+                        self.toolchain_searches
+                            .push((member.clone(), search.clone(), directory));
+                    }
+                }
+            }
             if let Some(interpreter) = elf.interpreter {
                 self.host_member(Path::new(&interpreter))?;
             }
@@ -9286,7 +9907,7 @@ pub fn materialize_until(
     if gcc.is_dir() {
         runtime.tree(
             &gcc,
-            &gcc.strip_prefix("/")
+            gcc.strip_prefix("/")
                 .map_err(|e| CiError::Message(e.to_string()))?,
             &cell.target,
         )?;
@@ -9377,6 +9998,56 @@ pub fn materialize_until(
             .join(&cell.target)
             .join("lib"),
     );
+    let mut declared = libraries
+        .iter()
+        .map(|directory| {
+            directory
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut search_evidence = Vec::new();
+    for (member, search, directory) in &runtime.toolchain_searches {
+        let copied = runtime.root.join(directory);
+        let present = match std::fs::symlink_metadata(&copied) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            _ => {
+                return Err(CiError::Message(
+                    "toolchain search aliases copied file authority".into(),
+                ));
+            }
+        };
+        let prefix = format!("{directory}/");
+        let contents = runtime
+            .entries
+            .values()
+            .filter(|entry| entry.path().as_str().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        if !present && !contents.is_empty() {
+            return Err(CiError::Message(
+                "absent toolchain search has copied members".into(),
+            ));
+        }
+        let entry = runtime
+            .entries
+            .get(member)
+            .expect("inspected copied ELF member");
+        search_evidence.push(serde_json::json!({"member":entry,"search":search,"directory":directory,"copied_directory_present":present,"member_count":contents.len(),"members_sha256":hex::encode(Sha256::digest(serde_json::to_vec(&contents)?))}));
+        super::native_toolchain_search::declare(&mut declared, directory.clone())
+            .map_err(CiError::Message)?;
+    }
+    retain(
+        &output.join("toolchain-loader-search.json"),
+        &serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.original-toolchain-loader-search","revision":1,"target":cell.target,"observations":search_evidence}),
+        )?,
+    )?;
+    libraries = declared
+        .into_iter()
+        .map(|directory| PathBuf::from(format!("/{directory}")))
+        .collect();
     let runtime = runtime.definition(
         "owned-readiness-runtime",
         &cell.target,

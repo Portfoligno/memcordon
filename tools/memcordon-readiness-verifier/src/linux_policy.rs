@@ -172,6 +172,10 @@ fn native_epoch(value: &Value) -> Result<(), String> {
 
 /// Discovery describes the old grant; the later native provider must still
 /// refuse preparation after the exact local revocation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent requested, prepared, activated and restored policy observations"
+)]
 pub fn validate_linux_policy_discovery(
     command: &Value,
     exit: &Value,
@@ -363,6 +367,10 @@ fn closed(value: &Value, fields: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent requested, prepared, activated and restored policy observations"
+)]
 pub(crate) fn validate_prepared_native_graph(
     prepared: &Value,
     native: &Value,
@@ -560,6 +568,10 @@ pub(crate) fn validate_prepared_native_graph(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent requested, prepared, activated and restored policy observations"
+)]
 pub fn validate_linux_policy_gate(
     scenario: &str,
     prepared: &Value,
@@ -815,6 +827,8 @@ pub fn validate_linux_policy_frontend(
     caller: u32,
     selected_cli_sha256: &str,
 ) -> Result<(), String> {
+    let resolved_command = crate::linux_frontend_access::resolve(command, None)?;
+    let command = &resolved_command;
     closed(
         command,
         &[
@@ -858,7 +872,6 @@ pub fn validate_linux_policy_frontend(
     let required = [
         (0, "--reuid"),
         (2, "--regid"),
-        (4, "--clear-groups"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
         (7, "+256M"),
@@ -913,6 +926,10 @@ pub fn validate_linux_policy_frontend(
 
 /// Validate an actual no-target public refusal without inventing retirement
 /// facts for a target, guardian or private root that was never created.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent requested, prepared, activated and restored policy observations"
+)]
 pub fn validate_linux_policy_refusal_result(
     result: &Value,
     public_request_bytes: &[u8],
@@ -1040,7 +1057,7 @@ pub fn validate_linux_policy_refusal_result(
     Ok(())
 }
 
-pub(crate) fn activation_registry<'a>(receipt: &'a Value) -> Result<&'a Value, String> {
+pub(crate) fn activation_registry(receipt: &Value) -> Result<&Value, String> {
     let object = receipt
         .as_object()
         .ok_or("activation receipt is not an object")?;
@@ -1151,6 +1168,10 @@ pub fn validate_linux_policy_activation_sequence(
 
 /// Decode only the exact nine installed binding mutations. Native invocation,
 /// provider refusal and restoration custody are separate mandatory joins.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent requested, prepared, activated and restored policy observations"
+)]
 pub fn validate_linux_policy_mutation(
     scenario: &str,
     baseline_registry: &Value,

@@ -39,6 +39,7 @@ pub(crate) fn retain_payload(
     crate::windows_installed_cases::SelectedArtifact,
     Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
 )> {
+    let selected_count = payload.selected_case_artifacts()?.len();
     fs::create_dir(destination)?;
     let mut held = Vec::new();
     let mut copy = |source: &Path, destination: &Path, expected: Option<&str>| -> Result<String> {
@@ -54,7 +55,7 @@ pub(crate) fn retain_payload(
         Ok(hash)
     };
     let mut artifacts = Vec::new();
-    for selected in &payload.artifacts {
+    for (index, selected) in payload.artifacts.iter().enumerate() {
         let path = destination.join(
             selected
                 .path
@@ -62,10 +63,12 @@ pub(crate) fn retain_payload(
                 .ok_or_else(|| CiError::Message("selected artifact filename missing".into()))?,
         );
         copy(&selected.path, &path, Some(&selected.sha256))?;
-        artifacts.push(crate::windows_installed_cases::SelectedArtifact {
-            path,
-            sha256: selected.sha256.clone(),
-        });
+        if index < selected_count {
+            artifacts.push(crate::windows_installed_cases::SelectedArtifact {
+                path,
+                sha256: selected.sha256.clone(),
+            });
+        }
     }
     let manifest = destination.join("runtime-manifest.json");
     if !manifest.exists() {
@@ -319,7 +322,6 @@ pub fn run(
             payload: older.clone(),
         },
     )?;
-    crate::windows_consumer_readiness::provision_from_source_until(root, &current, deadlines.work)?;
     let lease_id = super::artifacts::checksum(&serde_json::to_vec(&(
         identity,
         key,
@@ -338,7 +340,8 @@ pub fn run(
     let mut recovery_complete = false;
     let mut removal = None;
     let mut failures = Vec::new();
-    let assessment = crate::windows_installed_cases::run_with_observer_until(
+    let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
+        root,
         &current,
         &mut |observed| {
             let (phase, operation) = match observed.phase {

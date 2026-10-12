@@ -126,7 +126,6 @@ pub struct ImportRefusalReport {
 struct ImportSourceOwner {
     root: File,
     parent: File,
-    path: PathBuf,
     name: std::ffi::OsString,
     socket: Option<std::os::unix::net::UnixListener>,
     socket_parent: Option<File>,
@@ -136,6 +135,10 @@ struct ImportSourceOwner {
     directory: PathBuf,
 }
 impl ImportRefusalReport {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Import refusal proof binds installed images, account, policy, original lease, and acquisition independently"
+    )]
     pub fn run(
         &mut self,
         input: &super::linux_mixed_installed::InstalledMixedDriverInput<'_>,
@@ -258,7 +261,6 @@ impl ImportRefusalReport {
         self.source = Some(ImportSourceOwner {
             root,
             parent,
-            path: source.clone(),
             name: source.file_name().expect("finite source leaf").to_owned(),
             socket: None,
             socket_parent: None,
@@ -905,12 +907,13 @@ impl AccountRefusalReport {
                 failures.push(error.to_string());
             }
         }
-        if let Some(owner) = &mut self.external {
-            if !owner.settled {
-                if let Err(error) = owner.settle(deadline) {
-                    failures.push(error.to_string());
-                }
-            }
+        if let Some(Err(error)) = self
+            .external
+            .as_mut()
+            .filter(|owner| !owner.settled)
+            .map(|owner| owner.settle(deadline))
+        {
+            failures.push(error.to_string());
         }
         if let Some(reservation) = self.reservation.as_mut() {
             match reservation.settle() {

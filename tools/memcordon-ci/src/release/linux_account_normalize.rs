@@ -7,6 +7,10 @@ use memcordon_readiness_verifier::{Artifact, CaseKey, LinuxAccountRefusalEvidenc
 use std::{collections::BTreeMap, path::Path};
 
 impl AccountRefusalReport {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Normalization binds independent original account, lease, acquisition, and artifact custody inputs"
+    )]
     pub fn normalize(
         &self,
         identity: &SourceIdentity,
@@ -53,10 +57,13 @@ impl AccountRefusalReport {
                 length: bytes.len() as u64,
                 sha256: super::artifacts::checksum(bytes),
             };
-            if let Some(prior) = artifacts.insert(relative.clone(), artifact.clone()) {
-                if prior.length != artifact.length || prior.sha256 != artifact.sha256 {
-                    return Err(CiError::Message("account archive custody conflict".into()));
-                }
+            if artifacts
+                .insert(relative.clone(), artifact.clone())
+                .is_some_and(|prior| {
+                    prior.length != artifact.length || prior.sha256 != artifact.sha256
+                })
+            {
+                return Err(CiError::Message("account archive custody conflict".into()));
             }
             Ok(relative)
         };
@@ -166,8 +173,6 @@ impl AccountRefusalReport {
         let restoration_invocation = optional("alias-restoration.invocation.json", alias)?;
         let restoration_exit = optional("alias-restoration.exit.json", alias)?;
         let restoration_stderr = optional("alias-restoration.stderr.bin", alias)?;
-        drop(optional);
-        drop(capture);
         let challenge = persist("challenge.bin", &challenge_bytes)?;
         let owner_artifact = persist("owner.json", &serde_json::to_vec(owner)?)?;
         let frontend_invocation = persist(
@@ -182,7 +187,6 @@ impl AccountRefusalReport {
             "public-invocation.json",
             &serde_json::to_vec(&result_value["invocation"])?,
         )?;
-        drop(persist);
         let mut original_path = |path: &Path| -> Result<String> {
             let relative = path
                 .strip_prefix(artifact_root)
@@ -200,12 +204,15 @@ impl AccountRefusalReport {
                 length: bytes.len() as u64,
                 sha256: super::artifacts::checksum(&bytes),
             };
-            if let Some(prior) = artifacts.insert(relative.clone(), artifact.clone()) {
-                if prior.length != artifact.length || prior.sha256 != artifact.sha256 {
-                    return Err(CiError::Message(
-                        "account original archive custody conflict".into(),
-                    ));
-                }
+            if artifacts
+                .insert(relative.clone(), artifact.clone())
+                .is_some_and(|prior| {
+                    prior.length != artifact.length || prior.sha256 != artifact.sha256
+                })
+            {
+                return Err(CiError::Message(
+                    "account original archive custody conflict".into(),
+                ));
             }
             Ok(relative)
         };

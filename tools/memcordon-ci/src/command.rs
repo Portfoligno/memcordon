@@ -193,6 +193,18 @@ impl CommandSpec {
         command.env_remove("CARGO_REGISTRY_TOKEN");
         command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
         command.env_remove("GITHUB_TOKEN");
+        if matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+            && self
+                .arguments
+                .first()
+                .is_some_and(|argument| argument == OsStr::new("test"))
+        {
+            // Test fixtures can call real release emitters concurrently. Their
+            // observations must not enter the enclosing runner step's channels.
+            // Production children retain these channels for owner transitions.
+            command.env_remove("GITHUB_OUTPUT");
+            command.env_remove("GITHUB_STEP_SUMMARY");
+        }
     }
     pub fn cleared_environment(mut self) -> Self {
         self.clear_environment = true;
@@ -289,9 +301,103 @@ impl CommandSpec {
         &self,
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
     ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_mode(observe_creation, false)
+    }
+
+    /// Observe the genuine executed image while the original child is stopped
+    /// at its kernel exec event, then release it under the same cutoff.
+    #[cfg(target_os = "linux")]
+    pub fn output_quiet_with_exec_observation(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+    ) -> Result<ObservedOutput> {
+        self.output_quiet_with_creation_mode(observe_creation, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn output_quiet_with_creation_mode(
+        &self,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+        hold_exec: bool,
+    ) -> Result<ObservedOutput> {
         let command = self.materialize()?;
+        let budget = self.available_budget()?;
+        let deadline = self
+            .operation_deadline
+            .unwrap_or(Instant::now() + budget)
+            .min(Instant::now() + budget);
         let mut observation_error = None;
         let output = memcordon_testkit::run_with_deadline_owned_spawn_after_output_limit(
+            command,
+            budget,
+            self.output_limit,
+            |mut command| {
+                if hold_exec {
+                    memcordon_testkit::configure_native_exec_observation(&mut command);
+                }
+                let child = command.spawn()?;
+                let observed = (|| -> Result<()> {
+                    let stop = if hold_exec {
+                        Some(memcordon_testkit::NativeExecObservation::acquire(
+                            &child, deadline,
+                        )?)
+                    } else {
+                        None
+                    };
+                    observe_creation(&child)?;
+                    if let Some(stop) = stop {
+                        if Instant::now() >= deadline {
+                            return Err(CiError::Message(
+                                "original exec observation cutoff exhausted before release".into(),
+                            ));
+                        }
+                        stop.release()?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = observed {
+                    observation_error = Some(error);
+                }
+                Ok(child)
+            },
+            |_| Ok(()),
+        );
+        match (output, observation_error) {
+            (Ok(output), None) => Ok(output),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), original) => Err(CiError::Message(format!(
+                "native creation observation={original:?}; native settlement={error}"
+            ))),
+        }
+    }
+
+    /// Supply an already retained finite input without blocking a pipe before
+    /// the sole deadline owner starts. Creation failures still settle the child.
+    #[cfg(unix)]
+    pub fn output_quiet_with_stdin_and_creation(
+        &self,
+        input: &std::fs::File,
+        observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
+    ) -> Result<ObservedOutput> {
+        use std::io::{Read, Seek, SeekFrom};
+        let metadata = input.metadata()?;
+        let flags = rustix::fs::fcntl_getfl(input).map_err(std::io::Error::from)?;
+        if !metadata.is_file()
+            || metadata.len() > 65536
+            || flags & rustix::fs::OFlags::ACCMODE != rustix::fs::OFlags::RDONLY
+        {
+            return Err(CiError::Message(
+                "native recovery stdin is not a finite readonly record".into(),
+            ));
+        }
+        let mut supplied = input.try_clone()?;
+        supplied.seek(SeekFrom::Start(0))?;
+        let mut command = self.materialize()?;
+        command.stdin(std::process::Stdio::piped());
+        let mut observation_error = None;
+        let deliver_input = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_creation = std::sync::Arc::clone(&deliver_input);
+        let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
             command,
             self.available_budget()?,
             self.output_limit,
@@ -299,10 +405,24 @@ impl CommandSpec {
                 let child = command.spawn()?;
                 if let Err(error) = observe_creation(&child) {
                     observation_error = Some(error);
+                } else {
+                    observed_creation.store(true, std::sync::atomic::Ordering::Release);
                 }
                 Ok(child)
             },
-            |_| Ok(()),
+            move |_, stdin, _| {
+                let mut stdin = stdin
+                    .ok_or_else(|| std::io::Error::other("native recovery input pipe absent"))?;
+                if deliver_input.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut bounded = supplied.take(metadata.len() + 1);
+                    if std::io::copy(&mut bounded, &mut stdin)? != metadata.len() {
+                        return Err(std::io::Error::other(
+                            "native recovery input length changed during delivery",
+                        ));
+                    }
+                }
+                Ok(())
+            },
         );
         match (output, observation_error) {
             (Ok(output), None) => Ok(output),
@@ -390,7 +510,7 @@ impl CommandSpec {
             std::fs::create_dir_all(&directory)?;
             let temporary = directory.join(phase.name()).with_extension("tmp");
             let path = directory.join(phase.name()).with_extension("json");
-            crate::release::source::write_json(&temporary, &value)?;
+            crate::release::source::write_diagnostic_json(&temporary, &value)?;
             std::fs::rename(temporary, path)?;
             Ok(())
         };
@@ -425,8 +545,9 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
     if bytes.len() <= limit && first.len() <= limit {
         return (first.into_owned(), false);
     }
-    if let Some(failure) = libtest_failure_section(bytes) {
-        let before = " [excerpt truncated; first libtest failure section] ";
+    let failures = libtest_failure_sections(bytes);
+    if !failures.is_empty() {
+        let before = " [excerpt truncated; libtest failure sections] ";
         let after = " [excerpt truncated; remaining output] ";
         let content_budget = limit - before.len() - after.len();
         let failure_budget = content_budget / 2;
@@ -435,7 +556,13 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
         let mut text = String::with_capacity(limit);
         append_excerpt_head(&mut text, bytes, head_budget);
         text.push_str(before);
-        text.push_str(&head_tail_excerpt(failure, failure_budget).0);
+        let section_budget = failure_budget / failures.len();
+        let remainder = failure_budget % failures.len();
+        for (index, failure) in failures.into_iter().enumerate() {
+            text.push_str(
+                &head_tail_excerpt(failure, section_budget + usize::from(index < remainder)).0,
+            );
+        }
         text.push_str(after);
         append_excerpt_tail(&mut text, bytes, tail_budget);
         return (text, true);
@@ -443,9 +570,10 @@ fn excerpt(bytes: &[u8]) -> (String, bool) {
     head_tail_excerpt(bytes, limit)
 }
 
-fn libtest_failure_section(bytes: &[u8]) -> Option<&[u8]> {
+fn libtest_failure_sections(bytes: &[u8]) -> Vec<&[u8]> {
     let mut offset = 0;
     let mut start = None;
+    let mut sections = Vec::new();
     for raw_line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -456,13 +584,13 @@ fn libtest_failure_section(bytes: &[u8]) -> Option<&[u8]> {
         if line.starts_with(b"test result: FAILED.")
             && let Some(start) = start
         {
-            return Some(&bytes[start..offset]);
+            sections.push(&bytes[start..offset]);
         }
         if line.starts_with(b"test result: ") {
             start = None;
         }
     }
-    None
+    sections
 }
 
 fn head_tail_excerpt(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -471,6 +599,11 @@ fn head_tail_excerpt(bytes: &[u8], limit: usize) -> (String, bool) {
         return (first.into_owned(), false);
     }
     let marker = " [excerpt truncated] ";
+    if limit <= marker.len() {
+        let mut text = String::new();
+        append_excerpt_head(&mut text, bytes, limit);
+        return (text, true);
+    }
     let content_budget = limit - marker.len();
     let head_budget = content_budget / 2;
     let tail_budget = content_budget - head_budget;

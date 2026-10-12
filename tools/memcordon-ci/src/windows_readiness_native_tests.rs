@@ -1,5 +1,6 @@
 //! Exact native component test execution with explicit stdin receipt requests.
 //! Test harness success and native operation observations are separate facts.
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -546,7 +547,24 @@ mod native {
                     .file_name()
                     .is_some_and(|name| name != "native-receipt.json")
                 {
-                    let bytes = read(&path, 256 * 1024)?;
+                    let bound = if test_name == INDEX_PARSER
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                matches!(
+                                    name,
+                                    "base-index.json"
+                                        | "duplicate-case-index.json"
+                                        | "wrong-product-index.json"
+                                        | "omitted-case-index.json"
+                                )
+                            }) {
+                        memcordon_readiness_verifier::MAX_INDEX_BYTES
+                    } else {
+                        256 * 1024
+                    };
+                    let bytes = read(&path, bound)?;
                     record
                         .artifacts
                         .push(crate::windows_installed_cases::SelectedArtifact {

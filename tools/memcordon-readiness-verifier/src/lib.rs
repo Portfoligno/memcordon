@@ -14,7 +14,9 @@ mod linux_build;
 mod linux_component;
 mod linux_cross_account;
 mod linux_cross_attempt;
+pub mod linux_frontend_access;
 mod linux_isolation;
+mod linux_path;
 pub use linux_account_refusal::LinuxAccountRefusalEvidence;
 mod linux_import_refusal;
 pub use linux_import_refusal::LinuxIsolationImportEvidence;
@@ -36,6 +38,12 @@ mod linux_exports;
 mod linux_images;
 mod linux_limits;
 mod linux_recovery;
+mod original_fixture_recovery;
+pub use original_fixture_recovery::contract as original_fixture_recovery_contract;
+pub use original_fixture_recovery::{
+    OriginalFixtureRecovery, validate_embedded_original_fixture_recovery,
+    validate_original_fixture_recovery,
+};
 mod linux_recovery_route;
 mod linux_registry;
 mod linux_release;
@@ -165,7 +173,7 @@ fn validate_producer_bundle(
         }
     }
     let manifest_bytes = {
-        let mut member = archive
+        let member = archive
             .by_name("producer-manifest.json")
             .map_err(|_| "producer archive lacks immutable original manifest")?;
         if member.is_dir() || member.size() > MAX_INDEX_BYTES as u64 {
@@ -220,7 +228,7 @@ fn validate_producer_bundle(
         if expected.len() as u64 != artifact.length || sha256(expected) != artifact.sha256 {
             return Err("producer raw artifact table differs from assessed bytes".into());
         }
-        let mut member = archive
+        let member = archive
             .by_name(&artifact.path)
             .map_err(|_| "assessed raw artifact absent from actual producer ZIP")?;
         if member.is_dir() || member.size() != artifact.length {
@@ -1938,6 +1946,10 @@ pub fn validate_linux_endpoint_mismatch(
 /// sources; they do not imply a target, Job, guardian or terminal existed.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct typed refusal wire payloads and their public constructors"
+)]
 pub enum WindowsRefusalEvidence {
     AuthenticatedAdmission {
         provider_request: String,
@@ -2279,6 +2291,10 @@ pub struct WindowsNativeComponentReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct typed component wire payloads and their public constructors"
+)]
 pub enum WindowsNativeComponentPayload {
     CausalCapture {
         before_journal: String,
@@ -3590,7 +3606,8 @@ pub fn validate_acquisition_payload_shape(original: &serde_json::Value) -> Verif
         if rows.is_empty()
             || rows.len() > 64
             || rows.iter().any(|row| !artifact(row))
-            || field != "artifacts" && rows.len() != 4
+            || field == "components" && rows.len() != 4
+            || field == "installed_components" && rows.len() != 3
         {
             return Err("acquisition artifact array shape differs".into());
         }
@@ -3738,6 +3755,16 @@ fn verify_acquisition_case(
         .map(|component| component.installed_sha256.as_str())
         .collect::<BTreeSet<_>>();
     for field in ["components", "installed_components"] {
+        let expected = if field == "installed_components" {
+            product
+                .components
+                .iter()
+                .filter(|component| component.role != "public-cli")
+                .map(|component| component.installed_sha256.as_str())
+                .collect::<BTreeSet<_>>()
+        } else {
+            expected_hashes.clone()
+        };
         let rows = original[field]
             .as_array()
             .ok_or("acquisition full component table absent")?;
@@ -3745,8 +3772,13 @@ fn verify_acquisition_case(
             .iter()
             .map(|row| row["sha256"].as_str().ok_or("component hash absent"))
             .collect::<Result<BTreeSet<_>, _>>()?;
-        if rows.len() != 4
-            || hashes != expected_hashes
+        if rows.len()
+            != if field == "installed_components" {
+                3
+            } else {
+                4
+            }
+            || hashes != expected
             || rows.iter().any(|row| {
                 row.as_object().is_none_or(|object| {
                     object.len() != 2
@@ -3755,7 +3787,10 @@ fn verify_acquisition_case(
                 }) || row["path"].as_str().is_none_or(str::is_empty)
             })
         {
-            return Err("acquisition omitted/substituted selected four-component bytes".into());
+            return Err(
+                "acquisition omitted/substituted selected components or installed provider bytes"
+                    .into(),
+            );
         }
     }
     digest(&evidence.fixture_sha256)?;
@@ -4289,7 +4324,10 @@ fn verify_linux_policy_refusal(
         let arguments: Vec<Vec<u8>> =
             serde_json::from_value(discovery_command["arguments"].clone())
                 .map_err(|error| error.to_string())?;
-        let command = decode(&evidence.frontend_invocation)?;
+        let command = crate::linux_frontend_access::resolve(
+            &decode(&evidence.frontend_invocation)?,
+            Some(custody.bytes(&evidence.requested_contract)?),
+        )?;
         let frontend_arguments: Vec<Vec<u8>> = serde_json::from_value(command["arguments"].clone())
             .map_err(|error| error.to_string())?;
         let contract_path = frontend_arguments
@@ -4297,17 +4335,13 @@ fn verify_linux_policy_refusal(
             .ok_or("discovery public contract path absent")?;
         let contract_path = std::str::from_utf8(contract_path)
             .map_err(|_| "discovery contract path is not UTF8")?;
-        let expected_path = std::path::Path::new(contract_path)
-            .parent()
+        // This is retained Linux command wire, independent of the verifier host.
+        let parent = contract_path
+            .rsplit_once('/')
             .ok_or("discovery contract parent absent")?
-            .join("discovery-contract.json");
-        if arguments.last().map(Vec::as_slice)
-            != Some(
-                expected_path
-                    .to_str()
-                    .ok_or("discovery path is not UTF8")?
-                    .as_bytes(),
-            )
+            .0;
+        let expected_path = format!("{parent}/discovery-contract.json");
+        if arguments.last().map(Vec::as_slice) != Some(expected_path.as_bytes())
             || decode(&discovery.contract)? != requested
         {
             return Err("discovery command does not address original exact contract".into());
@@ -4398,7 +4432,10 @@ fn verify_linux_policy_refusal(
         );
     }
     let challenge = custody.bytes(&evidence.challenge)?;
-    let command = decode(&evidence.frontend_invocation)?;
+    crate::linux_frontend_access::resolve(
+        &decode(&evidence.frontend_invocation)?,
+        Some(custody.bytes(&evidence.requested_contract)?),
+    )?;
     let invocation = decode(&evidence.invocation)?;
     let caller = if record.key.scenario == "wrong-caller" {
         65533
@@ -4406,7 +4443,7 @@ fn verify_linux_policy_refusal(
         65534
     };
     validate_linux_policy_frontend(
-        &command,
+        &decode(&evidence.frontend_invocation)?,
         &invocation,
         challenge,
         caller,
@@ -4835,18 +4872,20 @@ fn verify_record(
                         && record.key.scenario == "argv-nul-rejection")
                         || (record.key.family == "W-STATUS"
                             && record.key.scenario == "admission-refusal"));
-                if frontend_refusal {
-                    if native.root_pid.is_some()
+                if frontend_refusal
+                    && (native.root_pid.is_some()
                         || native.root_birth.is_some()
                         || native.target_status.is_some()
                         || native.authenticated_provider_exchange
                         || native.attempt_id.is_some()
                         || native.attempt_nonce.is_some()
                         || evidence.authenticated_terminal.is_some()
-                        || evidence.provider_request.is_some()
-                    {
-                        return Err("preauthorization facade refusal invents released target/provider terminal".into());
-                    }
+                        || evidence.provider_request.is_some())
+                {
+                    return Err(
+                        "preauthorization facade refusal invents released target/provider terminal"
+                            .into(),
+                    );
                 }
                 let actual_request = if !frontend_refusal
                     && (record.key.target.ends_with("windows-msvc")
@@ -5477,12 +5516,11 @@ fn verify_semantic(
     }
     wire::validate_arguments(&input.target_argv, &evidence.key.target)?;
     let mut operations = BTreeSet::new();
-    if let Some(behavior) = &semantic.fixture_behavior {
-        if evidence.key.target.ends_with("linux-gnu")
-            && behavior.native_binding != evidence.prepared_native_receipt
-        {
-            return Err("Linux behavior root binding differs from independent preauthorization native observation".into());
-        }
+    if let Some(behavior) = &semantic.fixture_behavior
+        && evidence.key.target.ends_with("linux-gnu")
+        && behavior.native_binding != evidence.prepared_native_receipt
+    {
+        return Err("Linux behavior root binding differs from independent preauthorization native observation".into());
     }
     let behavior_facts = semantic
         .fixture_behavior

@@ -931,6 +931,16 @@ pub fn open_installed(
     if definition.target != native_target()? {
         return Err("image target differs from executing native provider".into());
     }
+    let regular = definition
+        .entries
+        .as_slice()
+        .iter()
+        .filter(|entry| matches!(entry, ImageEntryV1::Regular { .. }))
+        .count();
+    // Every authoritative image acquisition, including policy reactivation,
+    // must account for all image handles already held by this process.
+    let image_capacity = super::image_fd_budget::ensure(regular, 0)
+        .map_err(|error| format!("prepare image descriptor capacity: {error}"))?;
     let reference = definition.reference()?;
     let store = store(false)?;
     let root = directory_at(store.as_fd(), &image_name(&reference), false)?;
@@ -991,5 +1001,6 @@ pub fn open_installed(
         objects,
     };
     held.revalidate()?;
+    drop(image_capacity);
     Ok(held)
 }

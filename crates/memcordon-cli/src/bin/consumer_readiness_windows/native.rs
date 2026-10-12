@@ -6,8 +6,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsTokenRestricted, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
-    TokenUser,
+    GetTokenInformation, IsTokenRestricted, TokenElevation, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -22,6 +21,103 @@ use windows_sys::Win32::System::Threading::{
 
 fn wide(value: &Path) -> Vec<u16> {
     value.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// Observe the catalog in the original failing child; never load or replace a provider.
+pub fn tcp_bind_failure(original: io::Error) -> io::Error {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPROTOCOL_INFOW, WSCEnumProtocols, WSCGetProviderPath,
+    };
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    const ENTRIES: usize = 64;
+    const PATH_UNITS: usize = 2048;
+    let mut entries: Vec<WSAPROTOCOL_INFOW> = (0..ENTRIES)
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    let mut bytes = (ENTRIES * std::mem::size_of::<WSAPROTOCOL_INFOW>()) as u32;
+    let mut catalog_error = 0;
+    // SAFETY: the aligned vector has the exact advertised writable capacity.
+    let count = unsafe {
+        WSCEnumProtocols(
+            std::ptr::null(),
+            entries.as_mut_ptr(),
+            &raw mut bytes,
+            &raw mut catalog_error,
+        )
+    };
+    let mut observations = Vec::new();
+    let mut matching_count = 0;
+    if count >= 0 && (count as usize) <= ENTRIES {
+        matching_count = entries
+            .iter()
+            .take(count as usize)
+            .filter(|entry| {
+                entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
+            })
+            .count();
+        for entry in entries
+            .iter()
+            .take(count as usize)
+            .filter(|entry| {
+                entry.iAddressFamily == 2 && entry.iSocketType == 1 && entry.iProtocol == 6
+            })
+            .take(8)
+        {
+            let mut path = [0u16; PATH_UNITS];
+            let mut units = PATH_UNITS as i32;
+            let mut path_error = 0;
+            // SAFETY: provider identity comes from this actual catalog and output is bounded.
+            let status = unsafe {
+                WSCGetProviderPath(
+                    &entry.ProviderId,
+                    path.as_mut_ptr(),
+                    &raw mut units,
+                    &raw mut path_error,
+                )
+            };
+            let end = path.iter().position(|unit| *unit == 0);
+            let mut expanded = [0u16; PATH_UNITS];
+            let expanded_units = if status == 0 && end.is_some() {
+                // SAFETY: path is terminated and destination has the advertised capacity.
+                unsafe {
+                    ExpandEnvironmentStringsW(
+                        path.as_ptr(),
+                        expanded.as_mut_ptr(),
+                        PATH_UNITS as u32,
+                    )
+                }
+            } else {
+                0
+            };
+            let expansion_error = (status == 0 && end.is_some() && expanded_units == 0)
+                .then(io::Error::last_os_error);
+            let expanded_end = expanded.iter().position(|unit| *unit == 0);
+            let expanded_path = if expanded_units > 0 && expanded_units as usize <= PATH_UNITS {
+                expanded_end.map(|end| String::from_utf16_lossy(&expanded[..end]))
+            } else {
+                None
+            };
+            observations.push(format!(
+                "catalog-id={}; provider-id={:08x}-{:04x}-{:04x}-{:02x?}; chain-length={}; path-status={status}; path-error={path_error}; path-units={units}; path-cap={PATH_UNITS}; path-terminated={}; path={:?}; expanded={expanded_path:?}; expansion-units={expanded_units}; expansion-error={:?}",
+                entry.dwCatalogEntryId, entry.ProviderId.data1, entry.ProviderId.data2,
+                entry.ProviderId.data3, entry.ProviderId.data4,
+                entry.ProtocolChain.ChainLen,
+                end.is_some(),
+                end.filter(|_| status == 0).map(|end| String::from_utf16_lossy(&path[..end])),
+                expansion_error.and_then(|error| error.raw_os_error()),
+            ));
+        }
+    }
+    io::Error::new(
+        original.kind(),
+        format!(
+            "native TCP listener bind failed: raw-os-error={:?}; {original}; SystemRoot-present={}; windir-present={}; catalog-count={count}; catalog-cap={ENTRIES}; catalog-error={catalog_error}; catalog-bytes={bytes}; matching-provider-count={matching_count}; providers-truncated={}; IPv4-TCP-provider-observations={observations:?}",
+            original.raw_os_error(),
+            std::env::var_os("SystemRoot").is_some(),
+            std::env::var_os("windir").is_some(),
+            matching_count > 8,
+        ),
+    )
 }
 
 pub struct NamedPipeProducts {
@@ -171,7 +267,11 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
     // SAFETY: sizing query does not read a buffer.
     unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length) };
     if length == 0 || length > 64 * 1024 {
-        return Err(io::Error::other("token field exceeds bound"));
+        let cause = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "token-snapshot GetTokenInformation sizing; class={class}; length={length}; raw-os-error={:?}; cause={cause}; token field exceeds bound",
+            cause.raw_os_error()
+        )));
     }
     let slots = (length as usize).div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0usize; slots];
@@ -186,7 +286,11 @@ fn token_bytes(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        let cause = frontend_os_error("token-snapshot GetTokenInformation read");
+        return Err(io::Error::new(
+            cause.kind(),
+            format!("{cause}; class={class}"),
+        ));
     }
     Ok(buffer)
 }
@@ -196,13 +300,11 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{
         TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenRestrictedSids,
     };
-    let mut token = std::ptr::null_mut();
-    // SAFETY: pseudo current process handle and output token pointer are valid.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: newly opened token handle transfers to OwnedHandle once.
-    let owned = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
+    // GetCurrentProcessToken is an inline Windows SDK function returning -4.
+    // Its pseudo-handle queries this process's actual token without reopening
+    // the token object through its DACL. It grants only query access, cannot be
+    // inherited or duplicated, and must not be treated as an owned handle.
+    let token = -4isize as windows_sys::Win32::Foundation::HANDLE;
     let user = token_bytes(token, TokenUser)?;
     let integrity = token_bytes(token, TokenIntegrityLevel)?;
     let elevation = token_bytes(token, TokenElevation)?;
@@ -224,7 +326,7 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
             level,
         )
     };
-    // SAFETY: IsTokenRestricted only observes the live held token.
+    // SAFETY: IsTokenRestricted only observes this process's token pseudo-handle.
     let restricted = unsafe { IsTokenRestricted(token) } != 0;
     let groups = token_bytes(token, TokenRestrictedSids)?;
     // SAFETY: native TokenRestrictedSids result is an aligned TOKEN_GROUPS
@@ -263,10 +365,9 @@ pub fn token_observation() -> io::Result<Vec<u8>> {
     }
     restricting_sids.sort();
     let elevated = elevation.first().copied().unwrap_or(0) & u32::MAX as usize != 0;
-    drop(owned);
     serde_json::to_vec(&serde_json::json!({"user_sid":sid,"restricted":restricted,
         "integrity_rid":level,"elevated":elevated,"restricting_sids":restricting_sids}))
-    .map_err(io::Error::other)
+    .map_err(|error| io::Error::other(format!("token-snapshot serialize observation: {error}")))
 }
 
 pub fn nested_job() -> io::Result<()> {
@@ -481,6 +582,15 @@ pub fn current_identity() -> io::Result<memcordon_core::WindowsProcessIdentityV1
 
 pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32, bool)> {
     use std::os::windows::io::AsRawHandle;
+    process_parent_and_liveness(child.as_raw_handle(), child.id())
+}
+
+pub(super) fn held_parent_and_liveness(owner: &OwnedHandle, pid: u32) -> io::Result<(u32, bool)> {
+    use std::os::windows::io::AsRawHandle;
+    process_parent_and_liveness(owner.as_raw_handle(), pid)
+}
+
+fn process_parent_and_liveness(handle: HANDLE, pid: u32) -> io::Result<(u32, bool)> {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     #[repr(C)]
     struct BasicProcessInformation {
@@ -512,7 +622,7 @@ pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32
     // information layout, initialized bounded output; query changes no state.
     let status = unsafe {
         NtQueryInformationProcess(
-            child.as_raw_handle(),
+            handle,
             0,
             (&mut basic as *mut BasicProcessInformation).cast(),
             std::mem::size_of::<BasicProcessInformation>() as u32,
@@ -521,7 +631,7 @@ pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32
     };
     if status < 0
         || length as usize != std::mem::size_of::<BasicProcessInformation>()
-        || basic.process_id != child.id() as usize
+        || basic.process_id != pid as usize
     {
         return Err(io::Error::other(format!(
             "owned child native parent query failed with NTSTATUS {status}"
@@ -530,7 +640,7 @@ pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32
     let parent = u32::try_from(basic.parent_process_id)
         .map_err(|_| io::Error::other("native parent PID exceeds width"))?;
     // SAFETY: zero-time wait observes only this still-held native process handle.
-    let wait = unsafe { WaitForSingleObject(child.as_raw_handle(), 0) };
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
     match wait {
         0 => Ok((parent, false)),
         258 => Ok((parent, true)),
@@ -538,10 +648,40 @@ pub fn child_parent_and_liveness(child: &std::process::Child) -> io::Result<(u32
     }
 }
 
+fn frontend_os_error(operation: &'static str) -> io::Error {
+    let cause = io::Error::last_os_error();
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "native frontend {operation}: raw-os-error={:?}; {cause}",
+            cause.raw_os_error()
+        ),
+    )
+}
+
 /// Trusted test launcher only: it changes the frontend caller envelope and waits
 /// for that frontend. The installed provider remains the workload supervisor.
 pub fn restricted_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
-    launch_frontend(arguments, true, None)
+    launch_frontend(arguments, true, None, false)
+}
+
+pub fn system_frontend(arguments: impl Iterator<Item = std::ffi::OsString>) -> io::Result<i32> {
+    launch_frontend(arguments, false, None, true)
+}
+
+pub fn system_restricted_frontend(
+    arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> io::Result<i32> {
+    launch_frontend(arguments, true, None, true)
+}
+
+pub fn system_sentinel_frontend(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> io::Result<i32> {
+    let descriptor = arguments
+        .next()
+        .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), true)
 }
 
 pub fn sentinel_frontend(
@@ -550,13 +690,14 @@ pub fn sentinel_frontend(
     let descriptor = arguments
         .next()
         .ok_or_else(|| io::Error::other("sentinel descriptor missing"))?;
-    launch_frontend(arguments, false, Some(Path::new(&descriptor)))
+    launch_frontend(arguments, false, Some(Path::new(&descriptor)), false)
 }
 
 fn launch_frontend(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
     restrict: bool,
     sentinel_descriptor: Option<&Path>,
+    system_environment: bool,
 ) -> io::Result<i32> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
@@ -569,10 +710,11 @@ fn launch_frontend(
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, CreateProcessAsUserW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+        WaitForSingleObject,
     };
     let executable = arguments
         .next()
@@ -593,7 +735,7 @@ fn launch_frontend(
     let mut primary = std::ptr::null_mut();
     // SAFETY: current process pseudo-handle and writable output are valid.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("OpenProcessToken"));
     }
     // SAFETY: successful OpenProcessToken transfers one token reference.
     let primary_owned = unsafe { OwnedHandle::from_raw_handle(primary.cast()) };
@@ -611,7 +753,7 @@ fn launch_frontend(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("CreateWellKnownSid"));
     }
     let restricting = SID_AND_ATTRIBUTES {
         Sid: restricting_sid.as_mut_ptr().cast(),
@@ -635,7 +777,7 @@ fn launch_frontend(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("CreateRestrictedToken"));
     }
     // SAFETY: newly returned restricted token reference transfers once.
     let restricted_owned = unsafe { OwnedHandle::from_raw_handle(restricted.cast()) };
@@ -697,11 +839,12 @@ fn launch_frontend(
             ));
         }
         // SAFETY: query and scoped flag change on the three owned frontend streams.
-        if unsafe { GetHandleInformation(*handle, &mut original[index]) } == 0
-            || unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
-                == 0
-        {
-            return Err(io::Error::last_os_error());
+        if unsafe { GetHandleInformation(*handle, &mut original[index]) } == 0 {
+            return Err(frontend_os_error("GetHandleInformation standard stream"));
+        }
+        // SAFETY: scoped flag change on the same borrowed frontend stream.
+        if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(frontend_os_error("SetHandleInformation standard stream"));
         }
     }
     let mut size = 0usize;
@@ -711,7 +854,7 @@ fn launch_frontend(
     let attributes = storage.as_mut_ptr().cast();
     // SAFETY: aligned storage covers the complete native attribute-list size.
     if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(frontend_os_error("InitializeProcThreadAttributeList"));
     }
     let operation = (|| -> io::Result<i32> {
         // SAFETY: explicit borrowed standard-handle list lives through creation.
@@ -727,7 +870,7 @@ fn launch_frontend(
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("UpdateProcThreadAttribute handle list"));
         }
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -741,6 +884,16 @@ fn launch_frontend(
         command_line.push(0);
         let name: Vec<u16> = executable.encode_wide().chain(Some(0)).collect();
         let mut process = PROCESS_INFORMATION::default();
+        let environment = if system_environment {
+            Some(
+                memcordon_core::encode_windows_environment_block(
+                    &super::fixture_environment::entries()?,
+                )
+                .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
         // SAFETY: measured absolute image, reviewed native argv encoder, held
         // token and exact three-handle list. This is never a shell invocation.
         let token = if restrict {
@@ -756,22 +909,30 @@ fn launch_frontend(
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-                std::ptr::null(),
+                CREATE_SUSPENDED
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | if system_environment {
+                        CREATE_UNICODE_ENVIRONMENT
+                    } else {
+                        0
+                    },
+                environment
+                    .as_ref()
+                    .map_or(std::ptr::null(), |block| block.as_ptr().cast()),
                 std::ptr::null(),
                 &startup.StartupInfo,
                 &mut process,
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("CreateProcessAsUserW measured frontend"));
         }
         // SAFETY: returned process/thread references transfer exactly once.
         let process_owned = unsafe { OwnedHandle::from_raw_handle(process.hProcess.cast()) };
         let thread_owned = unsafe { OwnedHandle::from_raw_handle(process.hThread.cast()) };
         // SAFETY: only this launcher owns the frontend's initial suspended thread.
         if unsafe { ResumeThread(thread_owned.as_raw_handle()) } == u32::MAX {
-            let cause = io::Error::last_os_error();
+            let cause = frontend_os_error("ResumeThread");
             terminate_frontend(&process_owned)?;
             return Err(cause);
         }
@@ -785,7 +946,25 @@ fn launch_frontend(
         let mut code = 0;
         // SAFETY: process is held and has reached a terminal state.
         if unsafe { GetExitCodeProcess(process_owned.as_raw_handle(), &mut code) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(frontend_os_error("GetExitCodeProcess"));
+        }
+        if code != 0 {
+            use std::io::Write;
+            // Fixed native scalar fields bound this diagnostic independently of
+            // image paths or argv. A failed diagnostic write must not replace
+            // the original held child's exit status.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "native-frontend phase=inner-child-exited child-pid={} exit-code={} exit-code-hex=0x{:08x} restricted={} system-environment={}",
+                process.dwProcessId,
+                code,
+                code,
+                restrict,
+                system_environment,
+            );
+            if restrict && code == 0xc0000135 {
+                diagnose_restricted_dependencies(&restricted_owned);
+            }
         }
         Ok(code as i32)
     })();
@@ -807,6 +986,366 @@ fn launch_frontend(
     drop(primary_owned);
     drop(sentinel);
     operation
+}
+
+// Query existing native sections without mapping them or asserting that the
+// loader selected them. This uses the already duplicated original restricted
+// token solely for a section-DACL check, without thread impersonation.
+fn diagnose_known_dll_sections(token: &OwnedHandle) -> serde_json::Value {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE, LocalFree, UNICODE_STRING};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        AccessCheck, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET,
+    };
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut UNICODE_STRING,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtOpenDirectoryObject(
+            handle: *mut HANDLE,
+            access: u32,
+            attributes: *const ObjectAttributes,
+        ) -> i32;
+        fn NtOpenSection(
+            handle: *mut HANDLE,
+            access: u32,
+            attributes: *const ObjectAttributes,
+        ) -> i32;
+    }
+    fn attributes(
+        storage: &mut [u16],
+        name: &mut UNICODE_STRING,
+        root: HANDLE,
+    ) -> ObjectAttributes {
+        *name = UNICODE_STRING {
+            Length: (storage.len() * 2) as u16,
+            MaximumLength: (storage.len() * 2) as u16,
+            Buffer: storage.as_mut_ptr(),
+        };
+        ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: root,
+            object_name: name,
+            attributes: 0x40, // OBJ_CASE_INSENSITIVE
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        }
+    }
+    let mut storage: Vec<u16> = r"\KnownDlls".encode_utf16().collect();
+    let mut name = UNICODE_STRING::default();
+    let directory_attributes = attributes(&mut storage, &mut name, std::ptr::null_mut());
+    let mut directory = std::ptr::null_mut();
+    // SAFETY: fixed bounded native name and initialized output; query/traverse
+    // rights only. The name storage remains held throughout this call.
+    let directory_status =
+        unsafe { NtOpenDirectoryObject(&mut directory, 3, &directory_attributes) };
+    if directory_status < 0 || directory.is_null() {
+        return serde_json::json!({"scope":"known-dll-section-dacl-only", "namespace":r"\KnownDlls",
+            "stage":"NtOpenDirectoryObject", "ntstatus":directory_status,
+            "successful_status_null_handle":directory_status >= 0 && directory.is_null()});
+    }
+    // SAFETY: successful native open transferred one owned kernel handle.
+    let directory = unsafe { OwnedHandle::from_raw_handle(directory) };
+    let mut entries = Vec::new();
+    for leaf in [
+        "bcrypt.dll",
+        "bcryptprimitives.dll",
+        "kernel32.dll",
+        "advapi32.dll",
+        "ntdll.dll",
+    ] {
+        let mut storage: Vec<u16> = leaf.encode_utf16().collect();
+        let mut name = UNICODE_STRING::default();
+        let section_attributes = attributes(&mut storage, &mut name, directory.as_raw_handle());
+        let mut section = std::ptr::null_mut();
+        // SAFETY: same held native directory and fixed leaf, no map rights.
+        let status = unsafe { NtOpenSection(&mut section, 0x20001, &section_attributes) }; // READ_CONTROL | SECTION_QUERY
+        if status < 0 || section.is_null() {
+            entries.push(
+                serde_json::json!({"leaf":leaf,"stage":"NtOpenSection","ntstatus":status,
+                "absent":status == 0xc0000034u32 as i32,
+                "successful_status_null_handle":status >= 0 && section.is_null()}),
+            );
+            continue;
+        }
+        // SAFETY: successful native open transferred one section reference.
+        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: query security on this exact held section; descriptor allocation
+        // is LocalFree-owned and never outlives the section/token.
+        let security_status = unsafe {
+            GetSecurityInfo(
+                section.as_raw_handle(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if security_status != 0 || descriptor.is_null() {
+            entries.push(serde_json::json!({"leaf":leaf,"ntstatus":status,"stage":"held-section-security-descriptor",
+                "native_error":security_status,"successful_status_null_descriptor":security_status == 0 && descriptor.is_null()}));
+            continue;
+        }
+        let mut checks = Vec::new();
+        for desired in [12, 4, 8] {
+            // SECTION_MAP_READ | SECTION_MAP_EXECUTE, each separately
+            let mut mapping = GENERIC_MAPPING {
+                GenericRead: 0x20005,
+                GenericWrite: 0x20002,
+                GenericExecute: 0x20008,
+                GenericAll: 0xf001f,
+            };
+            let mut privileges = [0usize; 64];
+            let mut size = std::mem::size_of_val(&privileges) as u32;
+            let mut granted = 0;
+            let mut allowed = 0;
+            // SAFETY: original restricted query token, same held-section
+            // descriptor and fresh bounded aligned outputs. No section mapping.
+            let checked = unsafe {
+                AccessCheck(
+                    descriptor,
+                    token.as_raw_handle(),
+                    desired,
+                    &mut mapping,
+                    privileges.as_mut_ptr().cast::<PRIVILEGE_SET>(),
+                    &mut size,
+                    &mut granted,
+                    &mut allowed,
+                )
+            };
+            let error = if checked == 0 || allowed == 0 {
+                io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            checks.push(if checked == 0 {
+                serde_json::json!({"desired":desired,"api_native_error":error})
+            } else {
+                serde_json::json!({"desired":desired,"allowed":allowed != 0,"granted":granted,"denial_native_error":error})
+            });
+        }
+        // SAFETY: all descriptor users have finished; exact allocation returned
+        // by successful GetSecurityInfo is released once.
+        unsafe { LocalFree(descriptor) };
+        entries.push(serde_json::json!({"leaf":leaf,"ntstatus":status,"checks":checks}));
+    }
+    serde_json::json!({"scope":"known-dll-section-dacl-only","namespace":r"\KnownDlls",
+        "directory_ntstatus":directory_status,"entries":entries})
+}
+
+// Observe only a finite set of direct import candidates. These leaf-DACL
+// checks do not identify the loader-selected module or model its full access.
+fn diagnose_restricted_dependencies(token: &OwnedHandle) {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AccessCheck, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GENERIC_MAPPING,
+        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET,
+        SecurityImpersonation, TOKEN_QUERY, TokenImpersonation,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS, FILE_EXECUTE, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, GetFileInformationByHandle, READ_CONTROL,
+    };
+    let mut setup_stage = "duplicate-original-restricted-token-for-query";
+    let mut observe = || -> io::Result<serde_json::Value> {
+        let mut impersonation = std::ptr::null_mut();
+        // SAFETY: the original restricted primary token remains held; output
+        // acquires a query-only impersonation token without changing any thread.
+        if unsafe {
+            DuplicateTokenEx(
+                token.as_raw_handle(),
+                TOKEN_QUERY,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut impersonation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful duplication transfers exactly one token reference.
+        let impersonation = unsafe { OwnedHandle::from_raw_handle(impersonation) };
+        let sections = diagnose_known_dll_sections(&impersonation).to_string();
+        if sections.len() + "native-frontend known-dll-access=".len() + 1 <= 8192 {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "native-frontend known-dll-access={sections}"
+            );
+        } else {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "native-frontend known-dll-access-unavailable=serialized-bound-exceeded"
+            );
+        }
+        setup_stage = "native-system-directory";
+        let mut directory = [0u16; 2048];
+        // SAFETY: bounded writable buffer; successful length excludes the NUL.
+        let units = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+                directory.as_mut_ptr(),
+                directory.len() as u32,
+            )
+        };
+        if units == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if units as usize >= directory.len() {
+            return Err(io::Error::other(
+                "system directory exceeds diagnostic bound",
+            ));
+        }
+        let directory =
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(&directory[..units as usize]));
+        if !directory.is_absolute() {
+            return Err(io::Error::other("system directory is not absolute"));
+        }
+        let mut entries = Vec::new();
+        for leaf in [
+            "bcrypt.dll",
+            "bcryptprimitives.dll",
+            "kernel32.dll",
+            "advapi32.dll",
+            "ntdll.dll",
+        ] {
+            let mut stage = "controller-open-read-control-attributes";
+            let result = (|| -> io::Result<serde_json::Value> {
+                let file = OpenOptions::new()
+                    .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+                    .share_mode(1)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(directory.join(leaf))?;
+                let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+                stage = "held-file-identity";
+                // SAFETY: exact held file and initialized native output.
+                if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut identity) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if identity.dwFileAttributes & 0x410 != 0 {
+                    return Err(io::Error::other("candidate is directory or reparse point"));
+                }
+                let mut descriptor = std::ptr::null_mut();
+                stage = "held-file-security-descriptor";
+                // SAFETY: query the same held file; native output is LocalFree-owned.
+                let status = unsafe {
+                    GetSecurityInfo(
+                        file.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION
+                            | GROUP_SECURITY_INFORMATION
+                            | DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut descriptor,
+                    )
+                };
+                if status != 0 {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                if descriptor.is_null() {
+                    return Err(io::Error::other("native security descriptor is null"));
+                }
+                stage = "restricted-token-leaf-dacl-access-check";
+                let mut checks = Vec::new();
+                // A combined denial cannot identify which concrete permission
+                // failed. Observe both constituent rights on this same token
+                // and descriptor; none of these checks models loader policy.
+                for desired in [FILE_READ_DATA | FILE_EXECUTE, FILE_READ_DATA, FILE_EXECUTE] {
+                    let mut mapping = GENERIC_MAPPING {
+                        GenericRead: FILE_GENERIC_READ,
+                        GenericWrite: FILE_GENERIC_WRITE,
+                        GenericExecute: FILE_GENERIC_EXECUTE,
+                        GenericAll: FILE_ALL_ACCESS,
+                    };
+                    let mut privileges = [0usize; 64];
+                    let mut size = std::mem::size_of_val(&privileges) as u32;
+                    let mut granted = 0;
+                    let mut allowed = 0;
+                    // SAFETY: same descriptor/token and newly initialized,
+                    // aligned bounded outputs remain live for each query.
+                    let checked = unsafe {
+                        AccessCheck(
+                            descriptor,
+                            impersonation.as_raw_handle(),
+                            desired,
+                            &mut mapping,
+                            privileges.as_mut_ptr().cast::<PRIVILEGE_SET>(),
+                            &mut size,
+                            &mut granted,
+                            &mut allowed,
+                        )
+                    };
+                    let native_error = if checked == 0 || allowed == 0 {
+                        io::Error::last_os_error().raw_os_error()
+                    } else {
+                        None
+                    };
+                    checks.push(if checked == 0 {
+                        serde_json::json!({"desired":desired,"api_native_error":native_error})
+                    } else {
+                        serde_json::json!({"desired":desired,"allowed":allowed != 0,
+                            "granted":granted,"denial_native_error":native_error})
+                    });
+                }
+                // SAFETY: GetSecurityInfo returned this allocation; no users remain.
+                unsafe { LocalFree(descriptor) };
+                Ok(serde_json::json!({"volume":identity.dwVolumeSerialNumber,
+                    "file_index":(u64::from(identity.nFileIndexHigh)<<32)|u64::from(identity.nFileIndexLow),
+                    "attributes":identity.dwFileAttributes,"checks":checks}))
+            })();
+            entries.push(match result { Ok(value) => serde_json::json!({"leaf":leaf,"observation":value}),
+                Err(error) => serde_json::json!({"leaf":leaf,"stage":stage,"native_error":error.raw_os_error(),"kind":format!("{:?}",error.kind())}) });
+        }
+        let directory_text = directory.to_string_lossy();
+        Ok(
+            serde_json::json!({"scope":"system-directory-direct-import-candidates-leaf-dacl-only",
+            "system_directory":directory_text.chars().take(256).collect::<String>(),
+            "system_directory_truncated":directory_text.chars().count()>256,
+            "entries":entries}),
+        )
+    };
+    let observation = match observe() {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+        "setup_stage":setup_stage,"setup_native_error":error.raw_os_error(),"setup_kind":format!("{:?}",error.kind())}),
+    };
+    // Finite candidates and scalar fields bound this independent evidence;
+    // failures to publish it never replace the original child's status.
+    let encoded = observation.to_string();
+    if encoded.len() <= 8192 {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "native-frontend dependency-access={encoded}"
+        );
+    } else {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "native-frontend dependency-access-unavailable=serialized-bound-exceeded"
+        );
+    }
 }
 
 pub fn retain_child_handle(child: &std::process::Child) -> io::Result<OwnedHandle> {

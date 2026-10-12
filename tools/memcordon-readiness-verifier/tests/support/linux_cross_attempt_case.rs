@@ -5,9 +5,7 @@ use super::{
 };
 use memcordon_core::workload_contract::LogicalId;
 use memcordon_core::workload_contract_v3::{DeniedOperationV3, RequirementV3, WorkloadContractV3};
-use memcordon_core::workload_registry_v3::{
-    ExclusiveIdentityDefinitionV3, RuntimePrivatePolicyRegistryV3,
-};
+use memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3;
 use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
@@ -65,19 +63,18 @@ fn move_peer_identity(value: &mut Value, key: &str) {
                     && n >= 300
                 {
                     *value = json!(n - 100);
-                } else if key == "inode" && (100..=104).contains(&n)
-                    || (key == "inode" && (1100..=1104).contains(&n))
+                } else if (key == "inode"
+                    && ((100..=104).contains(&n) || (1100..=1104).contains(&n)))
+                    || key == "root_inode"
                 {
-                    *value = json!(n + 5000);
-                } else if key == "root_inode" {
                     *value = json!(n + 5000);
                 }
             }
         }
-        Value::String(text) => {
-            if key == "attempt_id" && text == "07070707070707070707070707070707" {
-                *text = "08080808080808080808080808080808".into();
-            }
+        Value::String(text)
+            if key == "attempt_id" && text == "07070707070707070707070707070707" =>
+        {
+            *text = "08080808080808080808080808080808".into();
         }
         _ => {}
     }
@@ -117,25 +114,15 @@ fn copy_peer(case: &mut PersistedCase, peer: &PersistedCase) {
                     rekey(value, names)
                 }
             }
-            Value::String(text) => {
-                if names.contains(&text.as_str()) {
-                    *text = std::path::Path::new("peer")
-                        .join(&text)
-                        .to_str()
-                        .unwrap()
-                        .into();
-                }
+            Value::String(text) if names.contains(&text.as_str()) => {
+                *text = format!("peer/{text}");
             }
             _ => {}
         }
     }
     for name in names {
         let bytes = std::fs::read(peer.root.path().join(name)).unwrap();
-        let path = std::path::Path::new("peer")
-            .join(name)
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let path = format!("peer/{name}");
         if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
             rekey(&mut value, &names);
             case.json(&path, &value);
@@ -155,9 +142,9 @@ fn policy_command(
     receipt: &Value,
     pid: u32,
     birth: u64,
-    protected: &std::path::Path,
+    protected: &str,
 ) {
-    let command = json!({"format":"memcordon.linux-cross-policy-command","revision":1,"program":b"/usr/libexec/memcordon-sealed-agent".as_slice(),"arguments":[b"package".as_slice(),b"policy",b"apply",b"--file",protected.join(format!("{stem}.policy.json")).as_os_str().as_encoded_bytes()],"cwd":case.root.path().join("cross").as_os_str().as_encoded_bytes(),"environment_cleared":true,"budget_millis":60,"program_sha256":sha256(b"original agent image"),"program_device":7,"program_inode":300,"policy_sha256":sha256(&serde_json::to_vec(policy).unwrap())});
+    let command = json!({"format":"memcordon.linux-cross-policy-command","revision":1,"program":b"/usr/libexec/memcordon-sealed-agent".as_slice(),"arguments":[b"package".as_slice(),b"policy",b"apply",b"--file",format!("{protected}/{stem}.policy.json").as_bytes()],"cwd":format!("{}/cross",installed::EVIDENCE_ROOT).as_bytes(),"environment_cleared":true,"budget_millis":60,"program_sha256":sha256(b"original agent image"),"program_device":7,"program_inode":300,"policy_sha256":sha256(&serde_json::to_vec(policy).unwrap())});
     let mut command = command;
     command["started_unix_millis"] = json!(if stem == "activation" { 25 } else { 125 });
     command["deadline_unix_millis"] = json!(if stem == "activation" { 100 } else { 200 });
@@ -183,8 +170,8 @@ pub fn baseline() -> PersistedCase {
         vec![],
         original["requirements"].clone(),
     );
-    let root = case.root.path().to_str().unwrap().to_owned();
-    let mut account_fields = accounts::populate(&mut case, &root, "cross/account", 202);
+    let root = installed::EVIDENCE_ROOT;
+    let mut account_fields = accounts::populate(&mut case, root, "cross/account", 202);
     account_fields["original_lease"] = json!("installed/lease-owner.json");
     account_fields["original_acquisition"] = json!("installed/owned-resources-acquired.json");
     let account = account_fields["peer_account"].clone();
@@ -369,8 +356,8 @@ pub fn baseline() -> PersistedCase {
         &std::fs::read(case.root.path().join("peer/transcript.bin")).unwrap(),
     );
     case.write("peer/stderr.bin", b"");
-    let peer_dir = case.root.path().join("peer");
-    let command = json!({"format":"memcordon.linux-owned-frontend-invocation","revision":1,"program":b"/usr/bin/setpriv".as_slice(),"arguments":[b"--reuid".as_slice(),b"65534",b"--regid",b"65534",b"--clear-groups",b"--",b"/usr/libexec/memcordon",b"+256M",b"+30000ms",b"--sealed",b"--workload-contract",peer_dir.join("contract.json").as_os_str().as_encoded_bytes(),b"--report-format",b"result-v2",b"--report",peer_dir.join("result.json").as_os_str().as_encoded_bytes(),b"--mixed-observation-directory",peer_dir.join("observations").as_os_str().as_encoded_bytes(),b"--image-entrypoint",b"owned-readiness",b"--",b"own-abstract-held",token.as_bytes()],"environment_cleared":true,"caller_uid":65534,"caller_gid":65534,"selected_cli_sha256":sha256(b"original CLI image")});
+    let peer_dir = format!("{}/peer", installed::EVIDENCE_ROOT);
+    let command = json!({"format":"memcordon.linux-owned-frontend-invocation","revision":1,"program":b"/usr/bin/setpriv".as_slice(),"arguments":[b"--reuid".as_slice(),b"65534",b"--regid",b"65534",b"--clear-groups",b"--",b"/usr/libexec/memcordon",b"+256M",b"+30000ms",b"--sealed",b"--workload-contract",format!("{peer_dir}/contract.json").as_bytes(),b"--report-format",b"result-v2",b"--report",format!("{peer_dir}/result.json").as_bytes(),b"--mixed-observation-directory",format!("{peer_dir}/observations").as_bytes(),b"--image-entrypoint",b"owned-readiness",b"--",b"own-abstract-held",token.as_bytes()],"environment_cleared":true,"caller_uid":65534,"caller_gid":65534,"selected_cli_sha256":sha256(b"original CLI image")});
     case.json("peer/original-frontend-invocation.json", &command);
     case.json("peer/original-frontend-exit.json",&json!({"format":"memcordon.linux-policy-frontend-exit","revision":1,"process_id":202,"process_birth":201,"raw_wait_status":0,"native_exit":0,"signal":null,"invocation_sha256":sha256(&serde_json::to_vec(&command).unwrap()),"stdout_sha256":sha256(&std::fs::read(case.root.path().join("peer/stdout.bin")).unwrap()),"stderr_sha256":sha256(b"")}));
     let retired = |role: &str| json!({"pid":peer_prepared[role]["pid"],"birth":peer_prepared[role]["birth"],"parent_pid":null,"parent_birth":null,"retirement_observed":true});
@@ -378,8 +365,10 @@ pub fn baseline() -> PersistedCase {
     case.json("cross/prior-registry.json", &prior);
     case.json("cross/prior-activation.json", &initial);
     case.json("cross/original-contract.json", &original);
-    let protected =
-        std::path::Path::new(owner["admin_root"].as_str().unwrap()).join("cross-attempt-abstract");
+    let protected = format!(
+        "{}/cross-attempt-abstract",
+        owner["admin_root"].as_str().unwrap()
+    );
     let mut restoration = initial.clone();
     restoration["epoch"]["revision"] = json!(3);
     policy_command(
@@ -401,12 +390,12 @@ pub fn baseline() -> PersistedCase {
         &protected,
     );
     let lease = installed::read(&case, "installed/lease-owner.json");
-    case.json("cross/owner.json",&json!({"format":"memcordon.linux-cross-attempt-owner","revision":1,"identity":lease["identity"],"cell":lease["cell"],"lease_id":"original-lease","acquisition_output":case.root.path().join("cross/account"),"protected_output":protected,"original_registry_sha256":sha256(&serde_json::to_vec(&prior).unwrap()),"primary_account":acquired["account"]}));
-    let original_lease = case.root.path().join("installed/lease-owner.json");
-    let original_acquisition = case
-        .root
-        .path()
-        .join("installed/owned-resources-acquired.json");
+    case.json("cross/owner.json",&json!({"format":"memcordon.linux-cross-attempt-owner","revision":1,"identity":lease["identity"],"cell":lease["cell"],"lease_id":"original-lease","acquisition_output":format!("{}/cross/account",installed::EVIDENCE_ROOT),"protected_output":protected,"original_registry_sha256":sha256(&serde_json::to_vec(&prior).unwrap()),"primary_account":acquired["account"]}));
+    let original_lease = format!("{}/installed/lease-owner.json", installed::EVIDENCE_ROOT);
+    let original_acquisition = format!(
+        "{}/installed/owned-resources-acquired.json",
+        installed::EVIDENCE_ROOT
+    );
     case.mutate("cross/owner.json", |owner| {
         owner["original_lease"] = json!(original_lease);
         owner["original_acquisition"] = json!(original_acquisition);

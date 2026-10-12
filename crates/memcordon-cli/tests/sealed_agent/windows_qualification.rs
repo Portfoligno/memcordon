@@ -440,6 +440,7 @@ fn terminal_ack_requires_exact_completed_v2_retirement_receipt() {
     let request_sha256 = "b".repeat(64);
     let terminal_response_sha256 = "c".repeat(64);
     let retired = WindowsTerminalRetiredV2 {
+        preauthorization_retirement_proof: None,
         schema_version: 2,
         attempt_id: attempt_id.clone(),
         nonce: nonce.to_owned(),

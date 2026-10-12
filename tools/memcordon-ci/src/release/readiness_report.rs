@@ -266,7 +266,7 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
     consumer_readiness_ledger::record_job_outcomes(&mut index, outcomes)
         .map_err(CiError::Message)?;
     let evidence = args.destination.join("evidence.json");
-    source::write_json(&evidence, &index)?;
+    consumer_readiness_ledger::persist(&index, &evidence).map_err(CiError::Message)?;
     let scope = match args.scope {
         Scope::CandidateBeforePublication => "candidate-before-publication",
         Scope::CompleteProfile => "complete-profile",

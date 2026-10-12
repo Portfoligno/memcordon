@@ -199,6 +199,14 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    match memcordon_ci::public_install_capture::run_if_wrapper() {
+        Ok(Some(status)) => memcordon_ci::public_install_capture::exit_wrapper(status),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("memcordon-ci compiler capture: {error}");
+            std::process::exit(1);
+        }
+    }
     if let Err(error) = run() {
         eprintln!("memcordon-ci: {error}");
         let mut source = std::error::Error::source(&error);

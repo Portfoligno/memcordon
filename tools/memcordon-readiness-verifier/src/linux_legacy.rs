@@ -1228,10 +1228,10 @@ fn validate_command(
     {
         return Err("frozen native command renews cutoff/environment/cwd".into());
     }
-    let native_output = owner["output"].as_str().ok_or("frozen output absent")?;
-    let native_request = format!("{native_output}/frozen-legacy/v{version}/request.json");
+    let native_work = owner["work"].as_str().ok_or("frozen cwd absent")?;
+    let native_request = format!("{native_work}/frozen-v{version}-request.json");
     let native_report = format!(
-        "{}/frozen-v{version}-{}.json",
+        "{}/frozen-v{version}-{}.reports/result.json",
         owner["work"].as_str().ok_or("frozen cwd absent")?,
         c.action
     );
@@ -1294,7 +1294,7 @@ fn validate_command(
             marker..marker,
             [
                 "--mixed-observation-directory".into(),
-                format!("{native_output}/frozen-legacy/v1/result/observations"),
+                format!("{native_work}/frozen-v1-result.observations"),
             ],
         );
     }

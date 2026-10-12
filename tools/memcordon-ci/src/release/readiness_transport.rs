@@ -92,12 +92,12 @@ pub fn producer_artifact_id(
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| CiError::Message("producer artifacts array absent".into()))?;
         for entry in entries {
-            if entry.get("name").and_then(serde_json::Value::as_str) == Some(expected.as_str()) {
-                if selected.replace(positive(entry, "id")?).is_some() {
-                    return Err(CiError::Message(
-                        "original producer artifact is ambiguous".into(),
-                    ));
-                }
+            if entry.get("name").and_then(serde_json::Value::as_str) == Some(expected.as_str())
+                && selected.replace(positive(entry, "id")?).is_some()
+            {
+                return Err(CiError::Message(
+                    "original producer artifact is ambiguous".into(),
+                ));
             }
         }
         if entries.len() < 100 {
@@ -232,6 +232,10 @@ pub fn job_outcomes(
 
 /// Retains the actual GitHub ZIP unchanged. Extraction copies only the strict
 /// original manifest's finite files; it never relabels their run or attempt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Download custody independently binds transport budget, run, attempt, artifact, producer, source, and destination"
+)]
 pub fn download_producer(
     transport: &impl Transport,
     budget: &ReadBudget,
@@ -478,6 +482,11 @@ pub fn download_producer(
         version: manifest.version,
         manifest_sha256: manifest.manifest_sha256,
     };
+    // Unix supports syncing directory entries. Windows has no equivalent
+    // directory FlushFileBuffers operation; every retained file was synced
+    // above. This download directory is scratch transport custody, not a
+    // recovery journal or an installed publication boundary.
+    #[cfg(unix)]
     fs::File::open(destination)?.sync_all()?;
     Ok(DownloadedProducer {
         origin,

@@ -267,6 +267,10 @@ fn add_case(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve independent case, request, registry, activation, prepared native, provider and privileged scope inputs"
+)]
 fn gate_records(
     case: &mut PersistedCase,
     scenario: &str,

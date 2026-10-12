@@ -34,6 +34,7 @@ Usage:
   memcordon-sealed-agent launch-broker
   memcordon-sealed-agent probe
   memcordon-sealed-agent package <install|upgrade|inspect|verify|uninstall> [--json]
+  memcordon-sealed-agent package uninstall --lease-cleanup-cutoff-nanos <CLOCK_MONOTONIC-nanoseconds> (Linux, root only)
   memcordon-sealed-agent package policy apply --file PATH
   memcordon-sealed-agent package policy inspect --json
   memcordon-sealed-agent package policy entrypoint install --definition PATH --source PATH
@@ -282,6 +283,14 @@ fn main() {
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             [package, operation] if package == "package" => package::run(operation, false),
+            #[cfg(target_os = "linux")]
+            [package, operation, flag, cutoff]
+                if package == "package"
+                    && operation == "uninstall"
+                    && flag == "--lease-cleanup-cutoff-nanos" =>
+            {
+                package::uninstall_until(cutoff)
+            }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             [package, operation, json] if package == "package" && json == "--json" => {
                 package::run(operation, true)

@@ -11,8 +11,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "recovery_artifact_tree.rs"]
+pub(crate) mod recovery_artifact_tree;
+
 /// Preserve the two actual recovery recipes without assigning a successful
 /// Rust-test count or exit code to the deliberately killed harness.
+#[expect(
+    clippy::type_complexity,
+    reason = "Recovery normalization returns associated case records and their original artifact bytes together"
+)]
 pub fn normalize_native_recovery_harness(
     identity: &SourceIdentity,
     build: &memcordon_readiness_verifier::ComponentBuild,
@@ -29,42 +36,7 @@ pub fn normalize_native_recovery_harness(
     String,
 > {
     use memcordon_readiness_verifier::*;
-    let mut frozen = std::collections::BTreeMap::new();
-    let mut total = 0usize;
-    let entries = std::fs::read_dir(output).map_err(|error| error.to_string())?;
-    for (ordinal, entry) in entries.enumerate() {
-        if ordinal >= 128 {
-            return Err("native recovery raw artifact count exceeds bound".into());
-        }
-        let entry = entry.map_err(|error| error.to_string())?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "native recovery artifact name is not UTF-8")?;
-        if name.starts_with('.')
-            || !entry
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_file()
-        {
-            return Err("native recovery retains unresolved/nonregular artifact".into());
-        }
-        let remaining = (128 * 1024 * 1024usize)
-            .checked_sub(total)
-            .ok_or("native recovery aggregate capture overflow")?;
-        let limit = remaining.min(16 * 1024 * 1024);
-        if entry.metadata().map_err(|error| error.to_string())?.len() > limit as u64 {
-            return Err("native recovery raw artifact exceeds remaining capture bound".into());
-        }
-        let bytes = measured(&entry.path(), limit as u64)?;
-        total = total
-            .checked_add(bytes.len())
-            .ok_or("native recovery raw size overflow")?;
-        if total > 128 * 1024 * 1024 {
-            return Err("native recovery aggregate raw capture exceeds bound".into());
-        }
-        frozen.insert(name, bytes);
-    }
+    let frozen = recovery_artifact_tree::collect(output, measured)?;
     let json = |name: &str| -> Result<serde_json::Value, String> {
         let bytes = frozen
             .get(name)
@@ -128,10 +100,13 @@ pub fn normalize_native_recovery_harness(
     }
     let executable_bytes = measured(&bundle.join(&build.executable), 512 * 1024 * 1024)?;
     let executable_sha256 = hex::encode(Sha256::digest(executable_bytes));
-    if source_artifact.length > 16 * 1024 * 1024 {
+    if source_artifact.length > crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64 {
         return Err("native recovery selected source archive exceeds measured bound".into());
     }
-    let source = measured(&bundle.join(&source_artifact.path), 16 * 1024 * 1024)?;
+    let source = measured(
+        &bundle.join(&source_artifact.path),
+        crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64,
+    )?;
     if source.len() as u64 != source_artifact.length
         || hex::encode(Sha256::digest(&source)) != source_artifact.sha256
         || source_artifact.sha256 != identity.source_tree_sha256
@@ -448,7 +423,10 @@ pub fn normalize_native_harness_with_fixture(
     };
     let executable_bytes = measured(&bundle.join(executable), 512 * 1024 * 1024)?;
     let executable_sha = hex::encode(Sha256::digest(executable_bytes));
-    let source = measured(&bundle.join(&source_artifact.path), 16 * 1024 * 1024)?;
+    let source = measured(
+        &bundle.join(&source_artifact.path),
+        crate::release::source::MAX_SOURCE_ARCHIVE_BYTES as u64,
+    )?;
     if source.len() as u64 != source_artifact.length
         || hex::encode(Sha256::digest(&source)) != source_artifact.sha256
         || source_artifact.sha256 != identity.source_tree_sha256
@@ -900,7 +878,7 @@ impl PreparedLinuxObserver {
             format: "memcordon.mixed-observer-acknowledgment".into(),
             revision: 2,
             attempt_id: self.observation.admission.attempt_id.clone(),
-            admission_nonce: self.observation.admission.admission_nonce.clone(),
+            admission_nonce: self.observation.admission.admission_nonce,
             target: self.observation.target.clone(),
             observer: memcordon_core::result_v2::NativeProcessV2 {
                 pid: observer_pid,
@@ -1179,20 +1157,35 @@ impl PreparedLinuxObserver {
         // Kernel removal of this held cgroup inode requires it to be empty;
         // otherwise read current populated state through that exact owner.
         if self.cgroup.metadata().map_err(|e| e.to_string())?.nlink() != 0 {
-            let events = rustix::fs::openat(
+            let events = match rustix::fs::openat(
                 &self.cgroup,
                 "cgroup.events",
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::NOFOLLOW
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
-            )
-            .map_err(|e| e.to_string())?;
+            ) {
+                Ok(events) => events,
+                Err(error) => {
+                    // Removal may occur after the preceding metadata check.
+                    // Only the same held inode's existing removal predicate,
+                    // with every held process already exited, proves retirement.
+                    if error == rustix::io::Errno::NOENT
+                        && self
+                            .cgroup
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.nlink() == 0)
+                    {
+                        return Ok(true);
+                    }
+                    return Err(format!("held cgroup.events open: {error}"));
+                }
+            };
             let mut text = String::new();
             File::from(events)
                 .take(4097)
                 .read_to_string(&mut text)
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| format!("held cgroup.events read: {error}"))?;
             if text.len() > 4096
                 || text
                     .lines()
@@ -1518,9 +1511,7 @@ impl HeldLinuxProcess {
             .split_whitespace()
             .map(|value| value.parse::<u32>().map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
-        if namespace_pids.first() != Some(&self.process_id)
-            || namespace_pids.iter().any(|pid| *pid == 0)
-        {
+        if namespace_pids.first() != Some(&self.process_id) || namespace_pids.contains(&0) {
             return Err("native namespace PID tuple differs".into());
         }
         let snapshot = LinuxHeldSnapshot {

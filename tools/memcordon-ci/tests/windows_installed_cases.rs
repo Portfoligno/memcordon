@@ -5,6 +5,35 @@ use memcordon_ci::windows_causal_acceptance::{
 use memcordon_core::diagnostics::*;
 
 #[test]
+fn rooted_process_membership_rejects_preexisting_pid_ancestry() {
+    use memcordon_ci::windows_consumer_readiness::rooted_process_depth;
+    use std::collections::BTreeMap;
+    let root = (3232, 134362137570896696);
+    let old = (2320, 134362137552439155);
+    let parents = BTreeMap::from([(2320, 11060), (11060, 3232), (4000, 3232), (4001, 4000)]);
+    assert_eq!(rooted_process_depth(old, root, &parents), None);
+    assert_eq!(rooted_process_depth(root, root, &parents), Some(0));
+    assert_eq!(
+        rooted_process_depth((3232, root.1 + 1), root, &parents),
+        None
+    );
+    assert_eq!(
+        rooted_process_depth((4000, root.1 + 1), root, &parents),
+        Some(1)
+    );
+    assert_eq!(
+        rooted_process_depth((4001, root.1 + 2), root, &parents),
+        Some(2)
+    );
+    assert_eq!(
+        rooted_process_depth((9999, root.1 + 1), root, &parents),
+        None
+    );
+    let cycle = BTreeMap::from([(4000, 4001), (4001, 4000)]);
+    assert_eq!(rooted_process_depth((4000, root.1 + 1), root, &cycle), None);
+}
+
+#[test]
 fn working_windows_selection_requires_all_real_production_companions_on_each_native_architecture() {
     use memcordon_ci::release::windows_installed_consumer::selected_distribution;
     for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
@@ -123,6 +152,24 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
         )
     };
     let payload = construct(&source).unwrap();
+    assert_eq!(payload.components.len(), 4);
+    assert_eq!(payload.cli.path, directory.path().join("memcordon.exe"));
+    assert_eq!(payload.installed_components.len(), 3);
+    let installed_names: std::collections::BTreeSet<_> = payload
+        .installed_components
+        .iter()
+        .map(|artifact| artifact.path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(
+        installed_names,
+        [
+            "memcordon-sealed-agent.exe",
+            "memcordon-target-desktop-bootstrap.exe",
+            "memcordon-session-broker.exe"
+        ]
+        .into_iter()
+        .collect()
+    );
     assert_eq!(
         payload.provider,
         manifest.public_binding(&manifest_bytes).unwrap()
@@ -213,6 +260,99 @@ fn projection() -> ProviderFailureDiagnosticV1 {
         &journal,
     )
     .unwrap()
+}
+
+#[test]
+fn injected_guardian_authority_requires_bound_ordered_physical_loss() {
+    use memcordon_ci::windows_readiness_components::guardian_injection_authority;
+    use memcordon_core::WindowsSealedFault;
+    let selected = WindowsSealedFault::GuardianKilledBeforeAuthorization;
+    let original = CausalEventV1 {
+        sequence: 0,
+        origin: DiagnosticOriginV1::Launcher,
+        category: FailureCategoryV1::Monitor,
+        operation: FailureOperationV1::CheckGuardian,
+        code: FailureCodeV1::GuardianLoss,
+        native_code: None,
+        observed_phase: AttemptObservationPhaseV1::BeforeAuthorization,
+        safe_detail: SafeDiagnosticDetailV1::NoAdditionalDetail,
+        detail_redacted: true,
+        detail_truncated: false,
+        terminalization_reference: None,
+    };
+    let mut injected = original.clone();
+    injected.category = FailureCategoryV1::Launch;
+    injected.operation = FailureOperationV1::UnclassifiedProviderOperation;
+    injected.code = FailureCodeV1::UnexpectedProviderFailure;
+    injected.safe_detail = SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected };
+    let make = |first: CausalEventV1, second: Option<CausalEventV1>| {
+        let mut journal = WindowsCausalDiagnosticsV1::default();
+        journal.observe(first).unwrap();
+        if let Some(second) = second {
+            journal.observe(second).unwrap();
+        }
+        ProviderFailureDiagnosticV1::from_journal(
+            provider(),
+            &"02".repeat(32),
+            &"03".repeat(32),
+            &journal,
+        )
+        .unwrap()
+    };
+    let valid = make(original.clone(), Some(injected.clone()));
+    let accepts = |value: &ProviderFailureDiagnosticV1| {
+        guardian_injection_authority(
+            value,
+            selected,
+            &provider(),
+            &"02".repeat(32),
+            &"03".repeat(32),
+        )
+    };
+    assert!(accepts(&valid));
+    assert!(!accepts(&make(original.clone(), None)));
+    assert!(!accepts(&make(injected.clone(), Some(original.clone()))));
+    let mut other = original.clone();
+    other.observed_phase = AttemptObservationPhaseV1::Monitoring;
+    assert!(!accepts(&make(other, Some(injected.clone()))));
+    let mut other = original.clone();
+    other.code = FailureCodeV1::UnexpectedProviderFailure;
+    assert!(!accepts(&make(other, Some(injected.clone()))));
+    let mut other = injected.clone();
+    other.safe_detail = SafeDiagnosticDetailV1::InjectedWindowsFault {
+        fault: WindowsSealedFault::GuardianCreate,
+    };
+    assert!(!accepts(&make(original, Some(other))));
+    assert!(!guardian_injection_authority(
+        &valid,
+        WindowsSealedFault::GuardianCreate,
+        &provider(),
+        &"02".repeat(32),
+        &"03".repeat(32)
+    ));
+    assert!(!guardian_injection_authority(
+        &valid,
+        selected,
+        &provider(),
+        &"04".repeat(32),
+        &"03".repeat(32)
+    ));
+    assert!(!guardian_injection_authority(
+        &valid,
+        selected,
+        &provider(),
+        &"02".repeat(32),
+        &"04".repeat(32)
+    ));
+    let mut other_provider = provider();
+    other_provider.generation = BoundedText::new("other-generation").unwrap();
+    assert!(!guardian_injection_authority(
+        &valid,
+        selected,
+        &other_provider,
+        &"02".repeat(32),
+        &"03".repeat(32)
+    ));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Native certification observations are collected from a separately measured
 //! test-support installation, never from the selected production distribution.
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -29,6 +30,48 @@ pub struct ComponentAssessment {
     pub collection: std::result::Result<(), String>,
     pub retirement: std::result::Result<(), String>,
     pub artifacts: Vec<crate::windows_installed_cases::SelectedArtifact>,
+}
+
+/// The guardian observer records the physical loss before the support-only
+/// injection label. Both ordered observations are required for this fault.
+pub fn guardian_injection_authority(
+    failure: &memcordon_core::ProviderFailureDiagnosticV1,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+) -> bool {
+    use memcordon_core::*;
+    if selected != WindowsSealedFault::GuardianKilledBeforeAuthorization
+        || !failure.is_consistent()
+        || &failure.provider_binding != provider
+        || String::from(failure.attempt_id.clone()) != attempt
+        || String::from(failure.request_sha256.clone()) != request
+    {
+        return false;
+    }
+    let OriginalFailureV1::Observed { event: original } = &failure.original else {
+        return false;
+    };
+    original.sequence == 1
+        && original.origin == DiagnosticOriginV1::Launcher
+        && original.category == FailureCategoryV1::Monitor
+        && original.operation == FailureOperationV1::CheckGuardian
+        && original.code == FailureCodeV1::GuardianLoss
+        && original.native_code.is_none()
+        && original.observed_phase == AttemptObservationPhaseV1::BeforeAuthorization
+        && original.safe_detail == SafeDiagnosticDetailV1::NoAdditionalDetail
+        && failure.secondary.as_slice().iter().any(|event| {
+            event.sequence == 2
+                && event.origin == DiagnosticOriginV1::Launcher
+                && event.category == FailureCategoryV1::Launch
+                && event.operation == FailureOperationV1::UnclassifiedProviderOperation
+                && event.code == FailureCodeV1::UnexpectedProviderFailure
+                && event.native_code.is_none()
+                && event.observed_phase == AttemptObservationPhaseV1::BeforeAuthorization
+                && event.safe_detail
+                    == (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
+        })
 }
 
 /// These are actual native injection points, not installed-product case rows.
@@ -547,8 +590,12 @@ mod native {
             "Local\\MemcordonComponentFrontend{}",
             crate::windows_causal_acceptance::sha256(&case.descriptor.challenge)
         );
-        let frontend_gate =
-            crate::windows_consumer_readiness::native::event_create(&frontend_gate_name)?;
+        let frontend_gate_owner = Arc::new(
+            crate::windows_consumer_readiness::native::event_create(&frontend_gate_name)?,
+        );
+        // The callback may finish before the child opens this named event.
+        // Keep the original event alive through the entire owned child lifetime.
+        let frontend_gate = Arc::clone(&frontend_gate_owner);
         arguments.extend([
             OsString::from("--controller-start-gate"),
             OsString::from(frontend_gate_name),
@@ -827,6 +874,7 @@ mod native {
                 record,
             )?;
         }
+        drop(frontend_gate_owner);
         let collection = (|| -> Result<()> {
             let output = output
                 .as_ref()
@@ -1031,8 +1079,9 @@ mod native {
                             failure.is_consistent()&&failure.provider_binding==config.provider
                                 && String::from(failure.attempt_id.clone())==attempt
                                 && String::from(failure.request_sha256.clone())==request
-                                && matches!(&failure.original,memcordon_core::OriginalFailureV1::Observed {event}
+                                && (matches!(&failure.original,memcordon_core::OriginalFailureV1::Observed {event}
                                     if fault.is_some_and(|selected|event.safe_detail==memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault {fault:selected}))
+                                    || fault.is_some_and(|selected| guardian_injection_authority(failure, selected, &config.provider, attempt, request)))
                         }) {
                         rejected = true;
                     }
@@ -1209,10 +1258,20 @@ mod native {
                 }))?,
                 record,
             )?;
+            if !output.status.success() {
+                let excerpt = &output.stderr[..output.stderr.len().min(4096)];
+                return Err(CiError::Message(format!(
+                    "component native recovery command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}; original recovery records retained",
+                    output.status,
+                    output.stdout.len(),
+                    output.stderr.len(),
+                    excerpt.len() != output.stderr.len(),
+                    String::from_utf8_lossy(excerpt),
+                )));
+            }
             let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
                 serde_json::from_slice(&output.stdout)?;
-            if !output.status.success()
-                || !inventory.is_consistent()
+            if !inventory.is_consistent()
                 || inventory.authority_unsettled()
                 || inventory.provider_generation != config.provider.generation.as_str()
                 || !memcordon_testkit::windows_processes_for_image(&config.fixture.path)?.is_empty()

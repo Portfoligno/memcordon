@@ -68,10 +68,15 @@ fn receive_inner(
             libc::MSG_CMSG_CLOEXEC | libc::MSG_WAITALL,
         )
     };
-    if received != FRAME_HEADER_LENGTH as isize {
+    if received < 0 {
         return Err(format!(
             "provider frame header receive failed: {}",
             std::io::Error::last_os_error()
+        ));
+    }
+    if received != FRAME_HEADER_LENGTH as isize {
+        return Err(format!(
+            "provider frame header receive incomplete: received {received} bytes; expected {FRAME_HEADER_LENGTH}"
         ));
     }
     if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {

@@ -1210,6 +1210,7 @@ fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
                 final_job_handles_closed: true,
                 loader_qualification: None,
                 frontend_delivery: None,
+                frontend_provider_association: None,
             },
         )),
     }

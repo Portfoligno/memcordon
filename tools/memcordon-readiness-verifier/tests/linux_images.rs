@@ -91,6 +91,10 @@ fn elf() -> Vec<u8> {
     bytes[513..521].copy_from_slice(b"libc.so\0");
     bytes
 }
+#[expect(
+    clippy::type_complexity,
+    reason = "the image vector keeps original definition, mutation, executable and native file bytes distinct"
+)]
 fn vector(
     scenario: &str,
 ) -> (
@@ -194,6 +198,10 @@ fn image_id(owner: &Value, scenario: &str) -> String {
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the import proof independently binds owner, scenario, definition, exit status and both native output streams"
+)]
 fn command_graph(
     case: &mut persisted_case::PersistedCase,
     prefix: &str,

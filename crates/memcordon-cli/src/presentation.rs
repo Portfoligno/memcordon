@@ -285,6 +285,10 @@ pub(crate) fn write_summary(out: &mut impl Write, summary: ExecutionSummary<'_>)
         }
         (Some(code), None, Some(detail)) => format!("; error {code}: {detail}"),
         (Some(code), _, None) => format!("; error {code}"),
+        (None, None, Some(detail)) => {
+            let truncated = detail.chars().nth(4096).is_some();
+            format!("; error {detail:.4096}; detail-truncated={truncated}")
+        }
         _ => String::new(),
     };
     writeln!(

@@ -386,6 +386,7 @@ pub struct WindowsLeaseEvent<'a> {
     pub stderr: Option<PathBuf>,
 }
 
+#[cfg(windows)]
 fn lease_event<'a>(
     phase: WindowsLeasePhase,
     subject: &'a InstalledWindowsPayload,
@@ -528,10 +529,14 @@ impl InstalledWindowsPayload {
                 path: payload_directory.join(&name),
                 sha256: component.sha256.clone(),
             };
-            installed_components.push(SelectedArtifact {
-                path: installed_directory.join(&name),
-                sha256: component.sha256.clone(),
-            });
+            // The Windows package installs the provider roles. The public CLI
+            // remains the independently measured client in the channel payload.
+            if component.role != RuntimeComponentRole::PublicCli {
+                installed_components.push(SelectedArtifact {
+                    path: installed_directory.join(&name),
+                    sha256: component.sha256.clone(),
+                });
+            }
             components.push(artifact.clone());
             match component.role {
                 RuntimeComponentRole::PublicCli => cli = Some(artifact),
@@ -743,7 +748,7 @@ mod native {
                 != config.installed_manifest.sha256
             || config.installed_agent.sha256 != config.agent.sha256
             || config.components.len() != 4
-            || config.installed_components.len() != 4
+            || config.installed_components.len() != 3
         {
             return Err(CiError::Message(
                 "selected installed channel identity differs".to_owned(),
@@ -772,7 +777,9 @@ mod native {
         }
         let mut command = CommandSpec::new(
             &config.cli.path,
-            &config.output_directory,
+            config.cli.path.parent().ok_or_else(|| {
+                CiError::Message("selected Windows CLI payload parent missing".into())
+            })?,
             Duration::from_secs(30),
         )
         .arg("--version")
@@ -1300,6 +1307,7 @@ mod native {
         config: &InstalledWindowsPayload,
         observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
         deadlines: WindowsLeaseDeadlines,
+        source_root: Option<&Path>,
     ) -> Result<InstalledWindowsAssessment> {
         if deadlines.work >= deadlines.cleanup {
             return Err(CiError::Message(
@@ -1335,6 +1343,11 @@ mod native {
             ));
         }
         verify_selected(older)?;
+        // Package commands use this owned diagnostic directory as their cwd.
+        // Materializing the predecessor payload does not create case output.
+        if source_root.is_some() {
+            fs::create_dir(&older.output_directory)?;
+        }
         if memcordon_testkit::windows_available_memory_bytes()? < 4 * 1024 * 1024 * 1024 {
             return Err(CiError::Message(
                 "selected Windows installed fixture requires 4 GiB available memory".to_owned(),
@@ -1424,6 +1437,14 @@ mod native {
                 verify_file(component).map_err(|error| error.to_string())?;
             }
             drop(quiescent(config).map_err(|error| error.to_string())?);
+            if let Some(root) = source_root {
+                crate::windows_consumer_readiness::provision_from_source_until(
+                    root,
+                    config,
+                    deadlines.work,
+                )
+                .map_err(|error| error.to_string())?;
+            }
             assessment.positive_suite = crate::windows_consumer_readiness::run_installed_until(
                 config,
                 &config.output_directory.join("windows-readiness-input.json"),
@@ -1565,6 +1586,7 @@ pub fn run_cases_for_installed_payload(
         config,
         &mut |_| Ok(()),
         WindowsLeaseDeadlines::finite_default(),
+        None,
     )
 }
 
@@ -1573,7 +1595,12 @@ pub fn run_with_observer(
     config: &InstalledWindowsPayload,
     observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
 ) -> Result<InstalledWindowsAssessment> {
-    native::run(config, observer, WindowsLeaseDeadlines::finite_default())
+    native::run(
+        config,
+        observer,
+        WindowsLeaseDeadlines::finite_default(),
+        None,
+    )
 }
 
 #[cfg(windows)]
@@ -1582,7 +1609,38 @@ pub fn run_with_observer_until(
     observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
     deadlines: WindowsLeaseDeadlines,
 ) -> Result<InstalledWindowsAssessment> {
-    native::run(config, observer, deadlines)
+    native::run(config, observer, deadlines, None)
+}
+
+/// Provision epoch-bound readiness only after the actual selected upgrade and
+/// verification. Any provisioning failure remains inside the installation's
+/// existing cleanup owner and original work/cleanup deadlines.
+#[cfg(windows)]
+pub fn run_from_source_with_observer_until(
+    root: &Path,
+    config: &InstalledWindowsPayload,
+    observer: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+    deadlines: WindowsLeaseDeadlines,
+) -> Result<InstalledWindowsAssessment> {
+    let source = crate::release::source::BuildSourceIdentity::working(root)?;
+    if source.commit() != config.source_commit || source.version().to_string() != config.version {
+        return Err(CiError::Message(
+            "Windows provisioning source differs from selected installed runtime".into(),
+        ));
+    }
+    native::run(config, observer, deadlines, Some(root))
+}
+
+#[cfg(not(windows))]
+pub fn run_from_source_with_observer_until(
+    _: &Path,
+    _: &InstalledWindowsPayload,
+    _: &mut impl FnMut(WindowsLeaseEvent<'_>) -> Result<()>,
+    _: WindowsLeaseDeadlines,
+) -> Result<InstalledWindowsAssessment> {
+    Err(CiError::Message(
+        "source-provisioned Windows lease requires native Windows".into(),
+    ))
 }
 
 #[cfg(not(windows))]

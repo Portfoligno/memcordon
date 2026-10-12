@@ -37,6 +37,10 @@ impl LinuxReleaseReceipt {
 
 /// Full raw receipt joins. Original-job native harness/input/capture custody
 /// and selected resource acquisition remain mandatory in the enclosing gate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind release evidence to independent source, account, worker and receipt observations"
+)]
 pub fn validate_linux_release_receipt(
     receipt: &LinuxReleaseReceipt,
     run_id: &str,
@@ -610,6 +614,10 @@ pub fn linux_release_effective_invocation(
 
 /// Decode unchanged acquisition and native account creation readbacks. This is
 /// source association, not a fresh account-absence observation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bind release evidence to independent source, account, worker and receipt observations"
+)]
 pub fn validate_linux_component_fixture_acquisition(
     checkpoint: &Value,
     intent: &Value,

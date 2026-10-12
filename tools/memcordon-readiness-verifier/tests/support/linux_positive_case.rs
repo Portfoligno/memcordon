@@ -54,12 +54,20 @@ pub fn baseline() -> PersistedCase {
     case
 }
 
+#[allow(
+    dead_code,
+    reason = "Only running-policy integration targets read back the shared positive graph"
+)]
 pub fn read(case: &PersistedCase, path: &str) -> Value {
     installed::read(case, path)
 }
 
 /// Retain the original positive files before creating another full attempt.
 /// Only artifact references move; native operands and semantic digests stay fixed.
+#[allow(
+    dead_code,
+    reason = "Only running-policy integration targets freeze the shared positive graph"
+)]
 pub fn freeze(case: &mut PersistedCase) -> CaseRecord {
     let original = case.index.artifacts.clone();
     let paths = original

@@ -273,7 +273,7 @@ pub(super) fn execute_brokered(
         let worker = super::private_attempt::ProcessIdentityV4::observe(pid, held.as_fd())?;
         Ok::<_, String>((execution_deadline, record, worker, held))
     })();
-    let (mut execution_deadline, mut record, worker, _held_worker) = match preallocation {
+    let (mut execution_deadline, record, worker, _held_worker) = match preallocation {
         Ok(value) => value,
         Err(error) => {
             return terminal(
@@ -298,11 +298,17 @@ pub(super) fn execute_brokered(
         captured,
         request.attempt_id,
         |metadata| {
-            record.mixed_admission_metadata = Some(metadata.clone());
-            record.mixed_worker = Some(worker);
             retained_journal = Some(super::private_attempt::DurablePrivateAttempt::create(
                 record,
             )?);
+            retained_journal
+                .as_mut()
+                .expect("original mixed ownership journal retained")
+                .attach_mixed_admission_metadata(metadata.clone())?;
+            retained_journal
+                .as_mut()
+                .expect("original mixed ownership journal retained")
+                .record_mixed_worker(worker)?;
             Ok(())
         },
     ) {

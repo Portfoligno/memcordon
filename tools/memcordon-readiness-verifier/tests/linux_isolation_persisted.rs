@@ -27,6 +27,45 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn cross_attempt_rejects_rehashed_protected_output_scope_aliases() {
+    for mutation in ["sibling", "windows-separator"] {
+        let mut case = linux_cross_attempt_case::baseline();
+        case.validate().unwrap();
+        let lease = linux_installed_case::read(&case, "installed/lease-owner.json");
+        let admin = lease["admin_root"].as_str().unwrap();
+        case.mutate("cross/owner.json", |owner| {
+            owner["protected_output"] = json!(match mutation {
+                "sibling" => format!("{admin}-sibling/cross-attempt-abstract"),
+                "windows-separator" => format!("{admin}\\cross-attempt-abstract"),
+                _ => unreachable!(),
+            });
+        });
+        assert_eq!(
+            case.validate().unwrap_err(),
+            "cross original lease/acquisition/native account scope differs",
+            "{mutation} escaped original Linux administrator custody"
+        );
+    }
+}
+
+#[test]
+fn cross_account_rejects_rehashed_windows_separator_source_aliases() {
+    for field in ["native_readback", "group_readback"] {
+        let mut case = linux_cross_attempt_case::baseline();
+        case.validate().unwrap();
+        case.mutate("cross/canary.json", |raw| {
+            let path = raw["peer_account"][field].as_str().unwrap();
+            raw["peer_account"][field] = json!(path.replace('/', "\\"));
+        });
+        assert_eq!(
+            case.validate().unwrap_err(),
+            "cross original secondary source paths differ",
+            "{field} accepted a Windows separator as Linux source custody"
+        );
+    }
+}
+
+#[test]
 fn complete_original_concurrent_other_attempt_abstract() {
     let mut case = linux_cross_attempt_case::baseline();
     case.validate().unwrap();
@@ -112,6 +151,51 @@ fn complete_original_three_hostile_input_imports() {
             "{scenario} adopts provider-attempt census instead of original probe"
         );
     }
+}
+
+#[test]
+fn importer_rejects_rehashed_sibling_prefix_authority() {
+    let mut case = linux_import_case::baseline("input-socket");
+    let evidence = linux_installed_case::read(&case, "case-evidence.json");
+    let owner_path = evidence["owner"].as_str().unwrap();
+    let owner = linux_installed_case::read(&case, owner_path);
+    let authority = owner["admin_root"].as_str().unwrap();
+    // The submitted definition starts with this text, but is not its child.
+    let sibling_prefix = authority.strip_suffix("-admin").unwrap();
+    for field in ["owner", "original_lease", "acquisition"] {
+        case.mutate(evidence[field].as_str().unwrap(), |raw| {
+            raw["admin_root"] = json!(sibling_prefix);
+        });
+    }
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "isolation importer native source escapes original protected authority"
+    );
+}
+
+#[test]
+fn importer_rejects_rehashed_source_parent_traversal() {
+    let mut case = linux_import_case::baseline("input-socket");
+    let intent = linux_installed_case::read(&case, "import-intent.json");
+    let source = format!("{}/../foreign", intent["source_root"].as_str().unwrap());
+    case.mutate("import-intent.json", |raw| {
+        raw["source_root"] = json!(source)
+    });
+    let mut command = linux_installed_case::read(&case, "import/invocation.json");
+    command["argv"][7] = json!(source);
+    linux_import_case::command_graph(
+        &mut case,
+        "import",
+        command,
+        800,
+        900,
+        1,
+        json!({"error":"original native hostile source refused"}),
+    );
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "isolation importer native source escapes original protected authority"
+    );
 }
 
 #[test]

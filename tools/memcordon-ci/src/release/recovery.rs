@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Total original-artifact validation phase, including native archive extraction.
+pub const ORIGINAL_VALIDATION_BUDGET: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecoveryMode {
@@ -456,7 +459,7 @@ pub fn recovery_inputs(root: &Path) -> Result<()> {
     let original = input.original.expect("validated publication-only IDs");
     validate_original(
         &http::HttpsTransport,
-        &ReadBudget::new(Instant::now() + Duration::from_secs(300)),
+        &ReadBudget::new(Instant::now() + ORIGINAL_VALIDATION_BUDGET),
         &headers()?,
         &selected,
         &original,

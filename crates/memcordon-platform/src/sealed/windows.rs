@@ -113,15 +113,10 @@ pub fn workload_discovery() -> Result<memcordon_core::workload_discovery::Worklo
     let pipe = connect()?;
     authenticate_peer(pipe.raw())?;
     let mut random = [0; 16];
-    // SAFETY: system RNG writes only the fixed output buffer.
+    // SAFETY: the OS cryptographic RNG writes only the fixed output buffer.
     if unsafe {
-        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
-            std::ptr::null_mut(),
-            random.as_mut_ptr(),
-            u32::try_from(random.len()).expect("nonce length fits"),
-            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    } < 0
+        windows_sys::Win32::Security::Cryptography::ProcessPrng(random.as_mut_ptr(), random.len())
+    } == 0
     {
         return Err("discovery challenge generation failed".into());
     }
@@ -160,14 +155,9 @@ fn recovery_challenge() -> Result<String, String> {
     let mut random = [0_u8; 16];
     // SAFETY: the system RNG writes only the fixed output buffer.
     let status = unsafe {
-        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
-            ptr::null_mut(),
-            random.as_mut_ptr(),
-            u32::try_from(random.len()).expect("challenge length fits"),
-            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
+        windows_sys::Win32::Security::Cryptography::ProcessPrng(random.as_mut_ptr(), random.len())
     };
-    if status < 0 {
+    if status == 0 {
         return Err("recovery challenge generation failed".to_owned());
     }
     Ok(digest_bytes(&random))
@@ -380,16 +370,11 @@ pub fn workload_plan(
     let pipe = connect()?;
     authenticate_peer(pipe.raw())?;
     let mut random = [0; 16];
-    // SAFETY: the system-preferred RNG writes only the provided fixed buffer.
+    // SAFETY: the OS cryptographic RNG writes only the provided fixed buffer.
     let status = unsafe {
-        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
-            std::ptr::null_mut(),
-            random.as_mut_ptr(),
-            u32::try_from(random.len()).expect("nonce fits Win32 length"),
-            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
+        windows_sys::Win32::Security::Cryptography::ProcessPrng(random.as_mut_ptr(), random.len())
     };
-    if status < 0 {
+    if status == 0 {
         return Err("workload plan challenge generation failed".into());
     }
     let challenge = memcordon_core::workload_contract::Nonce128(random);
@@ -1102,6 +1087,11 @@ pub fn run(
         frontend_loss_cleanup_authority_verified: true,
     };
     terminal_observation::retain(&provider_binding, &terminal, &delivery);
+    let association = provider_attempt_association(
+        &provider_binding,
+        &terminal.attempt_id,
+        &terminal.request_sha256,
+    )?;
     let memcordon_core::WindowsTerminalPayloadV2::Execution {
         child_pid,
         duration_millis,
@@ -1121,6 +1111,7 @@ pub fn run(
         &mut boundary_detail
     {
         native.frontend_delivery = Some(delivery);
+        native.frontend_provider_association = Some(association);
     }
     if !memcordon_core::boundary_evidence_is_consistent(
         &launch,

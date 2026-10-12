@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 pub fn baseline() -> PersistedCase {
     let mut case = linux_installed_case::installed("L-ID-01", "v1-preserve-caller");
     let prefix = "installed/installed/frozen-legacy";
-    let root = case.root.path().display().to_string();
+    let root = linux_installed_case::EVIDENCE_ROOT;
     let fixture = b"original installed fixture";
     let fixture_hash = sha256(fixture);
     let old = linux_installed_case::read(&case, "installed/lease-owner.json");
@@ -103,8 +103,8 @@ pub fn baseline() -> PersistedCase {
     let mut commands = Vec::new();
     for action in ["result", "plan", "capabilities"] {
         let row = format!("{prefix}/v1/{action}");
-        let native_request = format!("{output}/frozen-legacy/v1/request.json");
-        let native_report = format!("{work}/frozen-v1-{action}.json");
+        let native_request = format!("{work}/frozen-v1-request.json");
+        let native_report = format!("{work}/frozen-v1-{action}.reports/result.json");
         let mut args = vec![
             "--reuid=65534".to_owned(),
             "--regid=65534".into(),
@@ -152,7 +152,7 @@ pub fn baseline() -> PersistedCase {
                 9..9,
                 [
                     "--mixed-observation-directory".into(),
-                    format!("{output}/frozen-legacy/v1/result/observations"),
+                    format!("{work}/frozen-v1-result.observations"),
                 ],
             );
         }
@@ -365,13 +365,13 @@ pub fn baseline_v2() -> PersistedCase {
     let mut arguments: Vec<Vec<u8>> =
         serde_json::from_value(invocation["arguments"].clone()).unwrap();
     arguments.drain(9..11);
-    arguments[11] = format!(
-        "{}/frozen-legacy/v2/request.json",
-        owner["output"].as_str().unwrap()
+    arguments[11] =
+        format!("{}/frozen-v2-request.json", owner["work"].as_str().unwrap()).into_bytes();
+    arguments[15] = format!(
+        "{}/frozen-v2-result.reports/result.json",
+        owner["work"].as_str().unwrap()
     )
     .into_bytes();
-    arguments[15] =
-        format!("{}/frozen-v2-result.json", owner["work"].as_str().unwrap()).into_bytes();
     arguments.pop();
     arguments.extend(args.iter().map(|a| a.to_vec()));
     invocation["arguments"] = json!(arguments);

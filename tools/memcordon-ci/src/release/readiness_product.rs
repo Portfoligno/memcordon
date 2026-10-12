@@ -32,6 +32,10 @@ fn retain(source: &Path, destination: &Path) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Selected product evidence binds identity, payload generations, and independent custody roots"
+)]
 pub fn collect(
     identity: &SourceIdentity,
     key: &ProductKey,
@@ -84,12 +88,11 @@ pub fn collect(
         let readback = journal
             .events
             .iter()
-            .filter(|event| {
+            .rfind(|event| {
                 event.operation == "actual-installed-package-readback"
                     && event.phase == "upgrade"
                     && event.succeeded
             })
-            .last()
             .ok_or_else(|| CiError::Message("selected upgrade native readback absent".into()))?;
         let raw: serde_json::Value =
             source::read_json(&artifact_root.join(&readback.native_receipt))?;

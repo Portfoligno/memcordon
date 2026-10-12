@@ -9,12 +9,9 @@ use crate::{CiError, Result};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        process::ExitStatusExt,
-    },
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 fn retain(path: &Path, bytes: &[u8], files: &mut Vec<File>) -> Result<()> {
@@ -41,11 +38,6 @@ pub fn recover_report(
     input: &InstalledMixedDriverInput<'_>,
     account: &ExclusiveAccount,
 ) -> Result<()> {
-    let agent = super::linux_mixed_installed::read_owned_resource(
-        Path::new("/usr/libexec/memcordon-sealed-agent"),
-        512 * 1024 * 1024,
-    )?;
-    let agent_sha256 = super::artifacts::checksum(&agent);
     for row in &mut report.export_observations {
         if row.recovery.is_some() {
             continue;
@@ -276,53 +268,77 @@ pub fn recover_report(
                 "retained export ownership journal lacks original account reservation".into(),
             ));
         }
-        let invocation = serde_json::json!({"format":"memcordon.linux-export-recovery-invocation","revision":1,"identity":input.identity,"cell":input.cell,"lease_id":input.lease_id,
-            "attempt_id":attempt,"program":"/usr/libexec/memcordon-sealed-agent","arguments":["package","policy","recover","--json"],
-            "cwd_native_bytes":directory.as_os_str().as_encoded_bytes(),"timeout_millis":60000,"cleared_environment":true,
-            "work_deadline_unix_millis":input.work_deadline_unix_millis,"cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis,"selected_agent_sha256":agent_sha256});
+        use super::linux_original_recovery::{contract, record};
+        let reservation_path = directory.join("recovery-original-reservation.json");
+        let original_reservation = if let Some(bytes) = reservation_before
+            .as_ref()
+            .and_then(|value| value.get("bytes"))
+        {
+            let bytes: Vec<u8> = serde_json::from_value(bytes.clone())?;
+            retain(&reservation_path, &bytes, &mut report.file_custody)?;
+            Some(record(&reservation_path)?)
+        } else {
+            None
+        };
+        let recovery_input = contract::Input {
+            format: "memcordon.original-native-recovery-input".into(),
+            revision: 1,
+            identity: contract::Identity {
+                run_id: input.identity.run_id.clone(),
+                source_commit: input.identity.source_commit.clone(),
+                source_tree_sha256: input.identity.source_tree_sha256.clone(),
+                version: input.identity.version.clone(),
+            },
+            native_target: input.cell.target.clone(),
+            scope_id: input.lease_id.clone(),
+            artifact_root: directory.to_owned(),
+            original_artifact_root: directory.to_owned(),
+            origin_sha256: String::new(),
+            work_deadline_unix_millis: input.work_deadline_unix_millis,
+            cleanup_deadline_unix_millis: input.cleanup_deadline_unix_millis,
+            recovery_harness_owner_sha256: input.recovery_harness.owner_sha256()?,
+            context: contract::Context::Export {
+                lease_owner: record(
+                    &input
+                        .output
+                        .parent()
+                        .ok_or_else(|| {
+                            CiError::Message("original export lease parent absent".into())
+                        })?
+                        .join("lease-owner.json"),
+                )?,
+                prepared: record(prepared_path)?,
+                original_journal: if journal.is_some() {
+                    Some(record(&directory.join("recovery-original-journal.bin"))?)
+                } else {
+                    None
+                },
+                original_reservation,
+            },
+        };
+        let recovery = super::linux_original_recovery::run(
+            input.recovery_harness,
+            &recovery_input,
+            input.cleanup_deadline,
+        )?;
+        let mut invocation = recovery.invocation.clone();
+        invocation["original_fixture"] = recovery.proof().clone();
+        invocation["original_fixture"]["acquisition_artifacts"] =
+            super::linux_recovery_harness::acquisition_artifacts(
+                input.artifact_root,
+                &input
+                    .output
+                    .parent()
+                    .ok_or_else(|| CiError::Message("original export lease parent absent".into()))?
+                    .join("recovery-harness-acquisition"),
+            )?;
         let invocation_bytes = serde_json::to_vec(&invocation)?;
         retain(
             &directory.join("recovery-invocation.json"),
             &invocation_bytes,
             &mut report.file_custody,
         )?;
-        let mut creation = None;
-        let owner_index = report.export_worker_owners.len();
-        let output = crate::command::CommandSpec::new(
-            "/usr/libexec/memcordon-sealed-agent",
-            directory,
-            Duration::from_secs(60),
-        )
-        .args(["package", "policy", "recover", "--json"])
-        .cleared_environment()
-        .bounded_until(input.cleanup_deadline)
-        .output_quiet_with_creation(|child| {
-            let birth = crate::linux_consumer_readiness::process_birth(child.id())
-                .map_err(CiError::Message)?;
-            let mut held =
-                crate::linux_consumer_readiness::HeldLinuxProcess::acquire(child.id(), birth)
-                    .map_err(CiError::Message)?;
-            let image = held
-                .hold_executable_image(input.cleanup_deadline)
-                .map_err(CiError::Message)?;
-            if image["sha256"] != agent_sha256 {
-                return Err(CiError::Message(
-                    "original export recovery executable differs".into(),
-                ));
-            }
-            creation = Some((held.retirement_identity().map_err(CiError::Message)?, image));
-            report.export_worker_owners.push(held);
-            Ok(())
-        })?;
-        let (preinput, image) = creation
-            .ok_or_else(|| CiError::Message("actual export recovery creation absent".into()))?;
-        let held = report
-            .export_worker_owners
-            .get(owner_index)
-            .ok_or_else(|| CiError::Message("actual export recovery PIDFD owner absent".into()))?;
-        let process = serde_json::json!({"format":"memcordon.linux-export-recovery-process","revision":1,"preinput":preinput,"process":held.retirement_identity().map_err(CiError::Message)?,"native_image":image,
-            "invocation_sha256":super::artifacts::checksum(&invocation_bytes),"raw_wait_status":output.status.into_raw(),"native_exit":output.status.code(),"signal":output.status.signal(),
-            "stdout_sha256":super::artifacts::checksum(&output.stdout),"stderr_sha256":super::artifacts::checksum(&output.stderr)});
+        let process = &recovery.process;
         retain(
             &directory.join("recovery-process.json"),
             &serde_json::to_vec(&process)?,
@@ -330,19 +346,14 @@ pub fn recover_report(
         )?;
         retain(
             &directory.join("recovery-stdout.bin"),
-            &output.stdout,
+            &recovery.stdout,
             &mut report.file_custody,
         )?;
         retain(
             &directory.join("recovery-stderr.bin"),
-            &output.stderr,
+            &recovery.stderr,
             &mut report.file_custody,
         )?;
-        if !output.status.success() || !held.exited().map_err(CiError::Message)? {
-            return Err(CiError::Message(
-                "actual export abort-publication recovery remains unsettled".into(),
-            ));
-        }
         let mut absence = Vec::new();
         for item in &before_paths {
             let path = item["path"].as_str().ok_or_else(|| {

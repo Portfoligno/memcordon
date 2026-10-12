@@ -6,6 +6,10 @@ use super::{
 use memcordon_readiness_verifier::*;
 use serde_json::{Value, json};
 
+#[allow(
+    dead_code,
+    reason = "Some integration targets build only the requirements-specific image graph"
+)]
 pub fn baseline() -> PersistedCase {
     use memcordon_core::workload_contract_v3::{LocalPortV3, PrivatePeerV3, RequirementV3 as R};
     let id = |value: &str| memcordon_core::workload_contract::LogicalId::new(value.into()).unwrap();

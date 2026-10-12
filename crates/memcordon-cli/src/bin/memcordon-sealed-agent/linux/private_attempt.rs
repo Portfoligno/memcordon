@@ -563,7 +563,7 @@ impl DurablePrivateAttempt {
         self.replace(next)
     }
 
-    pub(super) fn attach_mixed_admission_metadata(
+    pub(crate) fn attach_mixed_admission_metadata(
         &mut self,
         metadata: memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot,
     ) -> Result<(), String> {
@@ -764,7 +764,7 @@ impl DurablePrivateAttempt {
         next.mixed_root_staging_intent = Some(BoundedText::new(path).map_err(str::to_owned)?);
         self.replace(next)
     }
-    pub(super) fn record_mixed_worker(&mut self, worker: ProcessIdentityV4) -> Result<(), String> {
+    pub(crate) fn record_mixed_worker(&mut self, worker: ProcessIdentityV4) -> Result<(), String> {
         if self.record.phase != PrivateAttemptPhase::Allocated
             || self.record.mixed_admission_metadata.is_none()
         {

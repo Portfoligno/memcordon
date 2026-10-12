@@ -77,7 +77,10 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         memcordon_platform::WriterImage::CurrentProcess,
     ) {
         Ok(runtime) => runtime,
-        Err(_) => return 125,
+        Err(error) => {
+            super::result_delivery::runtime_initialization_failed(&error);
+            return 125;
+        }
     };
     let phase_path = diagnostic_phase_path(&args);
     diagnostic_phase(phase_path.as_deref(), "execute-start");
@@ -790,6 +793,10 @@ fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
         SupervisionTerminal::Error { .. } => ("supervision failed", SummaryTone::Error),
     };
     let (failure_code, failure_phase, failure_detail) = match execution.terminal() {
+        SupervisionTerminal::AttemptOutcome {
+            outcome: memcordon_core::RunOutcome::MonitorFailed { error, .. },
+            ..
+        } => (None, None, Some(error.as_str())),
         SupervisionTerminal::Error { error, .. } => error.provider_rejection.as_ref().map_or(
             (
                 Some(error.code.as_str()),
@@ -883,6 +890,8 @@ fn resolve(
     let mut capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
     if policy.private_workload_contract().is_some() {
         capability.boundary.mechanism = "linux-tcp4-private-v1".into();
+    } else if policy.mixed_workload_contract().is_some() {
+        capability.boundary.mechanism = "linux-tcp4-unix-private-v1".into();
     }
     if policy.boundary() == BoundaryRequirement::Sealed
         && capability.boundary.class != BoundaryClass::Sealed

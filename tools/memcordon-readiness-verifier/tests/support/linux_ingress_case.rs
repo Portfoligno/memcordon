@@ -2,12 +2,12 @@
 use super::{linux_installed_case as installed, persisted_case::PersistedCase};
 use memcordon_readiness_verifier::*;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 pub fn baseline() -> PersistedCase {
     let mut case = installed::installed("L-ID-01", "v3-preserve-caller");
     let cell = case.index.products[0].key.clone();
-    let root = case.root.path().display().to_string();
+    let root = installed::EVIDENCE_ROOT;
     let lease = installed::read(&case, "installed/lease-owner.json");
     let identity = lease["identity"].clone();
     #[derive(Serialize)]

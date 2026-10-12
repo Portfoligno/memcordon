@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::job::{BoundedProcessSnapshot, Job, JobNotification};
 use super::pipe::{self, OwnedHandle, PipeListener, PipePreparationError};
-use super::process::{StreamSet, SuspendedTarget};
+use super::process::{GuardianProcess, StreamSet, SuspendedTarget};
 use super::security::{SecurityDescriptor, private_pipe_sddl};
 
 #[cfg(test)]
@@ -1118,18 +1118,39 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             && !challenge.is_empty()
             && deadline_millis != 0 =>
         {
-            let _settlement = SETTLEMENT.enter()?;
-            let deadline = Instant::now() + Duration::from_millis(deadline_millis);
-            terminate_active_jobs(deadline)?;
-            match super::record::converge_package_cleanup(deadline) {
-                Ok(()) | Err(super::record::PackageCleanupError::Ambiguous(_)) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-            let inventory = super::record::recovery_inventory(&challenge)?;
-            pipe::write_frame(
-                connection,
-                &WindowsLauncherResponseV3::RecoveryInventory(inventory),
-            )
+            let provider = super::package::installed_public_provider_binding()?;
+            let mut settlement = None;
+            let result = (|| {
+                settlement = Some(
+                    SETTLEMENT
+                        .enter()
+                        .map_err(|error| format!("convergence settlement admission: {error}"))?,
+                );
+                let deadline = Instant::now() + Duration::from_millis(deadline_millis);
+                terminate_active_jobs(deadline)
+                    .map_err(|error| format!("convergence terminate active jobs: {error}"))?;
+                match super::record::converge_package_cleanup(deadline) {
+                    Ok(()) | Err(super::record::PackageCleanupError::Ambiguous(_)) => {}
+                    Err(error) => return Err(format!("convergence package cleanup: {error}")),
+                }
+                super::record::recovery_inventory(&challenge)
+                    .map_err(|error| format!("convergence recovery inventory: {error}"))
+            })();
+            let response = match result {
+                Ok(inventory) => WindowsLauncherResponseV3::RecoveryInventory(inventory),
+                Err(error) => WindowsLauncherResponseV3::ReadOnlyQueryFailure(
+                    memcordon_core::WindowsReadOnlyQueryFailure::new(
+                        memcordon_core::WindowsReadOnlyQueryOperation::RecoveryConvergence,
+                        memcordon_core::BoundedText::new(&challenge).map_err(str::to_owned)?,
+                        provider,
+                        memcordon_core::WindowsReadOnlyQueryPhase::QueryHandler,
+                        &error,
+                    )?,
+                ),
+            };
+            let written = pipe::write_frame(connection, &response);
+            drop(settlement);
+            written
         }
         WindowsLauncherRequestV3::PackageCleanup {
             schema_version,
@@ -2799,14 +2820,16 @@ fn launch_attempt(
             memcordon_core::BoundarySetupPhase::Authorization,
         ));
     }
+    #[cfg(any(test, feature = "test-support"))]
     if request.certification_fault == Some(WindowsSealedFault::GuardianKilledBeforeAuthorization) {
-        // SAFETY: guardian is the live per-attempt process and this gated
-        // certification scenario deliberately removes it before authorization.
-        if unsafe { TerminateProcess(guardian.raw(), CANCEL_STATUS) } == 0
-            || unsafe { WaitForSingleObject(guardian.raw(), 10_000) } != WAIT_OBJECT_0
-        {
+        if let Err(detail) = guardian.terminate_for_certification(CANCEL_STATUS) {
+            retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
+        }
+        // SAFETY: the original per-attempt guardian handle remains held; the
+        // successful temporary termination capability never replaces it.
+        if unsafe { WaitForSingleObject(guardian.raw(), 10_000) } != WAIT_OBJECT_0 {
             retire_preauthorization_with_target!(LaunchAttemptError::from(
-                "failed to inject preauthorization guardian loss".to_owned()
+                "terminated certification guardian did not signal within original wait".to_owned()
             ));
         }
     }
@@ -3034,7 +3057,7 @@ fn launch_attempt(
             &job,
             &target,
             primary_token.raw(),
-            guardian.raw(),
+            &guardian,
             &mut process_observer,
         ),
     };
@@ -3094,7 +3117,13 @@ fn launch_attempt(
             observation.control_connected,
             Some(observation.peak_memory_bytes),
         ),
-        None => (TerminalReason::MonitorFailed, true, None),
+        None => (
+            TerminalReason::MonitorFailed,
+            !monitor_failure
+                .as_ref()
+                .is_some_and(|failure| failure.connection_must_close),
+            None,
+        ),
     };
     let mut mutant_candidate = None;
     if matches!(reason, TerminalReason::PolicyRevoked) {
@@ -3842,6 +3871,7 @@ fn complete_windows_boundary_evidence(
 ) -> BoundaryMechanismEvidence {
     BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(WindowsSealedEvidenceV2 {
         frontend_delivery: None,
+        frontend_provider_association: None,
         schema_version: 2,
         service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
         caller_token_authenticated: true,
@@ -3874,6 +3904,7 @@ fn complete_windows_boundary_evidence(
 fn complete_windows_boundary_evidence_for_candidate() -> BoundaryMechanismEvidence {
     BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(WindowsSealedEvidenceV2 {
         frontend_delivery: None,
+        frontend_provider_association: None,
         schema_version: 2,
         service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".to_owned(),
         caller_token_authenticated: true,
@@ -4574,6 +4605,18 @@ struct MonitorObservation {
     peak_memory_bytes: u64,
 }
 
+fn terminate_certification_guardian(guardian: &GuardianProcess) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        guardian.terminate_for_certification(CANCEL_STATUS)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = guardian;
+        Err("guardian termination injection requires test support".to_owned())
+    }
+}
+
 fn monitor(
     workload_admission: Option<&crate::admission::FrozenAdmission>,
     connection: HANDLE,
@@ -4581,9 +4624,10 @@ fn monitor(
     job: &Job,
     target: &SuspendedTarget,
     authenticated_primary: HANDLE,
-    guardian: HANDLE,
+    guardian_owner: &GuardianProcess,
     observer: &mut ProcessObserver,
 ) -> Result<MonitorObservation, LaunchAttemptError> {
+    let guardian = guardian_owner.raw();
     let mut direct_status = None;
     let mut command_exit = None;
     let mut memory_limit_notified = false;
@@ -4632,13 +4676,9 @@ fn monitor(
                         .into());
                 }
                 Some(WindowsSealedFault::AllJobOwnersClosedAfterAuthorization) => {
-                    // SAFETY: removing guardian then launcher closes every Job
-                    // owner; kill-on-close must retire the entire workload.
-                    if unsafe { TerminateProcess(guardian, CANCEL_STATUS) } == 0 {
-                        return Err("all-owner scenario could not terminate guardian"
-                            .to_owned()
-                            .into());
-                    }
+                    terminate_certification_guardian(guardian_owner)?;
+                    // SAFETY: removing the launcher after checked termination
+                    // of the identity-joined guardian closes every Job owner.
                     unsafe {
                         TerminateProcess(
                             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -4660,11 +4700,10 @@ fn monitor(
                 &request.launch.command.arguments,
                 target.process_id,
             )?;
-            // SAFETY: target was resumed and guardian is the live per-attempt
-            // authority removed by this release-required native scenario.
-            if unsafe { TerminateProcess(guardian, CANCEL_STATUS) } == 0
-                || unsafe { WaitForSingleObject(guardian, 10_000) } != WAIT_OBJECT_0
-            {
+            terminate_certification_guardian(guardian_owner)?;
+            // SAFETY: the original per-attempt guardian handle remains held;
+            // successful temporary termination never replaces its death observation.
+            if unsafe { WaitForSingleObject(guardian, 10_000) } != WAIT_OBJECT_0 {
                 return Err("failed to inject postauthorization guardian loss"
                     .to_owned()
                     .into());

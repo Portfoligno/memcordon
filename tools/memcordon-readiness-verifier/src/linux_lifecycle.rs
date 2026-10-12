@@ -37,6 +37,10 @@ fn closed(value: &Value, fields: &[&str]) -> VerificationResult<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub fn validate_linux_lifecycle_intervention(
     key: &CaseKey,
     intent: &Value,
@@ -280,6 +284,10 @@ impl LinuxLifecycleLossEvidence {
 
 /// Check the original held family after recovery, independently of whether the
 /// interrupted frontend managed to publish a result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub fn validate_linux_lifecycle_family_settlement(
     raw: &Value,
     prepared: &Value,
@@ -431,6 +439,10 @@ pub fn validate_linux_lifecycle_family_settlement(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent lifecycle identity, cell, worker, intent and native retirement evidence"
+)]
 pub(crate) fn validate_native_recovery(
     invocation: &Value,
     process: &Value,
@@ -629,10 +641,9 @@ pub(crate) fn validate_installed_owner(
         if original["identity"] == owner["identity"]
             && original["cell"] == owner["cell"]
             && original["lease_id"] == e.lease_id
+            && original_lease.replace(original).is_some()
         {
-            if original_lease.replace(original).is_some() {
-                return Err("lifecycle original acquired lease is ambiguous".into());
-            }
+            return Err("lifecycle original acquired lease is ambiguous".into());
         }
     }
     if original_lease.as_ref() != Some(&lease) {
@@ -897,7 +908,10 @@ fn validate_frontend(
             .ok_or_else(|| format!("lifecycle original frontend peer absent: {role}"))
     };
     let decode = |role: &str| crate::wire::json(custody.bytes(path(role)?)?);
-    let command = decode("frontend-invocation.json")?;
+    let command = crate::linux_frontend_access::resolve(
+        &decode("frontend-invocation.json")?,
+        Some(custody.bytes(path("original-contract.json")?)?),
+    )?;
     let wait = decode("frontend-wait.json")?;
     let preinput = decode("frontend-preinput.json")?;
     closed(
@@ -975,7 +989,6 @@ fn validate_frontend(
         (1, "65534"),
         (2, "--regid"),
         (3, "65534"),
-        (4, "--clear-groups"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
         (7, "+512M"),
@@ -1004,25 +1017,16 @@ fn validate_frontend(
         return Err("lifecycle original frontend paths/target arguments differ".into());
     }
     let report = std::str::from_utf8(&arguments[15]).map_err(|error| error.to_string())?;
-    let directory = Path::new(report)
-        .parent()
+    let directory = crate::linux_path::parent(report)
         .ok_or("lifecycle original frontend result parent absent")?;
-    let original_case = directory
-        .parent()
-        .ok_or("lifecycle original case directory absent")?;
-    if directory.file_name().and_then(|name| name.to_str()) != Some("frontend")
-        || Path::new(report).file_name().and_then(|name| name.to_str()) != Some("result.json")
-        || original_case != Path::new(&context.frontend_directory)
+    let original_case =
+        crate::linux_path::parent(&directory).ok_or("lifecycle original case directory absent")?;
+    if crate::linux_path::file_name(&directory) != Some("frontend")
+        || crate::linux_path::file_name(report) != Some("result.json")
+        || !crate::linux_path::equivalent(&original_case, &context.frontend_directory)
         || arguments[11]
-            != original_case
-                .join("mixed.contract.json")
-                .as_os_str()
-                .as_encoded_bytes()
-        || arguments[17]
-            != directory
-                .join("observations")
-                .as_os_str()
-                .as_encoded_bytes()
+            != crate::linux_path::join(&original_case, "mixed.contract.json").as_bytes()
+        || arguments[17] != crate::linux_path::join(&directory, "observations").as_bytes()
     {
         return Err(
             "lifecycle frontend observation/contract scope crosses original result directory"
@@ -1844,21 +1848,133 @@ fn validate_final_settlement(
             "lifecycle preauthorization/delivery adopts unrelated executed descendant graph".into(),
         );
     }
-    validate_native_recovery(
-        &decode("native-recovery-invocation.json")?,
-        &decode("native-recovery-process.json")?,
-        custody.bytes(path("native-recovery-invocation.json")?)?,
-        custody.bytes(path("native-recovery-stdout.bin")?)?,
-        custody.bytes(path("native-recovery-stderr.bin")?)?,
-        &context.owner,
-        &context.input.key,
-        custody.bytes(
-            context.owner["selected_agent"]
-                .as_str()
-                .ok_or("lifecycle actual recovery agent bytes absent")?,
-        )?,
-        context.case_directory.as_bytes(),
-    )?;
+    let recovery_invocation = decode("native-recovery-invocation.json")?;
+    if let Some(proof) = recovery_invocation.get("original_fixture") {
+        let mut records = std::collections::BTreeMap::new();
+        for (leaf, reference) in proof["acquisition_artifacts"]
+            .as_object()
+            .ok_or("lifecycle recovery acquisition references absent")?
+        {
+            records.insert(
+                leaf.clone(),
+                custody
+                    .bytes(
+                        reference
+                            .as_str()
+                            .ok_or("lifecycle recovery acquisition reference malformed")?,
+                    )?
+                    .to_vec(),
+            );
+        }
+        let recovered = crate::validate_embedded_original_fixture_recovery(
+            &recovery_invocation,
+            &decode("native-recovery-process.json")?,
+            &proof["capture"],
+            &records,
+        )?;
+        let recovery_owner_bytes: Vec<u8> = serde_json::from_value(proof["owner_bytes"].clone())
+            .map_err(|error| error.to_string())?;
+        let recovery_owner = crate::wire::json(&recovery_owner_bytes)?;
+        let original_lease = decode("original-lease-owner.json")?;
+        let admin = original_lease["admin_root"]
+            .as_str()
+            .ok_or("lifecycle original admin root absent")?;
+        if recovery_owner["cell"] != context.owner["cell"]
+            || recovery_owner["owner_path"]
+                != crate::linux_path::join(admin, "recovery-harness-owner.json")
+            || recovery_owner["executable"]
+                != crate::linux_path::join(
+                    admin,
+                    "recovery-harness/operational/native-test-harness",
+                )
+        {
+            return Err(
+                "lifecycle recovery harness replaces original installation acquisition".into(),
+            );
+        }
+        if serde_json::to_value(&recovered.identity).map_err(|error| error.to_string())?
+            != context.owner["identity"]
+            || serde_json::json!(recovered.scope_id) != context.owner["lease_id"]
+            || recovered.native_target != context.input.key.target
+            || recovered.original_artifact_root.to_str() != Some(context.case_directory.as_str())
+            || serde_json::json!(recovered.work_deadline_unix_millis)
+                != context.owner["work_deadline_unix_millis"]
+            || serde_json::json!(recovered.cleanup_deadline_unix_millis)
+                != context.owner["cleanup_deadline_unix_millis"]
+        {
+            return Err("lifecycle fixture recovery crosses original source/lifetime".into());
+        }
+        let (original_prepared, original_lease, journal, actions) = match &recovered.context {
+            crate::original_fixture_recovery_contract::Context::Lifecycle {
+                lease_owner,
+                prepared,
+                allocation_journal,
+                phase_journal,
+                controller_intent,
+                controller_action,
+            } if context.input.key.family == "L-LIFE-02" => (
+                prepared,
+                lease_owner,
+                allocation_journal,
+                vec![
+                    ("phase-journal.bin", phase_journal),
+                    ("controller-intent.json", controller_intent),
+                    ("controller-action.json", controller_action),
+                ],
+            ),
+            crate::original_fixture_recovery_contract::Context::Delivery {
+                lease_owner,
+                prepared,
+                allocation_journal,
+                report_destination,
+                report_delivery_failure,
+            } if context.input.key.family == "L-LIFE-05"
+                && context.input.key.scenario == "report-persistence-failure" =>
+            {
+                (
+                    prepared,
+                    lease_owner,
+                    allocation_journal,
+                    vec![
+                        ("report-destination.json", report_destination),
+                        ("report-delivery-failure.json", report_delivery_failure),
+                    ],
+                )
+            }
+            _ => return Err("lifecycle fixture recovery context differs".into()),
+        };
+        if original_prepared.sha256 != custody.hash(path("prepared.json")?)?
+            || original_lease.sha256 != custody.hash(path("original-lease-owner.json")?)?
+            || journal.sha256 != custody.hash(path("allocation-phase-journal.bin")?)?
+            || proof["capture"]["stdout"]
+                != serde_json::json!(custody.bytes(path("native-recovery-stdout.bin")?)?)
+            || proof["capture"]["stderr"]
+                != serde_json::json!(custody.bytes(path("native-recovery-stderr.bin")?)?)
+        {
+            return Err("lifecycle fixture recovery originals/captures differ".into());
+        }
+        for (name, record) in actions {
+            if record.sha256 != custody.hash(path(name)?)? {
+                return Err("lifecycle fixture recovery original intervention differs".into());
+            }
+        }
+    } else {
+        validate_native_recovery(
+            &decode("native-recovery-invocation.json")?,
+            &decode("native-recovery-process.json")?,
+            custody.bytes(path("native-recovery-invocation.json")?)?,
+            custody.bytes(path("native-recovery-stdout.bin")?)?,
+            custody.bytes(path("native-recovery-stderr.bin")?)?,
+            &context.owner,
+            &context.input.key,
+            custody.bytes(
+                context.owner["selected_agent"]
+                    .as_str()
+                    .ok_or("lifecycle actual recovery agent bytes absent")?,
+            )?,
+            context.case_directory.as_bytes(),
+        )?;
+    }
     let result_hash = if let Some(result) = context.peers.get("actual-result.json") {
         custody.hash(result)?.to_owned()
     } else {
@@ -2034,7 +2150,13 @@ pub(crate) fn verify_delivery(
         &failure["destination"],
         &["device", "inode", "uid", "gid", "mode", "is_directory"],
     )?;
-    let command = decode("frontend-invocation.json")?;
+    let raw_command = decode("frontend-invocation.json")?;
+    let raw_arguments: Vec<Vec<u8>> = serde_json::from_value(raw_command["arguments"].clone())
+        .map_err(|error| error.to_string())?;
+    let command = crate::linux_frontend_access::resolve(
+        &raw_command,
+        Some(custody.bytes(path("original-contract.json")?)?),
+    )?;
     let arguments: Vec<Vec<u8>> =
         serde_json::from_value(command["arguments"].clone()).map_err(|error| error.to_string())?;
     if before["format"] != "memcordon.linux-report-destination"
@@ -2043,7 +2165,13 @@ pub(crate) fn verify_delivery(
         || failure["revision"] != 1
         || before["path"]
             != serde_json::to_value(&arguments[15]).map_err(|error| error.to_string())?
-        || failure["report_path"] != before["path"]
+        || failure["report_path"]
+            != serde_json::to_value(
+                raw_arguments
+                    .get(15)
+                    .ok_or("lifecycle raw report operand absent")?,
+            )
+            .map_err(|error| error.to_string())?
         || failure["native_errno"] != 21
         || failure["native_error_code"] != "MCREPORT-WRITE"
         || failure["frontend_pid"] != context.prepared["caller"]["pid"]
@@ -2296,15 +2424,12 @@ fn original_context(
     }
     let owner: Value = crate::wire::json(custody.bytes(&e.owner)?)?;
     let (acquisition, lease) = validate_owner(index, e, product, &owner, custody)?;
-    let case_directory = Path::new(
+    let case_directory = crate::linux_path::join(
         lease["artifact_root"]
             .as_str()
             .ok_or("lifecycle original artifact root absent")?,
-    )
-    .join(prefix)
-    .to_str()
-    .ok_or("lifecycle original native case scope is not UTF8")?
-    .to_owned();
+        prefix,
+    );
     let raw_parent = format!(
         "{}/{}/linux-mixed/recipe-",
         e.key.target,
@@ -2332,20 +2457,17 @@ fn original_context(
     if original_leases.len() != 1 {
         return Err("lifecycle original acquired lease path ambiguous".into());
     }
-    let native_lease = Path::new(
+    let native_lease = crate::linux_path::join(
         lease["artifact_root"]
             .as_str()
             .ok_or("lifecycle original artifact root absent")?,
-    )
-    .join(original_leases[0]);
-    let frontend_directory = native_lease
-        .parent()
-        .ok_or("lifecycle original lease parent absent")?
-        .join("mixed-cases")
-        .join(format!("recipe-{ordinal}"))
-        .to_str()
-        .ok_or("lifecycle original frontend scope not UTF8")?
-        .to_owned();
+        original_leases[0],
+    );
+    let frontend_directory = crate::linux_path::join(
+        &crate::linux_path::parent(&native_lease)
+            .ok_or("lifecycle original lease parent absent")?,
+        &format!("mixed-cases/recipe-{ordinal}"),
+    );
     let prepared = decode("prepared.json")?;
     let native = decode("prepared-native-before-ack.json")?;
     let request = decode("original-contract.json")?;

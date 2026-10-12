@@ -1117,12 +1117,14 @@ impl WindowsAttemptRecordV1 {
         if self.terminal_response_json.is_none() {
             return Err("attempt has no durable terminal outbox to acknowledge".to_owned());
         }
+        let retired = self.terminal_retired_receipt(&self.nonce)?;
+        // Validate the exact disposition's checked authority before committing ACK.
+        let tombstone = ack_tombstone_for(self, &retired)?;
         if self.lifecycle != memcordon_core::WindowsTerminalLifecycleV1::AckCommitted {
             self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::AckCommitted;
             self.store()?;
         }
-        let retired = self.terminal_retired_receipt(&self.nonce)?;
-        stage_ack_tombstone(self, &retired)?;
+        stage_ack_tombstone(self, tombstone)?;
         remove_guardian_receipt(&self.attempt_id)?;
         super::attempt_store::retire(&self.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
@@ -1840,7 +1842,7 @@ fn validate_replay_directory(path: &Path) -> Result<(), String> {
                 || tombstone.original_boot_id.is_empty()
                 || validate_attempt_id(&tombstone.proof_sha256).is_err()
                 || validate_attempt_id(&tombstone.job_identity).is_err()
-                || validate_attempt_id(&tombstone.owner_manifest_sha256).is_err()
+                || !tombstone.authority_is_consistent()
                 || validate_attempt_id(&tombstone.ledger_generation).is_err()
                 || tombstone.caller_process_identity.process_id == 0
                 || tombstone.caller_process_identity.creation_time_100ns == 0
@@ -1948,6 +1950,9 @@ struct TerminalAckTombstoneV1 {
     launch_incarnation: String,
     original_boot_id: String,
     proof_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preauthorization_retirement_proof:
+        Option<memcordon_core::WindowsPreauthorizationRetirementProofV1>,
     job_identity: String,
     owner_manifest_sha256: String,
     ledger_generation: String,
@@ -1955,6 +1960,35 @@ struct TerminalAckTombstoneV1 {
     caller_process_identity: memcordon_core::WindowsProcessIdentityV1,
     caller_token_sha256: String,
     recovery_authorization: memcordon_core::WindowsRecoveryAuthorizationV1,
+}
+
+impl TerminalAckTombstoneV1 {
+    fn authority_is_consistent(&self) -> bool {
+        match (
+            &self.retired.disposition,
+            &self.preauthorization_retirement_proof,
+        ) {
+            (WindowsAttemptTerminalDispositionV1::Posttarget, None) => {
+                validate_attempt_id(&self.owner_manifest_sha256).is_ok()
+            }
+            (WindowsAttemptTerminalDispositionV1::PreauthorizationAbort, Some(proof)) => {
+                self.owner_manifest_sha256.is_empty()
+                    && proof.is_consistent()
+                    && proof.attempt_id == self.retired.attempt_id
+                    && proof.nonce == self.retired.nonce
+                    && proof.request_sha256 == self.retired.request_sha256
+                    && proof.terminal_response_sha256 == self.retired.terminal_response_sha256
+                    && proof.provider_generation == self.provider_generation
+                    && proof.original_boot_id == self.original_boot_id
+                    && proof.launch_incarnation == self.launch_incarnation
+                    && proof.job_identity == self.job_identity
+                    && proof
+                        .canonical_sha256()
+                        .is_ok_and(|digest| digest == self.proof_sha256)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Drop for AdmissionLease {
@@ -2179,6 +2213,13 @@ fn replay_record(
     if replay.attempt_id != attempt_id || replay.request_sha256 != request_sha256 {
         return Err("replay record is not bound to the acknowledged attempt".to_owned());
     }
+    if replay
+        .acknowledged
+        .as_ref()
+        .is_some_and(|tombstone| !tombstone.authority_is_consistent())
+    {
+        return Err("replay ACK retirement authority is inconsistent".to_owned());
+    }
     Ok((path, replay))
 }
 
@@ -2210,9 +2251,8 @@ fn recover_staged_ack_tombstones() -> Result<(), String> {
 
 fn stage_ack_tombstone(
     record: &WindowsAttemptRecordV1,
-    retired: &memcordon_core::WindowsTerminalRetiredV1,
+    tombstone: TerminalAckTombstoneV1,
 ) -> Result<(), String> {
-    let tombstone = ack_tombstone_for(record, retired)?;
     let (path, replay) = replay_record(&record.attempt_id, &record.request_sha256)?;
     stage_ack_tombstone_at(record, tombstone, &path, replay)?;
     let (_, committed) = replay_record(&record.attempt_id, &record.request_sha256)?;
@@ -2234,6 +2274,8 @@ fn stage_ack_tombstone_at(
     if let Some(existing) = replay.acknowledged.as_ref() {
         if existing.retired != tombstone.retired
             || existing.proof_sha256 != tombstone.proof_sha256
+            || existing.preauthorization_retirement_proof
+                != tombstone.preauthorization_retirement_proof
             || existing.launch_incarnation != tombstone.launch_incarnation
             || existing.caller_process_identity != tombstone.caller_process_identity
             || existing.caller_token_sha256 != tombstone.caller_token_sha256
@@ -2254,17 +2296,117 @@ fn ack_tombstone_for(
     record: &WindowsAttemptRecordV1,
     retired: &memcordon_core::WindowsTerminalRetiredV1,
 ) -> Result<TerminalAckTombstoneV1, String> {
-    let proof = record
-        .retirement_proof
-        .as_ref()
-        .ok_or_else(|| "ACK tombstone requires checked retirement proof".to_owned())?;
-    let proof_sha256 = digest(&serde_json::to_vec(proof).map_err(|error| error.to_string())?);
-    let owner_manifest_sha256 = record
-        .owner_manifest
-        .as_ref()
-        .ok_or_else(|| "ACK tombstone requires frozen owner manifest".to_owned())?
-        .canonical_sha256()
-        .map_err(str::to_owned)?;
+    let preauthorization_retirement_proof = if retired.disposition
+        == WindowsAttemptTerminalDispositionV1::PreauthorizationAbort
+    {
+        if record.authorization_unix_millis.is_some()
+            || record.resume_attempted
+            || record.target_released
+            || record.state != WindowsAttemptStateV1::Empty
+            || record.retirement_proof.is_some()
+            || record.terminal_seed.is_some()
+            || record.terminal_disposition
+                != Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
+        {
+            return Err(
+                "preauthorization ACK conflicts with durable execution authority".to_owned(),
+            );
+        }
+        let response: memcordon_core::WindowsLauncherResponseV3 = serde_json::from_str(
+            record
+                .terminal_response_json
+                .as_deref()
+                .ok_or("preauthorization ACK has no original outbox")?,
+        )
+        .map_err(|error| error.to_string())?;
+        if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(record), &response) {
+            return Err("preauthorization ACK outbox is not bound".to_owned());
+        }
+        let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = response else {
+            return Err("preauthorization ACK requires original rejection".to_owned());
+        };
+        if !matches!(
+            rejection.disposition,
+            memcordon_core::WindowsProviderRejectionDispositionV2::Preauthorization {
+                terminal_ack_required: true
+            }
+        ) || !rejection.cleanup_attempted
+            || rejection.target_released
+            || !rejection.restart_safety.containment_removed
+            || !rejection
+                .restart_safety
+                .containment_incapable_of_live_members
+            || !rejection
+                .restart_safety
+                .is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
+            || record_has_live_process(record)?
+        {
+            return Err(
+                "preauthorization ACK lacks checked owner extinction and cleanup".to_owned(),
+            );
+        }
+        let proof = memcordon_core::WindowsPreauthorizationRetirementProofV1 {
+            schema_version: 1,
+            attempt_id: record.attempt_id.clone(),
+            nonce: record.nonce.clone(),
+            request_sha256: record.request_sha256.clone(),
+            provider_generation: record.provider_generation.clone(),
+            original_boot_id: record.boot_identity.clone(),
+            launch_incarnation: record.launch_incarnation.clone(),
+            job_identity: record.job_identity_sha256.clone(),
+            terminal_response_sha256: retired.terminal_response_sha256.clone(),
+            target_identity: record.target_identity.clone(),
+            guardian_identity: record.guardian_identity.clone(),
+            worker_identity: record.worker_identity.clone(),
+            worker_thread_identity: record.worker_thread_identity,
+            frozen_owner_manifest_sha256: record
+                .owner_manifest
+                .as_ref()
+                .map(|manifest| manifest.canonical_sha256())
+                .transpose()
+                .map_err(str::to_owned)?,
+            target_created: rejection.target_created,
+            authorization_unix_millis: record.authorization_unix_millis,
+            resume_attempted: record.resume_attempted,
+            target_released: record.target_released,
+            cleanup_state: memcordon_core::WindowsDurableCleanupStateV1 {
+                termination_requested: record.cleanup_state.termination_requested,
+                active_processes_zero: record.cleanup_state.active_processes_zero,
+                guardian_reaped: record.cleanup_state.guardian_reaped,
+                final_handles_closed: record.cleanup_state.final_handles_closed,
+            },
+            recorded_target_and_guardian_extinct: true,
+        };
+        if !proof.is_consistent() {
+            return Err("preauthorization ACK proof is inconsistent".to_owned());
+        }
+        Some(proof)
+    } else {
+        None
+    };
+    let (proof_sha256, owner_manifest_sha256) = if let Some(proof) =
+        preauthorization_retirement_proof.as_ref()
+    {
+        (
+            proof
+                .canonical_sha256()
+                .map_err(|error| error.to_string())?,
+            String::new(),
+        )
+    } else {
+        let proof = record
+            .retirement_proof
+            .as_ref()
+            .ok_or_else(|| "ACK tombstone requires checked retirement proof".to_owned())?;
+        let proof_sha256 = digest(&serde_json::to_vec(proof).map_err(|error| error.to_string())?);
+        let owner_manifest_sha256 = record
+            .owner_manifest
+            .as_ref()
+            .ok_or_else(|| "ACK tombstone requires frozen owner manifest".to_owned())?
+            .canonical_sha256()
+            .map_err(str::to_owned)?;
+        (proof_sha256, owner_manifest_sha256)
+    };
     let ledger_generation = digest(
         &serde_json::to_vec(&(
             &record.attempt_id,
@@ -2281,6 +2423,7 @@ fn ack_tombstone_for(
         launch_incarnation: record.launch_incarnation.clone(),
         original_boot_id: record.boot_identity.clone(),
         proof_sha256,
+        preauthorization_retirement_proof,
         job_identity: record.job_identity_sha256.clone(),
         owner_manifest_sha256,
         ledger_generation,
@@ -2363,6 +2506,7 @@ fn retired_from_ack_tombstone(
         job_identity: tombstone.job_identity,
         owner_manifest_sha256: tombstone.owner_manifest_sha256,
         retirement_proof_sha256: tombstone.proof_sha256,
+        preauthorization_retirement_proof: tombstone.preauthorization_retirement_proof,
         ledger_generation: tombstone.ledger_generation,
         completion: memcordon_core::WindowsRetirementLedgerCompletionV1::RetirementComplete,
     };
@@ -2558,19 +2702,39 @@ pub fn recover_attempt_for_caller(
                     stage_recovered_closure(&mut record, &caller.current_boot_identity, None)?;
                 } else if guardian_receipt_path(attempt_id)?.exists() {
                     let guardian = read_guardian_receipt(attempt_id)?;
-                    if guardian_receipt_binds_record(&guardian, &record)?
-                        && frozen_manifest_owners_extinct(&record)?
-                    {
-                        stage_recovered_closure(
-                            &mut record,
-                            &caller.current_boot_identity,
-                            Some(&guardian),
-                        )?;
+                    if !guardian_receipt_binds_record(&guardian, &record)? {
+                        return Err("exact recovery pending checked closure: guardian receipt does not bind original record".to_owned());
                     }
+                    if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
+                        return Err(format!("exact recovery pending checked closure: {blocker}"));
+                    }
+                    stage_recovered_closure(
+                        &mut record,
+                        &caller.current_boot_identity,
+                        Some(&guardian),
+                    )?;
+                } else {
+                    return Err(format!(
+                        "exact recovery pending checked closure: guardian receipt absent on original boot; durable-state={:?}; resume-attempted={}; target-released={}; termination-requested={}; active-processes-zero={}; guardian-reaped={}; final-handles-closed={}; terminal-seed-present={}; retirement-proof-present={}; owner-manifest-present={}; terminal-publication-reserved={}",
+                        record.state,
+                        record.resume_attempted,
+                        record.target_released,
+                        record.cleanup_state.termination_requested,
+                        record.cleanup_state.active_processes_zero,
+                        record.cleanup_state.guardian_reaped,
+                        record.cleanup_state.final_handles_closed,
+                        record.terminal_seed.is_some(),
+                        record.retirement_proof.is_some(),
+                        record.owner_manifest.is_some(),
+                        record.terminal_publication_reserved,
+                    ));
                 }
             }
             let Some(outbox) = record.terminal_response_json.as_deref() else {
-                return Ok(None);
+                return Err(format!(
+                    "exact recovery pending checked closure: terminal outbox absent; authorized={}; same-boot={same_boot}",
+                    record.authorization_unix_millis.is_some()
+                ));
             };
             let response: memcordon_core::WindowsLauncherResponseV3 =
                 serde_json::from_str(outbox).map_err(|error| error.to_string())?;
@@ -2583,7 +2747,7 @@ pub fn recover_attempt_for_caller(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let (_, replay) = replay_record(attempt_id, request_sha256)?;
             let Some(tombstone) = replay.acknowledged else {
-                return Ok(None);
+                return Err("exact recovery pending checked closure: durable attempt absent and no acknowledged tombstone".to_owned());
             };
             if tombstone.retired.nonce != nonce {
                 return Err("recovery tombstone nonce differs".to_owned());
@@ -2610,6 +2774,12 @@ pub fn recover_attempt_for_caller(
 }
 
 fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<bool, String> {
+    frozen_manifest_owner_blocker(record).map(|blocker| blocker.is_none())
+}
+
+fn frozen_manifest_owner_blocker(
+    record: &WindowsAttemptRecordV1,
+) -> Result<Option<String>, String> {
     let manifest = record
         .owner_manifest
         .as_ref()
@@ -2621,7 +2791,10 @@ fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<boo
             continue;
         }
         let Some(identity) = entry.process_identity.as_ref() else {
-            return Ok(false);
+            return Ok(Some(format!(
+                "frozen owner lacks process identity; role={:?}",
+                entry.role
+            )));
         };
         if process_identity_is_live(identity.clone())? {
             if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay
@@ -2657,10 +2830,13 @@ fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<boo
             {
                 continue;
             }
-            return Ok(false);
+            return Ok(Some(format!(
+                "frozen owner remains live without checked owner retirement; role={:?}; pid={}; birth={}",
+                entry.role, identity.process_id, identity.creation_time_100ns
+            )));
         }
     }
-    Ok(true)
+    Ok(None)
 }
 
 fn worker_thread_is_extinct(expected: WindowsWorkerThreadIdentityV1) -> Result<bool, String> {
@@ -4572,15 +4748,38 @@ fn remove_guardian_receipt(attempt_id: &str) -> Result<(), String> {
     }
 }
 
+fn record_name_refusal(path: &Path, reason: &str) -> String {
+    let excerpt = |value: &std::ffi::OsStr, bound: usize| {
+        let text = value.to_string_lossy();
+        let lossy = matches!(&text, std::borrow::Cow::Owned(_));
+        let mut observed = String::new();
+        let mut truncated = false;
+        for character in text.chars().flat_map(char::escape_debug) {
+            if observed.len() + character.len_utf8() > bound {
+                truncated = true;
+                break;
+            }
+            observed.push(character);
+        }
+        (observed, truncated, lossy)
+    };
+    let (parent, parent_truncated, parent_lossy) =
+        excerpt(path.parent().unwrap_or(Path::new("")).as_os_str(), 128);
+    let (leaf, leaf_truncated, leaf_lossy) = excerpt(path.file_name().unwrap_or_default(), 256);
+    format!(
+        "{reason}; supplied-parent=\"{parent}\"; parent-truncated={parent_truncated}; parent-lossy={parent_lossy}; entry-name=\"{leaf}\"; entry-truncated={leaf_truncated}; entry-lossy={leaf_lossy}"
+    )
+}
+
 fn record_attempt_id(path: &Path) -> Result<String, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "attempt record name is not UTF-8".to_owned())?;
-    let attempt_id = name
-        .strip_suffix(".json")
-        .ok_or_else(|| "attempt directory contains an unrecognized entry".to_owned())?;
-    validate_attempt_id(attempt_id)?;
+        .ok_or_else(|| record_name_refusal(path, "attempt record name is not UTF-8"))?;
+    let attempt_id = name.strip_suffix(".json").ok_or_else(|| {
+        record_name_refusal(path, "attempt directory contains an unrecognized entry")
+    })?;
+    validate_attempt_id(attempt_id).map_err(|error| record_name_refusal(path, &error))?;
     Ok(attempt_id.to_owned())
 }
 

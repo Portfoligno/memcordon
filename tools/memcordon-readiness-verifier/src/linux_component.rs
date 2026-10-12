@@ -178,6 +178,10 @@ pub fn validate_linux_version_vector(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare each versioned request/result byte vector independently with its native receipt"
+)]
 pub fn validate_linux_mixed_version_vector(
     receipt: &LinuxVersionReceipt,
     key: &CaseKey,

@@ -548,7 +548,15 @@ impl ResultV1 {
                     operational_failure.and_then(|failure| failure.provider_failure.clone())
                 }),
             provider_association: operational_failure
-                .and_then(|failure| failure.provider_association.clone()),
+                .and_then(|failure| failure.provider_association.clone())
+                .or_else(|| {
+                    attempt.and_then(|attempt| match &attempt.boundary_detail {
+                        crate::BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
+                            native.frontend_provider_association.clone()
+                        }
+                        _ => None,
+                    })
+                }),
             delivery: DeliveryEvidence::Prepared,
         };
         if let Some(private) = &value.private_execution {
@@ -933,6 +941,24 @@ impl ResultV1 {
             }
         }
         if let RuntimeV1::WindowsSealed { observation } = &self.runtime {
+            if let Some(association) = &observation.frontend_provider_association {
+                let delivery = observation
+                    .frontend_delivery
+                    .as_ref()
+                    .ok_or("Windows provider association lacks authenticated frontend delivery")?;
+                if !delivery.is_consistent()
+                    || self.provider_association.as_ref() != Some(association)
+                    || String::from(association.attempt_id.clone()) != delivery.attempt_id
+                    || String::from(association.request_sha256.clone()) != delivery.request_sha256
+                    || self.attempts.last().is_some_and(|attempt| {
+                        matches!(&attempt.policy_enforcement,
+                            crate::workload_evidence::RuntimePolicyEnforcement::Authorized { admission, .. }
+                            if admission.plan.provider != association.provider)
+                    })
+                {
+                    return Err("Windows provider association differs from authenticated attempt".into());
+                }
+            }
             let attempt_observation =
                 self.attempts
                     .last()

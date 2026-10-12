@@ -1,5 +1,118 @@
 use memcordon_core::diagnostics::*;
 
+#[test]
+fn preauthorization_retirement_requires_its_exact_checked_authority() {
+    use memcordon_core::{
+        WindowsAttemptTerminalDispositionV1, WindowsDurableCleanupStateV1,
+        WindowsPreauthorizationRetirementProofV1, WindowsProcessIdentityV1,
+        WindowsRetirementLedgerCompletionV1, WindowsTerminalRetiredV2,
+    };
+    let proof = WindowsPreauthorizationRetirementProofV1 {
+        schema_version: 1,
+        attempt_id: "a".repeat(64),
+        nonce: "nonce".to_owned(),
+        request_sha256: "b".repeat(64),
+        provider_generation: "provider".to_owned(),
+        original_boot_id: "boot".to_owned(),
+        launch_incarnation: "launch".to_owned(),
+        job_identity: "c".repeat(64),
+        terminal_response_sha256: "d".repeat(64),
+        target_identity: Some(WindowsProcessIdentityV1 {
+            process_id: 41,
+            creation_time_100ns: 123,
+        }),
+        guardian_identity: Some(WindowsProcessIdentityV1 {
+            process_id: 42,
+            creation_time_100ns: 124,
+        }),
+        worker_identity: Some(WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 125,
+        }),
+        worker_thread_identity: None,
+        frozen_owner_manifest_sha256: None,
+        target_created: true,
+        authorization_unix_millis: None,
+        resume_attempted: false,
+        target_released: false,
+        cleanup_state: WindowsDurableCleanupStateV1 {
+            termination_requested: true,
+            active_processes_zero: true,
+            guardian_reaped: true,
+            final_handles_closed: true,
+        },
+        recorded_target_and_guardian_extinct: true,
+    };
+    let receipt = WindowsTerminalRetiredV2 {
+        schema_version: 2,
+        attempt_id: proof.attempt_id.clone(),
+        nonce: proof.nonce.clone(),
+        request_sha256: proof.request_sha256.clone(),
+        terminal_response_sha256: proof.terminal_response_sha256.clone(),
+        disposition: WindowsAttemptTerminalDispositionV1::PreauthorizationAbort,
+        provider_generation: proof.provider_generation.clone(),
+        original_boot_id: proof.original_boot_id.clone(),
+        launch_incarnation: proof.launch_incarnation.clone(),
+        job_identity: proof.job_identity.clone(),
+        owner_manifest_sha256: String::new(),
+        retirement_proof_sha256: proof.canonical_sha256().unwrap(),
+        preauthorization_retirement_proof: Some(proof),
+        ledger_generation: "e".repeat(64),
+        completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
+    };
+    let valid = |value: &WindowsTerminalRetiredV2| {
+        value.is_consistent_for(
+            &receipt.attempt_id,
+            &receipt.nonce,
+            &receipt.request_sha256,
+            &receipt.terminal_response_sha256,
+        )
+    };
+    assert!(valid(&receipt));
+    let decoded: WindowsTerminalRetiredV2 =
+        serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+    assert_eq!(decoded, receipt);
+    let mutations: [fn(&mut WindowsPreauthorizationRetirementProofV1); 12] = [
+        |proof| proof.authorization_unix_millis = Some(1),
+        |proof| proof.resume_attempted = true,
+        |proof| proof.target_released = true,
+        |proof| proof.cleanup_state.termination_requested = false,
+        |proof| proof.cleanup_state.active_processes_zero = false,
+        |proof| proof.cleanup_state.guardian_reaped = false,
+        |proof| proof.cleanup_state.final_handles_closed = false,
+        |proof| proof.recorded_target_and_guardian_extinct = false,
+        |proof| proof.target_identity = None,
+        |proof| proof.provider_generation = "different".to_owned(),
+        |proof| proof.terminal_response_sha256 = "f".repeat(64),
+        |proof| {
+            proof
+                .guardian_identity
+                .as_mut()
+                .unwrap()
+                .creation_time_100ns = 0
+        },
+    ];
+    for mutate in mutations {
+        let mut changed = receipt.clone();
+        let proof = changed.preauthorization_retirement_proof.as_mut().unwrap();
+        mutate(proof);
+        changed.retirement_proof_sha256 = proof.canonical_sha256().unwrap();
+        assert!(!valid(&changed));
+    }
+    let mut changed = receipt.clone();
+    changed.preauthorization_retirement_proof = None;
+    assert!(!valid(&changed));
+    changed = receipt.clone();
+    changed.owner_manifest_sha256 = "f".repeat(64);
+    assert!(!valid(&changed));
+    changed = receipt.clone();
+    changed.disposition = WindowsAttemptTerminalDispositionV1::Posttarget;
+    assert!(!valid(&changed));
+    changed.preauthorization_retirement_proof = None;
+    changed.owner_manifest_sha256 = "f".repeat(64);
+    assert!(valid(&changed));
+}
+
 fn assert_serialized_response_limit<T: WindowsResponseFrame + serde::Serialize>(
     response: &T,
     expected: usize,
@@ -144,6 +257,7 @@ fn versioned_terminal_retirement_receipt_survives_the_256_byte_prefix() {
         job_identity: "e".repeat(64),
         owner_manifest_sha256: "f".repeat(64),
         retirement_proof_sha256: "0".repeat(64),
+        preauthorization_retirement_proof: None,
         ledger_generation: "1".repeat(64),
         completion: WindowsRetirementLedgerCompletionV1::RetirementComplete,
     };

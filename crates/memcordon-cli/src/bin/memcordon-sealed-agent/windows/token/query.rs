@@ -199,7 +199,7 @@ pub fn authenticate_pipe_client(
     // SAFETY: pipe is the connected server end owned by the control service.
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         return Err(format!(
-            "MCSEALED-WINDOWS-CALLER-AUTH: {}",
+            "MCSEALED-WINDOWS-CALLER-AUTH: ImpersonateNamedPipeClient: {}",
             io::Error::last_os_error()
         ));
     }
@@ -216,10 +216,17 @@ pub fn authenticate_pipe_client(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(format!(
+            "MCSEALED-WINDOWS-CALLER-AUTH: OpenThreadToken(query|duplicate): {}",
+            io::Error::last_os_error()
+        ));
     }
-    let impersonation = OwnedHandle::new(impersonation)?;
-    let source_envelope = envelope(impersonation.raw())?;
+    let impersonation = OwnedHandle::new(impersonation).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: own impersonation token: {error}")
+    })?;
+    let source_envelope = envelope(impersonation.raw()).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: capture source token envelope: {error}")
+    })?;
     if source_envelope.token_type != TokenImpersonation as u32
         || source_envelope.impersonation_level < SecurityImpersonation as u32
         || source_envelope.impersonation_level > SecurityDelegation as u32
@@ -240,8 +247,13 @@ pub fn authenticate_pipe_client(
             0,
             client_process_id,
         )
+    })
+    .map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: OpenProcess frontend-before; pid={client_process_id}: {error}")
     })?;
-    let identity_before = super::process::process_identity(frontend.raw())?;
+    let identity_before = super::process::process_identity(frontend.raw()).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: capture frontend-before identity; pid={client_process_id}: {error}")
+    })?;
     let mut primary = ptr::null_mut();
     reject_fault(
         certification_fault,
@@ -260,10 +272,17 @@ pub fn authenticate_pipe_client(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(format!(
+            "MCSEALED-WINDOWS-CALLER-AUTH: DuplicateTokenEx(primary): {}",
+            io::Error::last_os_error()
+        ));
     }
-    let primary = OwnedHandle::new(primary)?;
-    let primary_envelope = envelope(primary.raw())?;
+    let primary = OwnedHandle::new(primary).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: own duplicated primary token: {error}")
+    })?;
+    let primary_envelope = envelope(primary.raw()).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-AUTH: capture duplicated primary envelope: {error}")
+    })?;
     if primary_envelope.token_type != TokenPrimary as u32
         || primary_envelope.impersonation_level != SecurityAnonymous as u32
     {
@@ -287,7 +306,9 @@ pub fn authenticate_pipe_client(
         .map_err(|error| format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: peer SID: {error}"))?;
     super::security::converge_token_peer_query(primary.raw(), &launcher_sid)
         .map_err(|error| format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: {error}"))?;
-    let prepared_envelope = envelope(primary.raw())?;
+    let prepared_envelope = envelope(primary.raw()).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-TOKEN-DACL: capture prepared primary envelope: {error}")
+    })?;
     if prepared_envelope != primary_envelope {
         let mismatch_fields = envelope_mismatch_fields(&primary_envelope, &prepared_envelope);
         return Err(format!(
@@ -307,7 +328,7 @@ pub fn authenticate_pipe_client(
     // brackets token capture with a fresh kernel-authenticated client PID.
     if unsafe { GetNamedPipeClientProcessId(pipe, &raw mut client_process_id_after) } == 0 {
         return Err(format!(
-            "MCSEALED-WINDOWS-CALLER-RACE: {}",
+            "MCSEALED-WINDOWS-CALLER-RACE: GetNamedPipeClientProcessId after capture: {}",
             io::Error::last_os_error()
         ));
     }
@@ -324,8 +345,13 @@ pub fn authenticate_pipe_client(
             0,
             client_process_id_after,
         )
+    })
+    .map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-RACE: OpenProcess frontend-after; pid={client_process_id_after}: {error}")
     })?;
-    let identity_after = super::process::process_identity(frontend_after.raw())?;
+    let identity_after = super::process::process_identity(frontend_after.raw()).map_err(|error| {
+        format!("MCSEALED-WINDOWS-CALLER-RACE: capture frontend-after identity; pid={client_process_id_after}: {error}")
+    })?;
     if identity_after != identity_before {
         return Err(
             "MCSEALED-WINDOWS-CALLER-RACE: pipe client process object changed during token capture"

@@ -134,6 +134,10 @@ pub struct OutstandingMixedRetirementV2 {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct typed public execution and rejection payloads in the versioned wire contract"
+)]
 pub enum MixedRuntimeOutcomeV2 {
     RejectedIngress {
         request_bytes_sha256: DiagnosticSha256,

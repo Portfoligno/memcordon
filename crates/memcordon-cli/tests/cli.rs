@@ -1,6 +1,10 @@
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
+#[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+#[path = "support/delivery_evidence.rs"]
+mod delivery_evidence;
+
 use memcordon::invocation::{
     BudgetToken, HELP_TOPIC_USAGE, HELP_USAGE, HelpKind, Invocation, LimitToken, route,
 };
@@ -1533,12 +1537,13 @@ fn asserted_spawn_failure_report(
     output: &std::process::Output,
     report: &std::path::Path,
     expected_status: i32,
+    delivery_evidence: &str,
 ) -> serde_json::Value {
     let report_contents = std::fs::read_to_string(report);
     assert_eq!(
         output.status.code(),
         Some(expected_status),
-        "stdout={:?}; stderr={:?}; report={report_contents:?}",
+        "stdout={:?}; stderr={:?}; report={report_contents:?}; delivery={delivery_evidence}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -1552,14 +1557,21 @@ fn command_not_found_maps_to_127_and_produces_schema_five_failure_report() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
     let report = temporary.path().join("failure.json");
     let missing = temporary.path().join("command-that-does-not-exist");
-    let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    let evidence = delivery_evidence::Evidence::attach(&mut command);
+    let output = command
         .args(["--report"])
         .arg(&report)
         .arg("+1GiB")
         .arg(&missing)
         .output()
         .expect("wrapper should run");
-    let value = asserted_spawn_failure_report(&output, &report, 127);
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    let evidence = evidence.finish();
+    #[cfg(not(all(target_os = "macos", feature = "test-fixtures")))]
+    let evidence = "";
+    let value = asserted_spawn_failure_report(&output, &report, 127, &evidence);
     assert_eq!(value["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
     assert_eq!(value["supervision"]["wrapper_exit_code"], 127);
     assert_eq!(value["attempts"][0]["error"]["code"], "MCSPAWN-NOT-FOUND");
@@ -1586,7 +1598,7 @@ fn command_not_executable_maps_to_126_in_aggregate_report() {
         .arg(&target)
         .output()
         .expect("wrapper should run");
-    let value = asserted_spawn_failure_report(&output, &report, 126);
+    let value = asserted_spawn_failure_report(&output, &report, 126, "");
     assert_eq!(value["supervision"]["wrapper_exit_code"], 126);
     assert_eq!(
         value["attempts"][0]["error"]["initial_spawn_failure"],

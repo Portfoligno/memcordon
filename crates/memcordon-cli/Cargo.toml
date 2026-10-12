@@ -86,18 +86,21 @@ windows-sys = { workspace = true, features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Environment",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Performance",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Services",
@@ -112,6 +115,10 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 memcordon-testkit = { path = "../memcordon-testkit" }
 toml.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hex.workspace = true
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [build-dependencies]
 serde.workspace = true

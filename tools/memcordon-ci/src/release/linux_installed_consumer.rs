@@ -2500,6 +2500,7 @@ pub enum SelectedInstallOperation {
 }
 #[cfg(target_os = "linux")]
 pub trait InstalledLeaseExtension {
+    fn package_cleanup_deadline(&self) -> std::time::Instant;
     fn before_install(&mut self, payload: &MaterializedPayload, output: &Path) -> Result<()>;
     fn selected_installation_operation(&self) -> SelectedInstallOperation;
     fn after_install(&mut self, payload: &MaterializedPayload, output: &Path) -> Result<()>;
@@ -2984,10 +2985,15 @@ fn run_owned(
                 native_group,
                 &registry,
                 &current_contracts,
-            )?;
+            )
+            .map_err(|error| {
+                CiError::Message(format!("capture installed frozen legacy commands: {error}"))
+            })?;
         }
         if let Some(extension) = extension.as_mut() {
-            extension.execute_cases(payload, output)?;
+            extension.execute_cases(payload, output).map_err(|error| {
+                CiError::Message(format!("execute installed lease extension cases: {error}"))
+            })?;
         }
         Ok(())
     })();
@@ -3000,19 +3006,42 @@ fn run_owned(
             } else {
                 Ok(())
             };
-            let uninstall = sudo(
-                work.path(),
-                &[AGENT.into(), "package".into(), "uninstall".into()],
-            );
+            let uninstall = (|| -> Result<Vec<u8>> {
+                let mut arguments = vec![AGENT.into(), "package".into(), "uninstall".into()];
+                if let Some(extension) = extension.as_ref() {
+                    // Sample the shared native clock before remaining Instant
+                    // so the cross-process cutoff cannot renew the budget.
+                    let sampled =
+                        memcordon_platform::test_support::private_observer_monotonic_ns()?;
+                    let remaining = extension
+                        .package_cleanup_deadline()
+                        .checked_duration_since(std::time::Instant::now())
+                        .ok_or_else(|| {
+                            CiError::Message("original package cleanup cutoff expired".into())
+                        })?;
+                    let nanos = u64::try_from(remaining.as_nanos())
+                        .map_err(|error| CiError::Message(error.to_string()))?;
+                    let cutoff = sampled.checked_add(nanos).ok_or_else(|| {
+                        CiError::Message("original package cleanup cutoff overflow".into())
+                    })?;
+                    arguments.push("--lease-cleanup-cutoff-nanos".into());
+                    arguments.push(cutoff.to_string().into());
+                }
+                sudo(work.path(), &arguments)
+            })();
             let observation = if let Some(extension) = extension.as_mut() {
                 extension.after_uninstall(payload, output, uninstall.is_ok())
             } else {
                 Ok(())
             };
-            let failures = [finalization, uninstall.map(|_| ()), observation]
-                .into_iter()
-                .filter_map(|result| result.err().map(|error| error.to_string()))
-                .collect::<Vec<_>>();
+            let failures = [
+                ("finalize before uninstall", finalization),
+                ("package uninstall command", uninstall.map(|_| ())),
+                ("observe after uninstall", observation),
+            ]
+            .into_iter()
+            .filter_map(|(phase, result)| result.err().map(|error| format!("{phase}: {error}")))
+            .collect::<Vec<_>>();
             if failures.is_empty() {
                 Ok(())
             } else {
@@ -3025,10 +3054,15 @@ fn run_owned(
     let fixture_cleanup = [FIXTURE, FIXTURE_RECEIPT, INSTALL_DEFINITION]
         .into_iter()
         .filter(|_| cleanup.is_ok())
-        .map(|path| match fs::symlink_metadata(path) {
-            Ok(_) => sudo(work.path(), &["unlink".into(), path.into()]).map(|_| ()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        .map(|path| {
+            (match fs::symlink_metadata(path) {
+                Ok(_) => sudo(work.path(), &["unlink".into(), path.into()]).map(|_| ()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            })
+            .map_err(|error: CiError| {
+                CiError::Message(format!("fixture retirement {path:?}: {error}"))
+            })
         })
         .collect::<Vec<_>>();
     let host_after = host_network_snapshot().and_then(|after| {
@@ -3036,12 +3070,18 @@ fn run_owned(
         if !host_network_configuration_unchanged(&host_before, &after)? { return Err(CiError::Message("private installed execution changed host network namespace, links, routes or sysctls".into())); }
         Ok(())
     });
-    let failures = [body, cleanup.map(|_| ()), host_after]
-        .into_iter()
-        .chain(fixture_cleanup)
-        .chain([unit_diagnostics])
-        .filter_map(|result| result.err().map(|error| error.to_string()))
-        .collect::<Vec<_>>();
+    let failures = [
+        ("installed case execution", body),
+        ("installed finalization", cleanup.map(|_| ())),
+        ("host network observation", host_after),
+    ]
+    .into_iter()
+    .map(|(phase, result)| result.map_err(|error| CiError::Message(format!("{phase}: {error}"))))
+    .chain(fixture_cleanup)
+    .chain([unit_diagnostics
+        .map_err(|error| CiError::Message(format!("private unit diagnostics: {error}")))])
+    .filter_map(|result| result.err().map(|error| error.to_string()))
+    .collect::<Vec<_>>();
     if failures.is_empty() {
         Ok(())
     } else {

@@ -26,7 +26,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 tempfile.workspace = true
-memcordon-core = { path = "../../crates/memcordon-core" }
+memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.8-dev" }
 
 [lints]
 workspace = true

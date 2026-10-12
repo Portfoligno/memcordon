@@ -330,6 +330,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         {
             let archived = crate::command::CommandSpec::new("git", root, Duration::from_secs(60))
                 .args(["archive", "--format=tar", &identity.source_commit])
+                .output_limit(super::source::MAX_SOURCE_ARCHIVE_BYTES)
                 .bounded_until(deadline)
                 .output_quiet()?;
             let fixture_source_sha256 = super::artifacts::checksum(&archived.stdout);

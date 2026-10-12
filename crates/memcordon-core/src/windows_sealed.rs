@@ -3367,8 +3367,81 @@ pub enum WindowsRetirementLedgerCompletionV1 {
     RetirementComplete,
 }
 
-/// V3 live-wire confirmation issued only from an authenticated, completed
-/// retirement-ledger tombstone. V1 remains an explicit historical decoder.
+/// Checked closure of an attempt that never acquired execution authorization.
+/// This is distinct from a postauthorization Job retirement receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsPreauthorizationRetirementProofV1 {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub provider_generation: String,
+    pub original_boot_id: String,
+    pub launch_incarnation: String,
+    pub job_identity: String,
+    pub terminal_response_sha256: String,
+    pub target_identity: Option<WindowsProcessIdentityV1>,
+    pub guardian_identity: Option<WindowsProcessIdentityV1>,
+    pub worker_identity: Option<WindowsProcessIdentityV1>,
+    pub worker_thread_identity: Option<WindowsWorkerThreadIdentityV1>,
+    pub frozen_owner_manifest_sha256: Option<String>,
+    pub target_created: bool,
+    pub authorization_unix_millis: Option<u64>,
+    pub resume_attempted: bool,
+    pub target_released: bool,
+    pub cleanup_state: WindowsDurableCleanupStateV1,
+    pub recorded_target_and_guardian_extinct: bool,
+}
+
+impl WindowsPreauthorizationRetirementProofV1 {
+    pub fn is_consistent(&self) -> bool {
+        self.schema_version == 1
+            && windows_sha256_text_is_valid(&self.attempt_id)
+            && !self.nonce.is_empty()
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && !self.provider_generation.is_empty()
+            && !self.original_boot_id.is_empty()
+            && !self.launch_incarnation.is_empty()
+            && windows_sha256_text_is_valid(&self.job_identity)
+            && windows_sha256_text_is_valid(&self.terminal_response_sha256)
+            && self.target_created == self.target_identity.is_some()
+            && self
+                .frozen_owner_manifest_sha256
+                .as_deref()
+                .is_none_or(windows_sha256_text_is_valid)
+            && [
+                &self.target_identity,
+                &self.guardian_identity,
+                &self.worker_identity,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|identity| identity.process_id != 0 && identity.creation_time_100ns != 0)
+            && self
+                .worker_thread_identity
+                .as_ref()
+                .is_none_or(|identity| identity.thread_id != 0 && identity.creation_time_100ns != 0)
+            && self.authorization_unix_millis.is_none()
+            && !self.resume_attempted
+            && !self.target_released
+            && self.cleanup_state.termination_requested
+            && self.cleanup_state.active_processes_zero
+            && self.cleanup_state.guardian_reaped
+            && self.cleanup_state.final_handles_closed
+            && self.recorded_target_and_guardian_extinct
+    }
+
+    pub fn canonical_sha256(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_vec(&(
+            "memcordon.windows-preauthorization-retirement-proof-v1",
+            self,
+        ))
+        .map(|bytes| windows_sha256(&bytes))
+    }
+}
+
+/// Confirmation issued only from an authenticated, completed retirement ledger.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsTerminalRetiredV2 {
@@ -3384,6 +3457,8 @@ pub struct WindowsTerminalRetiredV2 {
     pub job_identity: String,
     pub owner_manifest_sha256: String,
     pub retirement_proof_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preauthorization_retirement_proof: Option<WindowsPreauthorizationRetirementProofV1>,
     pub ledger_generation: String,
     pub completion: WindowsRetirementLedgerCompletionV1,
 }
@@ -3408,7 +3483,27 @@ impl WindowsTerminalRetiredV2 {
             && !self.original_boot_id.is_empty()
             && !self.launch_incarnation.is_empty()
             && windows_sha256_text_is_valid(&self.job_identity)
-            && windows_sha256_text_is_valid(&self.owner_manifest_sha256)
+            && match (&self.disposition, &self.preauthorization_retirement_proof) {
+                (WindowsAttemptTerminalDispositionV1::Posttarget, None) => {
+                    windows_sha256_text_is_valid(&self.owner_manifest_sha256)
+                }
+                (WindowsAttemptTerminalDispositionV1::PreauthorizationAbort, Some(proof)) => {
+                    self.owner_manifest_sha256.is_empty()
+                        && proof.is_consistent()
+                        && proof.attempt_id == self.attempt_id
+                        && proof.nonce == self.nonce
+                        && proof.request_sha256 == self.request_sha256
+                        && proof.provider_generation == self.provider_generation
+                        && proof.original_boot_id == self.original_boot_id
+                        && proof.launch_incarnation == self.launch_incarnation
+                        && proof.job_identity == self.job_identity
+                        && proof.terminal_response_sha256 == self.terminal_response_sha256
+                        && proof
+                            .canonical_sha256()
+                            .is_ok_and(|digest| digest == self.retirement_proof_sha256)
+                }
+                _ => false,
+            }
             && windows_sha256_text_is_valid(&self.retirement_proof_sha256)
             && windows_sha256_text_is_valid(&self.ledger_generation)
             && self.completion == WindowsRetirementLedgerCompletionV1::RetirementComplete
@@ -4048,7 +4143,9 @@ impl WindowsTerminalReceiptV2 {
         {
             if let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = boundary_detail.as_ref()
             {
-                if native.frontend_delivery.is_some() {
+                if native.frontend_delivery.is_some()
+                    || native.frontend_provider_association.is_some()
+                {
                     return Err("boundary_detail.frontend_delivery_before_ack");
                 }
             }

@@ -28,6 +28,8 @@ fn descriptor() -> Descriptor {
         cohort_gate: Some("Local\\memcordon-readiness-test-cohort".into()),
         generation_gate: Some("Local\\memcordon-readiness-test-generation".into()),
         toolchain: Some(Toolchain {
+            native_work_cutoff_ticks: 1,
+            native_work_frequency: 1,
             rustc: root.join("rustc.exe"),
             native_linker: root.join("link.exe"),
             native_library_directories: ["vc", "ucrt", "um"]
@@ -51,6 +53,13 @@ fn workload_cannot_narrow_churn_or_hide_invalid_native_argv() {
     let mut missing_toolchain = valid.clone();
     missing_toolchain.toolchain = None;
     assert!(missing_toolchain.validate().is_err());
+    let mut missing_cutoff = valid.clone();
+    missing_cutoff
+        .toolchain
+        .as_mut()
+        .unwrap()
+        .native_work_cutoff_ticks = 0;
+    assert!(missing_cutoff.validate().is_err());
     let mut insufficient = valid.clone();
     insufficient.churn_creations = 4095;
     assert!(insufficient.validate().is_err());

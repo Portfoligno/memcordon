@@ -311,22 +311,22 @@ fn stale_epoch_requires_original_activation_and_exact_restoration() {
             earlier,
         )
     };
-    assert!(check(&request, &restored, &[earlier.clone()]).is_ok());
+    assert!(check(&request, &restored, std::slice::from_ref(&earlier)).is_ok());
     let mut invented = request.clone();
     invented["expected_epoch"]["revision"] = 0.into();
-    assert!(check(&invented, &restored, &[earlier.clone()]).is_err());
+    assert!(check(&invented, &restored, std::slice::from_ref(&earlier)).is_err());
     invented["expected_epoch"]["revision"] = 4.into();
-    assert!(check(&invented, &restored, &[earlier.clone()]).is_err());
+    assert!(check(&invented, &restored, std::slice::from_ref(&earlier)).is_err());
     assert!(check(&request, &restored, &[]).is_err());
     let mut other_boot = earlier.clone();
     other_boot["epoch"]["service_instance"][0] = 2.into();
     assert!(check(&request, &restored, &[other_boot]).is_err());
     let mut wrong_registry = restored.clone();
     wrong_registry["registry"]["grants"][0]["enabled"] = false.into();
-    assert!(check(&request, &wrong_registry, &[earlier.clone()]).is_err());
+    assert!(check(&request, &wrong_registry, std::slice::from_ref(&earlier)).is_err());
     let mut backwards = restored.clone();
     backwards["epoch"]["revision"] = 1.into();
-    assert!(check(&request, &backwards, &[earlier.clone()]).is_err());
+    assert!(check(&request, &backwards, std::slice::from_ref(&earlier)).is_err());
     let mut extra = earlier.clone();
     extra["epoch"]["generation"] = 1.into();
     assert!(check(&request, &restored, &[extra]).is_err());

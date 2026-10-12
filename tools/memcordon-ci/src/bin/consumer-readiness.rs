@@ -4,6 +4,24 @@ use memcordon_ci::consumer_readiness_ledger::{self as ledger, CellEvidence, Sour
 use memcordon_readiness_verifier::{EvidenceIndex, JobOutcome, ProducerOrigin};
 use std::{fs, path::PathBuf, process::ExitCode};
 
+fn command_failure(result: &memcordon_ci::Result<memcordon_testkit::ObservedOutput>) -> String {
+    use memcordon_ci::command::bounded_excerpt;
+    match result {
+        Ok(output) => format!(
+            "status={:?}; capture-complete=true; stdout-bytes={}; stdout={:?}; stderr-bytes={}; stderr={:?}",
+            output.status,
+            output.stdout.len(),
+            bounded_excerpt(&output.stdout),
+            output.stderr.len(),
+            bounded_excerpt(&output.stderr)
+        ),
+        Err(error) => format!(
+            "observation failed: {}",
+            bounded_excerpt(error.to_string().as_bytes())
+        ),
+    }
+}
+
 #[derive(Parser)]
 struct Arguments {
     #[command(subcommand)]
@@ -362,6 +380,7 @@ fn run(operation: Operation) -> Result<(), String> {
             // and elapsed time independently of the caller's JSON claims.
             let archived = CommandSpec::new("git", &cwd, std::time::Duration::from_secs(60))
                 .args(["archive", "--format=tar", source.commit()])
+                .output_limit(memcordon_ci::release::source::MAX_SOURCE_ARCHIVE_BYTES)
                 .output_quiet()
                 .map_err(|error| error.to_string())?;
             if !archived.status.success() {
@@ -493,27 +512,45 @@ fn run(operation: Operation) -> Result<(), String> {
                 .output();
             let cell: Result<CellEvidence, String> = read(&destination.join("cell.json"));
             let mut failures = Vec::new();
-            if !acquisition.is_ok_and(|observed| observed.status.success()) {
-                failures.push("actual acquisition/installed runner failed");
+            if !acquisition
+                .as_ref()
+                .is_ok_and(|observed| observed.status.success())
+            {
+                failures.push(format!(
+                    "actual acquisition/installed runner failed: {}",
+                    command_failure(&acquisition)
+                ));
             }
-            if !cleanup.is_ok_and(|observed| observed.status.success()) {
-                failures.push("explicit native recovery/cleanup failed");
+            if !cleanup
+                .as_ref()
+                .is_ok_and(|observed| observed.status.success())
+            {
+                failures.push(format!(
+                    "explicit native recovery/cleanup failed: {}",
+                    command_failure(&cleanup)
+                ));
             }
             match cell {
                 Ok(cell) if cell.cache_quiescent && cell.cleanup_failures.is_empty() => {}
-                _ => failures.push("cell evidence or final cleanup/cache observation absent"),
+                Ok(_) => failures
+                    .push("cell evidence or final cleanup/cache observation absent".to_owned()),
+                Err(error) => failures.push(format!(
+                    "cell evidence read failed: {}",
+                    memcordon_ci::command::bounded_excerpt(error.as_bytes())
+                )),
             }
             if failures.is_empty() {
                 memcordon_ci::workflow_output::write(&[("cache-quiescent", "true".into())])
                     .map_err(|error| error.to_string())?;
                 Ok(())
             } else {
+                let original = failures.join("; ");
                 fs::write(
                     destination.join("acquisition-failure.json"),
                     serde_json::to_vec(&failures).map_err(|e| e.to_string())?,
                 )
-                .map_err(|e| e.to_string())?;
-                Err(failures.join("; "))
+                .map_err(|e| format!("{original}; acquisition failure retention failed: {e}"))?;
+                Err(original)
             }
         }
         Operation::Cleanup {
@@ -706,6 +743,14 @@ fn run(operation: Operation) -> Result<(), String> {
     }
 }
 fn main() -> ExitCode {
+    match memcordon_ci::public_install_capture::run_if_wrapper() {
+        Ok(Some(status)) => memcordon_ci::public_install_capture::exit_wrapper(status),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("memcordon-ci compiler capture: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     match run(Arguments::parse().command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -708,6 +708,10 @@ pub(crate) fn validate(
             "stderr_sha256",
         ],
     )?;
+    crate::linux_frontend_access::resolve(
+        &json("policy-fresh-frontend-invocation.json")?,
+        Some(custody.bytes(path("policy-fresh-contract.json")?)?),
+    )?;
     linux_policy::validate_linux_policy_frontend(
         &json("policy-fresh-frontend-invocation.json")?,
         &fresh_result["invocation"],
@@ -867,6 +871,10 @@ pub(crate) fn validate(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent running policy, native behavior, owner and retained custody observations"
+)]
 fn validate_restart(
     behavior: &FixtureBehavior,
     semantic: &SemanticObservation,

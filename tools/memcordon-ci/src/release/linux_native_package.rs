@@ -17,6 +17,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "native_artifact_reference.rs"]
+mod native_artifact_reference;
+
+#[path = "native_unit_retirement.rs"]
+pub(super) mod native_unit_retirement;
+
+fn component_record_path(
+    directory: &Path,
+    input: &serde_json::Value,
+    boundary: &serde_json::Value,
+    field: &str,
+    leaf: &str,
+) -> Result<PathBuf> {
+    let prefix = input["artifact_prefix"]
+        .as_str()
+        .ok_or_else(|| CiError::Message("original component artifact prefix absent".into()))?;
+    let reference = boundary[field]
+        .as_str()
+        .ok_or_else(|| CiError::Message("original component artifact reference absent".into()))?;
+    native_artifact_reference::resolve_case_reference(directory, prefix, reference, leaf)
+        .map_err(CiError::Message)
+}
+
 pub struct NativeLinuxPackageLease {
     pub driver: InstalledMixedDriver,
     payload: MaterializedPayload,
@@ -31,15 +54,7 @@ pub struct NativeLinuxPackageLease {
     failures: Vec<String>,
     native_settled: bool,
     resources_retired: bool,
-    recovery_processes: Vec<NativeRecoveryProcess>,
     recovery_observation_files: Vec<fs::File>,
-}
-
-struct NativeRecoveryProcess {
-    process_id: u32,
-    birth: u64,
-    pidfd: std::os::fd::OwnedFd,
-    image: Option<fs::File>,
 }
 
 fn observe_original_absence(
@@ -307,33 +322,6 @@ fn observe_recovery_credentials(
     }
     Ok(rows)
 }
-impl NativeRecoveryProcess {
-    fn exited(&self) -> Result<bool> {
-        let mut fds = [rustix::event::PollFd::new(
-            &self.pidfd,
-            rustix::event::PollFlags::IN,
-        )];
-        let count = rustix::event::poll(
-            &mut fds,
-            Some(&rustix::event::Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            }),
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        if fds[0]
-            .revents()
-            .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::NVAL)
-        {
-            return Err(CiError::Message("native recovery PIDFD poll failed".into()));
-        }
-        Ok(count > 0
-            && fds[0]
-                .revents()
-                .intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP))
-    }
-}
-
 impl NativeLinuxPackageLease {
     /// Replay persisted native cleanup after a fully retired component worker,
     /// before the next recipe may authenticate the same exclusive account.
@@ -344,9 +332,9 @@ impl NativeLinuxPackageLease {
         deadline: Instant,
         original_work_unix: u64,
         original_cleanup_unix: u64,
+        recovery_harness: &super::linux_recovery_harness::HeldRecoveryHarness,
     ) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::process::ExitStatusExt;
+        let _ = workspace;
         self.verify_agent()?;
         if Instant::now() >= deadline {
             return Err(CiError::Message(
@@ -398,144 +386,67 @@ impl NativeLinuxPackageLease {
                 "component recovery acquired source/account differs".into(),
             ));
         }
-        let arguments = ["package", "policy", "recover", "--json"];
-        let package_owner_bytes = crate::linux_consumer_readiness::measured(
-            &self.output.join("native-package-owner.json"),
-            16 * 1024 * 1024,
-        )
-        .map_err(CiError::Message)?;
-        let package_owner = decode(&package_owner_bytes)?;
-        let selected_program = self.held_agent.metadata()?;
-        if package_owner["cleanup_agent_sha256"] != self.agent_sha256
-            || package_owner["cleanup_agent_device"] != selected_program.dev()
-            || package_owner["cleanup_agent_inode"] != selected_program.ino()
-            || package_owner["source"] != serde_json::to_value(&self.payload.source)?
-        {
-            return Err(CiError::Message(
-                "original native package owner differs from selected recovery executable".into(),
-            ));
-        }
-        let invocation = serde_json::json!({"format":"memcordon.native-component-recovery-invocation","revision":1,
-            "identity":checkpoint["identity"],"run_id":input["run_id"],"recipe_id":input["recipe_id"],"native_target":input["native_target"],
-            "program":self.agent.as_os_str().as_bytes(),"arguments":arguments.iter().map(|value|value.as_bytes()).collect::<Vec<_>>(),
-            "package_owner_sha256":artifacts::checksum(&package_owner_bytes),
-            "selected_program":{"device":selected_program.dev(),"inode":selected_program.ino(),"length":selected_program.len(),"links":selected_program.nlink(),"uid":selected_program.uid(),"mode":selected_program.mode()},
-            "working_directory":workspace.as_os_str().as_bytes(),"executable_sha256":self.agent_sha256,"environment":[],
-            "work_deadline_unix_millis":input["work_deadline_unix_millis"],"cleanup_deadline_unix_millis":input["cleanup_deadline_unix_millis"],
-            "boundary_sha256":artifacts::checksum(&boundary_bytes),
-            "ownership_sha256":artifacts::checksum(&ownership_bytes)});
+        use super::linux_original_recovery::{self, contract};
+        let recovery_input = contract::Input {
+            format: "memcordon.original-native-recovery-input".into(),
+            revision: 1,
+            identity: serde_json::from_value(checkpoint["identity"].clone())?,
+            native_target: input["native_target"]
+                .as_str()
+                .ok_or_else(|| CiError::Message("original native target absent".into()))?
+                .into(),
+            scope_id: recovery_harness.owner().scope_id.clone(),
+            artifact_root: directory.to_path_buf(),
+            original_artifact_root: directory.to_path_buf(),
+            origin_sha256: String::new(),
+            work_deadline_unix_millis: original_work_unix,
+            cleanup_deadline_unix_millis: original_cleanup_unix,
+            recovery_harness_owner_sha256: recovery_harness.owner_sha256()?,
+            context: contract::Context::Component {
+                recipe_id: input["recipe_id"]
+                    .as_str()
+                    .ok_or_else(|| CiError::Message("original component recipe absent".into()))?
+                    .into(),
+                native_input: linux_original_recovery::record(
+                    &directory.join("native-input.json"),
+                )?,
+                boundary: linux_original_recovery::record(
+                    &directory.join("account-boundary.json"),
+                )?,
+                ownership: linux_original_recovery::record(
+                    &directory.join("account-ownership.json"),
+                )?,
+                journal: linux_original_recovery::record(&component_record_path(
+                    directory,
+                    &input,
+                    &boundary,
+                    "journal",
+                    "boundary-journal.bin",
+                )?)?,
+                reference: linux_original_recovery::record(&component_record_path(
+                    directory,
+                    &input,
+                    &boundary,
+                    "reference",
+                    "boundary-reference.json",
+                )?)?,
+            },
+        };
+        let observed = linux_original_recovery::run(recovery_harness, &recovery_input, deadline)?;
+        let mut invocation = observed.invocation.clone();
+        invocation["original_fixture"] = observed.proof().clone();
+        let mut capture = observed.capture.clone();
+        capture["stdout"] = serde_json::to_value(&observed.stdout)?;
+        capture["stderr"] = serde_json::to_value(&observed.stderr)?;
         super::source::write_json(
             &directory.join("native-recovery-invocation.json"),
             &invocation,
         )?;
-        let invocation_bytes = crate::linux_consumer_readiness::measured(
-            &directory.join("native-recovery-invocation.json"),
-            4 * 1024 * 1024,
-        )
-        .map_err(CiError::Message)?;
-        self.verify_agent()?;
-        let mut process_observation = None;
-        let expected_image = self.held_agent.metadata()?;
-        let captured = CommandSpec::new(&self.agent, workspace, Duration::from_secs(300))
-            .args(arguments)
-            .cleared_environment()
-            .bounded_until(deadline)
-            .output_limit(4 * 1024 * 1024)
-            .output_quiet_with_creation(|child| {
-                let birth = crate::linux_consumer_readiness::process_birth(child.id())
-                    .map_err(CiError::Message)?;
-                let pid = rustix::process::Pid::from_raw(
-                    i32::try_from(child.id())
-                        .map_err(|error| CiError::Message(error.to_string()))?,
-                )
-                .ok_or_else(|| CiError::Message("native recovery creation PID absent".into()))?;
-                let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-                    .map_err(|error| CiError::Message(error.to_string()))?;
-                self.recovery_processes.push(NativeRecoveryProcess {
-                    process_id: child.id(),
-                    birth,
-                    pidfd,
-                    image: None,
-                });
-                let held = self
-                    .recovery_processes
-                    .last_mut()
-                    .expect("creation owner retained");
-                if crate::linux_consumer_readiness::process_birth(child.id())
-                    .map_err(CiError::Message)?
-                    != birth
-                {
-                    return Err(CiError::Message(
-                        "native recovery creation birth changed".into(),
-                    ));
-                }
-                let image = match fs::File::open(format!("/proc/{}/exe", child.id())) {
-                    Ok(file) => {
-                        let metadata = file.metadata()?;
-                        if (metadata.dev(), metadata.ino())
-                            != (expected_image.dev(), expected_image.ino())
-                        {
-                            return Err(CiError::Message(
-                                "actual native recovery process image differs".into(),
-                            ));
-                        }
-                        held.image = Some(file);
-                        serde_json::json!({"device":metadata.dev(),"inode":metadata.ino()})
-                    }
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound && held.exited()? =>
-                    {
-                        serde_json::Value::Null
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                process_observation =
-                    Some(serde_json::json!({"process_id":child.id(),"birth":birth,"image":image}));
-                Ok(())
-            })?;
-        let retired_owner = self
-            .recovery_processes
-            .last()
-            .ok_or_else(|| CiError::Message("native recovery creation owner absent".into()))?;
-        if !retired_owner.exited()? {
-            return Err(CiError::Message(
-                "native recovery creation process remains held live".into(),
-            ));
-        }
-        let retired = serde_json::json!({"process_id":retired_owner.process_id,"birth":retired_owner.birth,"pidfd_retirement_observed":true});
-        self.verify_agent()?;
         super::source::write_json(
             &directory.join("native-recovery-process.json"),
-            &serde_json::json!({"format":"memcordon.native-component-recovery-process","revision":1,
-                "invocation_sha256":artifacts::checksum(&invocation_bytes),"creation":process_observation,
-                "native_wait_status":captured.status.into_raw(),"retirement":retired}),
+            &observed.process,
         )?;
-        let capture = serde_json::json!({"format":"memcordon.native-component-recovery-capture","revision":1,
-            "invocation_sha256":artifacts::checksum(&invocation_bytes),"native_wait_status":captured.status.into_raw(),"status":captured.status.code(),
-            "stdout":captured.stdout,"stderr":captured.stderr,"stdout_sha256":artifacts::checksum(&captured.stdout),"stderr_sha256":artifacts::checksum(&captured.stderr)});
         super::source::write_json(&directory.join("native-recovery-capture.json"), &capture)?;
-        if !captured.status.success() || captured.stdout.len() > 4 * 1024 * 1024 {
-            return Err(CiError::Message(
-                "component native recovery did not complete".into(),
-            ));
-        }
-        memcordon_core::canonical_json::reject_duplicate_json_keys(&captured.stdout)
-            .map_err(CiError::Message)?;
-        let response: serde_json::Value = serde_json::from_slice(&captured.stdout)?;
-        if !response.as_object().is_some_and(|object| object.len() == 3)
-            || response["format"] != "memcordon.native-recovery"
-            || response["revision"] != 1
-            || response["outstanding"] != serde_json::json!([])
-        {
-            return Err(CiError::Message(
-                "component native recovery retains original ownership obligations".into(),
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err(CiError::Message(
-                "original component recovery completed after cutoff".into(),
-            ));
-        }
         let uid = u32::try_from(
             checkpoint["account"]["uid"]
                 .as_u64()
@@ -681,7 +592,7 @@ impl NativeLinuxPackageLease {
         let uninstall_issued = match read(&output.join("native-package-uninstall-intent.json")) {
             Ok(record) => {
                 if record
-                    != serde_json::json!({"cleanup_agent_sha256":agent_sha256,"native_recovery_complete":true})
+                    != serde_json::json!({"cleanup_agent_sha256":agent_sha256,"owned_attempts_and_resources_settled":true})
                 {
                     return Err(CiError::Message(
                         "original native uninstall intent differs".into(),
@@ -699,7 +610,9 @@ impl NativeLinuxPackageLease {
                     && fields.contains_key("status")
                     && fields.contains_key("stdout")
                     && fields.contains_key("stderr")
-            }) {
+            }) || serde_json::from_value::<Vec<u8>>(capture["stdout"].clone()).is_err()
+                || serde_json::from_value::<Vec<u8>>(capture["stderr"].clone()).is_err()
+            {
                 return Err(CiError::Message(
                     "original native uninstall capture shape differs".into(),
                 ));
@@ -736,37 +649,14 @@ impl NativeLinuxPackageLease {
             failures: Vec::new(),
             native_settled: false,
             resources_retired: false,
-            recovery_processes: Vec::new(),
             recovery_observation_files: Vec::new(),
         };
         value.verify_agent()?;
         if install_issued {
-            if !uninstall_succeeded {
-                let recovered = CommandSpec::new(&value.agent, workspace, Duration::from_secs(300))
-                    .args(["package", "policy", "recover", "--json"])
-                    .bounded_until(cleanup)
-                    .output_quiet()?;
-                if !recovered.status.success() {
-                    return Err(CiError::Message(
-                        "original component native recovery remains unresolved".into(),
-                    ));
-                }
-            } else {
-                let recovery = read(&output.join("native-package-recovery.json"))?;
-                if !recovery.as_object().is_some_and(|fields| {
-                    fields.len() == 3
-                        && fields.contains_key("status")
-                        && fields.contains_key("stdout")
-                        && fields.contains_key("stderr")
-                }) || recovery["status"] != 0
-                    || serde_json::from_value::<Vec<u8>>(recovery["stdout"].clone()).is_err()
-                    || serde_json::from_value::<Vec<u8>>(recovery["stderr"].clone()).is_err()
-                {
-                    return Err(CiError::Message(
-                        "post-uninstall continuation lacks original successful recovery".into(),
-                    ));
-                }
-            }
+            // Reconstruct original resource custody before finalization. A
+            // successful accepted uninstall already includes its locked journal
+            // and native recovery gates; no retired public recovery command or
+            // synthetic standalone recovery receipt is part of this boundary.
             let resources = output.join("resources");
             match fs::symlink_metadata(&resources) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -829,7 +719,13 @@ impl NativeLinuxPackageLease {
     }
 
     /// Acquisition copies the measured cleanup executable but installs nothing.
-    pub fn acquire(payload: MaterializedPayload, admin: &Path, output: &Path) -> Result<Self> {
+    pub fn acquire(
+        recovery_harness: &super::linux_recovery_harness::HeldRecoveryHarness,
+        payload: MaterializedPayload,
+        admin: &Path,
+        output: &Path,
+    ) -> Result<Self> {
+        recovery_harness.verify()?;
         if !rustix::process::geteuid().is_root() {
             return Err(CiError::Message(
                 "original component package requires owned administrator controller".into(),
@@ -871,6 +767,7 @@ impl NativeLinuxPackageLease {
             .last()
             .ok_or_else(|| CiError::Message("held package administrator parent absent".into()))?
             .sync_all()?;
+        let held_agent = super::native_executable::retain_readonly(&agent, held_agent)?;
         let legacy = memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry {
             format: "memcordon.local-private-policy".into(),
             revision: 1,
@@ -895,7 +792,6 @@ impl NativeLinuxPackageLease {
             failures: Vec::new(),
             native_settled: false,
             resources_retired: false,
-            recovery_processes: Vec::new(),
             recovery_observation_files: Vec::new(),
         };
         value.verify_agent()?;
@@ -927,6 +823,10 @@ impl NativeLinuxPackageLease {
     }
 
     /// Called only after this owner has been retained by the outer native job.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Installation binds exact source, product, admin, artifact and finite owner custody"
+    )]
     pub fn install_and_prepare(
         &mut self,
         workspace: &Path,
@@ -938,6 +838,7 @@ impl NativeLinuxPackageLease {
         cleanup: Instant,
         work_unix: u64,
         cleanup_unix: u64,
+        recovery_harness: &super::linux_recovery_harness::HeldRecoveryHarness,
     ) -> Result<ActivatedMixedPolicy> {
         if self.install_issued || work >= cleanup {
             return Err(CiError::Message(
@@ -946,15 +847,38 @@ impl NativeLinuxPackageLease {
         }
         self.verify_agent()?;
         let payload = &self.payload;
+        // Installation snapshots current_exe and its complete selected sibling
+        // graph. The independent cleanup copy intentionally has no such graph.
+        let _source_ancestry =
+            super::linux_native_component::protected_directory(&payload.directory)?;
+        let source_agent = binary_path(
+            &payload.directory,
+            "memcordon-sealed-agent",
+            &payload.distribution.target,
+        );
+        let source_image = super::native_executable::pin_install_image(&source_agent)?;
+        let held = source_image.metadata()?;
+        let named = fs::symlink_metadata(&source_agent)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino())
+            || artifacts::checksum(
+                &crate::linux_consumer_readiness::measured(&source_agent, 512 * 1024 * 1024)
+                    .map_err(CiError::Message)?,
+            ) != self.agent_sha256
+        {
+            return Err(CiError::Message(
+                "native install source agent identity differs".into(),
+            ));
+        }
         super::source::write_json(
             &self.output.join("native-package-install-intent.json"),
             &serde_json::json!({"source":identity,"cell":cell,"cleanup_agent_sha256":self.agent_sha256,"uninstall_required":true}),
         )?;
         self.install_issued = true;
-        let observed = CommandSpec::new(&self.agent, workspace, Duration::from_secs(300))
+        let observed = CommandSpec::new(&source_agent, workspace, Duration::from_secs(300))
             .args(["package", "install"])
             .bounded_until(work)
             .output_quiet()?;
+        drop(source_image);
         let success = observed.status.success();
         super::source::write_json(
             &self.output.join("native-package-install.json"),
@@ -962,8 +886,11 @@ impl NativeLinuxPackageLease {
         )?;
         if !success {
             return Err(CiError::Message(
-                "native component selected package install failed; owner retains finalization"
-                    .into(),
+                super::native_package_diagnostics::install_failure(
+                    observed.status.code(),
+                    &observed.stdout,
+                    &observed.stderr,
+                ),
             ));
         }
         for binary in &payload.distribution.binaries {
@@ -1008,7 +935,6 @@ impl NativeLinuxPackageLease {
             &serde_json::json!({"source":identity,"cell":cell,"resource_setup_required":true}),
         )?;
         let resources = self.output.join("resources");
-        fs::create_dir(&resources)?;
         self.driver
             .prepare_native_component_fixture(InstalledMixedDriverInput {
                 payload,
@@ -1025,6 +951,7 @@ impl NativeLinuxPackageLease {
                 cleanup_deadline: cleanup,
                 work_deadline_unix_millis: work_unix,
                 cleanup_deadline_unix_millis: cleanup_unix,
+                recovery_harness,
             })
     }
 
@@ -1032,53 +959,18 @@ impl NativeLinuxPackageLease {
     /// retained even when later readback observes that native owners settled.
     pub fn finalize(&mut self, workspace: &Path, cleanup: Instant) -> Result<()> {
         let mut current = Vec::new();
-        for process in &self.recovery_processes {
-            match process.exited() {
-                Ok(true) => {}
-                Ok(false) => {
-                    current.push("actual native recovery process remains held live".into())
-                }
-                Err(error) => current.push(format!(
-                    "native recovery process retirement uncertainty: {error}"
-                )),
-            }
-        }
         if let Err(error) = self.driver.finalize_owned_attempts(cleanup) {
             current.push(error.to_string());
         }
-        let agent_verified = match self.verify_agent() {
-            Ok(()) => true,
-            Err(error) => {
-                current.push(error.to_string());
-                false
-            }
-        };
+        if let Err(error) = self.verify_agent() {
+            current.push(error.to_string());
+        }
         let payload = &self.payload;
         if self.install_issued {
-            if agent_verified && !self.uninstall_succeeded {
-                match CommandSpec::new(&self.agent, workspace, Duration::from_secs(300))
-                    .args(["package", "policy", "recover", "--json"])
-                    .bounded_until(cleanup)
-                    .output_quiet()
-                {
-                    Ok(recovered) => {
-                        let success = recovered.status.success();
-                        if let Err(error) = super::source::write_json(
-                            &self.output.join("native-package-recovery.json"),
-                            &serde_json::json!({"status":recovered.status.code(),"stdout":recovered.stdout,"stderr":recovered.stderr}),
-                        ) {
-                            current.push(error.to_string());
-                        }
-                        if !success {
-                            current.push(
-                                "original native package recovery retains unresolved obligations"
-                                    .into(),
-                            );
-                        }
-                    }
-                    Err(error) => current.push(error.to_string()),
-                }
-            }
+            // Owned attempts and resources settle here. The accepted package
+            // uninstall performs locked journal/native recovery and refuses live
+            // or ambiguous attempts before removal; the public recover route is
+            // retired and cannot authorize this cleanup.
             if current.is_empty() && !self.resources_retired {
                 let resource_stage = (|| -> Result<()> {
                     match fs::symlink_metadata(self.output.join("resources")) {
@@ -1116,7 +1008,7 @@ impl NativeLinuxPackageLease {
                 let uninstall = (|| -> Result<()> {
                     super::source::write_json(
                         &self.output.join("native-package-uninstall-intent.json"),
-                        &serde_json::json!({"cleanup_agent_sha256":self.agent_sha256,"native_recovery_complete":true}),
+                        &serde_json::json!({"cleanup_agent_sha256":self.agent_sha256,"owned_attempts_and_resources_settled":true}),
                     )?;
                     self.uninstall_issued = true;
                     let observed =
@@ -1174,6 +1066,14 @@ impl NativeLinuxPackageLease {
                             Err(error) => current.push(format!("{}: {error}", path.display())),
                             Ok(_) => remaining.push(path),
                         }
+                        match native_unit_retirement::selected_unit_kind(unit) {
+                            Ok(native_unit_retirement::SelectedUnitKind::Configuration) => continue,
+                            Ok(_) => {}
+                            Err(error) => {
+                                current.push(format!("{unit}: {error}"));
+                                continue;
+                            }
+                        }
                         let observed = match CommandSpec::new(
                             "/usr/bin/systemctl",
                             workspace,
@@ -1202,8 +1102,7 @@ impl NativeLinuxPackageLease {
                             }
                         };
                         if !observed.status.success()
-                            || !text.lines().any(|line| line == "ActiveState=inactive")
-                            || !text.lines().any(|line| line == "MainPID=0")
+                            || native_unit_retirement::verify_inactive(unit, text).is_err()
                         {
                             current
                                 .push(format!("original native unit remains unresolved: {unit}"));

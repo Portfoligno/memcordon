@@ -1,9 +1,13 @@
 //! External native loss probes. Original failures and recovered retirement are
 //! separate observations; recovery never turns an interrupted workload into a
 //! naturally completed workload.
-use crate::windows_consumer_readiness::{CaseInput, CaseKey, SuiteInput};
+use crate::windows_consumer_readiness::CaseKey;
+#[cfg(windows)]
+use crate::windows_consumer_readiness::{CaseInput, SuiteInput};
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,9 +567,10 @@ mod native {
             &directory.join("native-invocation.json"),
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-native-loss-invocation","revision":1,"target":config.target,
-                "executable_sha256":config.cli.sha256,"public_executable_sha256":config.cli.sha256,
+                "frontend_environment":crate::windows_consumer_readiness::fixture_environment::entries()?,
+                "executable_sha256":if command.get_program() == config.fixture.path.as_os_str() { &config.fixture.sha256 } else { &config.cli.sha256 },"public_executable_sha256":config.cli.sha256,
                 "program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
-                "public_program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
+                "public_program_utf16":config.cli.path.as_os_str().encode_wide().collect::<Vec<_>>(),
                 "argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
                 "cwd_utf16":command.get_current_dir().ok_or_else(||CiError::Message("loss frontend native cwd absent".into()))?.as_os_str().encode_wide().collect::<Vec<_>>(),
                 "environment_cleared":true
@@ -858,7 +863,8 @@ mod native {
             != String::from(observation.association.request_sha256.clone())
             || request.nonce != observation.live_nonce.as_deref().unwrap_or_default()
             || request.expected_provider_binding != observation.association.provider
-            || !request.environment.is_empty()
+            || request.environment
+                != crate::windows_consumer_readiness::fixture_environment::entries()?
         {
             return Err(CiError::Message("pre-Launch request custody differs from actual loss attempt/provider/native environment".into()));
         }

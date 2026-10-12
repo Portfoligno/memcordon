@@ -77,8 +77,16 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
         .ok_or_else(|| CiError::Message("image artifact path not UTF8".into()))
 }
 fn capture(root: &Path, path: &Path, artifacts: &mut BTreeMap<String, Artifact>) -> Result<String> {
+    capture_bounded(root, path, artifacts, 128 * 1024 * 1024)
+}
+fn capture_bounded(
+    root: &Path,
+    path: &Path,
+    artifacts: &mut BTreeMap<String, Artifact>,
+    limit: u64,
+) -> Result<String> {
     let path_string = relative(root, path)?;
-    let bytes = read(path, 128 * 1024 * 1024)?;
+    let bytes = read(path, limit)?;
     let artifact = Artifact {
         path: path_string.clone(),
         length: bytes.len() as u64,
@@ -371,6 +379,26 @@ pub fn collect_export_records(
             let recovery_path = required(&row.recovery)?;
             let recovery = json(recovery_path)?;
             let mut recovery_artifacts = BTreeMap::new();
+            let recovery_invocation = json(&directory.join("recovery-invocation.json"))?;
+            if let Some(references) =
+                recovery_invocation["original_fixture"]["acquisition_artifacts"].as_object()
+            {
+                for (leaf, reference) in references {
+                    let path = reference.as_str().ok_or_else(|| {
+                        CiError::Message("original recovery acquisition reference malformed".into())
+                    })?;
+                    capture_bounded(
+                        root,
+                        &root.join(path),
+                        artifacts,
+                        if leaf == "acquisition-2.bin" {
+                            512 * 1024 * 1024
+                        } else {
+                            16 * 1024 * 1024
+                        },
+                    )?;
+                }
+            }
             for field in ["invocation", "process", "stdout", "stderr", "census"] {
                 let name = recovery[field].as_str().ok_or_else(|| {
                     CiError::Message("export measured recovery capture leaf absent".into())

@@ -21,12 +21,15 @@ fn worker_loss_keeps_unavailable_coverage_without_inventing_final_diagnostics() 
     let observation = WindowsProcessObservationV2::unavailable(
         ProcessObservationUnavailableReasonV1::WorkerLostBeforeFreeze,
     );
-    let sampled = validate_process_observation(&observation, &[root.clone()], &expected).unwrap();
+    let sampled =
+        validate_process_observation(&observation, std::slice::from_ref(&root), &expected).unwrap();
     assert_eq!(sampled.capacity, None);
     assert_eq!(sampled.sampled, 0);
     assert!(observation.final_accounting.is_none());
     expected.worker_loss_before_freeze = false;
-    assert!(validate_process_observation(&observation, &[root.clone()], &expected).is_err());
+    assert!(
+        validate_process_observation(&observation, std::slice::from_ref(&root), &expected).is_err()
+    );
     expected.worker_loss_before_freeze = true;
     assert!(validate_process_observation(&observation, &[], &expected).is_err());
     assert!(validate_process_observation(&observation, &[root.clone(), root], &expected).is_err());

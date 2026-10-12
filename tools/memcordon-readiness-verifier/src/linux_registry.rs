@@ -79,7 +79,7 @@ fn sorted<'a>(value: &'a Value, key: &str, bound: usize) -> VerificationResult<V
     }
     Ok(values)
 }
-fn scalar_sorted<'a>(value: &'a Value, bound: usize) -> VerificationResult<Vec<&'a Value>> {
+fn scalar_sorted(value: &Value, bound: usize) -> VerificationResult<Vec<&Value>> {
     let mut values = value
         .as_array()
         .filter(|values| values.len() <= bound)

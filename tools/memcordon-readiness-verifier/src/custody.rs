@@ -155,7 +155,7 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
     let bytes = bounded_read(file.try_clone().map_err(|e| e.to_string())?, limit)?;
     let named = File::from(
         openat(
-            &parent,
+            parent,
             parts[parts.len() - 1],
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),

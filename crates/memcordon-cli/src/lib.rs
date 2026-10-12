@@ -27,6 +27,8 @@ use std::{
 
 pub mod exit_mapping;
 pub mod invocation;
+#[cfg(feature = "test-fixtures")]
+pub mod toolchain_creation_ack;
 
 pub use memcordon_core::{
     BoundaryRequirement, ByteSize, ChildTermination, CircuitBreakerPolicy, CleanupSummary,

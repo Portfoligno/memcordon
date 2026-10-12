@@ -283,6 +283,21 @@ fn installation_epoch_advances_even_for_byte_identical_package_replacement() {
     assert!(crate::package::next_installation_epoch(Some(&exhausted), [3; 32]).is_err());
 }
 
+fn source_runtime_manifest(
+    components: Vec<memcordon_core::runtime_manifest::RuntimeComponentRecord>,
+) -> memcordon_core::runtime_manifest::RuntimeManifest {
+    use memcordon_core::runtime_manifest::RuntimeManifest;
+    let version = env!("CARGO_PKG_VERSION").into();
+    let source_commit = crate::SOURCE_COMMIT.into();
+    let target = crate::linux::runtime_manifest::target().unwrap().into();
+    if cfg!(feature = "private-tcp") {
+        RuntimeManifest::linux_combined(version, source_commit, target, components)
+    } else {
+        RuntimeManifest::linux_selected(version, source_commit, target, components, false)
+    }
+    .unwrap()
+}
+
 #[test]
 #[cfg(target_env = "gnu")]
 fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
@@ -311,27 +326,20 @@ fn ordinary_source_inventory_binds_actual_images_and_helper_bytes() {
         mode: 0o755,
         sha256: crate::package::sha256_bytes(bytes),
     };
-    let manifest = RuntimeManifest::linux_selected(
-        env!("CARGO_PKG_VERSION").into(),
-        crate::SOURCE_COMMIT.into(),
-        crate::linux::runtime_manifest::target().unwrap().into(),
-        with_helper(vec![
-            component(
-                "public-cli",
-                "memcordon",
-                RuntimeComponentRole::PublicCli,
-                public,
-            ),
-            component(
-                "sealed-agent",
-                "memcordon-sealed-agent",
-                RuntimeComponentRole::SealedAgent,
-                agent,
-            ),
-        ]),
-        cfg!(feature = "private-tcp"),
-    )
-    .unwrap();
+    let manifest = source_runtime_manifest(with_helper(vec![
+        component(
+            "public-cli",
+            "memcordon",
+            RuntimeComponentRole::PublicCli,
+            public,
+        ),
+        component(
+            "sealed-agent",
+            "memcordon-sealed-agent",
+            RuntimeComponentRole::SealedAgent,
+            agent,
+        ),
+    ]));
     let bytes = serde_json::to_vec(&manifest).unwrap();
     std::fs::write(&manifest_path, &bytes).unwrap();
     let snapshot = crate::package::linux_source_snapshot(&source).unwrap();
@@ -398,31 +406,24 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
     let public_path = directory.path().join("memcordon");
     std::fs::write(&public_path, public).unwrap();
     std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let manifest = RuntimeManifest::linux_selected(
-        env!("CARGO_PKG_VERSION").into(),
-        crate::SOURCE_COMMIT.into(),
-        crate::linux::runtime_manifest::target().unwrap().into(),
-        vec![
-            RuntimeComponentRecord {
-                id: "public-cli".into(),
-                path: "memcordon".into(),
-                role: RuntimeComponentRole::PublicCli,
-                size: public.len() as u64,
-                mode: 0o755,
-                sha256: memcordon_core::workload_codec::hash_bytes(public).into(),
-            },
-            RuntimeComponentRecord {
-                id: "sealed-agent".into(),
-                path: "memcordon-sealed-agent".into(),
-                role: RuntimeComponentRole::SealedAgent,
-                size: agent.len() as u64,
-                mode: 0o755,
-                sha256: memcordon_core::workload_codec::hash_bytes(agent).into(),
-            },
-        ],
-        cfg!(feature = "private-tcp"),
-    )
-    .unwrap();
+    let manifest = source_runtime_manifest(vec![
+        RuntimeComponentRecord {
+            id: "public-cli".into(),
+            path: "memcordon".into(),
+            role: RuntimeComponentRole::PublicCli,
+            size: public.len() as u64,
+            mode: 0o755,
+            sha256: memcordon_core::workload_codec::hash_bytes(public).into(),
+        },
+        RuntimeComponentRecord {
+            id: "sealed-agent".into(),
+            path: "memcordon-sealed-agent".into(),
+            role: RuntimeComponentRole::SealedAgent,
+            size: agent.len() as u64,
+            mode: 0o755,
+            sha256: memcordon_core::workload_codec::hash_bytes(agent).into(),
+        },
+    ]);
     let validate = |manifest: &RuntimeManifest, image: &[u8]| {
         std::fs::write(&source, image).unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -430,6 +431,22 @@ fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
         crate::package::linux_source_snapshot(&source)
     };
     validate(&manifest, agent).unwrap();
+    if cfg!(feature = "private-tcp") {
+        let obsolete = RuntimeManifest::linux_selected(
+            manifest.version.clone(),
+            manifest.source_commit.clone(),
+            manifest.target.clone(),
+            manifest.components.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            validate(&obsolete, agent).err().as_deref(),
+            Some("source runtime manifest differs from exact copied images"),
+            "obsolete private-only contract must fail the exact source inventory comparison"
+        );
+        validate(&manifest, agent).unwrap();
+    }
     assert!(validate(&manifest, b"different installed image").is_err());
     let mut same_size_image = agent.to_vec();
     same_size_image[0] ^= 1;

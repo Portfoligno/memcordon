@@ -165,6 +165,7 @@ impl AccountReservation {
         );
         let path = PathBuf::from(super::STATE_ROOT).join(&name);
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)

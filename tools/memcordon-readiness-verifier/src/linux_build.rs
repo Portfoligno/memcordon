@@ -242,6 +242,10 @@ fn number(value: &Value, name: &str) -> VerificationResult<u64> {
 
 /// Validates fixture-owned creation/wait facts only when the separate
 /// controller held the complete native ancestry before releasing the child.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent compiler, generated target, held process and lifecycle observations"
+)]
 pub fn validate_linux_generated_lifecycle(
     created: &Value,
     retired: &Value,
@@ -331,6 +335,10 @@ pub fn validate_linux_generated_lifecycle(
 
 /// Physical held compiler/child proof is also required when an actual limit
 /// terminates the child before it can emit its natural-exit receipt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independent compiler, generated target, held process and lifecycle observations"
+)]
 pub(crate) fn validate_linux_generated_build(
     created: &Value,
     compiler: &Value,

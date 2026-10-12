@@ -591,11 +591,37 @@ pub fn acquire_package_lease() -> Result<std::fs::File, String> {
     acquire_lease(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
 }
 
+pub fn acquire_package_lease_until(deadline: u64) -> Result<std::fs::File, String> {
+    acquire_lease_inner(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate, Some(deadline))
+}
+
+pub fn acquire_legacy_package_lease_until(deadline: u64) -> Result<std::fs::File, String> {
+    acquire_lease_inner(
+        LEGACY_PACKAGE_LEASE,
+        LeaseAccess::ExclusiveCreate,
+        Some(deadline),
+    )
+}
+
 pub fn acquire_legacy_package_lease() -> Result<std::fs::File, String> {
     acquire_lease(LEGACY_PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
 }
 
 fn acquire_lease(path: &str, access: LeaseAccess) -> Result<std::fs::File, String> {
+    acquire_lease_inner(path, access, None)
+}
+
+fn acquire_lease_inner(
+    path: &str,
+    access: LeaseAccess,
+    deadline: Option<u64>,
+) -> Result<std::fs::File, String> {
+    match deadline {
+        Some(cutoff) if super::clock::monotonic_nanos()? >= cutoff => {
+            return Err("MCSEALED-PACKAGE-LEASE: original cleanup cutoff expired".into());
+        }
+        _ => {}
+    }
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
@@ -616,13 +642,64 @@ fn acquire_lease(path: &str, access: LeaseAccess) -> Result<std::fs::File, Strin
     if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o600 {
         return Err("MCSEALED-PACKAGE-LEASE: unsafe lock-file identity or mode".to_owned());
     }
-    // SAFETY: `file` owns a live descriptor for the duration of the advisory lock; flock has no
-    // pointer arguments and reports contention/error without changing Rust ownership.
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } == -1 {
-        return Err(format!(
-            "MCSEALED-PACKAGE-LEASE: {}",
-            std::io::Error::last_os_error()
-        ));
+    loop {
+        if let Some(cutoff) = deadline {
+            if super::clock::monotonic_nanos()? >= cutoff {
+                return Err("MCSEALED-PACKAGE-LEASE: original cleanup cutoff expired".into());
+            }
+            let named = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+            if !named.is_file()
+                || named.dev() != metadata.dev()
+                || named.ino() != metadata.ino()
+                || named.uid() != 0
+                || named.mode() & 0o7777 != 0o600
+            {
+                return Err("MCSEALED-PACKAGE-LEASE: original lock identity changed".into());
+            }
+        }
+        // SAFETY: file owns the unchanged live descriptor throughout acquisition and mutation.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            match deadline {
+                Some(cutoff) if super::clock::monotonic_nanos()? >= cutoff => {
+                    return Err(
+                        "MCSEALED-PACKAGE-LEASE: original cleanup cutoff expired at acquisition"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+            if deadline.is_some() {
+                let named = std::fs::symlink_metadata(path)
+                    .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+                if !named.is_file()
+                    || named.dev() != metadata.dev()
+                    || named.ino() != metadata.ino()
+                    || named.uid() != 0
+                    || named.mode() & 0o7777 != 0o600
+                {
+                    return Err(
+                        "MCSEALED-PACKAGE-LEASE: original lock identity changed at acquisition"
+                            .into(),
+                    );
+                }
+            }
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        let Some(cutoff) = deadline else {
+            return Err(format!("MCSEALED-PACKAGE-LEASE: {error}"));
+        };
+        if error.raw_os_error() != Some(libc::EAGAIN) {
+            return Err(format!("MCSEALED-PACKAGE-LEASE: {error}"));
+        }
+        let remaining = cutoff.saturating_sub(super::clock::monotonic_nanos()?);
+        if remaining == 0 {
+            return Err(format!(
+                "MCSEALED-PACKAGE-LEASE: {error}; original cleanup cutoff expired"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_nanos(remaining.min(10_000_000)));
     }
     Ok(file)
 }

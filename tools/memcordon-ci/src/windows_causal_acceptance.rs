@@ -75,15 +75,17 @@ pub fn validate_process_observation(
         // A killed observer cannot invent its final diagnostic accounting. The
         // caller separately validates authenticated retirement authority and
         // independently held process/guardian retirement; coverage stays unavailable.
-        if let Some(accounting) = &observation.final_accounting {
-            if !accounting.observed_after_target_retirement
-                || accounting.active_processes_native_u32 != 0
-                || accounting.counter_regression_observed
+        match &observation.final_accounting {
+            Some(accounting)
+                if !accounting.observed_after_target_retirement
+                    || accounting.active_processes_native_u32 != 0
+                    || accounting.counter_regression_observed =>
             {
                 return Err(CiError::Message(
                     "unavailable observer retained contradictory native accounting".into(),
                 ));
             }
+            _ => {}
         }
         return Ok(SamplingAssessment {
             capacity: None,
@@ -133,9 +135,34 @@ pub fn validate_process_observation(
                 .any(|entry| !independently_held.contains(&entry.identity))
                 || counters.identity_observations_verified < sample.0.len() as u64
             {
-                return Err(CiError::Message(
-                    "sample contains an unheld identity or impossible verified count".into(),
-                ));
+                let unheld: Vec<_> = sample
+                    .0
+                    .iter()
+                    .filter(|entry| !independently_held.contains(&entry.identity))
+                    .take(8)
+                    .map(|entry| {
+                        (
+                            entry.identity.process_id,
+                            entry.identity.creation_time_100ns,
+                            entry.last_observation_sequence,
+                        )
+                    })
+                    .collect();
+                let unheld_count = sample
+                    .0
+                    .iter()
+                    .filter(|entry| !independently_held.contains(&entry.identity))
+                    .count();
+                return Err(CiError::Message(format!(
+                    "sample contains an unheld identity or impossible verified count; root-pid={}; root-birth={}; sampled={}; independently-held={}; verified={}; total-native={}; unheld-count={unheld_count}; unheld-pid-birth-sequence={unheld:?}; unheld-truncated={}",
+                    expected.root.process_id,
+                    expected.root.creation_time_100ns,
+                    sample.0.len(),
+                    independently_held.len(),
+                    counters.identity_observations_verified,
+                    accounting.total_processes_native_u32,
+                    unheld_count > unheld.len(),
+                )));
             }
             Ok(SamplingAssessment {
                 capacity: Some(policy.sample_slots()),

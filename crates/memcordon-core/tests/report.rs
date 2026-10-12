@@ -902,6 +902,162 @@ fn report11_rejects_unbound_windows_delivery_on_standard_backend() {
 }
 
 #[test]
+fn successful_windows_result_preserves_authenticated_frontend_association() {
+    use memcordon_core::result_v1::{ProviderAttemptAssociationV1, ResultV1, RuntimeV1};
+    let association = ProviderAttemptAssociationV1 {
+        provider: windows_postauthorization_fixture::rejection()
+            .provider_failure
+            .unwrap()
+            .provider_binding,
+        attempt_id: memcordon_core::DiagnosticSha256::from_bytes([0xab; 32]),
+        request_sha256: memcordon_core::DiagnosticSha256::from_bytes([0xcd; 32]),
+    };
+    let delivery = memcordon_core::WindowsTerminalDeliveryEvidenceV1 {
+        schema_version: 1,
+        attempt_id: String::from(association.attempt_id.clone()),
+        nonce: "fixture-nonce".into(),
+        request_sha256: String::from(association.request_sha256.clone()),
+        authority_sha256: "01".repeat(32),
+        retired_sha256: "02".repeat(32),
+        retired_confirmed: true,
+    };
+    let mut attempt = attempt_record(
+        1,
+        Some(RunOutcome::Exited {
+            child: ChildTermination::WindowsStatus { status: 0 },
+            peak: None,
+            cleanup: cleanup(),
+        }),
+        None,
+    );
+    attempt.boundary_detail = BoundaryMechanismEvidence::WindowsJobObjectV2(Box::new(
+        memcordon_core::WindowsSealedEvidenceV2 {
+            schema_version: 2,
+            service_identity: "MemCordonSealedControl+MemCordonSealedLauncher:v1".into(),
+            caller_token_authenticated: true,
+            initial_target_token_matches_caller: true,
+            credential_transition_disposition:
+                memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope,
+            job_membership_independent_of_token: true,
+            job_created: true,
+            job_limits_verified: true,
+            kill_on_close_verified: true,
+            breakaway_denied: true,
+            completion_port_associated: true,
+            guardian_ready: true,
+            target_created_suspended: true,
+            job_list_applied_at_creation: true,
+            handle_list_applied_at_creation: true,
+            target_job_membership_verified: true,
+            target_still_suspended_during_verification: true,
+            inherited_handles_verified: true,
+            target_released: true,
+            terminate_job_invoked: true,
+            active_processes_zero: true,
+            direct_target_reaped: true,
+            relays_retired: true,
+            guardian_reaped: true,
+            final_job_handles_closed: true,
+            frontend_delivery: Some(delivery),
+            frontend_provider_association: Some(association.clone()),
+            ..Default::default()
+        },
+    ));
+    attempt.launch.mechanism = "windows-job-object-v2".into();
+    attempt.launch.target_spawn_error_reported = true;
+    attempt.launch.boundary_requested = memcordon_core::BoundaryRequirement::Sealed;
+    attempt.launch.boundary_effective = memcordon_core::BoundaryClass::Sealed;
+    attempt.launch.boundary_assignment_verified = true;
+    attempt.launch.boundary_reconfiguration_denied = true;
+    attempt.launch.inherited_resources_restricted = true;
+    attempt.launch.frontend_loss_cleanup_authority_verified = true;
+    attempt.restart_safety.containment_incapable_of_live_members = true;
+    attempt.restart_safety.sealed_boundary_retired = true;
+    let outcome = attempt.outcome.clone().unwrap();
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history.append(attempt, &mut aggregates).unwrap();
+    let execution = SupervisionExecution::new(
+        BackendCapabilityReport {
+            boundary: memcordon_core::BoundaryCapability {
+                class: memcordon_core::BoundaryClass::Sealed,
+                mechanism: "windows-job-object-v2".into(),
+                target_gated: true,
+                boundary_verified_before_authorization: true,
+                target_can_reconfigure_boundary: false,
+                frontend_loss_cleanup_authority: true,
+                workload_empty_proof: true,
+                limitations: Vec::new(),
+            },
+            ..Default::default()
+        },
+        SupervisionTerminal::AttemptOutcome {
+            attempt_number: 1,
+            outcome,
+        },
+        history,
+        aggregates,
+        RestartSummary::default(),
+        None,
+        4,
+        1,
+    )
+    .unwrap();
+    let mut report = report_from_execution(execution);
+    report.policy.requested.boundary = memcordon_core::BoundaryRequirement::Sealed;
+    report.policy.effective.boundary = memcordon_core::BoundaryClass::Sealed;
+    let result = ResultV1::from_legacy(&report, Vec::new()).unwrap();
+    assert_eq!(result.provider_association.as_ref(), Some(&association));
+    ResultV1::parse(&serde_json::to_vec(&result).unwrap()).unwrap();
+    for field in ["attempt_id", "request_sha256", "provider"] {
+        let mut changed = result.clone();
+        let RuntimeV1::WindowsSealed { observation } = &mut changed.runtime else {
+            panic!("Windows observation");
+        };
+        let observed = observation.frontend_provider_association.as_mut().unwrap();
+        match field {
+            "attempt_id" => {
+                observed.attempt_id = memcordon_core::DiagnosticSha256::from_bytes([9; 32])
+            }
+            "request_sha256" => {
+                observed.request_sha256 = memcordon_core::DiagnosticSha256::from_bytes([9; 32])
+            }
+            _ => {
+                observed.provider.generation =
+                    memcordon_core::BoundedText::new("substitution").unwrap()
+            }
+        }
+        let observation = observation.clone();
+        changed.attempts[0].boundary_detail =
+            BoundaryMechanismEvidence::WindowsJobObjectV2(observation);
+        assert!(changed.validate().is_err(), "{field}");
+    }
+    for field in ["schema_version", "authority_sha256", "retired_confirmed"] {
+        let mut changed = result.clone();
+        let RuntimeV1::WindowsSealed { observation } = &mut changed.runtime else {
+            panic!("Windows observation");
+        };
+        let delivery = observation.frontend_delivery.as_mut().unwrap();
+        match field {
+            "schema_version" => delivery.schema_version = 2,
+            "authority_sha256" => delivery.authority_sha256 = "invalid".into(),
+            _ => delivery.retired_confirmed = false,
+        }
+        changed.attempts[0].boundary_detail =
+            BoundaryMechanismEvidence::WindowsJobObjectV2(observation.clone());
+        assert!(changed.validate().is_err(), "{field}");
+    }
+    let mut missing_delivery = result;
+    let RuntimeV1::WindowsSealed { observation } = &mut missing_delivery.runtime else {
+        panic!("Windows observation");
+    };
+    observation.frontend_delivery = None;
+    missing_delivery.attempts[0].boundary_detail =
+        BoundaryMechanismEvidence::WindowsJobObjectV2(observation.clone());
+    assert!(missing_delivery.validate().is_err());
+}
+
+#[test]
 fn execution_report_rejects_corrupt_or_future_provider_diagnostics() {
     let projection = memcordon_core::ProviderFailureDiagnosticV1::from_journal(
         memcordon_core::PublicProviderBindingV1 {

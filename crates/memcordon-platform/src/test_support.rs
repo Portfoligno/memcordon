@@ -923,7 +923,195 @@ pub struct WindowsImageProcess {
 }
 
 #[cfg(windows)]
+fn windows_process_observation_error(
+    operation: &str,
+    pid: Option<u32>,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "native process observation {operation}; pid={pid:?}; raw-os-error={:?}; {error}",
+            error.raw_os_error(),
+        ),
+    )
+}
+
+#[cfg(windows)]
 impl WindowsImageProcess {
+    /// Diagnostic-only census of direct children absent from the caller's held
+    /// identities. These observations do not establish Job membership or add
+    /// any process to the independently accepted family.
+    pub fn diagnose_unheld_direct_children(
+        &self,
+        known: &[ProcessIdentity],
+        deadline: std::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            QueryFullProcessImageNameW, WaitForSingleObject,
+        };
+        let error_value = |error: io::Error| {
+            let detail = error.to_string();
+            serde_json::json!({"kind":format!("{:?}",error.kind()),"raw_os_error":error.raw_os_error(),
+                "detail":detail.chars().take(512).collect::<String>(),"detail_truncated":detail.chars().count()>512})
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original child diagnostic cutoff exhausted",
+            ));
+        }
+        if known.len() > 8192 || !known.contains(&self.identity) || self.has_exited()? {
+            return Err(io::Error::other(
+                "diagnostic root is not independently held live",
+            ));
+        }
+        // SAFETY: query-only snapshot has no mutable caller-owned buffers.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful snapshot transfers one owned native handle.
+        let snapshot = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: held snapshot and correctly sized writable entry.
+        let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+        if found == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut scanned = 0usize;
+        let mut direct = 0usize;
+        let mut unheld = 0usize;
+        let mut records = Vec::new();
+        let mut scan_truncated = false;
+        let mut deadline_exhausted = false;
+        while found != 0 {
+            if std::time::Instant::now() >= deadline {
+                deadline_exhausted = true;
+                break;
+            }
+            scanned += 1;
+            if scanned > 131_072 {
+                scan_truncated = true;
+                break;
+            }
+            if entry.th32ParentProcessID == self.identity.pid {
+                direct += 1;
+                if direct > 128 {
+                    scan_truncated = true;
+                    break;
+                }
+                let mut record = serde_json::json!({"snapshot_pid":entry.th32ProcessID,
+                    "snapshot_parent_pid":entry.th32ParentProcessID});
+                // SAFETY: query-only access to this enumerated candidate PID.
+                let raw = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        entry.th32ProcessID,
+                    )
+                };
+                let mut is_known = false;
+                if raw.is_null() {
+                    record["open_error"] = error_value(io::Error::last_os_error());
+                } else {
+                    // SAFETY: successful open transfers one native handle.
+                    let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+                    let mut creation = FILETIME::default();
+                    let mut exit = FILETIME::default();
+                    let mut kernel = FILETIME::default();
+                    let mut user = FILETIME::default();
+                    // SAFETY: same query-capable handle and writable FILETIMEs.
+                    if unsafe {
+                        GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user)
+                    } == 0
+                    {
+                        record["birth_error"] = error_value(io::Error::last_os_error());
+                    } else {
+                        let birth = (u64::from(creation.dwHighDateTime) << 32)
+                            | u64::from(creation.dwLowDateTime);
+                        let identity = ProcessIdentity {
+                            pid: entry.th32ProcessID,
+                            birth: u128::from(birth),
+                        };
+                        is_known = known.contains(&identity);
+                        record["birth"] = serde_json::json!(birth);
+                        record["predates_root"] =
+                            serde_json::json!(identity.birth < self.identity.birth);
+                        if !is_known && records.len() < 8 {
+                            let candidate = WindowsImageProcess {
+                                identity,
+                                _handle: handle,
+                            };
+                            match candidate.native_parent_process_id() {
+                                Ok(parent) => {
+                                    record["native_parent_pid"] = serde_json::json!(parent)
+                                }
+                                Err(error) => record["native_parent_error"] = error_value(error),
+                            }
+                            let mut image = [0u16; 2048];
+                            let mut units = image.len() as u32;
+                            // SAFETY: same held process and bounded writable UTF16 buffer.
+                            if unsafe {
+                                QueryFullProcessImageNameW(raw, 0, image.as_mut_ptr(), &mut units)
+                            } == 0
+                            {
+                                record["image_error"] = error_value(io::Error::last_os_error());
+                            } else if units as usize >= image.len() {
+                                record["image_error"] = serde_json::json!({"detail":"native image length exceeds diagnostic bound"});
+                            } else {
+                                record["image_utf16"] = serde_json::json!(&image[..units as usize]);
+                            }
+                            // SAFETY: original candidate handle retains SYNCHRONIZE.
+                            let wait = unsafe { WaitForSingleObject(raw, 0) };
+                            let wait_error = if wait == windows_sys::Win32::Foundation::WAIT_FAILED
+                            {
+                                Some(io::Error::last_os_error())
+                            } else {
+                                None
+                            };
+                            record["zero_wait_raw"] = serde_json::json!(wait);
+                            if let Some(error) = wait_error {
+                                record["wait_error"] = error_value(error);
+                            }
+                        }
+                    }
+                }
+                if !is_known {
+                    unheld += 1;
+                    if records.len() < 8 {
+                        records.push(record);
+                    }
+                }
+            }
+            // SAFETY: same held snapshot and correctly sized writable entry.
+            found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+            if found == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                    return Err(error);
+                }
+            }
+        }
+        let root_exited_after = self.has_exited()?;
+        Ok(
+            serde_json::json!({"format":"memcordon.windows-unheld-direct-child-diagnostic","revision":1,
+            "root_pid":self.identity.pid,"root_birth":self.identity.birth,"root_exited_after":root_exited_after,
+            "job_membership_established":false,"accepted_family_modified":false,
+            "snapshot_entries_observed":scanned.min(131_072),"direct_candidates_observed":direct.min(128),
+            "scan_truncated":scan_truncated,"deadline_exhausted":deadline_exhausted,
+            "unheld_candidates_observed":unheld,"records_truncated":unheld>records.len(),"records":records}),
+        )
+    }
+
     /// Reads the actual creator PID from this same retained native process
     /// object. Callers must separately hold and compare the parent's birth and
     /// liveness; a PID alone is not an ancestry identity.
@@ -968,7 +1156,8 @@ impl WindowsImageProcess {
         };
         if status < 0 {
             return Err(io::Error::other(format!(
-                "held native parent query failed NTSTATUS {status:#x}"
+                "held native parent NtQueryInformationProcess(class0) failed; pid={}; NTSTATUS={status:#x}",
+                self.identity.pid,
             )));
         }
         if returned as usize != std::mem::size_of::<BasicInformation>()
@@ -998,7 +1187,11 @@ impl WindowsImageProcess {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(windows_process_observation_error(
+                "GetExitCodeProcess",
+                Some(self.identity.pid),
+                io::Error::last_os_error(),
+            ));
         }
         Ok(Some(status))
     }
@@ -1011,13 +1204,155 @@ impl WindowsImageProcess {
         match unsafe { WaitForSingleObject(self._handle.as_raw_handle(), 0) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
+            _ => Err(windows_process_observation_error(
+                "WaitForSingleObject(process,0)",
+                Some(self.identity.pid),
+                io::Error::last_os_error(),
+            )),
         }
     }
 }
 
 #[cfg(windows)]
 pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageProcess>> {
+    windows_processes_for_image_inner(image, None, None)
+}
+
+#[cfg(windows)]
+pub fn windows_performance_counter() -> io::Result<(u64, u64)> {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let mut frequency = 0i64;
+    let mut ticks = 0i64;
+    // SAFETY: both native outputs point to live correctly sized scalar storage.
+    if unsafe { QueryPerformanceFrequency(&raw mut frequency) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ticks points to live correctly sized scalar storage.
+    if unsafe { QueryPerformanceCounter(&raw mut ticks) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match (u64::try_from(ticks), u64::try_from(frequency)) {
+        (Ok(ticks), Ok(frequency)) if frequency != 0 => Ok((ticks, frequency)),
+        _ => Err(io::Error::other("invalid native performance counter")),
+    }
+}
+
+#[cfg(windows)]
+pub fn windows_native_work_cutoff(deadline: std::time::Instant) -> io::Result<(u64, u64)> {
+    // Sample the shared native clock first: time spent transferring the budget
+    // must shorten the child's deadline rather than extend the original cutoff.
+    let (sampled, frequency) = windows_performance_counter()?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or_else(|| io::Error::other("native work cutoff already expired"))?;
+    let ticks = remaining
+        .as_nanos()
+        .checked_mul(u128::from(frequency))
+        .ok_or_else(|| io::Error::other("native work cutoff conversion overflow"))?
+        / 1_000_000_000;
+    let ticks = u64::try_from(ticks)
+        .map_err(|_| io::Error::other("native work cutoff exceeds clock range"))?;
+    if ticks == 0 {
+        return Err(io::Error::other(
+            "native work cutoff has no whole counter ticks",
+        ));
+    }
+    sampled
+        .checked_add(ticks)
+        .map(|cutoff| (cutoff, frequency))
+        .ok_or_else(|| io::Error::other("native work cutoff clock overflow"))
+}
+
+#[cfg(windows)]
+pub fn windows_console_host_path() -> io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut units = [0u16; 2048];
+    // SAFETY: the native API receives the exact writable buffer capacity.
+    let length = unsafe { GetSystemDirectoryW(units.as_mut_ptr(), units.len() as u32) };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize >= units.len() {
+        return Err(io::Error::other(
+            "native system directory exceeds finite bound",
+        ));
+    }
+    let directory =
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units[..length as usize]));
+    if !directory.is_absolute() {
+        return Err(io::Error::other("native system directory is not absolute"));
+    }
+    Ok(directory.join("conhost.exe"))
+}
+
+#[cfg(windows)]
+#[derive(serde::Serialize)]
+pub struct WindowsHeldFileIdentity {
+    pub volume_serial: u32,
+    pub file_index: u64,
+    pub length: u64,
+}
+
+#[cfg(windows)]
+pub fn windows_held_file_identity(file: &std::fs::File) -> io::Result<WindowsHeldFileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    // SAFETY: the plain writable output is initialized and the borrowed file remains owned.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the caller retains the readable file and the native output is valid.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WindowsHeldFileIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        length: (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow),
+    })
+}
+
+/// Observe image candidates under the original caller cutoff. A query-failed
+/// terminal transition is excluded only after this same owned object signals.
+#[cfg(windows)]
+pub fn windows_processes_for_image_until(
+    image: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<WindowsImageProcess>> {
+    windows_processes_for_image_inner(image, Some(deadline), None)
+}
+
+#[cfg(windows)]
+impl WindowsImageProcess {
+    /// Hold only image-verified direct children of this still-held live root.
+    pub fn direct_children_for_image_until(
+        &self,
+        image: &Path,
+        deadline: std::time::Instant,
+    ) -> io::Result<Vec<WindowsImageProcess>> {
+        if self.has_exited()? {
+            return Err(io::Error::other("original direct-child root is retired"));
+        }
+        let children = windows_processes_for_image_inner(image, Some(deadline), Some(self))?;
+        if self.has_exited()? {
+            return Err(io::Error::other(
+                "original direct-child root retired during census",
+            ));
+        }
+        Ok(children)
+    }
+}
+
+#[cfg(windows)]
+fn windows_processes_for_image_inner(
+    image: &Path,
+    deadline: Option<std::time::Instant>,
+    root: Option<&WindowsImageProcess>,
+) -> io::Result<Vec<WindowsImageProcess>> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
         ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE,
@@ -1027,11 +1362,14 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        QueryFullProcessImageNameW,
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
     };
 
-    let expected = std::fs::canonicalize(image)?
+    let expected = std::fs::canonicalize(image)
+        .map_err(|error| {
+            windows_process_observation_error("canonicalize expected image", None, error)
+        })?
         .to_string_lossy()
         .to_lowercase();
     let expected_name = image
@@ -1042,7 +1380,11 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
     // SAFETY: a process snapshot has no mutable external buffers.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        return Err(windows_process_observation_error(
+            "CreateToolhelp32Snapshot(processes)",
+            None,
+            io::Error::last_os_error(),
+        ));
     }
     // SAFETY: snapshot is a new owned handle and is closed on all exits.
     let _snapshot_owner = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
@@ -1053,17 +1395,29 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
     // SAFETY: snapshot and entry are valid for enumeration.
     let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
     if !found {
-        return Err(io::Error::last_os_error());
+        return Err(windows_process_observation_error(
+            "Process32FirstW",
+            None,
+            io::Error::last_os_error(),
+        ));
     }
     let mut matching = Vec::new();
     while found {
+        if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original image census cutoff expired",
+            ));
+        }
         let name_len = entry
             .szExeFile
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
-        if name == expected_name {
+        if name == expected_name
+            && root.is_none_or(|owner| entry.th32ParentProcessID == owner.identity.pid)
+        {
             // SAFETY: query-only access to an enumerated PID.
             let raw = unsafe {
                 OpenProcess(
@@ -1073,20 +1427,212 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
                 )
             };
             if raw.is_null() {
+                let original = io::Error::last_os_error();
                 // A matching image that cannot be inspected is never interpreted as absent.
-                return Err(io::Error::last_os_error());
+                let error = windows_process_observation_error(
+                    "OpenProcess(QUERY_LIMITED_INFORMATION|SYNCHRONIZE)",
+                    Some(entry.th32ProcessID),
+                    original,
+                );
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; snapshot-parent-pid={}; snapshot-name-utf16={:?}; snapshot-name-terminated={}; held-root-filter-pid-birth={:?}; original-cutoff-present={}; original-cutoff-expired={:?}; owned-process-identity-established=false; retirement-established=false",
+                        entry.th32ParentProcessID,
+                        &entry.szExeFile[..name_len],
+                        name_len < entry.szExeFile.len(),
+                        root.map(|owner| (owner.identity.pid, owner.identity.birth)),
+                        deadline.is_some(),
+                        deadline.map(|cutoff| std::time::Instant::now() >= cutoff),
+                    ),
+                ));
             }
             // SAFETY: OpenProcess returned one owned non-null handle.
             let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+            if let Some(owner) = root {
+                let mut creation = FILETIME::default();
+                let mut exit = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+                // SAFETY: the same held query handle and writable native outputs.
+                if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) }
+                    == 0
+                {
+                    return Err(windows_process_observation_error(
+                        "direct child GetProcessTimes",
+                        Some(entry.th32ProcessID),
+                        io::Error::last_os_error(),
+                    ));
+                }
+                let birth = (u128::from(creation.dwHighDateTime) << 32)
+                    | u128::from(creation.dwLowDateTime);
+                if birth < owner.identity.birth || entry.th32ProcessID == owner.identity.pid {
+                    drop(handle);
+                    // SAFETY: snapshot and entry remain held and writable.
+                    found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+                    continue;
+                }
+            }
             let mut units = [0u16; 32768];
             let mut length = u32::try_from(units.len()).expect("image path buffer fits u32");
             // SAFETY: handle and path buffer are valid, with writable length.
             if unsafe { QueryFullProcessImageNameW(raw, 0, units.as_mut_ptr(), &mut length) } == 0 {
-                return Err(io::Error::last_os_error());
+                let image_error = windows_process_observation_error(
+                    "QueryFullProcessImageNameW",
+                    Some(entry.th32ProcessID),
+                    io::Error::last_os_error(),
+                );
+                // A process can terminate after the snapshot/open and lose its
+                // image before this query. Exclude it only when this same held
+                // native object positively proves retirement. A live or unknown
+                // candidate remains an inspection refusal, never an absence.
+                use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+                use windows_sys::Win32::System::Threading::WaitForSingleObject;
+                // SAFETY: handle stays owned here and already has SYNCHRONIZE.
+                match unsafe { WaitForSingleObject(raw, 0) } {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => {
+                        let mut creation = FILETIME::default();
+                        let mut exit = FILETIME::default();
+                        let mut kernel = FILETIME::default();
+                        let mut user = FILETIME::default();
+                        // SAFETY: the original query-capable handle remains owned,
+                        // and all four FILETIME outputs are writable.
+                        let (birth, exit_filetime) = if unsafe {
+                            GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user)
+                        } != 0
+                        {
+                            (
+                                format!(
+                                    "{}",
+                                    (u64::from(creation.dwHighDateTime) << 32)
+                                        | u64::from(creation.dwLowDateTime)
+                                ),
+                                format!(
+                                    "{}",
+                                    (u64::from(exit.dwHighDateTime) << 32)
+                                        | u64::from(exit.dwLowDateTime)
+                                ),
+                            )
+                        } else {
+                            let error = io::Error::last_os_error();
+                            let unavailable = format!(
+                                "unavailable(kind={:?},raw-os-error={:?})",
+                                error.kind(),
+                                error.raw_os_error()
+                            );
+                            (unavailable.clone(), unavailable)
+                        };
+                        let mut exit_code = 0;
+                        // SAFETY: the same query-capable handle remains owned and
+                        // exit_code is writable. A terminal status permits a
+                        // bounded wait, but only the held object's signal proves retirement.
+                        let (exit_code, terminal_status) =
+                            if unsafe { GetExitCodeProcess(raw, &mut exit_code) } != 0 {
+                                (
+                                    exit_code.to_string(),
+                                    exit_code
+                                        != windows_sys::Win32::Foundation::STILL_ACTIVE as u32,
+                                )
+                            } else {
+                                let error = io::Error::last_os_error();
+                                (
+                                    format!(
+                                        "unavailable(kind={:?},raw-os-error={:?})",
+                                        error.kind(),
+                                        error.raw_os_error()
+                                    ),
+                                    false,
+                                )
+                            };
+                        // SAFETY: the original SYNCHRONIZE handle remains owned.
+                        // This second zero-wait never changes the original refusal.
+                        let subsequent_wait = unsafe { WaitForSingleObject(raw, 0) };
+                        let subsequent_wait_error =
+                            if subsequent_wait == windows_sys::Win32::Foundation::WAIT_FAILED {
+                                let error = io::Error::last_os_error();
+                                format!(
+                                    "kind={:?},raw-os-error={:?}",
+                                    error.kind(),
+                                    error.raw_os_error()
+                                )
+                            } else {
+                                "none".to_owned()
+                            };
+                        let mut cutoff_wait = "not-attempted".to_owned();
+                        if let Some(cutoff) = deadline.filter(|_| terminal_status) {
+                            match cutoff.checked_duration_since(std::time::Instant::now()) {
+                                Some(remaining) => {
+                                    let millis =
+                                        remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+                                    // SAFETY: the exact original SYNCHRONIZE handle remains
+                                    // owned. This is one finite wait under the caller cutoff.
+                                    let observed = unsafe { WaitForSingleObject(raw, millis) };
+                                    let wait_error = if observed
+                                        == windows_sys::Win32::Foundation::WAIT_FAILED
+                                    {
+                                        Some(io::Error::last_os_error())
+                                    } else {
+                                        None
+                                    };
+                                    let within_cutoff = std::time::Instant::now() < cutoff;
+                                    if observed == WAIT_OBJECT_0 && within_cutoff {
+                                        drop(handle);
+                                        // SAFETY: snapshot and entry remain owned and valid.
+                                        found =
+                                            unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+                                        continue;
+                                    }
+                                    cutoff_wait = format!(
+                                        "raw={observed},within-original-cutoff={within_cutoff},error={wait_error:?}"
+                                    );
+                                }
+                                None => {
+                                    cutoff_wait = "original-cutoff-expired".to_owned();
+                                }
+                            }
+                        }
+                        return Err(io::Error::new(
+                            image_error.kind(),
+                            format!(
+                                "{image_error}; same-held-handle-retirement=not-signaled; snapshot-parent-pid={}; same-held-handle-birth={birth}; lifecycle-query-order=GetProcessTimes,GetExitCodeProcess,WaitForSingleObject-zero; exit-filetime-100ns={exit_filetime}; raw-exit-code={exit_code}; subsequent-zero-wait-raw={subsequent_wait}; subsequent-zero-wait-error={subsequent_wait_error}; original-cutoff-retirement-wait={cutoff_wait}",
+                                entry.th32ParentProcessID,
+                            ),
+                        ));
+                    }
+                    _ => {
+                        let retirement_error = windows_process_observation_error(
+                            "WaitForSingleObject(image-query-failure,0)",
+                            Some(entry.th32ProcessID),
+                            io::Error::last_os_error(),
+                        );
+                        return Err(io::Error::new(
+                            image_error.kind(),
+                            format!(
+                                "{image_error}; retirement observation unavailable: {retirement_error}"
+                            ),
+                        ));
+                    }
+                }
+                // Advance the original snapshot below; do not query a retired
+                // object's removed image or fabricate its process identity.
+                // Close before enumeration so CloseHandle cannot replace its
+                // terminal GetLastError value when the snapshot is exhausted.
+                drop(handle);
+                // SAFETY: snapshot and entry remain valid for enumeration.
+                found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+                continue;
             }
             let observed = std::fs::canonicalize(Path::new(&String::from_utf16_lossy(
                 &units[..length as usize],
-            )))?
+            )))
+            .map_err(|error| {
+                windows_process_observation_error(
+                    "canonicalize observed image",
+                    Some(entry.th32ProcessID),
+                    error,
+                )
+            })?
             .to_string_lossy()
             .to_lowercase();
             if observed == expected {
@@ -1098,16 +1644,32 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
                 if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) }
                     == 0
                 {
-                    return Err(io::Error::last_os_error());
+                    return Err(windows_process_observation_error(
+                        "GetProcessTimes",
+                        Some(entry.th32ProcessID),
+                        io::Error::last_os_error(),
+                    ));
                 }
-                matching.push(WindowsImageProcess {
+                let process = WindowsImageProcess {
                     identity: ProcessIdentity {
                         pid: entry.th32ProcessID,
                         birth: (u128::from(creation.dwHighDateTime) << 32)
                             | u128::from(creation.dwLowDateTime),
                     },
                     _handle: handle,
-                });
+                };
+                match root {
+                    Some(owner)
+                        if process.identity.birth < owner.identity.birth
+                            || process.native_parent_process_id()? != owner.identity.pid =>
+                    {
+                        return Err(io::Error::other(
+                            "held direct-child identity or native parent differs",
+                        ));
+                    }
+                    _ => {}
+                }
+                matching.push(process);
             }
         }
         // SAFETY: snapshot and entry remain valid for the next query.
@@ -1116,8 +1678,16 @@ pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageP
     // SAFETY: GetLastError reads this thread's immediately preceding enumeration result.
     let enumeration_error = unsafe { GetLastError() };
     if enumeration_error != ERROR_NO_MORE_FILES {
-        return Err(io::Error::from_raw_os_error(
-            i32::try_from(enumeration_error).unwrap_or(i32::MAX),
+        return Err(windows_process_observation_error(
+            "Process32NextW",
+            None,
+            io::Error::from_raw_os_error(i32::try_from(enumeration_error).unwrap_or(i32::MAX)),
+        ));
+    }
+    if deadline.is_some_and(|cutoff| std::time::Instant::now() >= cutoff) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original image census cutoff expired",
         ));
     }
     Ok(matching)
@@ -1408,6 +1978,8 @@ impl OuterTestBoundary {
 #[cfg(unix)]
 enum ChildSetup {
     Session,
+    #[cfg(target_os = "linux")]
+    TraceExec,
     InheritDescriptor(std::os::fd::OwnedFd),
     #[cfg(target_os = "linux")]
     InheritDescriptorAt {
@@ -1422,6 +1994,118 @@ enum ChildSetup {
         reuse: Option<std::os::fd::OwnedFd>,
         writer: std::os::fd::RawFd,
     },
+}
+
+/// Stop this original child at its kernel exec event, before user code runs.
+#[cfg(target_os = "linux")]
+pub fn configure_native_exec_observation(command: &mut Command) {
+    configure_child_setup(command, ChildSetup::TraceExec);
+}
+
+/// A genuine exec stop owned by the spawning thread. Exit reaping remains with
+/// the original runner; dropping an unreleased stop kills only this child.
+#[cfg(target_os = "linux")]
+pub struct NativeExecObservation {
+    pid: libc::pid_t,
+    released: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeExecObservation {
+    pub fn acquire(child: &Child, deadline: std::time::Instant) -> io::Result<Self> {
+        let owner = Self {
+            pid: i32::try_from(child.id()).map_err(io::Error::other)?,
+            released: false,
+        };
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native exec observation deadline",
+                ));
+            }
+            // SAFETY: siginfo is a writable native output; WNOWAIT preserves
+            // every exit result for the original Child wait owner.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owner.pid as libc::id_t,
+                    &mut info,
+                    libc::WSTOPPED | libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: waitid initialized this siginfo output.
+            if unsafe { info.si_pid() } == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            if info.si_code != libc::CLD_TRAPPED || unsafe { info.si_status() } != libc::SIGTRAP {
+                return Err(io::Error::other(
+                    "original child did not reach its native exec trap",
+                ));
+            }
+            // SAFETY: requesting only WSTOPPED cannot reap an exit if an
+            // external signal races the previously observed stop.
+            let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owner.pid as libc::id_t,
+                    &mut consumed,
+                    libc::WSTOPPED | libc::WNOHANG,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { consumed.si_pid() } != owner.pid
+                || consumed.si_code != libc::CLD_TRAPPED
+                || unsafe { consumed.si_status() } != libc::SIGTRAP
+            {
+                return Err(io::Error::other("native exec trap changed before custody"));
+            }
+            return Ok(owner);
+        }
+    }
+
+    pub fn release(mut self) -> io::Result<()> {
+        // SAFETY: this spawning thread owns the validated trace stop; signal0
+        // suppresses the synthetic exec trap and resumes the original program.
+        if unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                self.pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NativeExecObservation {
+    fn drop(&mut self) {
+        if !self.released {
+            // SAFETY: an unreaped original child cannot reuse this PID. Do not
+            // reap here: the bounded runner retains sole native exit ownership.
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Retain an owned CLOEXEC endpoint and inherit it only in this command's child.
@@ -1456,7 +2140,7 @@ pub fn inherit_test_descriptor_at(
     destination: i32,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    if descriptor.as_raw_fd() < 3 || destination < 3 || destination > 4096 {
+    if descriptor.as_raw_fd() < 3 || !(3..=4096).contains(&destination) {
         return Err(io::Error::other(
             "test descriptor slot outside finite nonstandard bound",
         ));
@@ -1567,6 +2251,18 @@ fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
             match &setup {
                 ChildSetup::Session => {
                     if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                ChildSetup::TraceExec => {
+                    if libc::ptrace(
+                        libc::PTRACE_TRACEME,
+                        0,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    ) != 0
+                    {
                         return Err(io::Error::last_os_error());
                     }
                 }

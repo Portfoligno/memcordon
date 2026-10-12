@@ -190,6 +190,11 @@ fn flattened_inspections_preserve_all_versions_and_platforms_strictly() {
             historical_platform
                 .as_object_mut()
                 .unwrap()
+                .remove("policy_root")
+                .unwrap();
+            historical_platform
+                .as_object_mut()
+                .unwrap()
                 .remove("target_desktop_bootstrap_runtime")
                 .unwrap();
             historical_platform["target_desktop_bootstrap_crt_static"] = json!(true);

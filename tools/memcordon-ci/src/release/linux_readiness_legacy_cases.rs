@@ -22,14 +22,38 @@ const FIXTURE: &str = "/usr/libexec/memcordon-installed-private-fixture";
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+fn file_operation<T>(operation: &str, path: &Path, result: std::io::Result<T>) -> Result<T> {
+    result.map_err(|error| CiError::Message(format!("frozen legacy {operation} {path:?}: {error}")))
+}
+fn read_original(path: &Path) -> Result<Vec<u8>> {
+    file_operation("original file read", path, fs::read(path))
+}
+fn command_observation(output: &memcordon_testkit::ObservedOutput) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!(
+        "native-status={:?}; capture-complete=true; stdout-bytes={}; stdout={:?}; stdout-truncated={}; stderr-bytes={}; stderr={:?}; stderr-truncated={}",
+        output.status,
+        output.stdout.len(),
+        stdout.chars().take(4096).collect::<String>(),
+        stdout.chars().count() > 4096,
+        output.stderr.len(),
+        stderr.chars().take(4096).collect::<String>(),
+        stderr.chars().count() > 4096
+    )
+}
 fn save(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let mut file = file_operation(
+        "retained file exclusive creation",
+        path,
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path),
+    )?;
+    file_operation("retained file write", path, file.write_all(bytes))?;
+    file_operation("retained file sync", path, file.sync_all())?;
     Ok(())
 }
 fn json(path: &Path, value: &serde_json::Value) -> Result<()> {
@@ -38,8 +62,8 @@ fn json(path: &Path, value: &serde_json::Value) -> Result<()> {
     save(path, &bytes)
 }
 fn image(path: &Path) -> Result<serde_json::Value> {
-    let file = fs::File::open(path)?;
-    let before = file.metadata()?;
+    let file = file_operation("image open", path, fs::File::open(path))?;
+    let before = file_operation("held image initial metadata", path, file.metadata())?;
     if !before.is_file()
         || before.uid() != 0
         || before.mode() & 0o022 != 0
@@ -49,9 +73,13 @@ fn image(path: &Path) -> Result<serde_json::Value> {
             "frozen installed image custody differs".into(),
         ));
     }
-    let bytes = fs::read(path)?;
-    let after = file.metadata()?;
-    let named = fs::symlink_metadata(path)?;
+    let bytes = read_original(path)?;
+    let after = file_operation("held image final metadata", path, file.metadata())?;
+    let named = file_operation(
+        "named image final metadata",
+        path,
+        fs::symlink_metadata(path),
+    )?;
     if (
         before.dev(),
         before.ino(),
@@ -84,7 +112,11 @@ fn apply_registry(
 ) -> Result<serde_json::Value> {
     let path = root.join(format!("{stem}.policy.json"));
     json(&path, registry)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    file_operation(
+        "policy input permissions",
+        &path,
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)),
+    )?;
     let started = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -103,24 +135,28 @@ fn apply_registry(
         OsString::from("package"),
         "policy".into(),
         "apply".into(),
-        "--registry".into(),
+        "--file".into(),
         path.into_os_string(),
     ];
     let selected = image(Path::new(program))?;
     let invocation = serde_json::json!({"program":program.as_bytes(),"arguments":args.iter().map(|v|v.as_os_str().as_bytes()).collect::<Vec<_>>(),"cwd":work.as_os_str().as_bytes(),"environment":[],"started_unix_millis":started,"work_deadline_unix_millis":cutoff,"budget_millis":budget,"selected_image":selected});
     json(&root.join(format!("{stem}.invocation.json")), &invocation)?;
     let mut held = None;
-    let observed=CommandSpec::new(program,work,Duration::from_millis(budget)).args(args).cleared_environment().bounded_until(deadline).output_limit(16*1024*1024).output_quiet_with_creation(|child|{
-        let stat=fs::read_to_string(format!("/proc/{}/stat",child.id()))?;let birth=stat.rsplit_once(") ").and_then(|(_,tail)|tail.split_whitespace().nth(19)).and_then(|v|v.parse().ok()).ok_or_else(||CiError::Message("frozen policy original child birth absent".into()))?;
-        let mut owner=HeldLinuxProcess::acquire(child.id(),birth).map_err(CiError::Message)?;let kernel=owner.hold_executable_image(deadline).map_err(CiError::Message)?;json(&root.join(format!("{stem}.creation.json")),&serde_json::json!({"identity":owner.retirement_identity().map_err(CiError::Message)?,"kernel_image":kernel,"stat":stat.as_bytes()}))?;held=Some(owner);Ok(())})?;
+    let observed=CommandSpec::new(program,work,Duration::from_millis(budget)).args(args).cleared_environment().bounded_until(deadline).output_limit(16*1024*1024).output_quiet_with_exec_observation(|child|{
+        let stat=fs::read_to_string(format!("/proc/{}/stat",child.id())).map_err(|error| CiError::Message(format!("frozen policy {stem} original child {} stat read: {error}",child.id())))?;let birth=stat.rsplit_once(") ").and_then(|(_,tail)|tail.split_whitespace().nth(19)).and_then(|v|v.parse().ok()).ok_or_else(||CiError::Message("frozen policy original child birth absent".into()))?;
+        let mut owner=HeldLinuxProcess::acquire(child.id(),birth).map_err(|error|CiError::Message(format!("frozen policy {stem} child {} custody acquisition: {error}",child.id())))?;let kernel=owner.hold_executable_image(deadline).map_err(|error|CiError::Message(format!("frozen policy {stem} child {} executable image acquisition: {error}",child.id())))?;json(&root.join(format!("{stem}.creation.json")),&serde_json::json!({"identity":owner.retirement_identity().map_err(|error|CiError::Message(format!("frozen policy {stem} child {} retirement identity: {error}",child.id())))?,"kernel_image":kernel,"stat":stat.as_bytes()}))?;held=Some(owner);Ok(())}).map_err(|error|CiError::Message(format!("frozen policy {stem} process observation: {error}")))?;
     let owner =
         held.ok_or_else(|| CiError::Message("frozen policy original child owner absent".into()))?;
-    let retired = owner.retirement_identity().map_err(CiError::Message)?;
+    let retired = owner.retirement_identity().map_err(|error| {
+        CiError::Message(format!(
+            "frozen policy {stem} retained process retirement identity: {error}"
+        ))
+    })?;
     save(&root.join(format!("{stem}.stdout.json")), &observed.stdout)?;
     save(&root.join(format!("{stem}.stderr.bin")), &observed.stderr)?;
     json(
         &root.join(format!("{stem}.exit.json")),
-        &serde_json::json!({"identity":retired,"native_status":observed.status.into_raw(),"invocation_sha256":hash(&fs::read(root.join(format!("{stem}.invocation.json")))?),"stdout_sha256":hash(&observed.stdout),"stderr_sha256":hash(&observed.stderr)}),
+        &serde_json::json!({"identity":retired,"native_status":observed.status.into_raw(),"invocation_sha256":hash(&read_original(&root.join(format!("{stem}.invocation.json")))?),"stdout_sha256":hash(&observed.stdout),"stderr_sha256":hash(&observed.stderr)}),
     )?;
     if !observed.status.success() || !retired.retirement_observed {
         return Err(CiError::Message(
@@ -159,14 +195,17 @@ pub fn capture(
         })
         .ok_or_else(|| CiError::Message("original preserved legacy contract absent".into()))?;
     let root = output.join("frozen-legacy");
-    fs::create_dir(&root)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
-    let lease: serde_json::Value = serde_json::from_slice(&fs::read(
-        output
-            .parent()
-            .ok_or_else(|| CiError::Message("original installed parent absent".into()))?
-            .join("lifetime/lease-owner.json"),
-    )?)?;
+    file_operation("capture directory creation", &root, fs::create_dir(&root))?;
+    file_operation(
+        "capture directory permissions",
+        &root,
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)),
+    )?;
+    let lease_path = output
+        .parent()
+        .ok_or_else(|| CiError::Message("original installed parent absent".into()))?
+        .join("lifetime/lease-owner.json");
+    let lease: serde_json::Value = serde_json::from_slice(&read_original(&lease_path)?)?;
     let work_cutoff = lease["work_deadline_unix_millis"]
         .as_u64()
         .ok_or_else(|| CiError::Message("original frozen work cutoff absent".into()))?;
@@ -176,10 +215,20 @@ pub fn capture(
     let cli = image(Path::new(CLI))?;
     let fixture = image(Path::new(FIXTURE))?;
     let launcher = image(Path::new("/usr/bin/setpriv"))?;
-    let host_network = fs::metadata("/proc/self/ns/net")?;
-    save(&root.join("cli.bin"), &fs::read(CLI)?)?;
-    save(&root.join("fixture.bin"), &fs::read(FIXTURE)?)?;
-    save(&root.join("launcher.bin"), &fs::read("/usr/bin/setpriv")?)?;
+    let host_network = file_operation(
+        "host network namespace metadata",
+        Path::new("/proc/self/ns/net"),
+        fs::metadata("/proc/self/ns/net"),
+    )?;
+    save(&root.join("cli.bin"), &read_original(Path::new(CLI))?)?;
+    save(
+        &root.join("fixture.bin"),
+        &read_original(Path::new(FIXTURE))?,
+    )?;
+    save(
+        &root.join("launcher.bin"),
+        &read_original(Path::new("/usr/bin/setpriv"))?,
+    )?;
     let mut current_contract = contract.clone();
     for version in [1, 2] {
         let mut actual_registry = serde_json::to_value(registry)?;
@@ -207,15 +256,33 @@ pub fn capture(
             .map_err(CiError::Message)?;
         }
         let directory = root.join(format!("v{version}"));
-        fs::create_dir(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
+        file_operation(
+            "version directory creation",
+            &directory,
+            fs::create_dir(&directory),
+        )?;
+        file_operation(
+            "version directory permissions",
+            &directory,
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)),
+        )?;
         json(
             &directory.join("owner.json"),
             &serde_json::json!({"format":"memcordon.linux-frozen-legacy-owner","revision":1,"registry":actual_registry,"contract":request,"caller_uid":65534,"caller_gid":65534,"caller_group":group,"work":work,"output":output,"cli":cli,"fixture":fixture,"launcher":launcher,"host_network_namespace":{"device":host_network.dev(),"inode":host_network.ino()},"work_deadline_unix_millis":work_cutoff,"cleanup_deadline_unix_millis":cleanup_cutoff}),
         )?;
-        let request_path = directory.join("request.json");
+        // Child inputs must traverse the original public work scope, not the
+        // controller's protected evidence ancestry.
+        let request_path = work.join(format!("frozen-v{version}-request.json"));
         json(&request_path, &request)?;
-        fs::set_permissions(&request_path, fs::Permissions::from_mode(0o644))?;
+        let request_bytes = read_original(&request_path)?;
+        save(&directory.join("request.json"), &request_bytes)?;
+        file_operation(
+            "request input permissions",
+            &request_path,
+            fs::set_permissions(&request_path, fs::Permissions::from_mode(0o644)),
+        )?;
+        let request_owner = fs::File::open(&request_path)?;
+        let request_metadata = request_owner.metadata()?;
         let commands = (|| -> Result<()> {
             for action in if version == 1 {
                 &["result", "plan", "capabilities"][..]
@@ -223,8 +290,39 @@ pub fn capture(
                 &["result"][..]
             } {
                 let row = directory.join(action);
-                fs::create_dir(&row)?;
-                let report = work.join(format!("frozen-v{version}-{action}.json"));
+                file_operation("command directory creation", &row, fs::create_dir(&row))?;
+                let report_parent = work.join(format!("frozen-v{version}-{action}.reports"));
+                let report_owner = if *action == "result" {
+                    file_operation(
+                        "report directory creation",
+                        &report_parent,
+                        fs::create_dir(&report_parent),
+                    )?;
+                    file_operation(
+                        "report directory permissions",
+                        &report_parent,
+                        fs::set_permissions(&report_parent, fs::Permissions::from_mode(0o700)),
+                    )?;
+                    let owner = file_operation(
+                        "report directory hold",
+                        &report_parent,
+                        fs::File::open(&report_parent),
+                    )?;
+                    rustix::fs::fchown(
+                        &owner,
+                        Some(rustix::process::Uid::from_raw(65534)),
+                        Some(rustix::process::Gid::from_raw(65534)),
+                    )
+                    .map_err(|error| {
+                        CiError::Message(format!(
+                            "frozen legacy report directory ownership {report_parent:?}: {error}"
+                        ))
+                    })?;
+                    Some(owner)
+                } else {
+                    None
+                };
+                let report = report_parent.join("result.json");
                 let mut args = vec![
                     OsString::from("--reuid=65534"),
                     "--regid=65534".into(),
@@ -274,17 +372,35 @@ pub fn capture(
                     args.truncate(args.len() - 3);
                     args.push("assert-frozen-baseline".into());
                 }
+                let observations = work.join("frozen-v1-result.observations");
+                let mut observation_owner = None;
                 if version == 1 && *action == "result" {
-                    let observations = row.join("observations");
-                    fs::create_dir(&observations)?;
-                    fs::set_permissions(&observations, fs::Permissions::from_mode(0o700))?;
-                    let held = fs::File::open(&observations)?;
+                    file_operation(
+                        "observation directory creation",
+                        &observations,
+                        fs::create_dir(&observations),
+                    )?;
+                    file_operation(
+                        "observation directory permissions",
+                        &observations,
+                        fs::set_permissions(&observations, fs::Permissions::from_mode(0o700)),
+                    )?;
+                    let held = file_operation(
+                        "observation directory open",
+                        &observations,
+                        fs::File::open(&observations),
+                    )?;
                     rustix::fs::fchown(
                         &held,
                         Some(rustix::process::Uid::from_raw(65534)),
                         Some(rustix::process::Gid::from_raw(65534)),
                     )
-                    .map_err(|e| CiError::Message(e.to_string()))?;
+                    .map_err(|error| {
+                        CiError::Message(format!(
+                            "frozen legacy observation directory owner {observations:?}: {error}"
+                        ))
+                    })?;
+                    observation_owner = Some(held);
                     let marker = args
                         .iter()
                         .position(|arg| arg == "--sealed")
@@ -293,7 +409,7 @@ pub fn capture(
                         marker..marker,
                         [
                             OsString::from("--mixed-observation-directory"),
-                            observations.into_os_string(),
+                            observations.as_os_str().to_owned(),
                         ],
                     );
                 }
@@ -316,14 +432,14 @@ pub fn capture(
                 let invocation = serde_json::json!({"format":"memcordon.linux-frozen-legacy-invocation","revision":1,"program":b"/usr/bin/setpriv","arguments":args.iter().map(|arg|arg.as_os_str().as_bytes().to_vec()).collect::<Vec<_>>(),"cwd":work.as_os_str().as_bytes(),"environment":[],"started_unix_millis":started,"work_deadline_unix_millis":work_cutoff,"cleanup_deadline_unix_millis":cleanup_cutoff,"budget_millis":budget});
                 json(&row.join("invocation.json"), &invocation)?;
                 let observed=CommandSpec::new("/usr/bin/setpriv",work,Duration::from_millis(budget)).args(&args).cleared_environment().output_limit(16*1024*1024).bounded_until(deadline).output_quiet_with_creation(|child| {
-                let stat=fs::read_to_string(format!("/proc/{}/stat",child.id()))?;let birth=stat.rsplit_once(") ").and_then(|(_,tail)|tail.split_whitespace().nth(19)).and_then(|value|value.parse().ok()).ok_or_else(||CiError::Message("original frozen child birth absent".into()))?;
-                let mut owner=HeldLinuxProcess::acquire(child.id(),birth).map_err(CiError::Message)?;
-                let kernel_image=owner.hold_executable_image(deadline).map_err(CiError::Message)?;
+                let stat=fs::read_to_string(format!("/proc/{}/stat",child.id())).map_err(|error| CiError::Message(format!("frozen legacy v{version} {action} original child {} stat read: {error}",child.id())))?;let birth=stat.rsplit_once(") ").and_then(|(_,tail)|tail.split_whitespace().nth(19)).and_then(|value|value.parse().ok()).ok_or_else(||CiError::Message("original frozen child birth absent".into()))?;
+                let mut owner=HeldLinuxProcess::acquire(child.id(),birth).map_err(|error| CiError::Message(format!("frozen legacy v{version} {action} child {} custody acquisition: {error}",child.id())))?;
+                let kernel_image=owner.hold_executable_image(deadline).map_err(|error| CiError::Message(format!("frozen legacy v{version} {action} child {} executable image acquisition: {error}",child.id())))?;
                 json(&row.join("creation.json"),&serde_json::json!({"identity":owner.retirement_identity().map_err(CiError::Message)?,"kernel_image":kernel_image,"stat":stat.as_bytes()}))?;held=Some(owner);Ok(())
-            })?;
+            }).map_err(|error|CiError::Message(format!("frozen legacy v{version} {action} process observation: {error}")))?;
                 let held =
                     held.ok_or_else(|| CiError::Message("frozen native child hold absent".into()))?;
-                let retired = held.retirement_identity().map_err(CiError::Message)?;
+                let retired = held.retirement_identity().map_err(|error| CiError::Message(format!("frozen legacy v{version} {action} retained process retirement identity: {error}")))?;
                 if !retired.retirement_observed {
                     return Err(CiError::Message("frozen child has not retired".into()));
                 }
@@ -331,14 +447,175 @@ pub fn capture(
                 save(&row.join("stderr.bin"), &observed.stderr)?;
                 json(
                     &row.join("exit.json"),
-                    &serde_json::json!({"identity":retired,"native_status":observed.status.into_raw(),"invocation_sha256":hash(&fs::read(row.join("invocation.json"))?),"stdout_sha256":hash(&observed.stdout),"stderr_sha256":hash(&observed.stderr),"cli":image(Path::new(CLI))?,"fixture":image(Path::new(FIXTURE))?,"launcher":image(Path::new("/usr/bin/setpriv"))?}),
+                    &serde_json::json!({"identity":retired,"native_status":observed.status.into_raw(),"invocation_sha256":hash(&read_original(&row.join("invocation.json"))?),"stdout_sha256":hash(&observed.stdout),"stderr_sha256":hash(&observed.stderr),"cli":image(Path::new(CLI))?,"fixture":image(Path::new(FIXTURE))?,"launcher":image(Path::new("/usr/bin/setpriv"))?}),
                 )?;
+                let request_named = fs::symlink_metadata(&request_path)?;
+                let request_held = request_owner.metadata()?;
+                if !request_named.is_file()
+                    || request_named.nlink() != 1
+                    || request_named.uid() != 0
+                    || request_named.mode() & 0o7777 != 0o644
+                    || (request_named.dev(), request_named.ino())
+                        != (request_metadata.dev(), request_metadata.ino())
+                    || (
+                        request_held.len(),
+                        request_held.ctime(),
+                        request_held.ctime_nsec(),
+                    ) != (
+                        request_metadata.len(),
+                        request_metadata.ctime(),
+                        request_metadata.ctime_nsec(),
+                    )
+                    || read_original(&request_path)? != request_bytes
+                {
+                    return Err(CiError::Message(
+                        "original frozen request bytes changed".into(),
+                    ));
+                }
+                if let Some(owner) = observation_owner {
+                    let held = owner.metadata()?;
+                    let named = fs::symlink_metadata(&observations)?;
+                    if !held.is_dir()
+                        || held.uid() != 65534
+                        || held.gid() != 65534
+                        || held.mode() & 0o7777 != 0o700
+                        || !named.is_dir()
+                        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+                    {
+                        return Err(CiError::Message(
+                            "original frozen observation directory custody differs".into(),
+                        ));
+                    }
+                    let retained = row.join("observations");
+                    fs::create_dir(&retained)?;
+                    let mut count = 0;
+                    for entry in fs::read_dir(&observations)? {
+                        if Instant::now() >= deadline {
+                            return Err(CiError::Message(
+                                "original frozen observation copy cutoff exhausted".into(),
+                            ));
+                        }
+                        let path = entry?.path();
+                        let name =
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .ok_or_else(|| {
+                                    CiError::Message("original observation name differs".into())
+                                })?;
+                        count += 1;
+                        if count > 2
+                            || !(name.ends_with(".legacy-provider-request.bin")
+                                || name.ends_with(".legacy-provider-terminal.bin"))
+                        {
+                            return Err(CiError::Message(
+                                "original observation inventory differs".into(),
+                            ));
+                        }
+                        use std::io::Read;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let mut file = fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&path)?;
+                        let before = file.metadata()?;
+                        if !before.is_file()
+                            || before.nlink() != 1
+                            || before.uid() != 65534
+                            || before.len() > 16 * 1024 * 1024
+                        {
+                            return Err(CiError::Message(
+                                "original observation file differs".into(),
+                            ));
+                        }
+                        let mut bytes = Vec::new();
+                        (&mut file)
+                            .take(16 * 1024 * 1024 + 1)
+                            .read_to_end(&mut bytes)?;
+                        let after = file.metadata()?;
+                        let named = fs::symlink_metadata(&path)?;
+                        if bytes.len() as u64 != before.len()
+                            || (
+                                before.dev(),
+                                before.ino(),
+                                before.len(),
+                                before.ctime(),
+                                before.ctime_nsec(),
+                            ) != (
+                                after.dev(),
+                                after.ino(),
+                                after.len(),
+                                after.ctime(),
+                                after.ctime_nsec(),
+                            )
+                            || !named.is_file()
+                            || (named.dev(), named.ino()) != (before.dev(), before.ino())
+                        {
+                            return Err(CiError::Message(
+                                "original observation file changed".into(),
+                            ));
+                        }
+                        save(&retained.join(name), &bytes)?;
+                    }
+                    let stamp = |metadata: &fs::Metadata| {
+                        (
+                            metadata.dev(),
+                            metadata.ino(),
+                            metadata.uid(),
+                            metadata.gid(),
+                            metadata.mode(),
+                            metadata.nlink(),
+                            metadata.ctime(),
+                            metadata.ctime_nsec(),
+                            metadata.mtime(),
+                            metadata.mtime_nsec(),
+                        )
+                    };
+                    if stamp(&owner.metadata()?) != stamp(&held)
+                        || stamp(&fs::symlink_metadata(&observations)?) != stamp(&held)
+                    {
+                        return Err(CiError::Message(
+                            "original observation directory changed during retention".into(),
+                        ));
+                    }
+                }
                 if *action == "result" {
-                    save(&row.join("result.json"), &fs::read(&report)?)?;
+                    let held = file_operation(
+                        "report directory final held metadata",
+                        &report_parent,
+                        report_owner
+                            .as_ref()
+                            .expect("result report directory owner")
+                            .metadata(),
+                    )?;
+                    let named = file_operation(
+                        "report directory final named metadata",
+                        &report_parent,
+                        fs::symlink_metadata(&report_parent),
+                    )?;
+                    if !held.is_dir()
+                        || held.uid() != 65534
+                        || held.gid() != 65534
+                        || held.mode() & 0o7777 != 0o700
+                        || named.file_type().is_symlink()
+                        || (named.dev(), named.ino()) != (held.dev(), held.ino())
+                    {
+                        return Err(CiError::Message(
+                            "original frozen report directory custody differs".into(),
+                        ));
+                    }
+                    save(
+                        &row.join("result.json"),
+                        &fs::read(&report).map_err(|error| {
+                            CiError::Message(format!(
+                                "frozen legacy v{version} {action} report read {report:?}: {error}; {}", command_observation(&observed)
+                            ))
+                        })?,
+                    )?;
                 }
                 if !observed.status.success() {
                     return Err(CiError::Message(format!(
-                        "actual frozen v{version} {action} command failed"
+                        "actual frozen v{version} {action} command failed; {}",
+                        command_observation(&observed)
                     )));
                 }
             }
@@ -354,7 +631,11 @@ pub fn capture(
             )?;
             current_contract.expected_epoch = serde_json::from_value(restored["epoch"].clone())?;
         }
-        commands?;
+        commands.map_err(|error| {
+            CiError::Message(format!(
+                "frozen legacy v{version} command collection: {error}"
+            ))
+        })?;
     }
     Ok(())
 }

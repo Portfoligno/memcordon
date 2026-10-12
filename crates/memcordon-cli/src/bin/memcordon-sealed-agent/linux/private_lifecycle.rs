@@ -474,6 +474,10 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     /// The mixed profile clones from the protected provider context; it never
     /// joins caller mount/root/cwd authority. Original staging and received root
     /// capabilities enter the ledger before any subsequent fallible operation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The protected clone binds original root channel, independent namespaces, lifetime and finite deadline"
+    )]
     pub(super) fn spawn_mixed_namespace(
         &mut self,
         prelaunch: PrivateGatedPrelaunch,
@@ -572,7 +576,20 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             layout,
             root_identity,
             &entry,
-        )?;
+        )
+        .map_err(|root_error| {
+            let startup = self.startup.as_ref().ok_or_else(|| "mixed startup channel absent".to_owned())
+                .and_then(|startup| startup.receive(init.host_pid, deadline));
+            match startup {
+                Ok(observed) => format!(
+                    "{root_error}; authenticated namespace startup after root-transfer failure: {:?}",
+                    observed.observation
+                ),
+                Err(startup_error) => format!(
+                    "{root_error}; authenticated namespace startup unavailable: {startup_error}"
+                ),
+            }
+        })?;
         self.mixed_root = Some(root);
         self.expected_descriptors
             .as_mut()
@@ -1504,6 +1521,33 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     }
 
     #[cfg(test)]
+    pub(crate) fn component_retire_empty_export(
+        &mut self,
+        retirement: &memcordon_core::result_v2::MixedRetirementV2,
+        original_receipt: &[u8],
+        deadline: Instant,
+    ) -> Result<serde_json::Value, String> {
+        if self.record.is_some()
+            || !self.native_exec_observed
+            || self.mixed_root_retired.is_none()
+            || self.cgroup.is_some()
+            || self.namespace_init.is_some()
+            || self.guardian.is_some()
+            || self.target_pidfd.is_some()
+            || self.mixed_root.is_some()
+            || self.mixed_staging.is_some()
+            || retirement.export_receipt_sha256
+                != memcordon_core::workload_codec::hash_bytes(original_receipt)
+        {
+            return Err("component export cleanup lacks completed original retirement".into());
+        }
+        self.mixed_export_destination
+            .as_mut()
+            .ok_or("component original export owner absent")?
+            .component_retire_empty(retirement.attempt_id.as_str(), original_receipt, deadline)
+    }
+
+    #[cfg(test)]
     pub(crate) fn component_pre_account_observation(
         &self,
         admission: &super::mixed_admission::MixedOperationalAdmission,
@@ -1550,14 +1594,20 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The native component probe retains original admission, worker, owned streams, separate deadlines and pre-account callback"
+    )]
     pub(crate) fn component_execute_to_pre_account(
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        provider: memcordon_core::PublicProviderBindingV1,
         attempt: [u8; 16],
         worker: BorrowedFd<'_>,
         streams: [OwnedFd; 3],
         work: Instant,
         cleanup: Instant,
+        frontend_observer: &mut dyn FnMut(bool) -> Result<(), String>,
         callback: &mut dyn FnMut(
             &Self,
             &super::mixed_admission::MixedOperationalAdmission,
@@ -1605,10 +1655,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             self.capture_mixed_gated_facts(admission, &observed)?;
             self.prepare_relay(streams)?;
             self.prepare_operational_release(&observed)?;
-            let snapshot = self.mixed_prepared_observation(
-                admission,
-                super::runtime_manifest::installed_binding()?,
-            )?;
+            let snapshot = self.mixed_prepared_observation(admission, provider)?;
             let mut released = None;
             let mut clock = None;
             self.release_mixed(admission, &observed, &mut released, &mut clock)
@@ -1619,8 +1666,20 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             ) {
                 return Err("component native exec not observed".into());
             }
+            let frontend = admission
+                .frontend_pidfd
+                .try_clone()
+                .map_err(|error| error.to_string())?;
             if !matches!(
-                self.monitor_mixed(admission, Some(work), &control)?,
+                self.monitor_native(
+                    frontend.as_fd(),
+                    Some(work),
+                    || {
+                        frontend_observer(false)?;
+                        admission.revoked()
+                    },
+                    &control
+                )?,
                 PrivateMonitorOutcome::Completed
             ) {
                 return Err("component workload did not complete naturally".into());
@@ -1628,7 +1687,10 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             let retired = self.retire_mixed_before_account_for_component(
                 admission,
                 cleanup,
-                &mut |owner, admission| callback(owner, admission, &snapshot),
+                &mut |owner, admission| {
+                    frontend_observer(true)?;
+                    callback(owner, admission, &snapshot)
+                },
             )?;
             let execution = self.mixed_execution_after_retirement(
                 admission,
@@ -1658,6 +1720,13 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         }
     }
 
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::type_complexity,
+            reason = "The test-only pre-account boundary observes the original lifecycle owner and operational admission together"
+        )
+    )]
     fn retire_mixed_inner(
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,

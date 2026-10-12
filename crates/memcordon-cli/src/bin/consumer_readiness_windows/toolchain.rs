@@ -9,6 +9,7 @@ fn observed_output(
     root: &Path,
     role: &str,
     challenge: &[u8],
+    creation: Option<&super::descriptor::Toolchain>,
 ) -> io::Result<Output> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -20,8 +21,13 @@ fn observed_output(
         .read(true)
         .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(command.get_program())?;
-    let metadata = image.metadata()?;
+        .open(command.get_program())
+        .map_err(|error| {
+            super::toolchain_debug::operation_error("original-image-open", None, error)
+        })?;
+    let metadata = image.metadata().map_err(|error| {
+        super::toolchain_debug::operation_error("original-image-metadata", None, error)
+    })?;
     if !metadata.is_file()
         || metadata.len() > 512 * 1024 * 1024
         || metadata.file_attributes()
@@ -35,7 +41,10 @@ fn observed_output(
     let mut code = Vec::new();
     (&image)
         .take(512 * 1024 * 1024 + 1)
-        .read_to_end(&mut code)?;
+        .read_to_end(&mut code)
+        .map_err(|error| {
+            super::toolchain_debug::operation_error("original-image-read", None, error)
+        })?;
     if code.len() > 512 * 1024 * 1024 {
         return Err(io::Error::other("owned toolchain code exceeds bound"));
     }
@@ -48,6 +57,22 @@ fn observed_output(
         .get_args()
         .map(|argument| argument.encode_wide().collect())
         .collect();
+    if let Some(inputs) = creation {
+        return creation_output(
+            command,
+            CreationInput {
+                root,
+                role,
+                challenge,
+                inputs,
+                image: &image,
+                image_sha256: &image_sha256,
+                parent,
+                program: &program,
+                arguments: &arguments,
+            },
+        );
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let held = match super::native::retain_child_handle(&child) {
@@ -137,8 +162,279 @@ fn observed_output(
     Ok(output)
 }
 
-fn checked(command: &mut Command, root: &Path, role: &str, challenge: &[u8]) -> io::Result<()> {
-    let output = observed_output(command, root, role, challenge)?;
+struct CreationInput<'a> {
+    root: &'a Path,
+    role: &'a str,
+    challenge: &'a [u8],
+    inputs: &'a super::descriptor::Toolchain,
+    image: &'a fs::File,
+    image_sha256: &'a str,
+    parent: memcordon_core::WindowsProcessIdentityV1,
+    program: &'a [u16],
+    arguments: &'a [Vec<u16>],
+}
+
+fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Result<Output> {
+    let CreationInput {
+        root,
+        role,
+        challenge,
+        inputs,
+        image,
+        image_sha256,
+        parent,
+        program,
+        arguments,
+    } = input;
+    use std::io::Read;
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    };
+    super::toolchain_debug::validate_clock(
+        inputs.native_work_cutoff_ticks,
+        inputs.native_work_frequency,
+    )?;
+    let output_root = root
+        .parent()
+        .ok_or_else(|| io::Error::other("compiler acknowledgment root absent"))?;
+    command
+        .creation_flags(windows_sys::Win32::System::Threading::DEBUG_PROCESS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut debug_started = false;
+    let operation = (|| {
+        let capture = |pipe: Box<dyn Read + Send>| {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new().spawn(move || {
+                let mut bytes = Vec::new();
+                let result = pipe
+                    .take(16 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .and_then(|_| {
+                        if bytes.len() <= 16 * 1024 * 1024 {
+                            Ok(bytes)
+                        } else {
+                            Err(io::Error::other("compiler output exceeds bound"))
+                        }
+                    });
+                let _ = send.send(result);
+            })?;
+            Ok::<_, io::Error>(receive)
+        };
+        let stdout =
+            capture(Box::new(child.stdout.take().ok_or_else(|| {
+                io::Error::other("compiler stdout pipe absent")
+            })?))?;
+        let stderr =
+            capture(Box::new(child.stderr.take().ok_or_else(|| {
+                io::Error::other("compiler stderr pipe absent")
+            })?))?;
+        let held = super::native::retain_child_handle(&child)?;
+        let mut original = None;
+        debug_started = true;
+        super::toolchain_debug::run(
+            inputs.native_work_cutoff_ticks,
+            inputs.native_work_frequency,
+            &parent,
+            &child,
+            |created| {
+                if original.is_none() {
+                    super::native::verify_child_image(&child, image).map_err(|error| {
+                        super::toolchain_debug::operation_error(
+                            "original-child-image-verify",
+                            Some(child.id()),
+                            error,
+                        )
+                    })?;
+                    let identity = super::native::child_identity(&child)?;
+                    let (parent_pid, live) = super::native::child_parent_and_liveness(&child)?;
+                    if created.identity != identity
+                        || parent_pid != parent.process_id
+                        || created.parent_pid != parent.process_id
+                        || created.parent_birth != parent.creation_time_100ns
+                        || created.image != inputs.rustc
+                        || created.image_sha256 != image_sha256
+                        || !live
+                    {
+                        return Err(io::Error::other(
+                            "compiler creation event differs from held original child",
+                        ));
+                    }
+                    let receipt = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-created","revision":1,
+                        "role":role,"challenge":challenge,"parent":parent,"child":identity,
+                        "program_utf16":program,"argv_utf16":arguments,"image_sha256":image_sha256,
+                        "held_from_process_creation":true,"held_live_before_wait":live,"native_parent_edge_observed":true});
+                    fs::write(
+                        root.join(format!("native-child-{role}.created.json")),
+                        serde_json::to_vec(&receipt).map_err(io::Error::other)?,
+                    )
+                    .map_err(|error| {
+                        super::toolchain_debug::operation_error(
+                            "original-child-created-receipt-write",
+                            Some(child.id()),
+                            error,
+                        )
+                    })?;
+                    original = Some((identity, live));
+                }
+                if created.image != inputs.rustc && created.image != inputs.native_linker {
+                    return Err(io::Error::other(
+                        "unselected real compiler descendant image",
+                    ));
+                }
+                let path = output_root.join(format!(
+                    "native-toolchain-{}-{}.ack.json",
+                    created.identity.process_id, created.identity.creation_time_100ns
+                ));
+                let published_path = path.with_extension("published");
+                loop {
+                    super::toolchain_debug::remaining(
+                        inputs.native_work_cutoff_ticks,
+                        inputs.native_work_frequency,
+                    )?;
+                    // This hint only sequences the strict ACK open after the
+                    // publisher has finished persistence and final readback.
+                    // It supplies no authority: the complete ACK is still checked.
+                    if !published_path.try_exists().map_err(|error| {
+                        super::toolchain_debug::operation_error(
+                            "creation-ack-publication-hint",
+                            Some(created.identity.process_id),
+                            error,
+                        )
+                    })? {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    match fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                        .custom_flags(
+                            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                        )
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            let metadata = file.metadata().map_err(|error| {
+                                super::toolchain_debug::operation_error(
+                                    "creation-ack-held-metadata",
+                                    Some(created.identity.process_id),
+                                    error,
+                                )
+                            })?;
+                            if !metadata.is_file() || metadata.len() > 16 * 1024
+                                || metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                                return Err(io::Error::other("compiler acknowledgment is not bounded ordinary evidence"));
+                            }
+                            let mut bytes = Vec::new();
+                            file.take(16 * 1024 + 1)
+                                .read_to_end(&mut bytes)
+                                .map_err(|error| {
+                                    super::toolchain_debug::operation_error(
+                                        "creation-ack-held-read",
+                                        Some(created.identity.process_id),
+                                        error,
+                                    )
+                                })?;
+                            if bytes.len() > 16 * 1024 || bytes.len() as u64 != metadata.len() {
+                                return Err(io::Error::other(
+                                    "compiler acknowledgment length changed",
+                                ));
+                            }
+                            memcordon::toolchain_creation_ack::validate(
+                                &bytes,
+                                memcordon::toolchain_creation_ack::Expected {
+                                    challenge,
+                                    root_pid: parent.process_id,
+                                    child: &created.identity,
+                                    parent: &memcordon_core::WindowsProcessIdentityV1 {
+                                        process_id: created.parent_pid,
+                                        creation_time_100ns: created.parent_birth,
+                                    },
+                                    image_sha256: &created.image_sha256,
+                                },
+                            )
+                            .map_err(io::Error::other)?;
+                            return Ok(());
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => {
+                            return Err(super::toolchain_debug::operation_error(
+                                "creation-ack-open",
+                                Some(created.identity.process_id),
+                                error,
+                            ));
+                        }
+                    }
+                }
+            },
+        )?;
+        super::toolchain_debug::wait_retired(
+            &held,
+            super::toolchain_debug::remaining(
+                inputs.native_work_cutoff_ticks,
+                inputs.native_work_frequency,
+            )?,
+        )?;
+        super::toolchain_debug::remaining(
+            inputs.native_work_cutoff_ticks,
+            inputs.native_work_frequency,
+        )?;
+        let status = child.wait()?;
+        let receive = |capture: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>| {
+            let milliseconds = super::toolchain_debug::remaining(
+                inputs.native_work_cutoff_ticks,
+                inputs.native_work_frequency,
+            )?;
+            capture
+                .recv_timeout(std::time::Duration::from_millis(u64::from(milliseconds)))
+                .map_err(io::Error::other)?
+        };
+        let output = Output {
+            status,
+            stdout: receive(stdout)?,
+            stderr: receive(stderr)?,
+        };
+        let (identity, live) =
+            original.ok_or_else(|| io::Error::other("compiler creation receipt absent"))?;
+        let retired = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,
+            "role":role,"challenge":challenge,"parent":parent,"child":identity,"image_sha256":image_sha256,
+            "held_from_process_creation":true,"held_live_before_wait":live,"native_parent_edge_observed":true,
+            "native_wait_completed":true,"native_status":output.status.code()});
+        fs::write(
+            root.join(format!("native-child-{role}.retired.json")),
+            serde_json::to_vec(&retired).map_err(io::Error::other)?,
+        )?;
+        Ok(output)
+    })();
+    match operation {
+        Err(original) if !debug_started => {
+            let cleanup = super::toolchain_debug::run(
+                inputs.native_work_cutoff_ticks,
+                inputs.native_work_frequency,
+                &parent,
+                &child,
+                |_| Err(io::Error::other("compiler setup failed before release")),
+            );
+            Err(io::Error::other(format!(
+                "{original}; creation-owner cleanup={cleanup:?}"
+            )))
+        }
+        other => other,
+    }
+}
+
+fn checked(
+    command: &mut Command,
+    root: &Path,
+    role: &str,
+    challenge: &[u8],
+    creation: Option<&super::descriptor::Toolchain>,
+) -> io::Result<()> {
+    let output = observed_output(command, root, role, challenge, creation)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "owned toolchain command failed with native status {:?}, stderr bytes {:?}",
@@ -187,6 +483,7 @@ fn compile(
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::other("owned compiler output role invalid"))?,
         challenge,
+        Some(inputs),
     )
 }
 
@@ -265,6 +562,7 @@ pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> i
         &root,
         "run-tests",
         &descriptor.challenge,
+        None,
     )?;
     if !result.status.success() {
         return Err(io::Error::other("owned compiled test driver failed"));
@@ -280,6 +578,7 @@ pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> i
         &root,
         "run-child",
         &descriptor.challenge,
+        None,
     )?;
     if fs::read(&product)? != descriptor.challenge {
         return Err(io::Error::other("compiled child bytes differ"));
@@ -289,6 +588,7 @@ pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> i
         &root,
         "run-loader",
         &descriptor.challenge,
+        None,
     )?;
     if fs::read(root.join("dll-output.bin"))? != (0..=255).collect::<Vec<u8>>()
         || !fs::read(root.join("dll-empty.bin"))?.is_empty()

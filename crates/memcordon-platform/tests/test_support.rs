@@ -12,6 +12,22 @@ fn windows_held_identity_child_fixture() {
 #[cfg(windows)]
 #[test]
 fn windows_held_identity_observes_original_process_retirement() {
+    assert!(
+        memcordon_platform::test_support::windows_native_work_cutoff(std::time::Instant::now())
+            .is_err()
+    );
+    let (ticks_before, frequency_before) =
+        memcordon_platform::test_support::windows_performance_counter().unwrap();
+    let (cutoff, frequency) = memcordon_platform::test_support::windows_native_work_cutoff(
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let (ticks_after, frequency_after) =
+        memcordon_platform::test_support::windows_performance_counter().unwrap();
+    assert_eq!(frequency, frequency_before);
+    assert_eq!(frequency, frequency_after);
+    assert!(cutoff >= ticks_before);
+    assert!(cutoff <= ticks_after + frequency * 5);
     struct ChildOwner(std::process::Child);
     impl Drop for ChildOwner {
         fn drop(&mut self) {
@@ -20,6 +36,26 @@ fn windows_held_identity_observes_original_process_retirement() {
         }
     }
     let image = std::env::current_exe().unwrap();
+    let console_path = memcordon_platform::test_support::windows_console_host_path().unwrap();
+    assert!(console_path.is_absolute());
+    assert_eq!(console_path.file_name().unwrap(), "conhost.exe");
+    let image_file = fs::File::open(&image).unwrap();
+    let image_identity =
+        memcordon_platform::test_support::windows_held_file_identity(&image_file).unwrap();
+    assert_eq!(image_identity.length, image_file.metadata().unwrap().len());
+    let expired = memcordon_platform::test_support::windows_processes_for_image_until(
+        &image,
+        std::time::Instant::now(),
+    );
+    assert!(matches!(expired, Err(error) if error.kind() == std::io::ErrorKind::TimedOut));
+    let live = memcordon_platform::test_support::windows_processes_for_image_until(
+        &image,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(live.iter().any(|process| {
+        process.identity.pid == std::process::id() && !process.has_exited().unwrap()
+    }));
     let mut child = ChildOwner(
         std::process::Command::new(&image)
             .args([
@@ -39,11 +75,78 @@ fn windows_held_identity_observes_original_process_retirement() {
         .unwrap();
     assert_ne!(held.identity.birth, 0);
     assert!(!held.has_exited().unwrap());
+    let root = memcordon_platform::test_support::windows_processes_for_image(&image)
+        .unwrap()
+        .into_iter()
+        .find(|process| process.identity.pid == std::process::id())
+        .unwrap();
+    let direct = root
+        .direct_children_for_image_until(
+            &image,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(
+        direct
+            .iter()
+            .any(|process| process.identity == held.identity)
+    );
+    assert!(direct.iter().all(|process| {
+        process.identity.birth >= root.identity.birth
+            && process.native_parent_process_id().unwrap() == root.identity.pid
+            && process.identity != root.identity
+    }));
+    let diagnostic = root
+        .diagnose_unheld_direct_children(
+            &[root.identity],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(diagnostic["accepted_family_modified"], false);
+    assert_eq!(diagnostic["job_membership_established"], false);
+    let observed = diagnostic["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["snapshot_pid"] == child.0.id())
+        .unwrap();
+    assert_eq!(
+        observed["birth"].as_u64().map(u128::from),
+        Some(held.identity.birth)
+    );
+    assert_eq!(observed["native_parent_pid"], root.identity.pid);
+    assert!(!observed["image_utf16"].as_array().unwrap().is_empty());
+    let known = root
+        .diagnose_unheld_direct_children(
+            &[root.identity, held.identity],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(
+        known["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["snapshot_pid"] != child.0.id())
+    );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     assert!(held.has_exited().unwrap());
     // The held native object remains observable after process-table retirement.
     assert!(held.has_exited().unwrap());
+    let remaining = memcordon_platform::test_support::windows_processes_for_image(&image).unwrap();
+    for process in remaining
+        .iter()
+        .filter(|process| process.identity == held.identity)
+    {
+        assert!(process.has_exited().unwrap());
+    }
+    // The census must still acquire the genuinely live original test process.
+    assert!(
+        remaining
+            .iter()
+            .any(|process| process.identity.pid == std::process::id())
+    );
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

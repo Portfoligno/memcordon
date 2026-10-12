@@ -1,6 +1,7 @@
 //! Capacity observations retain each constituent natural attempt and each
 //! authenticated public recovery inventory; bounded samples are not quotas.
 use crate::windows_consumer_readiness::{CaseAssessment, CaseKey};
+#[cfg(windows)]
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 

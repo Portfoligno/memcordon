@@ -10,6 +10,7 @@ pub mod envelope;
 pub(crate) mod execution_identity;
 pub mod guardian;
 pub(crate) mod image_elf_closure;
+mod image_fd_budget;
 pub mod launch;
 pub mod launcher;
 pub(crate) mod mixed_admission;

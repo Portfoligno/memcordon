@@ -351,7 +351,10 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
     // replay ledger, policy reference or acknowledgement store is accessed.
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("component-outbox.json");
+    // Logical fixture validation above did not commit a previous durable image.
+    record.record_revision = 0;
     crate::windows::record::publish_owned_component_record_for_test(&mut record, &path).unwrap();
+    assert_eq!(record.record_revision, 1);
     let persisted = std::fs::read(&path).unwrap();
     let duplicate_refusal = record
         .stage_terminal_response_for_test(&response)

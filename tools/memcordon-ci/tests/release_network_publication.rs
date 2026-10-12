@@ -140,15 +140,17 @@ fn expired_and_excessive_retry_budgets_never_issue_another_read() {
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
     for status in [401, 403, 404, 500] {
         let transport = Script::new(vec![response(status, vec![])]);
-        assert!(
-            http::download(
-                &transport,
-                &ReadBudget::new(Instant::now() + Duration::from_secs(1)),
-                &Url::parse("https://example.com").unwrap(),
-                &[],
-                1
-            )
-            .is_err()
+        let error = http::download(
+            &transport,
+            &ReadBudget::new(Instant::now() + Duration::from_secs(1)),
+            &Url::parse("https://example.com").unwrap(),
+            &[],
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("HTTPS artifact unavailable; status={status}; redirect-index=0")
         );
         assert_eq!(transport.calls.lock().unwrap().len(), 1);
     }
@@ -1203,6 +1205,7 @@ struct RecoveryRemote {
     tool_name: String,
     assembly_conclusion: String,
     archive: Vec<u8>,
+    tool_archive: Vec<u8>,
 }
 impl Transport for RecoveryRemote {
     fn request(
@@ -1242,14 +1245,14 @@ impl Transport for RecoveryRemote {
                 let bytes = if id == 10 {
                     self.archive.clone()
                 } else {
-                    publication_tool_zip()
+                    self.tool_archive.clone()
                 };
                 Ok(json_response(
                     json!({"id":id,"expired":false,"size_in_bytes":bytes.len(),"name":name,"created_at":"2026-10-01T01:14:00Z","digest":format!("sha256:{}",artifacts::checksum(&bytes)),"workflow_run":{"id":9,"head_sha":self.source.commit}}),
                 ))
             }
             "artifacts/10/zip" => Ok(response(200, self.archive.clone())),
-            "artifacts/11/zip" => Ok(response(200, publication_tool_zip())),
+            "artifacts/11/zip" => Ok(response(200, self.tool_archive.clone())),
             _ => panic!("unexpected recovery path"),
         }
     }
@@ -1265,7 +1268,9 @@ fn recovery_requires_exact_original_artifact_names_and_complete_archive_inventor
     let run = |remote: &RecoveryRemote| {
         recovery::validate_original(
             remote,
-            &ReadBudget::new(Instant::now() + Duration::from_secs(2)),
+            // This exercises complete native archive extraction/validation,
+            // not just mock HTTP latency. Admit the actual recovery phase.
+            &ReadBudget::new(Instant::now() + recovery::ORIGINAL_VALIDATION_BUDGET),
             &[],
             &remote.source,
             &locator,
@@ -1277,6 +1282,7 @@ fn recovery_requires_exact_original_artifact_names_and_complete_archive_inventor
         tool_name: "publication-tool-9-1".into(),
         assembly_conclusion: "success".into(),
         archive: prepared_zip(),
+        tool_archive: publication_tool_zip(),
     };
     run(&remote).unwrap();
     for name in [

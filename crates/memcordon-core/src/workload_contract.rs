@@ -336,6 +336,10 @@ pub struct WorkloadContractV2 {
 
 /// Dispatches only on the explicit version; a V2 identity can never disappear into V1.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Preserve direct public versioned contract payloads without changing the constructor API"
+)]
 pub enum WorkloadContract {
     V1(WorkloadContractV1),
     V2(WorkloadContractV2),

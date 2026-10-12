@@ -506,6 +506,11 @@ fn validate_original_frontend(
     index: &EvidenceIndex,
     custody: &custody::Custody,
 ) -> VerificationResult<()> {
+    let resolved_command = crate::linux_frontend_access::resolve(
+        command,
+        Some(custody.bytes(&e.original_source_request)?),
+    )?;
+    let command = &resolved_command;
     closed(
         command,
         &[
@@ -556,7 +561,6 @@ fn validate_original_frontend(
         (1, "65534"),
         (2, "--regid"),
         (3, "65534"),
-        (4, "--clear-groups"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
         (7, "+256M"),
@@ -658,6 +662,10 @@ pub(crate) fn validate_owned_frontend_launch(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independently retained account files, acquisition intent, owner and lease evidence"
+)]
 fn validate_account(
     account: &Value,
     intent: &Value,
@@ -682,6 +690,10 @@ fn validate_account(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compare independently retained account files, acquisition intent, owner and lease evidence"
+)]
 pub(crate) fn validate_owned_account(
     account: &Value,
     intent: &Value,

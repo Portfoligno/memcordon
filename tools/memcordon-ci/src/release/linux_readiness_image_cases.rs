@@ -892,7 +892,7 @@ pub fn capture_import_command(
     let mut child_kernel_owner = None;
     let captured = CommandSpec::new(
         "/usr/libexec/memcordon-sealed-agent",
-        &output,
+        output,
         remaining(context.deadline)?,
     )
     .bounded_until(context.deadline)
@@ -907,7 +907,7 @@ pub fn capture_import_command(
         let mut owner=crate::linux_consumer_readiness::HeldLinuxProcess::acquire(pid,birth).map_err(CiError::Message)?;
         let image=owner.hold_executable_image(context.deadline).map_err(CiError::Message)?;
         if image["sha256"]!=context.expected_agent_sha256||image["device"]!=agent_before.dev()||image["inode"]!=agent_before.ino()||image["length"]!=agent_before.len(){return Err(CiError::Message("actual kernel importer image differs from held selected agent".into()));}
-        retain(&native_creation,&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-image-import-creation","revision":1,
+        retain(native_creation,&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-image-import-creation","revision":1,
             "process_id":pid,"birth":birth,"pidfd_device":stat.st_dev,"pidfd_inode":stat.st_ino,
             "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json"))?)),"kernel_image":image}))?,file_custody)?;
         child_kernel_owner=Some(owner);
@@ -941,7 +941,6 @@ pub fn capture_import_command(
         ));
     }
     let pidfd_revents = wait[0].revents().bits();
-    drop(wait);
     let pidfd_stat =
         rustix::fs::fstat(&pidfd).map_err(|error| CiError::Message(error.to_string()))?;
     drop(pidfd);
@@ -977,14 +976,14 @@ pub fn capture_import_command(
     }
     use std::os::unix::process::ExitStatusExt;
     retain(
-        &native_process,
+        native_process,
         &serde_json::to_vec(
             &serde_json::json!({"format":"memcordon.linux-image-import-process","revision":1,
         "process_id":pid,"birth":birth,"raw_wait_status":captured.status.into_raw(),"native_exit":captured.status.code(),"signal":captured.status.signal(),
         "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json"))?)),
         "stdout_sha256":hex(&Sha256::digest(&captured.stdout)),"stderr_sha256":hex(&Sha256::digest(&captured.stderr)),
         "executable_device":agent_before.dev(),"executable_inode":agent_before.ino(),
-        "creation_sha256":hex(&Sha256::digest(std::fs::read(&native_creation)?)),
+        "creation_sha256":hex(&Sha256::digest(std::fs::read(native_creation)?)),
         "pidfd_device":pidfd_stat.st_dev,"pidfd_inode":pidfd_stat.st_ino,"pidfd_revents":pidfd_revents}),
         )?,
         file_custody,
@@ -1253,7 +1252,7 @@ fn add_writable_rpath(bytes: &mut [u8]) -> Result<()> {
         .iter()
         .position(|byte| *byte == 0)
         .ok_or_else(failure)?;
-    if length < 5 || length > 4096 {
+    if !(5..=4096).contains(&length) {
         return Err(failure());
     }
     bytes
@@ -2728,7 +2727,7 @@ fn finish_export_permission_helper(
             }
         }
     })();
-    let close = memcordon_platform::linux_checked_close(sender.into());
+    let close = memcordon_platform::linux_checked_close(sender);
     if let Err(error) = close {
         let failure = format!("external acknowledgment socket close: {error}");
         report.failures.push(failure.clone());
@@ -2858,12 +2857,14 @@ fn finish_export_permission_helper(
         ));
     }
     let helper = &mut report.export_helpers[helper_index];
-    if let Some(peer) = helper.peer.take() {
-        if let Err(error) = memcordon_platform::linux_checked_close(peer) {
-            let failure = format!("external settled peer native close: {error}");
-            report.failures.push(failure.clone());
-            peer_close_errors.push(failure);
-        }
+    if let Some(Err(error)) = helper
+        .peer
+        .take()
+        .map(memcordon_platform::linux_checked_close)
+    {
+        let failure = format!("external settled peer native close: {error}");
+        report.failures.push(failure.clone());
+        peer_close_errors.push(failure);
     }
     let status = loop {
         remaining(context.cleanup_deadline)?;

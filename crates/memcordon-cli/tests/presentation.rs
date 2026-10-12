@@ -163,3 +163,33 @@ fn failed_summary_preserves_the_typed_provider_rejection() {
         },
     );
 }
+
+#[test]
+fn monitor_summary_preserves_bounded_original_detail_without_inventing_a_code() {
+    for detail in [
+        "mixed admission refused: original native reason".to_owned(),
+        "é".repeat(4097),
+    ] {
+        let expected_detail: String = detail.chars().take(4096).collect();
+        let expected = format!(
+            "memcordon: monitor failed 125; backend linux-sealed-provider; attempts 1; restarts 0; error {expected_detail}; detail-truncated={}\n",
+            detail.chars().count() > 4096,
+        );
+        assert_renderer(&expected, |out| {
+            presentation::write_summary(
+                out,
+                ExecutionSummary {
+                    outcome: "monitor failed",
+                    tone: SummaryTone::Error,
+                    status: 125,
+                    backend: "linux-sealed-provider",
+                    attempts: 1,
+                    restarts: 0,
+                    failure_code: None,
+                    failure_phase: None,
+                    failure_detail: Some(&detail),
+                },
+            )
+        });
+    }
+}
