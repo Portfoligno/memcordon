@@ -2580,15 +2580,10 @@ fn finish_export_permission_helper(
         ));
     }
     let group = &report.administrative_export_handles[helper.cgroup_index];
-    let stamp = group.metadata()?;
-    let group_observation = serde_json::json!({"device":stamp.dev(),"inode":stamp.ino(),"native_links":stamp.nlink(),
-        "filesystem":"cgroup2","kind":"removed-held-inode"});
-    if stamp.nlink() != 0
-        || rustix::fs::fstatfs(group)
-            .map_err(std::io::Error::from)?
-            .f_type as u64
-            != 0x63677270
-        || group_observation != event["cgroup_retirement"]
+    let removal = memcordon_platform::linux_cgroup_retirement(group)?
+        .ok_or_else(|| CiError::Message("external event cgroup handle remains active".into()))?;
+    let group_observation = serde_json::to_value(removal)?;
+    if group_observation != event["cgroup_retirement"]
         || group_observation["device"] != helper.setup["cgroup"]["device"]
         || group_observation["inode"] != helper.setup["cgroup"]["inode"]
     {

@@ -1440,6 +1440,15 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
     )?;
     build.actor_executable = Some(actor.path.clone());
     cell.artifacts.push(actor);
+    let wrapper = retain_file(
+        &owner.config.fixture.path,
+        &destination,
+        &prefix.join("actors/consumer-fixture.exe"),
+        Some(&owner.config.fixture.sha256),
+        512 * 1024 * 1024,
+    )?;
+    build.frontend_wrapper_executable = Some(wrapper.path.clone());
+    cell.artifacts.push(wrapper);
     cell.component_build = Some(build);
     // An existing provider is never adopted as this original support owner.
     crate::windows_readiness_adapter::observe_removed(
@@ -2638,6 +2647,7 @@ fn prepare_build(
                 .ok_or_else(|| CiError::Message("operational native role absent".into()))?,
             instrumented: true,
             actor_executable: None,
+            frontend_wrapper_executable: None,
             parser_executable: parser,
         },
         source,

@@ -73,6 +73,13 @@ fn linux_runtime_image_retire_command(arguments: &[OsString]) -> bool {
                 && json == "--json")
 }
 
+fn linux_bounded_uninstall_command(arguments: &[OsString]) -> bool {
+    matches!(arguments,
+        [package, operation, cutoff, _]
+            if package == "package" && operation == "uninstall"
+                && cutoff == "--lease-cleanup-cutoff-nanos")
+}
+
 pub(crate) fn retired_release_command(platform: ReleasePlatform, arguments: &[OsString]) -> bool {
     let Some(command) = arguments.first().and_then(|argument| argument.to_str()) else {
         return false;
@@ -81,7 +88,8 @@ pub(crate) fn retired_release_command(platform: ReleasePlatform, arguments: &[Os
         if platform == ReleasePlatform::Linux
             && (linux_entrypoint_install_command(arguments)
                 || linux_runtime_image_install_command(arguments)
-                || linux_runtime_image_retire_command(arguments))
+                || linux_runtime_image_retire_command(arguments)
+                || linux_bounded_uninstall_command(arguments))
         {
             return false;
         }

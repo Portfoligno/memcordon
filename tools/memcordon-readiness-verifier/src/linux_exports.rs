@@ -2739,10 +2739,48 @@ pub fn validate_linux_export_permission_settlement(
         ],
     )?;
     closed(&event["worker"], &["pid", "birth", "image_sha256"])?;
-    closed(
-        &event["cgroup_retirement"],
-        &["device", "inode", "native_links", "filesystem", "kind"],
-    )?;
+    let removal = &event["cgroup_retirement"];
+    let removal_fields = if removal.get("handle_retirement").is_some() {
+        &[
+            "device",
+            "inode",
+            "native_links",
+            "filesystem",
+            "kind",
+            "handle_retirement",
+        ][..]
+    } else {
+        &["device", "inode", "native_links", "filesystem", "kind"][..]
+    };
+    closed(removal, removal_fields)?;
+    if let Some(handle) = removal.get("handle_retirement") {
+        closed(
+            handle,
+            &[
+                "handle_type",
+                "handle_bytes",
+                "handle_id",
+                "mount_id",
+                "open_errno",
+            ],
+        )?;
+        // FILEID_KERNFS encodes one u64 id, equal to the inode on the supported
+        // 64-bit Linux targets. Only ESTALE from that exact filesystem handle
+        // proves removal on kernels whose directory link count stays nonzero.
+        if handle["handle_type"] != 0xfe
+            || handle["handle_bytes"] != std::mem::size_of::<u64>()
+            || handle["handle_id"] != removal["inode"]
+            || handle["mount_id"].as_i64().is_none_or(|id| id <= 0)
+            || handle["open_errno"] != 116
+            || removal["native_links"]
+                .as_u64()
+                .is_none_or(|links| links == 0)
+        {
+            return Err("held cgroup kernfs retirement handle differs".into());
+        }
+    } else if removal["native_links"] != 0 {
+        return Err("held cgroup removal lacks native link or kernfs handle proof".into());
+    }
     let family: Value = crate::wire::decode(family_bytes)?;
     closed(
         &family,
@@ -2847,7 +2885,6 @@ pub fn validate_linux_export_permission_settlement(
             .is_none_or(|mode| mode & 0o170000 != 0o040000 || mode & 0o022 != 0)
         || event["cgroup_retirement"]["filesystem"] != "cgroup2"
         || event["cgroup_retirement"]["kind"] != "removed-held-inode"
-        || event["cgroup_retirement"]["native_links"] != 0
         || event["cgroup_retirement"]["device"] != setup["cgroup"]["device"]
         || event["cgroup_retirement"]["inode"] != setup["cgroup"]["inode"]
     {

@@ -1178,14 +1178,26 @@ impl PreparedLinuxObserver {
                     {
                         return Ok(true);
                     }
+                    if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV) {
+                        return memcordon_platform::linux_cgroup_retirement(&self.cgroup)
+                            .map(|retirement| retirement.is_some())
+                            .map_err(|error| format!("held cgroup handle retirement: {error}"));
+                    }
                     return Err(format!("held cgroup.events open: {error}"));
                 }
             };
             let mut text = String::new();
-            File::from(events)
-                .take(4097)
-                .read_to_string(&mut text)
-                .map_err(|error| format!("held cgroup.events read: {error}"))?;
+            let read = File::from(events).take(4097).read_to_string(&mut text);
+            if let Err(error) = read {
+                // A previously opened kernfs control may deactivate before
+                // its read. Its read error alone is not retirement evidence.
+                if error.raw_os_error() == Some(libc::ENODEV) {
+                    return memcordon_platform::linux_cgroup_retirement(&self.cgroup)
+                        .map(|retirement| retirement.is_some())
+                        .map_err(|error| format!("held cgroup handle retirement: {error}"));
+                }
+                return Err(format!("held cgroup.events read: {error}"));
+            }
             if text.len() > 4096
                 || text
                     .lines()
@@ -1650,7 +1662,9 @@ pub(crate) fn measured(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
             .open(&current_path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                format!("open measured artifact ancestor {current_path:?} for {path:?}: {error}")
+            })?;
         let metadata = held.metadata().map_err(|error| error.to_string())?;
         ancestors.push((current_path.clone(), held, metadata.dev(), metadata.ino()));
     }
@@ -1658,7 +1672,7 @@ pub(crate) fn measured(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| format!("open measured artifact {path:?}: {error}"))?;
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() || before.nlink() != 1 || before.len() > maximum {
         return Err("Linux driver artifact is not bounded exclusive regular custody".into());
@@ -1674,7 +1688,7 @@ pub(crate) fn measured(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| format!("reopen measured artifact {path:?}: {error}"))?;
     let current = named.metadata().map_err(|e| e.to_string())?;
     if bytes.len() as u64 != before.len()
         || (
@@ -1706,8 +1720,8 @@ pub(crate) fn measured(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
         let named = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
-            .open(path)
-            .map_err(|error| error.to_string())?;
+            .open(&path)
+            .map_err(|error| format!("reopen measured artifact ancestor {path:?}: {error}"))?;
         let original = held.metadata().map_err(|error| error.to_string())?;
         let named = named.metadata().map_err(|error| error.to_string())?;
         if (original.dev(), original.ino()) != (device, inode)

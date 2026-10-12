@@ -48,6 +48,12 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
         .as_deref()
         .ok_or("measured native actor executable absent")?;
     let executable_sha = context.custody.hash(executable)?;
+    let wrapper_sha = context.custody.hash(
+        build
+            .frontend_wrapper_executable
+            .as_deref()
+            .ok_or("measured native frontend wrapper absent")?,
+    )?;
     if !build.instrumented
         || build.source_commit != context.index.source_commit
         || build.source_tree_sha256 != context.index.source_tree_sha256
@@ -157,6 +163,10 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
                 "program_utf16",
                 "argv_utf16",
                 "cwd_utf16",
+                "frontend_environment",
+                "wrapper_executable_sha256",
+                "wrapper_program_utf16",
+                "wrapper_argv_utf16",
                 "environment_cleared",
             ],
             &[],
@@ -167,6 +177,7 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             || command["recipe_id"] != build.recipe_id
             || command["native_target"] != key.target
             || command["executable_sha256"] != executable_sha
+            || command["wrapper_executable_sha256"] != wrapper_sha
             || command["environment_cleared"] != true
         {
             return Err("actor invocation differs from actual native build/source".into());
@@ -177,6 +188,27 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             .map_err(|error| error.to_string())?;
         let cwd: Vec<u16> = serde_json::from_value(command["cwd_utf16"].clone())
             .map_err(|error| error.to_string())?;
+        let wrapper_program: Vec<u16> =
+            serde_json::from_value(command["wrapper_program_utf16"].clone())
+                .map_err(|error| error.to_string())?;
+        let wrapper_args: Vec<Vec<u16>> =
+            serde_json::from_value(command["wrapper_argv_utf16"].clone())
+                .map_err(|error| error.to_string())?;
+        let expected_wrapper_args: Vec<Vec<u16>> = [
+            "consumer-readiness-windows".encode_utf16().collect(),
+            "system-frontend".encode_utf16().collect(),
+            program.clone(),
+        ]
+        .into_iter()
+        .chain(args.iter().cloned())
+        .collect();
+        if wrapper_program.is_empty()
+            || wrapper_program.contains(&0)
+            || wrapper_program == program
+            || wrapper_args != expected_wrapper_args
+        {
+            return Err("actor native environment wrapper invocation differs".into());
+        }
         if program.is_empty()
             || cwd.is_empty()
             || program.contains(&0)
@@ -205,6 +237,9 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
         if observation["selection"] != selection || !observation["capture_failure"].is_null() {
             return Err("actor actual capture/selection differs".into());
         }
+        if command["wrapper_program_utf16"] != observation["launch"]["command"]["program"] {
+            return Err("actor wrapper differs from the measured native fixture program".into());
+        }
         let attempt = observation["attempt_id"]
             .as_str()
             .ok_or("actor actual attempt absent")?;
@@ -216,6 +251,9 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             .filter(|nonce| !nonce.is_empty())
             .ok_or("actor actual nonce absent")?;
         validate_launch_request(&observation["launch"])?;
+        if command["frontend_environment"] != observation["launch"]["environment"] {
+            return Err("actor declared environment differs from authenticated launch".into());
+        }
         crate::digest(attempt)?;
         crate::digest(request)?;
         let request_bytes = context.custody.bytes(&actor.provider_request)?;
@@ -242,6 +280,9 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
                 "creation_time_100ns",
                 "held_before_execution",
                 "native_live_before_release",
+                "wrapper_process_id",
+                "wrapper_creation_time_100ns",
+                "native_parent_process_id",
             ],
             &[],
         )?;
@@ -253,11 +294,21 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             .as_u64()
             .filter(|birth| *birth > 0)
             .ok_or("held actor birth absent")?;
+        let wrapper_pid = held["wrapper_process_id"]
+            .as_u64()
+            .filter(|value| *value > 0 && *value <= u64::from(u32::MAX) && *value != pid)
+            .ok_or("held wrapper PID absent")?;
+        let wrapper_birth = held["wrapper_creation_time_100ns"]
+            .as_u64()
+            .filter(|value| *value > 0 && *value <= birth)
+            .ok_or("held wrapper birth absent")?;
         if held["format"] != "memcordon.windows-component-frontend-held"
             || held["revision"] != 1
             || held["held_before_execution"] != true
             || held["native_live_before_release"] != true
             || !identities.insert((pid, birth))
+            || !identities.insert((wrapper_pid, wrapper_birth))
+            || held["native_parent_process_id"] != wrapper_pid
             || observation["caller"]["process_id"] != pid
             || observation["caller"]["creation_time_100ns"] != birth
         {
@@ -297,6 +348,11 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
                 "held_before_execution",
                 "retirement_observed",
                 "native_status",
+                "wrapper_process_id",
+                "wrapper_creation_time_100ns",
+                "wrapper_image_sha256",
+                "wrapper_retirement_observed",
+                "wrapper_native_status",
             ],
             &[],
         )?;
@@ -315,6 +371,11 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             || wait["held_before_execution"] != true
             || wait["retirement_observed"] != true
             || wait["native_status"] != native_status
+            || wait["wrapper_process_id"] != wrapper_pid
+            || wait["wrapper_creation_time_100ns"] != wrapper_birth
+            || wait["wrapper_image_sha256"] != wrapper_sha
+            || wait["wrapper_retirement_observed"] != true
+            || wait["wrapper_native_status"] != native_status
         {
             return Err("actor actual native wait/capture differs from held process".into());
         }

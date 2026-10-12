@@ -3817,6 +3817,24 @@ fn token_peer_query_merge_is_exact_preserving_and_idempotent() {
 }
 
 #[test]
+fn control_token_clients_receive_only_identity_query_authority() {
+    let token = crate::windows::token::restricted_current_primary().unwrap();
+    crate::windows::security::converge_control_token_client_query(token.raw()).unwrap();
+    for sid in ["S-1-5-11", "S-1-5-12"] {
+        attest_token_peer_query(token.raw(), sid).unwrap();
+    }
+    // This unrelated service SID is absent, so its non-peer fingerprint
+    // covers the entire resulting DACL and catches changes on a second pass.
+    let unrelated = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
+    let before = token_dacl_nonpeer_fingerprint(token.raw(), &unrelated).unwrap();
+    crate::windows::security::converge_control_token_client_query(token.raw()).unwrap();
+    assert_eq!(
+        token_dacl_nonpeer_fingerprint(token.raw(), &unrelated).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn token_peer_query_merge_rejects_an_invalid_peer_sid() {
     let token = crate::windows::token::restricted_current_primary().unwrap();
     let error = converge_token_peer_query(token.raw(), "not-a-sid").unwrap_err();

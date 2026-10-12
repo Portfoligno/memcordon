@@ -193,14 +193,17 @@ fn removed(cgroup: &OwnedFd, expected: &Cgroup) -> Result<serde_json::Value, Box
     native::close(file.into())?;
     if !actual.is_dir()
         || (actual.dev(), actual.ino()) != (expected.device, expected.inode)
-        || actual.nlink() != 0
         || !native::cgroup2(cgroup.as_raw_fd())?
     {
         return Err("actual original cgroup inode is not natively removed".into());
     }
-    Ok(
-        serde_json::json!({"device":actual.dev(),"inode":actual.ino(),"native_links":actual.nlink(),"filesystem":"cgroup2","kind":"removed-held-inode"}),
-    )
+    let held = File::from(native::duplicate(cgroup.as_raw_fd())?);
+    let observation = memcordon_platform::linux_cgroup_retirement(&held);
+    let closed = native::close(held.into());
+    let observation = observation?;
+    closed?;
+    let observation = observation.ok_or("actual original cgroup handle remains active")?;
+    Ok(serde_json::to_value(observation)?)
 }
 
 /// fd0 is one parent-owned SOCK_SEQPACKET channel. It transfers exactly the

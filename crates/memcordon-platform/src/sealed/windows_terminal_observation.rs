@@ -28,6 +28,7 @@ struct Active {
     multiple_terminals: bool,
     provider_request: Option<Vec<u8>>,
     request_publication: Option<(std::path::PathBuf, std::fs::File)>,
+    first_probe_failure: Option<String>,
 }
 
 thread_local! {
@@ -79,6 +80,7 @@ impl WindowsTerminalObservationScope {
                 multiple_terminals: false,
                 provider_request: None,
                 request_publication: None,
+                first_probe_failure: None,
             });
             Ok(Self {
                 active: true,
@@ -96,7 +98,10 @@ impl WindowsTerminalObservationScope {
             return Err("Windows observation requires exactly one authenticated terminal".into());
         }
         captured.observation.ok_or_else(|| {
-            "requested authenticated Windows terminal observation is unavailable".into()
+            unavailable(
+                "requested authenticated Windows terminal observation is unavailable",
+                captured.first_probe_failure.as_deref(),
+            )
         })
     }
 
@@ -111,7 +116,10 @@ impl WindowsTerminalObservationScope {
             return Err("Windows request observation requires exactly one request".into());
         }
         let bytes = captured.provider_request.ok_or_else(|| {
-            "requested Windows launch request observation is unavailable".to_owned()
+            unavailable(
+                "requested Windows launch request observation is unavailable",
+                captured.first_probe_failure.as_deref(),
+            )
         })?;
         let (path, file) = captured
             .request_publication
@@ -157,6 +165,30 @@ impl WindowsTerminalObservationScope {
         }
         Ok(bytes)
     }
+}
+
+fn unavailable(message: &str, failure: Option<&str>) -> String {
+    match failure {
+        Some(failure) => format!("{message}; first local provider probe failure: {failure}"),
+        None => message.to_owned(),
+    }
+}
+
+/// Local failure context only: never a request, authenticated receipt, or proof.
+/// Preserve the original failure within the explicit thread-owned scope.
+pub(super) fn retain_probe_failure(detail: &str) {
+    ACTIVE.with(|active| {
+        if let Some(active) = active.borrow_mut().as_mut() {
+            if active.first_probe_failure.is_none() {
+                const LIMIT: usize = 2048;
+                let mut end = detail.len().min(LIMIT);
+                while !detail.is_char_boundary(end) {
+                    end -= 1;
+                }
+                active.first_probe_failure = Some(detail[..end].to_owned());
+            }
+        }
+    });
 }
 
 pub(super) fn retain_request(bytes: &[u8]) -> Result<(), String> {

@@ -2733,13 +2733,18 @@ impl InstalledMixedDriver {
                     host_path_canary,
                 });
                 let owned = self.active.last_mut().expect("inserted native owner");
-                let observer = owned.launch.acquire_prepared(
-                    input.provider,
-                    &policy.contract,
-                    input.artifact_root,
-                    &format!("{prefix}/prepared.json"),
-                    timeout,
-                )?;
+                let observer = owned
+                    .launch
+                    .acquire_prepared(
+                        input.provider,
+                        &policy.contract,
+                        input.artifact_root,
+                        &format!("{prefix}/prepared.json"),
+                        timeout,
+                    )
+                    .map_err(|error| {
+                        CiError::Message(format!("acquire prepared native owner: {error}"))
+                    })?;
                 owned.observer = Some(observer);
                 // Persist the independently acquired live snapshot before the
                 // observation ACK, rather than minting it after retirement.
@@ -2778,32 +2783,42 @@ impl InstalledMixedDriver {
                             .min(timeout),
                     )?;
                 } else {
-                    owned.launch.observe_fixture(
+                    owned
+                        .launch
+                        .observe_fixture(
+                            observer,
+                            &challenge,
+                            &mut owned.held,
+                            &mut owned.transcript,
+                            input
+                                .deadline
+                                .saturating_duration_since(std::time::Instant::now())
+                                .min(timeout),
+                        )
+                        .map_err(|error| {
+                            CiError::Message(format!("observe owned fixture barriers: {error}"))
+                        })?;
+                }
+                let mut collected = owned
+                    .launch
+                    .collect_completed(
                         observer,
-                        &challenge,
-                        &mut owned.held,
-                        &mut owned.transcript,
+                        &owned.held,
+                        input.identity.clone(),
+                        input.lease_id.clone(),
+                        key.clone(),
+                        challenge,
+                        prefix.clone(),
+                        &directory.join("mixed.contract.json"),
+                        input.artifact_root,
                         input
                             .deadline
                             .saturating_duration_since(std::time::Instant::now())
                             .min(timeout),
-                    )?;
-                }
-                let mut collected = owned.launch.collect_completed(
-                    observer,
-                    &owned.held,
-                    input.identity.clone(),
-                    input.lease_id.clone(),
-                    key.clone(),
-                    challenge,
-                    prefix.clone(),
-                    &directory.join("mixed.contract.json"),
-                    input.artifact_root,
-                    input
-                        .deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .min(timeout),
-                )?;
+                    )
+                    .map_err(|error| {
+                        CiError::Message(format!("collect completed native attempt: {error}"))
+                    })?;
                 if let Some(listener) = &owned.host_tcp_canary {
                     let canary =
                         read_owned_resource(&directory.join("host-tcp-canary.json"), 64 * 1024)?;
@@ -2871,11 +2886,14 @@ impl InstalledMixedDriver {
                         );
                     }
                 }
-                let public_bytes = std::fs::read(
-                    input
-                        .artifact_root
-                        .join(format!("{prefix}/provider-request.json")),
-                )?;
+                let public_path = input
+                    .artifact_root
+                    .join(format!("{prefix}/provider-request.json"));
+                let public_bytes = std::fs::read(&public_path).map_err(|error| {
+                    CiError::Message(format!(
+                        "read collected provider request {public_path:?}: {error}"
+                    ))
+                })?;
                 let public =
                     memcordon_core::mixed_runtime::MixedRuntimeRequest::parse(&public_bytes)
                         .map_err(CiError::Message)?;
@@ -2919,7 +2937,10 @@ impl InstalledMixedDriver {
                     &input,
                     &arguments,
                     &prefix,
-                )?;
+                )
+                .map_err(|error| {
+                    CiError::Message(format!("normalize completed native case: {error}"))
+                })?;
                 self.completed.push((key.clone(), collected));
                 // Only completed independent native retirement permits dropping
                 // the associated held owners. Failure keeps this vector intact.
@@ -2927,11 +2948,17 @@ impl InstalledMixedDriver {
                 Ok(())
             })();
             if let Err(error) = result {
+                let error =
+                    CiError::Message(format!("installed mixed recipe {ordinal} {key:?}: {error}"));
                 self.failures.push((key.clone(), error.to_string()));
-                retain(
+                if let Err(retain_error) = retain(
                     &input.output.join("driver-failures.json"),
                     &serde_json::to_vec(&self.failures)?,
-                )?;
+                ) {
+                    return Err(CiError::Message(format!(
+                        "{error}; retain original failure: {retain_error}"
+                    )));
+                }
                 return Err(error);
             }
         }
@@ -7594,12 +7621,20 @@ impl InstalledMixedLaunch {
         destination: &Path,
         timeout: Duration,
     ) -> Result<CompletedMixedCollection> {
-        let status = self.wait_and_capture(timeout)?;
-        if !observer
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| CiError::Message("native collection deadline overflow".into()))?;
+        let status =
+            self.wait_and_capture(deadline.saturating_duration_since(std::time::Instant::now()))?;
+        while !observer
             .native_family_retired(held)
             .map_err(CiError::Message)?
         {
-            return Err(CiError::Message("native target/init/guardian/cohort/cgroup retirement not observed; owners retained".into()));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(CiError::Message("native target/init/guardian/cohort/cgroup retirement not observed; owners retained".into()));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
         let raw_result = crate::linux_consumer_readiness::measured(&self.result, 4 * 1024 * 1024)
             .map_err(CiError::Message)?;
@@ -9427,7 +9462,11 @@ pub(super) fn read_protected_export(path: &Path, maximum: u64) -> Result<Vec<u8>
                 Mode::empty(),
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
             )
-            .map_err(|e| CiError::Message(e.to_string()))?,
+            .map_err(|error| {
+                CiError::Message(format!(
+                    "open protected export ancestor {name:?} for {path:?}: {error}"
+                ))
+            })?,
         );
         let metadata = child.metadata()?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -9446,7 +9485,9 @@ pub(super) fn read_protected_export(path: &Path, maximum: u64) -> Result<Vec<u8>
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         )
-        .map_err(|e| CiError::Message(e.to_string()))?,
+        .map_err(|error| {
+            CiError::Message(format!("open protected export leaf {path:?}: {error}"))
+        })?,
     );
     let before = file.metadata()?;
     if !before.is_file()
@@ -9745,9 +9786,15 @@ impl ImageBuilder {
 }
 
 pub(super) fn retain(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| CiError::Message(format!("create retained evidence {path:?}: {error}")))?;
+    file.write_all(bytes)
+        .map_err(|error| CiError::Message(format!("write retained evidence {path:?}: {error}")))?;
+    file.sync_all()
+        .map_err(|error| CiError::Message(format!("sync retained evidence {path:?}: {error}")))?;
     Ok(())
 }
 
@@ -9763,7 +9810,8 @@ pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| CiError::Message(format!("open owned resource {path:?}: {error}")))?;
     let before = file.metadata()?;
     if !before.is_file()
         || before.uid() != 0
@@ -9778,7 +9826,8 @@ pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.try_clone()?.take(bound + 1).read_to_end(&mut bytes)?;
     let after = file.metadata()?;
-    let named = std::fs::symlink_metadata(path)?;
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| CiError::Message(format!("restat owned resource {path:?}: {error}")))?;
     if bytes.len() as u64 != before.len()
         || named.file_type().is_symlink()
         || (named.dev(), named.ino()) != (before.dev(), before.ino())

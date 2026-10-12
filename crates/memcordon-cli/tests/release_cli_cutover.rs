@@ -11,6 +11,28 @@ fn denied(platform: ReleasePlatform, arguments: &[&str]) -> bool {
 }
 
 #[test]
+fn linux_bounded_uninstall_reaches_root_and_deadline_validation() {
+    let arguments = [
+        "package",
+        "uninstall",
+        "--lease-cleanup-cutoff-nanos",
+        "9228303070258",
+    ];
+    assert!(!denied(ReleasePlatform::Linux, &arguments));
+    assert!(denied(ReleasePlatform::Windows, &arguments));
+    assert!(denied(ReleasePlatform::Other, &arguments));
+    assert!(denied(ReleasePlatform::Linux, &arguments[..3]));
+    for (index, replacement) in [(1, "install"), (1, "upgrade"), (2, "--force")] {
+        let mut wrong = arguments;
+        wrong[index] = replacement;
+        assert!(denied(ReleasePlatform::Linux, &wrong));
+    }
+    let mut extra = arguments.to_vec();
+    extra.push("--json");
+    assert!(denied(ReleasePlatform::Linux, &extra));
+}
+
+#[test]
 fn original_registry_restoration_uses_the_accepted_apply_boundary() {
     let accepted = [
         "package",

@@ -1594,6 +1594,22 @@ pub fn converge_current_service_token_peer_query(service_name: &str) -> Result<(
         })?;
         converge_token_peer_query(token.raw(), &peer_sid)?;
     }
+    if service_name == memcordon_core::WINDOWS_CONTROL_SERVICE_NAME {
+        converge_control_token_client_query(token.raw())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn converge_control_token_client_query(
+    token: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<(), TokenDaclError> {
+    // Public clients authenticate the control service's token after querying
+    // its process. Match the AU/RC process-query policy: a restricted caller
+    // must satisfy both access checks. Query reveals identity only; it grants
+    // no token duplication, impersonation, adjustment, or DACL authority.
+    for sid in ["S-1-5-11", "S-1-5-12"] {
+        converge_token_peer_query(token, sid)?;
+    }
     Ok(())
 }
 

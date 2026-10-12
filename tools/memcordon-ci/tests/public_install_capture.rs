@@ -115,8 +115,12 @@ fn refuses_ambiguous_foreign_and_output_redirected_invocations() {
     assert!(selected_output(&foreign, &args).is_err());
 }
 
-#[test]
-fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output() {
+fn compiler_fixture() -> (
+    tempfile::TempDir,
+    Descriptor,
+    Vec<OsString>,
+    std::path::PathBuf,
+) {
     use sha2::{Digest, Sha256};
     let (root, mut descriptor, args) = fixture();
     let compiler = std::process::Command::new("rustup")
@@ -174,6 +178,12 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
     )
     .unwrap()
         + 60_000;
+    (root, descriptor, args, wrapper)
+}
+
+#[test]
+fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output() {
+    let (root, descriptor, args, wrapper) = compiler_fixture();
     let source = std::path::PathBuf::from(&args[2]);
     let manifest = source
         .parent()
@@ -239,7 +249,18 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
         std::fs::read(installed).unwrap()
     );
     assert!(!execute().status.success(), "duplicate capture must refuse");
+}
+
+#[test]
+fn independent_compiler_probes_preserve_output_and_refuse_expired_deadlines() {
     for probe in ["-vV", "--not-a-real-compiler-option"] {
+        // Each probe is an independent acquisition, not a continuation of the
+        // Cargo capture (whose original deadline must never be refreshed).
+        let (root, mut descriptor, _, wrapper) = compiler_fixture();
+        let descriptor_path = root
+            .path()
+            .join(memcordon_ci::public_install_capture::DESCRIPTOR_NAME);
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let direct = std::process::Command::new(&descriptor.compiler)
             .arg(probe)
             .output()
@@ -252,59 +273,74 @@ fn synchronous_wrapper_retains_real_compiler_bytes_before_cargo_consumes_output(
         assert_eq!(wrapped.status.code(), direct.status.code());
         assert_eq!(wrapped.stdout, direct.stdout);
         assert_eq!(wrapped.stderr, direct.stderr);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        let signal_source = root.path().join("aborting_compiler.rs");
-        std::fs::write(&signal_source, b"fn main() { std::process::abort(); }\n").unwrap();
-        let compiled = std::process::Command::new(&descriptor.compiler)
-            .args(["--crate-name", "aborting_compiler"])
-            .arg(&signal_source)
-            .arg("--out-dir")
-            .arg(root.path())
-            .output()
-            .unwrap();
-        assert!(
-            compiled.status.success(),
-            "{}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        descriptor.compiler = std::fs::canonicalize(root.path().join("aborting_compiler")).unwrap();
-        descriptor.compiler_sha256 =
-            hex::encode(Sha256::digest(std::fs::read(&descriptor.compiler).unwrap()));
-        // This independently compiled signal fixture is a new acquisition;
-        // the original Cargo capture keeps its original absolute deadline.
-        descriptor.deadline_unix_millis = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap()
-            + 60_000;
-        std::fs::write(
-            wrapper
-                .parent()
-                .unwrap()
-                .join(memcordon_ci::public_install_capture::DESCRIPTOR_NAME),
-            serde_json::to_vec(&descriptor).unwrap(),
-        )
-        .unwrap();
-        let terminated = std::process::Command::new(&wrapper)
+
+        descriptor.deadline_unix_millis = 1;
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let expired = std::process::Command::new(&wrapper)
             .arg(&descriptor.compiler)
+            .arg(probe)
             .output()
             .unwrap();
-        assert_eq!(
-            terminated.status.signal(),
-            Some(libc::SIGABRT),
-            "actual wrapper status={:?}; stderr-bytes={}; stderr-prefix={:?}",
-            terminated.status,
-            terminated.stderr.len(),
-            String::from_utf8_lossy(&terminated.stderr)
-                .chars()
-                .take(4096)
-                .collect::<String>()
-        );
+        assert!(!expired.status.success());
+        assert!(expired.stdout.is_empty());
+        assert_eq!(expired.stderr, b"memcordon-ci compiler capture: public install compiler capture: original compile deadline passed\n");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn independent_compiler_signal_preserves_native_status() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::process::ExitStatusExt;
+    let (root, mut descriptor, _, wrapper) = compiler_fixture();
+    let signal_source = root.path().join("aborting_compiler.rs");
+    std::fs::write(&signal_source, b"fn main() { std::process::abort(); }\n").unwrap();
+    let compiled = std::process::Command::new(&descriptor.compiler)
+        .args(["--crate-name", "aborting_compiler"])
+        .arg(&signal_source)
+        .arg("--out-dir")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    descriptor.compiler = std::fs::canonicalize(root.path().join("aborting_compiler")).unwrap();
+    descriptor.compiler_sha256 =
+        hex::encode(Sha256::digest(std::fs::read(&descriptor.compiler).unwrap()));
+    // This independently compiled signal fixture is a new acquisition;
+    // the original Cargo capture keeps its original absolute deadline.
+    descriptor.deadline_unix_millis = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 60_000;
+    std::fs::write(
+        wrapper
+            .parent()
+            .unwrap()
+            .join(memcordon_ci::public_install_capture::DESCRIPTOR_NAME),
+        serde_json::to_vec(&descriptor).unwrap(),
+    )
+    .unwrap();
+    let terminated = std::process::Command::new(&wrapper)
+        .arg(&descriptor.compiler)
+        .output()
+        .unwrap();
+    assert_eq!(
+        terminated.status.signal(),
+        Some(libc::SIGABRT),
+        "actual wrapper status={:?}; stderr-bytes={}; stderr-prefix={:?}",
+        terminated.status,
+        terminated.stderr.len(),
+        String::from_utf8_lossy(&terminated.stderr)
+            .chars()
+            .take(4096)
+            .collect::<String>()
+    );
 }

@@ -37,6 +37,12 @@ fn persist_actor_effect(
         units("C:\\owned\\fixture.exe"),
     ];
     let request = json!({"restart_attempt":0,"schema_version":3,"expected_provider_binding":provider,"workload_contract":null,"nonce":nonce,"command":{"program":units("C:\\owned\\fixture.exe"),"arguments":[]},"environment":[],"current_directory":units("C:\\owned"),"policy":{"memory_limit_bytes":null,"absolute_deadline_millis":123456,"lifetime":"workload","poll_interval_millis":100,"signal_grace_millis":0,"command_exit_grace_millis":0,"limit_grace_millis":0}});
+    let mut request = request;
+    request["environment"] = json!([
+        {"name":units("=C:"),"value":units("C:\\")},
+        {"name":units("PROCESSOR_ARCHITECTURE"),"value":units("AMD64")},
+        {"name":units("SystemRoot"),"value":units("C:\\Windows")}
+    ]);
     let request_bytes = serde_json::to_vec(&request).unwrap();
     let digest = sha256(&request_bytes);
     let mut selection = json!({"kind":kind});
@@ -78,10 +84,19 @@ fn persist_actor_effect(
         path
     };
     let selection_path = put(case, "selection.json", &selection);
+    let wrapper_sha = sha256(b"measured frontend wrapper decoder vector image");
+    let wrapper_args: Vec<_> = [
+        units("consumer-readiness-windows"),
+        units("system-frontend"),
+        units("C:\\owned\\actor.exe"),
+    ]
+    .into_iter()
+    .chain(args.iter().cloned())
+    .collect();
     let invocation = put(
         case,
         "invocation.json",
-        &json!({"format":"memcordon.windows-native-component-invocation","revision":1,"run_id":"vector-run","recipe_id":recipe,"native_target":target,"executable_sha256":image,"program_utf16":units("C:\\owned\\actor.exe"),"argv_utf16":args,"cwd_utf16":units("C:\\owned"),"environment_cleared":true}),
+        &json!({"format":"memcordon.windows-native-component-invocation","revision":1,"run_id":"vector-run","recipe_id":recipe,"native_target":target,"executable_sha256":image,"program_utf16":units("C:\\owned\\actor.exe"),"argv_utf16":args,"cwd_utf16":units("C:\\owned"),"environment_cleared":true,"frontend_environment":request["environment"],"wrapper_executable_sha256":wrapper_sha,"wrapper_program_utf16":request["command"]["program"],"wrapper_argv_utf16":wrapper_args}),
     );
     let observation = put(
         case,
@@ -91,7 +106,7 @@ fn persist_actor_effect(
     let actor_held = put(
         case,
         "held.json",
-        &json!({"format":"memcordon.windows-component-frontend-held","revision":1,"process_id":pid,"creation_time_100ns":birth,"held_before_execution":true,"native_live_before_release":true}),
+        &json!({"format":"memcordon.windows-component-frontend-held","revision":1,"process_id":pid,"creation_time_100ns":birth,"held_before_execution":true,"native_live_before_release":true,"wrapper_process_id":pid+5000,"wrapper_creation_time_100ns":birth-1,"native_parent_process_id":pid+5000}),
     );
     let exit = put(
         case,
@@ -101,7 +116,7 @@ fn persist_actor_effect(
     let native_retirement = put(
         case,
         "retirement.json",
-        &json!({"format":"memcordon.windows-component-actor-retirement","revision":1,"process_id":pid,"creation_time_100ns":birth,"image_sha256":image,"held_before_execution":true,"retirement_observed":true,"native_status":125}),
+        &json!({"format":"memcordon.windows-component-actor-retirement","revision":1,"process_id":pid,"creation_time_100ns":birth,"image_sha256":image,"held_before_execution":true,"retirement_observed":true,"native_status":125,"wrapper_process_id":pid+5000,"wrapper_creation_time_100ns":birth-1,"wrapper_image_sha256":wrapper_sha,"wrapper_retirement_observed":true,"wrapper_native_status":125}),
     );
     let settlement_inventory = put(
         case,
@@ -292,6 +307,7 @@ fn persist_actor_late_effect(
             case.json(&actor.exit, &exit);
             let mut wait = read(case, &actor.native_retirement);
             wait["native_status"] = json!(status);
+            wait["wrapper_native_status"] = json!(status);
             case.json(&actor.native_retirement, &wait);
         }
     }
@@ -299,6 +315,14 @@ fn persist_actor_late_effect(
         let recovery = json!({"schema_version":1,"provider_response":{"kind":"recovery-attempt-unavailable","schema_version":3,"challenge":"a".repeat(64),"attempt_id":attempt,"detail":"exact recovery authority remains retained pending checked closure"},"frontend_delivery":null,"provider_request":{"kind":"recover-attempt","schema_version":3,"attempt_id":attempt,"nonce":nonce,"request_sha256":digest,"challenge":"a".repeat(64)}});
         actor.recovery = Some(put(case, "recovery.json", &recovery));
         let mut command = read(case, &actor.invocation);
+        for field in [
+            "frontend_environment",
+            "wrapper_executable_sha256",
+            "wrapper_program_utf16",
+            "wrapper_argv_utf16",
+        ] {
+            command.as_object_mut().unwrap().remove(field);
+        }
         command["format"] = json!("memcordon.windows-component-recovery-command");
         command["argv_utf16"] = json!(
             ["windows-recover", "attempt", attempt, nonce, digest]
@@ -354,6 +378,10 @@ fn persisted_actor_facet(facet: &str) -> persisted_actor_support::PersistedCase 
     let provider = read(&case, "quiescence.json")["provider"].clone();
     let actor_sha = sha256(b"measured actor decoder vector image");
     case.write("actor.exe", b"measured actor decoder vector image");
+    case.write(
+        "wrapper.exe",
+        b"measured frontend wrapper decoder vector image",
+    );
     let recipe = "original-native-components-v1";
     case.index.component_builds.push(ComponentBuild {
         target: case.record.key.target.clone(),
@@ -365,6 +393,7 @@ fn persisted_actor_facet(facet: &str) -> persisted_actor_support::PersistedCase 
         executable: "actor.exe".into(),
         instrumented: true,
         actor_executable: Some("actor.exe".into()),
+        frontend_wrapper_executable: Some("wrapper.exe".into()),
         parser_executable: None,
     });
     let faults = [
@@ -526,6 +555,38 @@ fn persisted_all_26_preauthorization_actor_effects_reject_rehashed_raw_reassocia
         case.write(&path, &original);
     }
     for (path, field, value) in [
+        (
+            "actors/0/invocation.json",
+            "frontend_environment",
+            json!([{"name":[65],"value":[66]}]),
+        ),
+        (
+            "actors/0/invocation.json",
+            "wrapper_executable_sha256",
+            json!("f".repeat(64)),
+        ),
+        ("actors/0/invocation.json", "wrapper_argv_utf16", json!([])),
+        (
+            "actors/0/invocation.json",
+            "wrapper_program_utf16",
+            json!([65, 66]),
+        ),
+        ("actors/0/held.json", "native_parent_process_id", json!(999)),
+        (
+            "actors/0/retirement.json",
+            "wrapper_creation_time_100ns",
+            json!(999),
+        ),
+        (
+            "actors/0/retirement.json",
+            "wrapper_retirement_observed",
+            json!(false),
+        ),
+        (
+            "actors/0/retirement.json",
+            "wrapper_native_status",
+            json!(0),
+        ),
         ("actors/0/held.json", "creation_time_100ns", json!(999)),
         (
             "actors/0/retirement.json",

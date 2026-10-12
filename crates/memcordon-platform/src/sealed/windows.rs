@@ -418,7 +418,11 @@ pub fn workload_plan(
 }
 
 pub fn probe() -> Result<memcordon_core::WindowsProviderProbeV1, String> {
-    probe_with_binding().map(|(qualification, _)| qualification)
+    probe_with_binding()
+        .map(|(qualification, _)| qualification)
+        .inspect_err(|detail| {
+            terminal_observation::retain_probe_failure(detail);
+        })
 }
 
 fn probe_with_binding() -> Result<
@@ -428,16 +432,21 @@ fn probe_with_binding() -> Result<
     ),
     String,
 > {
-    prepare_current_process_for_restricted_broker()?;
-    let pipe = connect()?;
-    authenticate_peer(pipe.raw())?;
+    prepare_current_process_for_restricted_broker()
+        .map_err(|detail| format!("probe caller preparation: {detail}"))?;
+    let pipe = connect().map_err(|detail| format!("probe pipe connection: {detail}"))?;
+    authenticate_peer(pipe.raw())
+        .map_err(|detail| format!("probe peer authentication: {detail}"))?;
     write_frame(
         pipe.raw(),
         &WindowsProviderRequestV3::Probe {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
         },
-    )?;
-    match read_frame::<WindowsProviderResponseV3>(pipe.raw())? {
+    )
+    .map_err(|detail| format!("write provider probe frame: {detail}"))?;
+    match read_frame::<WindowsProviderResponseV3>(pipe.raw())
+        .map_err(|detail| format!("read provider probe frame: {detail}"))?
+    {
         WindowsProviderResponseV3::Probe {
             schema_version,
             observation,
@@ -466,10 +475,11 @@ fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
     // SAFETY: the current-process pseudo-handle is valid and token receives an
     // owned query handle.
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("OpenProcessToken(current, TOKEN_QUERY)"));
     }
     let token = OwnedHandle::new(token)?;
-    let user = token_user_sid_string(token.raw())?;
+    let user = token_user_sid_string(token.raw())
+        .map_err(|detail| format!("current token user identity: {detail}"))?;
     // The broker opens this process while impersonating the authenticated
     // caller. A restricted token must satisfy the normal user and restricting
     // SID checks, so RC receives only query, duplicate-handle and synchronize.
@@ -489,7 +499,9 @@ fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW(current process)",
+        ));
     }
     // SAFETY: descriptor is a valid self-relative security descriptor and the
     // pseudo-handle identifies the current process.
@@ -500,13 +512,17 @@ fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
             descriptor,
         )
     };
-    // SAFETY: the conversion API allocated descriptor with LocalAlloc.
-    unsafe { LocalFree(descriptor as HLOCAL) };
-    if applied == 0 {
-        Err(io::Error::last_os_error().to_string())
+    // Capture the failing API's last-error before freeing its input buffer.
+    let result = if applied == 0 {
+        Err(native_api_failure(
+            "SetKernelObjectSecurity(current process DACL)",
+        ))
     } else {
         Ok(())
-    }
+    };
+    // SAFETY: the conversion API allocated descriptor with LocalAlloc.
+    unsafe { LocalFree(descriptor as HLOCAL) };
+    result
 }
 
 fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
@@ -514,7 +530,7 @@ fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
     // SAFETY: sid came from a TOKEN_USER buffer and value receives a
     // LocalAlloc string.
     if unsafe { ConvertSidToStringSidW(sid, &raw mut value) } == 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("ConvertSidToStringSidW"));
     }
     let mut length = 0_usize;
     // SAFETY: value is a NUL-terminated string allocated by the conversion API.
@@ -1360,6 +1376,14 @@ fn relay(role: WindowsStreamRoleV1, remote: HANDLE, stop: &AtomicBool) -> Result
     Ok(())
 }
 
+fn native_api_failure(operation: &'static str) -> String {
+    let error = io::Error::last_os_error();
+    format!(
+        "{operation}: raw-os-error={:?}; {error}",
+        error.raw_os_error()
+    )
+}
+
 fn connect() -> Result<OwnedHandle, String> {
     let name: Vec<u16> = WINDOWS_CONTROL_PIPE
         .encode_utf16()
@@ -1387,7 +1411,10 @@ fn connect() -> Result<OwnedHandle, String> {
             .and_then(|value| u32::try_from(value).ok())
             != Some(ERROR_PIPE_BUSY)
         {
-            return Err(error.to_string());
+            return Err(format!(
+                "CreateFileW(control pipe): raw-os-error={:?}; {error}",
+                error.raw_os_error()
+            ));
         }
         // SAFETY: name remains NUL-terminated.
         unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
@@ -1398,12 +1425,18 @@ fn connect() -> Result<OwnedHandle, String> {
 fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
     let mut pid = 0_u32;
     // SAFETY: connected pipe and output storage are live.
-    if unsafe { GetNamedPipeServerProcessId(pipe, &raw mut pid) } == 0 || pid == 0 {
-        return Err(io::Error::last_os_error().to_string());
+    if unsafe { GetNamedPipeServerProcessId(pipe, &raw mut pid) } == 0 {
+        return Err(native_api_failure("GetNamedPipeServerProcessId"));
+    }
+    if pid == 0 {
+        return Err("GetNamedPipeServerProcessId returned zero provider identity".into());
     }
     // SAFETY: kernel supplied PID; rights are query-only.
     let process =
-        OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+        OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+            .map_err(|detail| {
+                format!("OpenProcess(provider, PROCESS_QUERY_LIMITED_INFORMATION): {detail}")
+            })?;
     let mut path = vec![0_u16; 32 * 1024];
     let mut length = path.len() as u32;
     // SAFETY: path is writable and length supplies its element capacity.
@@ -1416,7 +1449,7 @@ fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("QueryFullProcessImageNameW(provider)"));
     }
     path.truncate(length as usize);
     let actual = String::from_utf16_lossy(&path);
@@ -1434,17 +1467,24 @@ fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
     // SAFETY: process is a live query handle and token ownership transfers to
     // the local wrapper.
     if unsafe { OpenProcessToken(process.raw(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure(
+            "OpenProcessToken(provider, TOKEN_QUERY)",
+        ));
     }
     let token = OwnedHandle::new(token)?;
-    let local_service = account_sid(r"NT AUTHORITY\LocalService")?;
+    let local_service = account_sid(r"NT AUTHORITY\LocalService")
+        .map_err(|detail| format!("resolve LocalService SID: {detail}"))?;
     let control_service = account_sid(&format!(
         r"NT SERVICE\{}",
         memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
-    ))?;
-    if !token_user_matches(token.raw(), &local_service)?
-        || !token_groups_contain(token.raw(), TokenGroups, &control_service)?
-        || !token_groups_contain(token.raw(), TokenRestrictedSids, &control_service)?
+    ))
+    .map_err(|detail| format!("resolve control service SID: {detail}"))?;
+    if !token_user_matches(token.raw(), &local_service)
+        .map_err(|detail| format!("provider TokenUser identity: {detail}"))?
+        || !token_groups_contain(token.raw(), TokenGroups, &control_service)
+            .map_err(|detail| format!("provider TokenGroups identity: {detail}"))?
+        || !token_groups_contain(token.raw(), TokenRestrictedSids, &control_service)
+            .map_err(|detail| format!("provider TokenRestrictedSids identity: {detail}"))?
     {
         return Err(
             "connected Windows sealed provider lacks the restricted control-service identity"
@@ -1475,7 +1515,7 @@ fn account_sid(account: &str) -> Result<Vec<u32>, String> {
         )
     };
     if sid_bytes == 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("LookupAccountNameW(size)"));
     }
     let mut sid = vec![0_u32; (sid_bytes as usize).div_ceil(std::mem::size_of::<u32>())];
     let mut domain = vec![0_u16; domain_chars as usize];
@@ -1492,7 +1532,7 @@ fn account_sid(account: &str) -> Result<Vec<u32>, String> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("LookupAccountNameW(data)"));
     }
     Ok(sid)
 }
@@ -1523,7 +1563,7 @@ fn token_information(token: HANDLE, class: i32) -> Result<TokenInformationBuffer
     // SAFETY: null-buffer sizing query writes only the required length.
     unsafe { GetTokenInformation(token, class, ptr::null_mut(), 0, &raw mut length) };
     if length == 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("GetTokenInformation(size)"));
     }
     let requested = length as usize;
     let mut words = vec![0_usize; requested.div_ceil(std::mem::size_of::<usize>())];
@@ -1539,7 +1579,7 @@ fn token_information(token: HANDLE, class: i32) -> Result<TokenInformationBuffer
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(native_api_failure("GetTokenInformation(data)"));
     }
     let buffer = TokenInformationBuffer {
         words,

@@ -241,6 +241,52 @@ fn post_empty_permission_graph_rejects_rehashed_live_owner_and_incomplete_ordere
         &cgroup_bytes,
     )
     .unwrap();
+    let validate_removal = |removal: Value| {
+        let mut event = event.clone();
+        event["cgroup_retirement"] = removal.clone();
+        let mut cgroup = cgroup.clone();
+        cgroup["held"] = removal.clone();
+        let cgroup_bytes = serde_json::to_vec(&cgroup).unwrap();
+        let mut ack = ack.clone();
+        ack["cgroup_retirement_sha256"] = json!(sha256(&cgroup_bytes));
+        let mut settled = settled.clone();
+        settled["operation"]["cgroup_retirement"] = removal;
+        settled["operation"]["cgroup_retirement_sha256"] = json!(sha256(&cgroup_bytes));
+        validate_linux_export_permission_settlement(
+            &setup,
+            &event,
+            &ack,
+            &settled,
+            &family_bytes,
+            &cgroup_bytes,
+        )
+    };
+    let mut kernfs_removed = group.clone();
+    kernfs_removed["native_links"] = json!(2);
+    kernfs_removed["handle_retirement"] = json!({
+        "handle_type":254,"handle_bytes":8,"handle_id":10,"mount_id":17,"open_errno":116
+    });
+    validate_removal(kernfs_removed.clone()).unwrap();
+    for (field, invalid) in [
+        ("handle_type", json!(1)),
+        ("handle_bytes", json!(16)),
+        ("handle_id", json!(11)),
+        ("mount_id", json!(0)),
+        ("open_errno", json!(2)),
+        ("open_errno", json!(1)),
+    ] {
+        let mut invalid_removal = kernfs_removed.clone();
+        invalid_removal["handle_retirement"][field] = invalid;
+        assert!(
+            validate_removal(invalid_removal).is_err(),
+            "accepted {field}"
+        );
+    }
+    kernfs_removed
+        .as_object_mut()
+        .unwrap()
+        .remove("handle_retirement");
+    assert!(validate_removal(kernfs_removed).is_err());
     for pointer in [
         "/permission_answer/fan_allow_written",
         "/unmark/completed",

@@ -17,3 +17,15 @@ fn checked_close_delivers_native_eof_for_the_exact_owned_endpoint() {
     receiver.read_to_end(&mut observed).unwrap();
     assert_eq!(observed, b"owned-close");
 }
+
+#[test]
+fn cgroup_retirement_refuses_live_and_unlinked_non_cgroup_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let child = directory.path().join("held");
+    std::fs::create_dir(&child).unwrap();
+    let held = std::fs::File::open(&child).unwrap();
+    assert!(memcordon_platform::linux_cgroup_retirement(&held).is_err());
+    std::fs::remove_dir(&child).unwrap();
+    // A zero-link ordinary inode is not cgroup retirement evidence.
+    assert!(memcordon_platform::linux_cgroup_retirement(&held).is_err());
+}

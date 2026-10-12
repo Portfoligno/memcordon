@@ -602,12 +602,31 @@ mod native {
         ]);
         arguments.extend(execution.get_args().map(std::ffi::OsStr::to_os_string));
         let actor_budget = deadlines.work_budget(Duration::from_secs(90))?;
-        let mut command =
+        let actor_cutoff = deadlines.work.min(Instant::now() + actor_budget);
+        let actor_command =
             crate::command::CommandSpec::new(&config.cli.path, directory, actor_budget)
                 .args(arguments)
                 .materialize()?;
+        let wrapper_arguments = [
+            OsString::from("consumer-readiness-windows"),
+            OsString::from("system-frontend"),
+            config.cli.path.clone().into_os_string(),
+        ]
+        .into_iter()
+        .chain(actor_command.get_args().map(std::ffi::OsStr::to_os_string));
+        let mut command =
+            crate::command::CommandSpec::new(&config.fixture.path, directory, actor_budget)
+                .args(wrapper_arguments)
+                .materialize()?;
         command.env_clear();
         use std::os::windows::ffi::OsStrExt;
+        // The owned TCP fixture needs the native Winsock provider's SystemRoot
+        // expansion. Keep ambient controller data excluded, and use the same
+        // measured OS prerequisites as the positive readiness frontend.
+        // The measured wrapper supplies the explicit native environment block;
+        // no controller environment mutation or inherited ambient data is used.
+        let frontend_environment =
+            crate::windows_consumer_readiness::fixture_environment::entries()?;
         let invocation_path = directory.join("actor-invocation.json");
         retain(
             &invocation_path,
@@ -615,9 +634,13 @@ mod native {
                 "format":"memcordon.windows-native-component-invocation","revision":1,
                 "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
                 "executable_sha256":config.cli.sha256,
-                "program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
-                "argv_utf16":command.get_args().map(|arg| arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                "program_utf16":actor_command.get_program().encode_wide().collect::<Vec<_>>(),
+                "argv_utf16":actor_command.get_args().map(|arg| arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                "wrapper_executable_sha256":config.fixture.sha256,
+                "wrapper_program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
+                "wrapper_argv_utf16":command.get_args().map(|arg| arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
                 "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),
+                "frontend_environment":frontend_environment,
                 "environment_cleared":true
             }))?,
             record,
@@ -640,6 +663,9 @@ mod native {
         let held_control_worker = Arc::clone(&control_worker);
         let frontend = Arc::new(Mutex::new(None));
         let held_frontend = Arc::clone(&frontend);
+        let wrapper = Arc::new(Mutex::new(None));
+        let held_wrapper = Arc::clone(&wrapper);
+        let wrapper_image = config.fixture.path.clone();
         let fixture = config.fixture.path.clone();
         let cli = config.cli.path.clone();
         let cwd = directory.to_owned();
@@ -672,16 +698,43 @@ mod native {
             == Some(memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization);
         let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
             command,
-            actor_budget,
+            actor_cutoff
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    CiError::Message("original actor cutoff exhausted before spawn".into())
+                })?,
             4 * 1024 * 1024,
             |mut command| command.spawn(),
-            move |frontend_pid, _, _| {
-                let held = memcordon_testkit::windows_processes_for_image(&cli)?
+            move |wrapper_pid, _, _| {
+                let wrapper = memcordon_testkit::windows_processes_for_image(&wrapper_image)?
                     .into_iter()
-                    .find(|held| held.identity.pid == frontend_pid)
+                    .find(|held| held.identity.pid == wrapper_pid)
                     .ok_or_else(|| {
-                        io::Error::other("component frontend image/identity could not be held")
+                        io::Error::other("component wrapper image/identity could not be held")
                     })?;
+                let wrapper_identity = wrapper.identity;
+                let held = loop {
+                    let mut matches =
+                        wrapper.direct_children_for_image_until(&cli, actor_cutoff)?;
+                    if matches.len() > 1 {
+                        return Err(io::Error::other(
+                            "component wrapper created multiple frontend identities",
+                        ));
+                    }
+                    if let Some(held) = matches.pop() {
+                        break held;
+                    }
+                    if Instant::now() >= actor_cutoff {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "original frontend discovery cutoff exhausted",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                *held_wrapper
+                    .lock()
+                    .map_err(|_| io::Error::other("wrapper ownership poisoned"))? = Some(wrapper);
                 if held.has_exited()? {
                     return Err(io::Error::other(
                         "component frontend already exited before fault",
@@ -690,7 +743,9 @@ mod native {
                 let bytes = serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-component-frontend-held","revision":1,
                     "process_id":held.identity.pid,"creation_time_100ns":held.identity.birth,
-                    "held_before_execution":true,"native_live_before_release":true
+                    "held_before_execution":true,"native_live_before_release":true,
+                    "wrapper_process_id":wrapper_identity.pid,"wrapper_creation_time_100ns":wrapper_identity.birth,
+                    "native_parent_process_id":held.native_parent_process_id()?
                 }))
                 .map_err(io::Error::other)?;
                 let mut file = OpenOptions::new()
@@ -708,7 +763,10 @@ mod native {
                 };
                 let deadline = deadlines.work.min(Instant::now() + Duration::from_secs(30));
                 let roots = loop {
-                    let roots = memcordon_testkit::windows_processes_for_image(&fixture)?;
+                    let roots: Vec<_> = memcordon_testkit::windows_processes_for_image(&fixture)?
+                        .into_iter()
+                        .filter(|process| process.identity != wrapper_identity)
+                        .collect();
                     if transcript.is_file() && roots.len() == 1 && !roots[0].has_exited()? {
                         break roots;
                     }
@@ -893,7 +951,15 @@ mod native {
                 let held = held.as_ref().ok_or_else(|| {
                     CiError::Message("component frontend was not held before execution".into())
                 })?;
+                let wrapper = wrapper
+                    .lock()
+                    .map_err(|_| CiError::Message("wrapper ownership poisoned".into()))?;
+                let wrapper = wrapper.as_ref().ok_or_else(|| {
+                    CiError::Message("component wrapper was not held before execution".into())
+                })?;
                 if !held.has_exited()?
+                    || !wrapper.has_exited()?
+                    || wrapper.native_exit_status()? != held.native_exit_status()?
                     || held.native_exit_status()?
                         != output.status.code().map(|status| status as u32)
                 {
@@ -908,7 +974,10 @@ mod native {
                         "format":"memcordon.windows-component-actor-retirement","revision":1,
                         "process_id":held.identity.pid,"creation_time_100ns":held.identity.birth,
                         "image_sha256":config.cli.sha256,"held_before_execution":true,
-                        "retirement_observed":true,"native_status":held.native_exit_status()?
+                        "retirement_observed":true,"native_status":held.native_exit_status()?,
+                        "wrapper_process_id":wrapper.identity.pid,"wrapper_creation_time_100ns":wrapper.identity.birth,
+                        "wrapper_image_sha256":config.fixture.sha256,"wrapper_retirement_observed":true,
+                        "wrapper_native_status":wrapper.native_exit_status()?
                     }))?,
                     record,
                 )?;

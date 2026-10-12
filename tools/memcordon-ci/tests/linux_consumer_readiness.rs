@@ -65,6 +65,17 @@ fn collection_preserves_raw_provider_and_binary_bytes_without_certifying_them() 
 }
 
 #[test]
+fn missing_artifact_failure_retains_the_exact_read_path_and_os_error() {
+    let (source, destination, mut input) = setup();
+    input.result = source.path().join("missing-original-result.json");
+    let path = input.result.clone();
+    let error = collect(input, destination.path()).unwrap_err();
+    assert!(error.contains("open measured artifact"), "{error}");
+    assert!(error.contains(&format!("{path:?}")), "{error}");
+    assert!(error.contains("os error 2"), "{error}");
+}
+
+#[test]
 fn transcript_changed_challenge_or_sequence_is_rejected() {
     let (_source, destination, input) = setup();
     let mut row: serde_json::Value =

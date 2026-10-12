@@ -350,6 +350,13 @@ fn validate_producer_bundle(
         {
             return Err("native parser harness crosses original producer archive custody".into());
         }
+        if build
+            .frontend_wrapper_executable
+            .as_ref()
+            .is_some_and(|path| !artifact_names.contains(path.as_str()))
+        {
+            return Err("native frontend wrapper crosses original producer archive custody".into());
+        }
     }
     for build in &index.component_builds {
         if producer_job(&build.target, None)? == origin.job
@@ -1409,6 +1416,7 @@ pub struct ComponentBuild {
     pub executable: String,
     pub instrumented: bool,
     pub actor_executable: Option<String>,
+    pub frontend_wrapper_executable: Option<String>,
     pub parser_executable: Option<String>,
 }
 
@@ -3110,6 +3118,16 @@ fn verify_index(
                 );
             }
             custody.bytes(parser)?;
+        }
+        if let Some(wrapper) = &build.frontend_wrapper_executable {
+            if !build.target.ends_with("windows-msvc")
+                || wrapper == &build.executable
+                || build.actor_executable.as_ref() == Some(wrapper)
+                || build.parser_executable.as_ref() == Some(wrapper)
+            {
+                return Err("native frontend wrapper must be a distinct Windows executable".into());
+            }
+            custody.bytes(wrapper)?;
         }
     }
     if builds.keys().map(String::as_str).collect::<BTreeSet<_>>()

@@ -12,7 +12,11 @@ mod guardian;
 #[cfg(target_os = "linux")]
 mod linux_cgroup;
 #[cfg(target_os = "linux")]
+mod linux_cgroup_retirement;
+#[cfg(target_os = "linux")]
 mod linux_owned_descriptor;
+#[cfg(target_os = "linux")]
+pub use linux_cgroup_retirement::{LinuxCgroupRetirement, linux_cgroup_retirement};
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use linux_owned_descriptor::checked_close as linux_checked_close;
