@@ -3,6 +3,47 @@
 use memcordon_core::{ErrorCategory, InitialSpawnFailure};
 
 #[test]
+fn incremental_mixed_reader_consumes_each_observation_once_before_terminal() {
+    use memcordon_platform::test_support::{linux_private_frame, linux_private_incoming_reader};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let (mut receiver, mut provider) = UnixStream::pair().unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let mut read = linux_private_incoming_reader();
+    for (kind, payload) in [
+        (118, &b"prepared"[..]),
+        (119, &b""[..]),
+        (114, &b"terminal"[..]),
+    ] {
+        assert!(
+            read(&mut receiver).unwrap().is_none(),
+            "live idle provider is not EOF"
+        );
+        let frame = linux_private_frame(kind, payload).unwrap();
+        for byte in &frame[..frame.len() - 1] {
+            provider.write_all(&[*byte]).unwrap();
+            assert!(
+                read(&mut receiver).unwrap().is_none(),
+                "fragment is not a completed frame"
+            );
+        }
+        provider.write_all(&frame[frame.len() - 1..]).unwrap();
+        assert_eq!(read(&mut receiver).unwrap(), Some((kind, payload.to_vec())));
+    }
+    assert!(
+        read(&mut receiver).unwrap().is_none(),
+        "terminal was consumed too"
+    );
+    drop(provider);
+    assert!(
+        read(&mut receiver)
+            .unwrap_err()
+            .contains("closed before complete terminal")
+    );
+}
+
+#[test]
 fn exact_channel_pairing_refuses_both_version_directions_before_authorization() {
     assert!(
         memcordon_platform::test_support::sealed_provider_pairing_is_exact(

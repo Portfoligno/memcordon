@@ -23,6 +23,25 @@ pub fn profile_reference() -> ProfileRef {
     }
 }
 
+pub fn profile_reference_v2() -> ProfileRef {
+    ProfileRef {
+        id: LogicalId::new(PROFILE_V2.into()).expect("fixed profile identifier"),
+        semantic_digest: hash_bytes(b"memcordon.profile/linux-tcp4-unix-private-v2\0ipv4-tcp-loopback-only-all-ports;unix-stream-pair-path-abstract;unix-seqpacket-pair-only;scm-rights-intra-attempt;no-ipv6-udp-raw-packet-netlink;fresh-mount-pid-net-ipc-root;immutable-image-input;declared-generated-exec-work;exclusive-admin-nonroot;no-new-privileges-no-caps;stdio-byte-pipes-three;no-host-proc-or-fd-import;closed-native-abi;clone3-enosys;native-exec-observed;aggregate-empty-before-root-export-retire-account"),
+    }
+}
+
+pub fn profile_reference_for_id(id: &str) -> Option<ProfileRef> {
+    match id {
+        PROFILE => Some(profile_reference()),
+        PROFILE_V2 => Some(profile_reference_v2()),
+        _ => None,
+    }
+}
+
+pub fn is_supported_profile(profile: &ProfileRef) -> bool {
+    profile_reference_for_id(profile.id.as_str()).as_ref() == Some(profile)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum ImageEntryV1 {
@@ -663,7 +682,7 @@ impl RuntimePrivatePolicyRegistryV3 {
         let mut grants = BTreeSet::new();
         for grant in self.grants.as_slice() {
             if !grants.insert(&grant.id)
-                || grant.profile != profile_reference()
+                || !is_supported_profile(&grant.profile)
                 || grant.callers.as_slice().is_empty()
                 || grant.approved_plans.as_slice().is_empty()
                 || !self.execution_identities.as_slice().iter().any(|identity| {
@@ -739,7 +758,7 @@ impl RuntimePrivatePolicyRegistryV3 {
         {
             return Err(AdmissionCodeV3::UnauthorizedPlan);
         }
-        if grant.profile != request.authorized_profile || grant.profile != profile_reference() {
+        if grant.profile != request.authorized_profile || !is_supported_profile(&grant.profile) {
             return Err(AdmissionCodeV3::UnauthorizedProfile);
         }
         if grant.execution_identity != request.execution_identity {

@@ -174,6 +174,7 @@ mod native {
     fn hold_worker(
         observed: &memcordon_core::WindowsGuardianAttemptObservation,
         image: &std::path::Path,
+        deadline: Instant,
     ) -> io::Result<HeldWorker> {
         let expected = observed
             .worker_process_identity
@@ -183,13 +184,14 @@ mod native {
             .worker_thread_identity
             .as_ref()
             .ok_or_else(|| io::Error::other("component worker thread absent"))?;
-        hold_worker_identity(expected, identity, image)
+        hold_worker_identity(expected, identity, image, deadline)
     }
     #[allow(unsafe_code)] // Retains exact observed process/thread native births before the owned actor barrier release.
     fn hold_worker_identity(
         expected: &memcordon_core::WindowsProcessIdentityV1,
         identity: &memcordon_core::WindowsWorkerThreadIdentityV1,
         image: &std::path::Path,
+        deadline: Instant,
     ) -> io::Result<HeldWorker> {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::System::Threading::{
@@ -197,7 +199,7 @@ mod native {
             WaitForSingleObject,
         };
         let identity = identity.clone();
-        let process = memcordon_testkit::windows_processes_for_image(image)?
+        let process = memcordon_testkit::windows_processes_for_image_until(image, deadline)?
             .into_iter()
             .find(|held| {
                 held.identity.pid == expected.process_id
@@ -706,12 +708,15 @@ mod native {
             4 * 1024 * 1024,
             |mut command| command.spawn(),
             move |wrapper_pid, _, _| {
-                let wrapper = memcordon_testkit::windows_processes_for_image(&wrapper_image)?
-                    .into_iter()
-                    .find(|held| held.identity.pid == wrapper_pid)
-                    .ok_or_else(|| {
-                        io::Error::other("component wrapper image/identity could not be held")
-                    })?;
+                let wrapper = memcordon_testkit::windows_processes_for_image_until(
+                    &wrapper_image,
+                    actor_cutoff,
+                )?
+                .into_iter()
+                .find(|held| held.identity.pid == wrapper_pid)
+                .ok_or_else(|| {
+                    io::Error::other("component wrapper image/identity could not be held")
+                })?;
                 let wrapper_identity = wrapper.identity;
                 let held = loop {
                     let mut matches =
@@ -763,10 +768,11 @@ mod native {
                 };
                 let deadline = deadlines.work.min(Instant::now() + Duration::from_secs(30));
                 let roots = loop {
-                    let roots: Vec<_> = memcordon_testkit::windows_processes_for_image(&fixture)?
-                        .into_iter()
-                        .filter(|process| process.identity != wrapper_identity)
-                        .collect();
+                    let roots: Vec<_> =
+                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?
+                            .into_iter()
+                            .filter(|process| process.identity != wrapper_identity)
+                            .collect();
                     if transcript.is_file() && roots.len() == 1 && !roots[0].has_exited()? {
                         break roots;
                     }
@@ -840,6 +846,7 @@ mod native {
                         Some(hold_worker(
                             observed.as_ref().expect("captured association"),
                             &worker_image,
+                            deadline,
                         )?);
                 }
                 if control_loss {
@@ -880,7 +887,7 @@ mod native {
                             "held control worker does not belong to actual running SCM service",
                         ));
                     }
-                    let held = hold_worker_identity(&process, &thread, &worker_image)?;
+                    let held = hold_worker_identity(&process, &thread, &worker_image, deadline)?;
                     if crate::windows_readiness_faults::observe_running_control_service()? != scm {
                         return Err(io::Error::other(
                             "SCM control service changed during native worker acquisition",
@@ -1343,7 +1350,11 @@ mod native {
             if !inventory.is_consistent()
                 || inventory.authority_unsettled()
                 || inventory.provider_generation != config.provider.generation.as_str()
-                || !memcordon_testkit::windows_processes_for_image(&config.fixture.path)?.is_empty()
+                || !memcordon_testkit::windows_processes_for_image_until(
+                    &config.fixture.path,
+                    deadlines.cleanup,
+                )?
+                .is_empty()
             {
                 return Err(CiError::Message(
                     "component native recovery retained authority or live fixture family".into(),

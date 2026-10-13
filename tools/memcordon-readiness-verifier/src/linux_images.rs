@@ -1800,8 +1800,7 @@ fn verify_preparation(
         || contract["launch"]
             != serde_json::json!({"entrypoint":"owned-readiness","working_directory":"work"})
         || policy["active_attempt_disposition"] != "drain-existing"
-        || contract["authorized_profile"]
-            != crate::linux_registry::linux_combined_profile_reference()
+        || !crate::linux_registry::linux_combined_profile_supported(&contract["authorized_profile"])
         || contract["workload_plan_digest"] != owned_empty_plan_digest(&contract)?
         || contract["authorization"]["approved_plan_digest"] != contract["workload_plan_digest"]
     {

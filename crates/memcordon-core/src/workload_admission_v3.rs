@@ -34,7 +34,7 @@ impl RuntimeMixedAdmissionSnapshot {
             || self.request.digest()? != self.request_sha256
             || self.epoch != self.request.expected_epoch
             || self.profile_id != self.request.authorized_profile
-            || self.profile_id != crate::workload_registry_v3::profile_reference()
+            || !crate::workload_registry_v3::is_supported_profile(&self.profile_id)
             || self.admission_nonce.0 == [0; 16]
         {
             return Err("combined admission correlation differs".into());

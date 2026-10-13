@@ -637,7 +637,7 @@ pub(crate) fn validate_export_execution_graph(
     let grants = policy["grants"]
         .as_array()
         .ok_or("export actual sole grant absent")?;
-    if contract["authorized_profile"] != crate::linux_registry::linux_combined_profile_reference()
+    if !crate::linux_registry::linux_combined_profile_supported(&contract["authorized_profile"])
         || contract["execution_identity"]
             != serde_json::json!({"identity":identity_ref,"exclusive_use_policy":exclusive})
         || execution["identity_id"] != "owned-readiness-identity"

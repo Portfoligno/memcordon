@@ -2,6 +2,7 @@
 //! its authenticated provider's generation claim. Caller images are unrestricted.
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -16,14 +17,30 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
 };
 
 fn open_protected(path: &Path) -> Result<File, String> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        let metadata = std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let mut units = current.as_os_str().encode_wide().collect::<Vec<_>>();
+        if units.contains(&0) {
+            return Err("installed runtime path contains a NUL".into());
+        }
+        units.push(0);
+        // SAFETY: the path is NUL-terminated with no interior NUL. This API
+        // reports the link's own attributes rather than following its target.
+        let attributes = unsafe { GetFileAttributesW(units.as_ptr()) };
+        if attributes == INVALID_FILE_ATTRIBUTES {
+            let error = std::io::Error::last_os_error();
+            return Err(format!(
+                "GetFileAttributesW(runtime path {:?}): raw-os-error={:?}; {error}",
+                current,
+                error.raw_os_error()
+            ));
+        }
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("installed runtime path contains a reparse point".into());
         }
     }
@@ -32,8 +49,20 @@ fn open_protected(path: &Path) -> Result<File, String> {
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            format!(
+                "open protected runtime {:?}: raw-os-error={:?}; {error}",
+                path,
+                error.raw_os_error()
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "metadata(protected runtime {:?}): raw-os-error={:?}; {error}",
+            path,
+            error.raw_os_error()
+        )
+    })?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err("installed runtime is not a regular file".into());
     }
@@ -54,11 +83,16 @@ fn open_protected(path: &Path) -> Result<File, String> {
         )
     };
     if status != 0 {
-        return Err(std::io::Error::from_raw_os_error(status as i32).to_string());
+        return Err(format!(
+            "GetSecurityInfo(protected runtime {:?}): raw-os-error={status}; {}",
+            path,
+            std::io::Error::from_raw_os_error(status as i32)
+        ));
     }
     let result = (|| {
-        let admins = super::account_sid(r"BUILTIN\Administrators")?;
-        let system = super::account_sid(r"NT AUTHORITY\SYSTEM")?;
+        let admins =
+            super::well_known_sid(windows_sys::Win32::Security::WinBuiltinAdministratorsSid)?;
+        let system = super::well_known_sid(windows_sys::Win32::Security::WinLocalSystemSid)?;
         // SAFETY: queried SIDs and ACL are valid for the descriptor lifetime.
         let privileged = |sid| unsafe {
             EqualSid(sid, admins.as_ptr().cast_mut().cast()) != 0
@@ -73,7 +107,12 @@ fn open_protected(path: &Path) -> Result<File, String> {
         for index in 0..unsafe { (*dacl).AceCount } {
             let mut ace = std::ptr::null_mut();
             if unsafe { GetAce(dacl, u32::from(index), &raw mut ace) } == 0 {
-                return Err(std::io::Error::last_os_error().to_string());
+                let error = std::io::Error::last_os_error();
+                return Err(format!(
+                    "GetAce(protected runtime {:?}, index={index}): raw-os-error={:?}; {error}",
+                    path,
+                    error.raw_os_error()
+                ));
             }
             let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
             // SAFETY: inspect header first; only ordinary allowed ACE layout is used.
@@ -106,7 +145,12 @@ pub(super) fn verify_binding(
     let mut bytes = Vec::new();
     file.take(128 * 1024 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            format!(
+                "read protected runtime manifest: raw-os-error={:?}; {error}",
+                error.raw_os_error()
+            )
+        })?;
     let manifest = RuntimeManifest::parse(&bytes)?;
     let target = match std::env::consts::ARCH {
         "x86_64" => "x86_64-pc-windows-msvc",
@@ -153,11 +197,24 @@ pub(super) fn verify_binding(
         }
         let record = records[0];
         let mut image = open_protected(&root.join(name))?;
-        let size = image.metadata().map_err(|error| error.to_string())?.len();
+        let size = image
+            .metadata()
+            .map_err(|error| {
+                format!(
+                    "metadata(protected runtime {name}): raw-os-error={:?}; {error}",
+                    error.raw_os_error()
+                )
+            })?
+            .len();
         let mut hash = Sha256::new();
         let mut chunk = [0_u8; 64 * 1024];
         loop {
-            let read = image.read(&mut chunk).map_err(|error| error.to_string())?;
+            let read = image.read(&mut chunk).map_err(|error| {
+                format!(
+                    "read protected runtime {name}: raw-os-error={:?}; {error}",
+                    error.raw_os_error()
+                )
+            })?;
             if read == 0 {
                 break;
             }

@@ -890,8 +890,8 @@ fn resolve(
     let mut capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
     if policy.private_workload_contract().is_some() {
         capability.boundary.mechanism = "linux-tcp4-private-v1".into();
-    } else if policy.mixed_workload_contract().is_some() {
-        capability.boundary.mechanism = "linux-tcp4-unix-private-v1".into();
+    } else if let Some(contract) = policy.mixed_workload_contract() {
+        capability.boundary.mechanism = contract.authorized_profile.id.as_str().into();
     }
     if policy.boundary() == BoundaryRequirement::Sealed
         && capability.boundary.class != BoundaryClass::Sealed

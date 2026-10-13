@@ -39,7 +39,7 @@ fn dispatch(program: &mut Vec<Instruction>, number: u32, body: Vec<Instruction>)
     program.extend(body);
     program.push(load(0));
 }
-fn socket(unix: bool) -> Vec<Instruction> {
+fn socket(unix: bool, seqpacket_pair: bool) -> Vec<Instruction> {
     let family = 0x50061;
     let protocol = 0x5005d;
     let mut result = vec![
@@ -53,16 +53,26 @@ fn socket(unix: bool) -> Vec<Instruction> {
         equal(0, 1, 0),
         ret(protocol),
         load(24),
-        w(0x45, 0, 1, !(1 | 0x800 | 0x80000)),
+        w(
+            0x45,
+            0,
+            1,
+            !((if seqpacket_pair { 5 } else { 1 }) | 0x800 | 0x80000),
+        ),
         ret(protocol),
         w(0x54, 0, 0, 15),
+    ];
+    if seqpacket_pair {
+        result.push(equal(5, 2, 0));
+    }
+    result.extend([
         equal(1, 1, 0),
         ret(protocol),
         load(36),
         equal(0, 1, 0),
         ret(protocol),
         load(32),
-    ];
+    ]);
     if unix {
         result.push(equal(0, 1, 0));
     } else {
@@ -174,6 +184,17 @@ const ARM64: &[u32] = &[
 ];
 
 pub fn frozen_linux_filter_program(abi: &str) -> VerificationResult<Vec<Instruction>> {
+    frozen_linux_filter_program_for_profile(abi, "linux-tcp4-unix-private-v1")
+}
+pub fn frozen_linux_filter_program_for_profile(
+    abi: &str,
+    profile: &str,
+) -> VerificationResult<Vec<Instruction>> {
+    let seqpacket_pair = match profile {
+        "linux-tcp4-unix-private-v1" => false,
+        "linux-tcp4-unix-private-v2" => true,
+        _ => return Err("unknown mixed filter profile".into()),
+    };
     let (arch, numbers, catalogue, rights) = match abi {
         "x86_64" => (
             0xc000003e,
@@ -228,11 +249,11 @@ pub fn frozen_linux_filter_program(abi: &str) -> VerificationResult<Vec<Instruct
     if abi == "x86_64" {
         dispatch(&mut program, 158, commands(16, &[0x1002, 0x1003]));
     }
-    dispatch(&mut program, numbers[14], socket(true));
-    let unix = socket(true);
+    dispatch(&mut program, numbers[14], socket(true, seqpacket_pair));
+    let unix = socket(true, false);
     let mut mixed = vec![load(16), equal(1, 1, 0), w(5, 0, 0, unix.len() as u32)];
     mixed.extend(unix);
-    mixed.extend(socket(false));
+    mixed.extend(socket(false, false));
     dispatch(&mut program, numbers[15], mixed);
     for number in catalogue.iter().copied().chain(rights) {
         program.extend([equal(number, 0, 1), ret(ALLOW)]);

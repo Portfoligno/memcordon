@@ -481,6 +481,17 @@ pub fn linux_launcher_status(bytes: &[u8]) -> io::Result<Option<i32>> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn linux_private_incoming_reader()
+-> impl FnMut(&mut std::os::unix::net::UnixStream) -> Result<Option<(u16, Vec<u8>)>, String> {
+    crate::sealed::client::incoming_reader_for_test()
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_private_frame(kind: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+    crate::sealed::client::encoded_frame_for_test(kind, payload)
+}
+
+#[cfg(target_os = "linux")]
 pub fn sealed_terminal_spawn_error(
     payload: &[u8],
 ) -> Result<Option<memcordon_core::Error>, String> {
@@ -603,6 +614,7 @@ pub fn backend_selection_matches(
     crate::supervisor::test_backend_selection_matches(selected, observed, metric)
 }
 
+pub use crate::supervisor::test_authorization_evidence_failure as authorization_evidence_failure;
 pub use crate::supervisor::test_supervise_counted_failed_attempt as supervise_counted_failed_attempt;
 pub use crate::supervisor::test_supervise_failed_attempt as supervise_failed_attempt;
 

@@ -479,13 +479,17 @@ pub fn boundary_evidence_is_consistent(
         }
         BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
             native.runtime.validate().is_ok()
-                && launch.mechanism == "linux-tcp4-unix-private-v1"
+                && matches!(
+                    launch.mechanism.as_str(),
+                    "linux-tcp4-unix-private-v1" | "linux-tcp4-unix-private-v2"
+                )
                 && launch.boundary_requested == BoundaryRequirement::Sealed
                 && (!restart_safety.is_safe()
                     || (native.frontend.relay_drained && native.frontend.relay_error.is_none()))
                 && match &native.runtime.outcome {
-                    crate::result_v2::MixedRuntimeOutcomeV2::Executed { .. } => {
-                        launch.target_released
+                    crate::result_v2::MixedRuntimeOutcomeV2::Executed { admission, .. } => {
+                        launch.mechanism == admission.profile_id.id.as_str()
+                            && launch.target_released
                             && launch.boundary_effective == BoundaryClass::Sealed
                             && restart_safety.sealed_boundary_retired
                     }

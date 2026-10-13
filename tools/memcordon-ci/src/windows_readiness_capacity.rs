@@ -418,16 +418,18 @@ mod native {
                 .as_u64()
                 .ok_or_else(|| CiError::Message("capacity TCP peer birth missing".into()))?;
             let parents = process_parents()?;
-            let first_family: Vec<_> =
-                memcordon_testkit::windows_processes_for_image(&config.fixture.path)?
-                    .into_iter()
-                    .filter(|process| {
-                        (process.identity.pid == root.process_id
-                            && process.identity.birth == u128::from(root.creation_time_100ns))
-                            || (process.identity.pid == peer_pid
-                                && process.identity.birth == u128::from(peer_birth))
-                    })
-                    .collect();
+            let first_family: Vec<_> = memcordon_testkit::windows_processes_for_image_until(
+                &config.fixture.path,
+                deadline,
+            )?
+            .into_iter()
+            .filter(|process| {
+                (process.identity.pid == root.process_id
+                    && process.identity.birth == u128::from(root.creation_time_100ns))
+                    || (process.identity.pid == peer_pid
+                        && process.identity.birth == u128::from(peer_birth))
+            })
+            .collect();
             if !observed.is_consistent()
                 || observed.association.provider != config.provider
                 || first_family.len() != 2

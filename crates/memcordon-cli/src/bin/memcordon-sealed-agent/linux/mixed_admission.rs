@@ -342,10 +342,15 @@ impl MixedOperationalAdmission {
             ("aarch64", true) => super::network_filter::NativeAbi::Aarch64,
             _ => return Err("mixed runtime requires supported native GNU ABI".into()),
         };
-        let filter = super::network_filter::filter_instruction_digest(
-            &super::network_filter::compile_mixed_closed_filter(abi),
-        )
-        .map_err(str::to_owned)?;
+        let program = if self.contract.authorized_profile
+            == memcordon_core::workload_registry_v3::profile_reference_v2()
+        {
+            super::network_filter::compile_mixed_seqpacket_filter(abi)
+        } else {
+            super::network_filter::compile_mixed_closed_filter(abi)
+        };
+        let filter =
+            super::network_filter::filter_instruction_digest(&program).map_err(str::to_owned)?;
         let command =
             super::private_target::PrivateExecArguments::from_native_launch(&self.launch)?;
         let mut prelaunch = super::launch::build_private_gated_prelaunch(

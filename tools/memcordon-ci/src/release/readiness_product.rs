@@ -202,7 +202,7 @@ pub fn collect(
         if key.target.ends_with("-pc-windows-msvc") {
             (1, 1, "windows-host-network-external-v1")
         } else {
-            (3, 2, "linux-tcp4-unix-private-v1")
+            (3, 2, "linux-tcp4-unix-private-v2")
         };
     let product = ProductObservation {
         key: key.clone(),

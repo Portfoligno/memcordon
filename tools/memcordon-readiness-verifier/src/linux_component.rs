@@ -18,6 +18,7 @@ pub struct LinuxFilterReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterVector {
+    pub profile: String,
     pub abi: String,
     pub program: Vec<Instruction>,
     pub program_sha256: String,
@@ -494,7 +495,7 @@ pub fn validate_linux_filter_receipt(
         || receipt.test_name
             != "native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts"
         || receipt.operation != "mixed-filter-compiler-bpf-vectors"
-        || receipt.vectors.len() != 2
+        || receipt.vectors.len() != 4
     {
         return Err("filter component source/ABI-vector applicability differs".into());
     }
@@ -504,7 +505,7 @@ pub fn validate_linux_filter_receipt(
     digest(&receipt.challenge_sha256)?;
     let mut abis = BTreeSet::new();
     for vector in &receipt.vectors {
-        if !abis.insert(vector.abi.as_str()) {
+        if !abis.insert((vector.abi.as_str(), vector.profile.as_str())) {
             return Err("duplicate BPF ABI vector".into());
         }
         let (arch, socket, pair) = match vector.abi.as_str() {
@@ -522,7 +523,10 @@ pub fn validate_linux_filter_receipt(
         if sha256(&bytes) != vector.program_sha256 {
             return Err("actual BPF instruction bytes/digest differ".into());
         }
-        let expected = frozen_linux_filter_program(&vector.abi)?;
+        let expected = crate::filter_anchor::frozen_linux_filter_program_for_profile(
+            &vector.abi,
+            &vector.profile,
+        )?;
         if vector.program.len() != expected.len()
             || vector
                 .program
@@ -541,6 +545,31 @@ pub fn validate_linux_filter_receipt(
             ("tcp-positive", arch, socket, [2, 1, 0], 0x7fff0000),
             ("unix-positive", arch, socket, [1, 1, 0], 0x7fff0000),
             ("unix-pair-positive", arch, pair, [1, 1, 0], 0x7fff0000),
+            (
+                "seqpacket-pair-positive-or-denied",
+                arch,
+                pair,
+                [1, 5 | 0x80000, 0],
+                if vector.profile == "linux-tcp4-unix-private-v2" {
+                    0x7fff0000
+                } else {
+                    0x0005005d
+                },
+            ),
+            (
+                "named-seqpacket-denied",
+                arch,
+                socket,
+                [1, 5, 0],
+                0x0005005d,
+            ),
+            (
+                "seqpacket-protocol-denied",
+                arch,
+                pair,
+                [1, 5, 1],
+                0x0005005d,
+            ),
             (
                 "wrong-architecture",
                 arch ^ 1,
@@ -590,7 +619,16 @@ pub fn validate_linux_filter_receipt(
             }
         }
     }
-    if abis != ["x86_64", "aarch64"].into_iter().collect() {
+    if abis
+        != ["x86_64", "aarch64"]
+            .into_iter()
+            .flat_map(|abi| {
+                ["linux-tcp4-unix-private-v1", "linux-tcp4-unix-private-v2"]
+                    .into_iter()
+                    .map(move |profile| (abi, profile))
+            })
+            .collect()
+    {
         return Err("BPF ABI inventory narrowed".into());
     }
     Ok(())

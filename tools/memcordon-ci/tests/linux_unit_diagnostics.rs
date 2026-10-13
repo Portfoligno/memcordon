@@ -6,7 +6,8 @@ use memcordon_ci::{
     config,
     release::linux_installed_consumer::{
         PRIVATE_UNIT_DIAGNOSTIC_BYTES, PrivateUnitDiagnostic, diagnose_then_cleanup,
-        private_unit_diagnostic_command, retain_private_unit_diagnostic,
+        private_unit_diagnostic_command, private_unit_journal_excerpt,
+        retain_private_unit_diagnostic,
     },
 };
 use memcordon_testkit::{ProcessTestError, TimeoutObservation};
@@ -17,6 +18,28 @@ fn directory() -> tempfile::TempDir {
     } else {
         tempfile::tempdir().unwrap()
     }
+}
+
+#[test]
+fn journal_summary_preserves_first_worker_failure_beyond_context_and_bounds_invalid_bytes() {
+    let mut journal = vec![b'x'; 4096];
+    journal.extend_from_slice(b"\nsealed provider rejected request: original allocation error\n");
+    journal.extend_from_slice(&vec![b'y'; 4096]);
+    journal.extend_from_slice(b"\nsealed provider rejected request: later failure\n");
+    journal.extend_from_slice(&vec![b'z'; 4096]);
+    let summary = private_unit_journal_excerpt(&journal);
+    assert!(summary.contains("observed-matches=2"));
+    assert!(summary.contains("original allocation error"));
+    assert!(summary.contains("later failure"));
+    assert!(summary.contains("context-complete=false"));
+    assert!(summary.len() < 16 * 1024);
+
+    let mut malformed = b"sealed launcher rejected request: ".to_vec();
+    malformed.extend_from_slice(&vec![0xff; PRIVATE_UNIT_DIAGNOSTIC_BYTES]);
+    let summary = private_unit_journal_excerpt(&malformed);
+    assert!(summary.contains("observed-matches=1"));
+    assert!(summary.contains("truncated=true"));
+    assert!(summary.len() < 16 * 1024);
 }
 
 #[test]

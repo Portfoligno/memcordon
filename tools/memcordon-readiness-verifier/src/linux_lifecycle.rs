@@ -2557,8 +2557,7 @@ fn original_context(
         || grant["revision"] != request["authorization"]["grant_revision"]
         || grant["enabled"] != true
         || grant["profile"] != request["authorized_profile"]
-        || request["authorized_profile"]
-            != crate::linux_registry::linux_combined_profile_reference()
+        || !crate::linux_registry::linux_combined_profile_supported(&request["authorized_profile"])
         || grant["callers"] != serde_json::json!([{"platform":"linux","uid":65534}])
         || grant["approved_plans"] != serde_json::json!([request["workload_plan_digest"]])
         || request["authorization"]["approved_plan_digest"] != request["workload_plan_digest"]

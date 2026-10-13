@@ -859,8 +859,7 @@ fn validate_baseline(
                 &acquired["account"],
             )?
         || contract["execution_identity"] != execution
-        || contract["authorized_profile"]
-            != crate::linux_registry::linux_combined_profile_reference()
+        || !crate::linux_registry::linux_combined_profile_supported(&contract["authorized_profile"])
         || contract["runtime_image"]
             != crate::linux_image_reference(&acquired["images"]["runtime"], target)?
         || contract["input_image"]

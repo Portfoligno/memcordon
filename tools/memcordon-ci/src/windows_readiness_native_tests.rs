@@ -401,7 +401,8 @@ mod native {
                 let setup = (|| -> io::Result<()> {
                     let deadline = work_deadline.min(Instant::now() + Duration::from_secs(10));
                     loop {
-                        let mut processes = memcordon_testkit::windows_processes_for_image(&image)?;
+                        let mut processes =
+                            memcordon_testkit::windows_processes_for_image_until(&image, deadline)?;
                         processes.retain(|process| process.identity.pid == child.id());
                         if processes.len() == 1 && !processes[0].has_exited()? {
                             *capture.lock().map_err(|_| {
@@ -583,8 +584,11 @@ mod native {
                 .map_err(|_| CiError::Message("native test ownership poisoned".into()))?;
             if held.len() != 1
                 || !held[0].has_exited()?
-                || !memcordon_testkit::windows_processes_for_image(&input.executable.path)?
-                    .is_empty()
+                || !memcordon_testkit::windows_processes_for_image_until(
+                    &input.executable.path,
+                    work_deadline,
+                )?
+                .is_empty()
             {
                 return Err(CiError::Message(
                     "native component root/helpers failed to retire".into(),

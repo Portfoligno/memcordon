@@ -442,7 +442,7 @@ pub(crate) fn mixed_backend_run(
     };
     let failure = |detail: String| {
         let mut error = Error::new(ErrorCategory::Monitor, "MCSEALED-MIXED-TRANSACTION", detail);
-        error.backend = Some("linux-tcp4-unix-private-v1".into());
+        error.backend = Some(contract.authorized_profile.id.as_str().into());
         error.workload_may_be_alive = true;
         error
     };
@@ -560,7 +560,7 @@ pub(crate) fn mixed_backend_run(
     let outcome=match &receipt.terminal.outcome{
         MixedRuntimeOutcomeV2::Executed{execution,..}=>match execution.outcome_origin{
             MixedOutcomeOriginV2::NativeExit|MixedOutcomeOriginV2::NativeSignal=>RunOutcome::Exited{child:child.clone().expect("validated native termination"),peak:None,cleanup},
-            MixedOutcomeOriginV2::MemoryOom=>RunOutcome::LimitExceeded{limit:policy.memory.ok_or_else(||failure("mixed OOM lacks requested memory limit".into()))?,observed:None,peak:None,evidence:memcordon_core::LimitEvidence{backend:"linux-tcp4-unix-private-v1".into(),metric:"memory.events".into(),detail:"native owned cgroup oom_kill incremented".into()},child_after_termination:child.clone(),cleanup},
+            MixedOutcomeOriginV2::MemoryOom=>RunOutcome::LimitExceeded{limit:policy.memory.ok_or_else(||failure("mixed OOM lacks requested memory limit".into()))?,observed:None,peak:None,evidence:memcordon_core::LimitEvidence{backend:contract.authorized_profile.id.as_str().into(),metric:"memory.events".into(),detail:"native owned cgroup oom_kill incremented".into()},child_after_termination:child.clone(),cleanup},
             MixedOutcomeOriginV2::Deadline=>{
                 let configured=policy.deadline.ok_or_else(||failure("mixed native deadline lacks requested timer".into()))?;
                 let duration=effective_deadline_duration(policy,context,Duration::ZERO).ok_or_else(||failure("mixed effective deadline missing".into()))?;
@@ -579,7 +579,7 @@ pub(crate) fn mixed_backend_run(
     if let crate::backend::SealedAvailability::Available { capability, .. } =
         &mut backend.boundary_support.sealed
     {
-        capability.mechanism = "linux-tcp4-unix-private-v1".into();
+        capability.mechanism = contract.authorized_profile.id.as_str().into();
     }
     Ok(crate::backend::Execution {
         private_execution: None,
@@ -591,7 +591,7 @@ pub(crate) fn mixed_backend_run(
         duration: started.elapsed(),
         authorization_offset: authorization.map(Duration::from_millis),
         launch: memcordon_core::LaunchEvidence {
-            mechanism: "linux-tcp4-unix-private-v1".into(),
+            mechanism: contract.authorized_profile.id.as_str().into(),
             target_released: released,
             containment_verified_before_authorization: released,
             guardian_started_before_authorization: released,
@@ -1459,6 +1459,17 @@ fn native_send(count: isize) -> std::io::Result<usize> {
     }
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn incoming_reader_for_test()
+-> impl FnMut(&mut UnixStream) -> Result<Option<(u16, Vec<u8>)>, String> {
+    let mut incoming = Incoming::new(4);
+    move |stream| {
+        incoming
+            .read(stream)
+            .map(|frame| frame.map(|frame| (frame.kind, frame.payload)))
+    }
+}
+
 struct Incoming {
     bytes: Vec<u8>,
     total: Option<usize>,
@@ -1502,7 +1513,10 @@ impl Incoming {
             self.total = Some(total);
         }
         if self.total == Some(self.bytes.len()) {
-            return read_frame_for_version(&mut self.bytes.as_slice(), self.version).map(Some);
+            let frame = read_frame_for_version(&mut self.bytes.as_slice(), self.version)?;
+            self.bytes.clear();
+            self.total = None;
+            return Ok(Some(frame));
         }
         Ok(None)
     }

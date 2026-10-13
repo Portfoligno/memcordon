@@ -336,7 +336,9 @@ pub(crate) fn validate_request(
     if request
         .pointer("/authorized_profile/id")
         .and_then(Value::as_str)
-        != Some(profile)
+        .is_none_or(|actual| {
+            actual != profile && !(linux && actual == "linux-tcp4-unix-private-v2")
+        })
         && origin != OutcomeOrigin::AdmissionRefusal
     {
         return Err("request profile differs".into());
@@ -418,6 +420,7 @@ fn known_requirement(kind: &str, linux: bool) -> bool {
         [
             "tcp_listener",
             "unix_stream_pair",
+            "unix_seqpacket_pair",
             "unix_path_stream",
             "unix_abstract_stream",
             "intra_attempt_descriptor_transfer",
@@ -4536,12 +4539,19 @@ pub(crate) fn v3_request_digest(request: &Value) -> VerificationResult<String> {
     string(&mut bytes, text(authorization, "grant_id")?)?;
     bytes.extend_from_slice(&number(authorization, "grant_revision")?.to_be_bytes());
     hash(&mut bytes, text(authorization, "approved_plan_digest")?)?;
-    if request.get("ceiling").and_then(Value::as_str)
-        != Some("fresh_root_ipv4_tcp_unix_streams_intra_attempt_no_gain")
-    {
-        return Err("unknown mixed ceiling".into());
-    }
-    bytes.push(1);
+    let profile_id = text(profile, "id")?;
+    let ceiling = request.get("ceiling").and_then(Value::as_str);
+    bytes.push(match (profile_id, ceiling) {
+        (
+            "linux-tcp4-unix-private-v1",
+            Some("fresh_root_ipv4_tcp_unix_streams_intra_attempt_no_gain"),
+        ) => 1,
+        (
+            "linux-tcp4-unix-private-v2",
+            Some("fresh_root_ipv4_tcp_unix_streams_and_seqpacket_pairs_intra_attempt_no_gain"),
+        ) => 2,
+        _ => return Err("mixed profile/ceiling differs".into()),
+    });
     let identity = request
         .get("execution_identity")
         .ok_or("exclusive identity missing")?;
@@ -4624,10 +4634,19 @@ pub(crate) fn v3_request_digest(request: &Value) -> VerificationResult<String> {
                     }
                 }
             }
-            "unix_stream_pair" | "unix_abstract_stream" | "intra_attempt_descriptor_transfer" => {
+            "unix_stream_pair"
+            | "unix_seqpacket_pair"
+            | "unix_abstract_stream"
+            | "intra_attempt_descriptor_transfer" => {
                 object(requirement, &["kind", "id"], &[])?;
                 bytes.push(match text(requirement, "kind")? {
                     "unix_stream_pair" => 2,
+                    "unix_seqpacket_pair" => {
+                        if profile_id != "linux-tcp4-unix-private-v2" {
+                            return Err("seqpacket requires combined profile v2".into());
+                        }
+                        8
+                    }
                     "unix_abstract_stream" => 4,
                     _ => 5,
                 });

@@ -78,6 +78,7 @@ tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 flate2.workspace = true
+rustix = { version = "1.1.4", features = ["fs"] }
 tar.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -118,7 +119,6 @@ toml.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex.workspace = true
-rustix = { version = "1.1.4", features = ["fs"] }
 
 [build-dependencies]
 serde.workspace = true

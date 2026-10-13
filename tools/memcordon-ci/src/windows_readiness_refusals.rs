@@ -645,8 +645,11 @@ mod native {
                     &config.installed_manifest.sha256,
                 )
                 .and_then(|_| {
-                    if memcordon_testkit::windows_processes_for_image(&config.fixture.path)?
-                        .is_empty()
+                    if memcordon_testkit::windows_processes_for_image_until(
+                        &config.fixture.path,
+                        deadlines.cleanup,
+                    )?
+                    .is_empty()
                     {
                         Ok(())
                     } else {

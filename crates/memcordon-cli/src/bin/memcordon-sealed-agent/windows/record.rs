@@ -892,6 +892,23 @@ impl WindowsAttemptRecordV1 {
         Ok(())
     }
 
+    pub(super) fn persist_retirement_operation_failure(
+        &mut self,
+        stage: WindowsTerminalizationErrorStageV1,
+        code: &str,
+        primary: String,
+    ) -> String {
+        self.persist_terminalization_failure(
+            WindowsTerminalizationOwnerV1::LauncherWorker,
+            stage,
+            code,
+            primary.clone(),
+            None,
+            primary,
+            &mut |record| record.store(),
+        )
+    }
+
     fn persist_terminalization_failure<F>(
         &mut self,
         owner: WindowsTerminalizationOwnerV1,
@@ -1261,6 +1278,24 @@ fn terminalization_error(
     native_code: Option<i32>,
 ) -> WindowsTerminalizationErrorV1 {
     bounded_terminalization_error(stage, error_code, detail, native_code)
+}
+
+fn recovery_terminalization_error(error: Option<&WindowsTerminalizationErrorV1>) -> String {
+    let Some(error) = error else {
+        return "none".into();
+    };
+    let mut end = error.detail.len().min(512);
+    while !error.detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "stage={:?}; code={}; native-code={:?}; detail-truncated={}; detail={}",
+        error.stage,
+        error.error_code,
+        error.native_code,
+        end != error.detail.len(),
+        &error.detail[..end],
+    )
 }
 
 pub fn record_terminalization_failure(
@@ -2715,7 +2750,7 @@ pub fn recover_attempt_for_caller(
                     )?;
                 } else {
                     return Err(format!(
-                        "exact recovery pending checked closure: guardian receipt absent on original boot; durable-state={:?}; resume-attempted={}; target-released={}; termination-requested={}; active-processes-zero={}; guardian-reaped={}; final-handles-closed={}; terminal-seed-present={}; retirement-proof-present={}; owner-manifest-present={}; terminal-publication-reserved={}",
+                        "exact recovery pending checked closure: guardian receipt absent on original boot; durable-state={:?}; resume-attempted={}; target-released={}; termination-requested={}; active-processes-zero={}; guardian-reaped={}; final-handles-closed={}; terminal-seed-present={}; retirement-proof-present={}; owner-manifest-present={}; terminal-publication-reserved={}; first-terminalization-error={}",
                         record.state,
                         record.resume_attempted,
                         record.target_released,
@@ -2727,6 +2762,7 @@ pub fn recover_attempt_for_caller(
                         record.retirement_proof.is_some(),
                         record.owner_manifest.is_some(),
                         record.terminal_publication_reserved,
+                        recovery_terminalization_error(record.terminalization.last_error.as_ref()),
                     ));
                 }
             }

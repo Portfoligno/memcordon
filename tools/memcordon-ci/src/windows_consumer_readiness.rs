@@ -2937,7 +2937,8 @@ pub(crate) mod native {
             move |_, _, _| {
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
-                    let mut held = memcordon_testkit::windows_processes_for_image(&fixture)?;
+                    let mut held =
+                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?;
                     if transcript.is_file() && !held.is_empty() {
                         let published = super::live_events(
                             &read(&transcript, 16 * 1024 * 1024).map_err(io::Error::other)?,
@@ -3142,12 +3143,12 @@ pub(crate) mod native {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        let peer = memcordon_testkit::windows_processes_for_image(&fixture)?
-                            .into_iter()
-                            .find(|process| process.identity.pid == peer_identity.process_id)
-                            .ok_or_else(|| {
-                                io::Error::other("native TCP peer handle unavailable")
-                            })?;
+                        let peer = memcordon_testkit::windows_processes_for_image_until(
+                            &fixture, deadline,
+                        )?
+                        .into_iter()
+                        .find(|process| process.identity.pid == peer_identity.process_id)
+                        .ok_or_else(|| io::Error::other("native TCP peer handle unavailable"))?;
                         let mut held = held_family
                             .lock()
                             .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
@@ -3221,8 +3222,9 @@ pub(crate) mod native {
                             };
                             if let Some(controller) = controller {
                                 let parents = process_parents()?;
-                                let active =
-                                    memcordon_testkit::windows_processes_for_image(&fixture)?;
+                                let active = memcordon_testkit::windows_processes_for_image_until(
+                                    &fixture, deadline,
+                                )?;
                                 let mut family = held_family
                                     .lock()
                                     .map_err(|_| io::Error::other("fixture ownership poisoned"))?;
@@ -3625,7 +3627,9 @@ pub(crate) mod native {
                                 let identities: Intermediate = serde_json::from_slice(&event.value)
                                     .map_err(io::Error::other)?;
                                 let mut active =
-                                    memcordon_testkit::windows_processes_for_image(&fixture)?;
+                                    memcordon_testkit::windows_processes_for_image_until(
+                                        &fixture, deadline,
+                                    )?;
                                 let parents = process_parents()?;
                                 let mut family = held_family
                                     .lock()
@@ -3696,7 +3700,9 @@ pub(crate) mod native {
                         }) {
                             let child: memcordon_core::WindowsProcessIdentityV1 =
                                 serde_json::from_slice(&event.value).map_err(io::Error::other)?;
-                            let active = memcordon_testkit::windows_processes_for_image(&fixture)?;
+                            let active = memcordon_testkit::windows_processes_for_image_until(
+                                &fixture, deadline,
+                            )?;
                             let held_child = active
                                 .into_iter()
                                 .find(|p| {
@@ -3995,7 +4001,10 @@ pub(crate) mod native {
                     "independently held fixture family did not retire".into(),
                 ));
             }
-            let remaining = memcordon_testkit::windows_processes_for_image(&config.fixture.path)?;
+            let remaining = memcordon_testkit::windows_processes_for_image_until(
+                &config.fixture.path,
+                work_deadline,
+            )?;
             if let Some(owned) = &excluded_fixture {
                 let expected: BTreeSet<_> = owned
                     .family

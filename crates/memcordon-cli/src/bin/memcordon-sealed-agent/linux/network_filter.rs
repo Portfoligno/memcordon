@@ -484,7 +484,31 @@ pub fn compile_mixed_closed_filter(abi: NativeAbi) -> Vec<sock_filter> {
     compile_closed_filter(abi, true)
 }
 
+pub fn compile_mixed_seqpacket_filter(abi: NativeAbi) -> Vec<sock_filter> {
+    compile_closed_filter_with_pairs(abi, true, true)
+}
+
+pub fn select_mixed_filter(abi: NativeAbi, expected: [u8; 32]) -> Result<Vec<sock_filter>, String> {
+    for program in [
+        compile_mixed_closed_filter(abi),
+        compile_mixed_seqpacket_filter(abi),
+    ] {
+        if filter_instruction_digest(&program).map_err(str::to_owned)? == expected {
+            return Ok(program);
+        }
+    }
+    Err("MCSEALED-PRIVATE-FILTER: unknown mixed instruction digest".into())
+}
+
 fn compile_closed_filter(abi: NativeAbi, mixed: bool) -> Vec<sock_filter> {
+    compile_closed_filter_with_pairs(abi, mixed, false)
+}
+
+fn compile_closed_filter_with_pairs(
+    abi: NativeAbi,
+    mixed: bool,
+    seqpacket_pair: bool,
+) -> Vec<sock_filter> {
     let numbers = abi.syscalls();
     let mut program = vec![
         load(ARCH_OFFSET),
@@ -601,7 +625,7 @@ fn compile_closed_filter(abi: NativeAbi, mixed: bool) -> Vec<sock_filter> {
     }
 
     if mixed {
-        let checks = unix_stream_checks();
+        let checks = unix_checks(seqpacket_pair);
         program.push(jump_equal(numbers.socketpair, 1, 0));
         program.push(instruction(
             BPF_JMP_JA,
@@ -725,7 +749,11 @@ fn install_selected_filter(
     if abi != native_abi {
         return Err("MCSEALED-PRIVATE-FILTER: requested ABI is not native".into());
     }
-    let mut program = compile_closed_filter(abi, mixed);
+    let mut program = if mixed {
+        select_mixed_filter(abi, expected_digest)?
+    } else {
+        compile_closed_filter(abi, false)
+    };
     let digest = filter_instruction_digest(&program)
         .map_err(|reason| format!("MCSEALED-PRIVATE-FILTER: invalid program: {reason}"))?;
     if digest != expected_digest {
@@ -843,10 +871,19 @@ fn socket_checks() -> Vec<sock_filter> {
 }
 
 fn unix_stream_checks() -> Vec<sock_filter> {
+    unix_checks(false)
+}
+
+fn unix_checks(seqpacket_pair: bool) -> Vec<sock_filter> {
     let family_error = errno(libc::EAFNOSUPPORT);
     let protocol_error = errno(libc::EPROTONOSUPPORT);
-    let flags = (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32;
-    vec![
+    let types = if seqpacket_pair {
+        libc::SOCK_STREAM | libc::SOCK_SEQPACKET
+    } else {
+        libc::SOCK_STREAM
+    };
+    let flags = (types | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32;
+    let mut checks = vec![
         load(ARG0_HIGH),
         jump_equal(0, 1, 0),
         return_action(family_error),
@@ -860,6 +897,11 @@ fn unix_stream_checks() -> Vec<sock_filter> {
         instruction(BPF_JMP_JSET_K, 0, 1, !flags),
         return_action(protocol_error),
         instruction(BPF_ALU_AND_K, 0, 0, 0xf),
+    ];
+    if seqpacket_pair {
+        checks.push(jump_equal(libc::SOCK_SEQPACKET as u32, 2, 0));
+    }
+    checks.extend([
         jump_equal(libc::SOCK_STREAM as u32, 1, 0),
         return_action(protocol_error),
         load(ARG2_HIGH),
@@ -869,7 +911,8 @@ fn unix_stream_checks() -> Vec<sock_filter> {
         jump_equal(0, 1, 0),
         return_action(protocol_error),
         return_action(SECCOMP_RET_ALLOW),
-    ]
+    ]);
+    checks
 }
 
 fn mixed_socket_checks() -> Vec<sock_filter> {

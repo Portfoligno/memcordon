@@ -3719,7 +3719,12 @@ pub fn observe_removed(
     }
     let (absent_services, service_observations) = absent_owned_services(cleanup_deadline)?;
     absent_component_processes(config, cleanup_deadline)?;
-    if !memcordon_testkit::windows_processes_for_image(&config.fixture.path)?.is_empty() {
+    if !memcordon_testkit::windows_processes_for_image_until(
+        &config.fixture.path,
+        cleanup_deadline,
+    )?
+    .is_empty()
+    {
         return Err(crate::CiError::Message(
             "owned fixture family remains after package uninstall".into(),
         ));

@@ -434,6 +434,80 @@ fn evaluate_filter<const N: usize>(
     panic!("filter did not return")
 }
 
+#[test]
+fn mixed_seqpacket_profile_preserves_stream_only_authority() {
+    use crate::linux::network_filter::{
+        compile_mixed_closed_filter, compile_mixed_seqpacket_filter, select_mixed_filter,
+    };
+    const ALLOW: u32 = 0x7fff_0000;
+    const ERRNO: u32 = 0x0005_0000;
+    for (abi, arch, socket, pair) in [
+        (NativeAbi::X86_64, 0xc000_003e, 41, 53),
+        (NativeAbi::Aarch64, 0xc000_00b7, 198, 199),
+    ] {
+        let old = compile_mixed_closed_filter(abi);
+        let new = compile_mixed_seqpacket_filter(abi);
+        validate_program(&new).unwrap();
+        for flags in [
+            0,
+            libc::SOCK_CLOEXEC,
+            libc::SOCK_NONBLOCK,
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        ] {
+            let args = [
+                libc::AF_UNIX as u64,
+                (libc::SOCK_SEQPACKET | flags) as u64,
+                0,
+            ];
+            assert_eq!(
+                evaluate_filter(&old, arch, pair, args),
+                ERRNO | libc::EPROTONOSUPPORT as u32
+            );
+            assert_eq!(evaluate_filter(&new, arch, pair, args), ALLOW);
+            assert_eq!(
+                evaluate_filter(&new, arch, socket, args),
+                ERRNO | libc::EPROTONOSUPPORT as u32
+            );
+        }
+        for args in [
+            [libc::AF_UNIX as u64, libc::SOCK_DGRAM as u64, 0],
+            [libc::AF_UNIX as u64, libc::SOCK_SEQPACKET as u64, 1],
+            [
+                libc::AF_UNIX as u64,
+                (libc::SOCK_SEQPACKET as u64) | (1_u64 << 32),
+                0,
+            ],
+        ] {
+            assert_eq!(
+                evaluate_filter(&new, arch, pair, args),
+                ERRNO | libc::EPROTONOSUPPORT as u32
+            );
+        }
+        assert_eq!(
+            evaluate_filter(
+                &new,
+                arch,
+                pair,
+                [libc::AF_INET as u64, libc::SOCK_SEQPACKET as u64, 0]
+            ),
+            ERRNO | libc::EAFNOSUPPORT as u32
+        );
+        assert_ne!(
+            filter_instruction_digest(&old).unwrap(),
+            filter_instruction_digest(&new).unwrap()
+        );
+        for program in [&old, &new] {
+            let selected =
+                select_mixed_filter(abi, filter_instruction_digest(program).unwrap()).unwrap();
+            assert_eq!(
+                filter_instruction_digest(&selected).unwrap(),
+                filter_instruction_digest(program).unwrap()
+            );
+        }
+        assert!(select_mixed_filter(abi, [0; 32]).is_err());
+    }
+}
+
 /// Emits compiler vectors from this measured native operational harness. These
 /// are BPF evaluations, not claims that a foreign ABI was attached to the kernel.
 #[test]
@@ -492,17 +566,50 @@ fn mixed_filter_vectors_emit_actual_component_receipts() {
         .unwrap();
     assert!(executable.len() <= 512 * 1024 * 1024);
     let mut vectors = Vec::new();
-    for (abi, name, architecture, socket, socketpair) in [
-        (NativeAbi::X86_64, "x86_64", 0xc000_003e_u32, 41_u32, 53_u32),
+    for (abi, name, architecture, socket, socketpair, seqpacket) in [
+        (
+            NativeAbi::X86_64,
+            "x86_64",
+            0xc000_003e_u32,
+            41_u32,
+            53_u32,
+            false,
+        ),
+        (
+            NativeAbi::X86_64,
+            "x86_64",
+            0xc000_003e_u32,
+            41_u32,
+            53_u32,
+            true,
+        ),
         (
             NativeAbi::Aarch64,
             "aarch64",
             0xc000_00b7_u32,
             198_u32,
             199_u32,
+            false,
+        ),
+        (
+            NativeAbi::Aarch64,
+            "aarch64",
+            0xc000_00b7_u32,
+            198_u32,
+            199_u32,
+            true,
         ),
     ] {
-        let program = crate::linux::network_filter::compile_mixed_closed_filter(abi);
+        let program = if seqpacket {
+            crate::linux::network_filter::compile_mixed_seqpacket_filter(abi)
+        } else {
+            crate::linux::network_filter::compile_mixed_closed_filter(abi)
+        };
+        let profile = if seqpacket {
+            "linux-tcp4-unix-private-v2"
+        } else {
+            "linux-tcp4-unix-private-v1"
+        };
         validate_program(&program).unwrap();
         let cases = [
             (
@@ -525,6 +632,35 @@ fn mixed_filter_vectors_emit_actual_component_receipts() {
                 socketpair,
                 [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0],
                 0x7fff_0000,
+            ),
+            (
+                "seqpacket-pair-positive-or-denied",
+                architecture,
+                socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    (libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC) as u64,
+                    0,
+                ],
+                if seqpacket {
+                    0x7fff_0000
+                } else {
+                    0x0005_0000 | libc::EPROTONOSUPPORT as u32
+                },
+            ),
+            (
+                "named-seqpacket-denied",
+                architecture,
+                socket,
+                [libc::AF_UNIX as u64, libc::SOCK_SEQPACKET as u64, 0],
+                0x0005_0000 | libc::EPROTONOSUPPORT as u32,
+            ),
+            (
+                "seqpacket-protocol-denied",
+                architecture,
+                socketpair,
+                [libc::AF_UNIX as u64, libc::SOCK_SEQPACKET as u64, 1],
+                0x0005_0000 | libc::EPROTONOSUPPORT as u32,
             ),
             (
                 "wrong-architecture",
@@ -557,7 +693,7 @@ fn mixed_filter_vectors_emit_actual_component_receipts() {
             .iter()
             .map(|word| serde_json::json!({"code":word.code,"jt":word.jt,"jf":word.jf,"k":word.k}))
             .collect::<Vec<_>>();
-        vectors.push(serde_json::json!({"abi":name,"program":instructions,"program_sha256":hexadecimal(&filter_instruction_digest(&program).unwrap()),"observations":observations}));
+        vectors.push(serde_json::json!({"abi":name,"profile":profile,"program":instructions,"program_sha256":hexadecimal(&filter_instruction_digest(&program).unwrap()),"observations":observations}));
     }
     let receipt = serde_json::json!({"format":"memcordon.linux-filter-component","revision":1,
         "run_id":input.run_id,"recipe_id":input.recipe_id,"test_name":"native_private_tcp::mixed_filter_vectors_emit_actual_component_receipts",

@@ -11,8 +11,8 @@ fn digest(program: &[Instruction]) -> String {
     }
     hex::encode(Sha256::digest(bytes))
 }
-fn vector(abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
-    let program = frozen_linux_filter_program(abi).unwrap();
+fn vector(profile: &str, abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
+    let program = frozen_linux_filter_program_for_profile(abi, profile).unwrap();
     let cases: [(&str, u32, [u32; 3], u32); 8] = [
         ("tcp-positive", socket, [2, 1, 0], 0x7fff0000),
         ("unix-positive", socket, [1, 1, 0], 0x7fff0000),
@@ -40,7 +40,30 @@ fn vector(abi: &str, arch: u32, socket: u32, pair: u32) -> FilterVector {
         arguments: [2, 1, 0],
         actual_bpf_return: 0x80000000,
     });
+    for (case, syscall, arguments, actual_bpf_return) in [
+        (
+            "seqpacket-pair-positive-or-denied",
+            pair,
+            [1, 5 | 0x80000, 0],
+            if profile.ends_with("v2") {
+                0x7fff0000
+            } else {
+                0x5005d
+            },
+        ),
+        ("named-seqpacket-denied", socket, [1, 5, 0], 0x5005d),
+        ("seqpacket-protocol-denied", pair, [1, 5, 1], 0x5005d),
+    ] {
+        observations.push(FilterObservation {
+            case: case.into(),
+            architecture: arch,
+            syscall,
+            arguments,
+            actual_bpf_return,
+        });
+    }
     FilterVector {
+        profile: profile.into(),
         abi: abi.into(),
         program_sha256: digest(&program),
         program,
@@ -92,11 +115,38 @@ fn structural_filter_decoder_rejects_rehashed_decision_and_inventory_mutations()
         challenge_sha256: "22".repeat(32),
         operation: "mixed-filter-compiler-bpf-vectors".into(),
         vectors: vec![
-            vector("x86_64", 0xc000003e, 41, 53),
-            vector("aarch64", 0xc00000b7, 198, 199),
+            vector("linux-tcp4-unix-private-v1", "x86_64", 0xc000003e, 41, 53),
+            vector(
+                "linux-tcp4-unix-private-v1",
+                "aarch64",
+                0xc00000b7,
+                198,
+                199,
+            ),
+            vector("linux-tcp4-unix-private-v2", "x86_64", 0xc000003e, 41, 53),
+            vector(
+                "linux-tcp4-unix-private-v2",
+                "aarch64",
+                0xc00000b7,
+                198,
+                199,
+            ),
         ],
     };
     validate_linux_filter_receipt(&receipt, &key).unwrap();
+    let mut changed = receipt.clone();
+    changed.vectors[2].profile = "linux-tcp4-unix-private-v1".into();
+    assert!(
+        validate_linux_filter_receipt(&changed, &key).is_err(),
+        "v2 program cannot masquerade as old authority"
+    );
+    let mut changed = receipt.clone();
+    changed.vectors[2].program = receipt.vectors[0].program.clone();
+    changed.vectors[2].program_sha256 = digest(&changed.vectors[2].program);
+    assert!(
+        validate_linux_filter_receipt(&changed, &key).is_err(),
+        "old program cannot substitute for declared v2"
+    );
     let mut changed = receipt.clone();
     changed.vectors[0].program[11].k = 0x7fff0001;
     changed.vectors[0].program_sha256 = digest(&changed.vectors[0].program);

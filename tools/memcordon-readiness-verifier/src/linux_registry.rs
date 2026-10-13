@@ -308,6 +308,15 @@ pub(crate) fn linux_combined_profile_reference() -> Value {
     serde_json::json!({"id":"linux-tcp4-unix-private-v1","semantic_digest":crate::sha256(semantics)})
 }
 
+pub(crate) fn linux_combined_profile_supported(profile: &Value) -> bool {
+    if profile == &linux_combined_profile_reference() {
+        return true;
+    }
+    let semantics=b"memcordon.profile/linux-tcp4-unix-private-v2\0ipv4-tcp-loopback-only-all-ports;unix-stream-pair-path-abstract;unix-seqpacket-pair-only;scm-rights-intra-attempt;no-ipv6-udp-raw-packet-netlink;fresh-mount-pid-net-ipc-root;immutable-image-input;declared-generated-exec-work;exclusive-admin-nonroot;no-new-privileges-no-caps;stdio-byte-pipes-three;no-host-proc-or-fd-import;closed-native-abi;clone3-enosys;native-exec-observed;aggregate-empty-before-root-export-retire-account";
+    profile
+        == &serde_json::json!({"id":"linux-tcp4-unix-private-v2","semantic_digest":crate::sha256(semantics)})
+}
+
 pub(crate) fn linux_identity_reference(identity: &Value) -> VerificationResult<Value> {
     fields(
         identity,

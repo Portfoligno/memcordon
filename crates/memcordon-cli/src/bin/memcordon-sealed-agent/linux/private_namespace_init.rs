@@ -740,7 +740,10 @@ fn run_namespace_init(
                 drop(directory);
                 target.entrypoint = root.open_entrypoint(&preparation.entry)?;
                 target.mixed_root_filter = true;
-                let program = super::network_filter::compile_mixed_closed_filter(target.native_abi);
+                let program = super::network_filter::select_mixed_filter(
+                    target.native_abi,
+                    target.expected_filter_digest,
+                )?;
                 let digest = super::network_filter::filter_instruction_digest(&program)
                     .map_err(str::to_owned)?;
                 if digest != target.expected_filter_digest {

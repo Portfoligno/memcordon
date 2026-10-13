@@ -297,6 +297,51 @@ pub fn private_unit_diagnostic_command(cwd: &Path, kind: PrivateUnitDiagnostic) 
     }
 }
 
+/// Bounded original journal context, never an authenticated execution receipt.
+pub fn private_unit_journal_excerpt(bytes: &[u8]) -> String {
+    let mut summary = String::new();
+    use std::fmt::Write;
+    for marker in [
+        "sealed provider rejected request:",
+        "sealed launcher rejected request:",
+    ] {
+        let mut matches = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| String::from_utf8_lossy(line).contains(marker));
+        let first = matches.next();
+        let mut last = first;
+        let mut count = usize::from(first.is_some());
+        for line in matches {
+            last = Some(line);
+            count += 1;
+        }
+        writeln!(summary, "worker-marker={marker}; observed-matches={count}")
+            .expect("String writing cannot fail");
+        for (position, line) in [("first", first), ("last", last)] {
+            if let Some(line) = line {
+                writeln!(
+                    summary,
+                    "{position}; observed-bytes={}; truncated={}; original={}",
+                    line.len(),
+                    line.len() > 512,
+                    String::from_utf8_lossy(&line[..line.len().min(512)]),
+                )
+                .expect("String writing cannot fail");
+            }
+        }
+    }
+    writeln!(
+        summary,
+        "journal-observed-bytes={}; context-complete={}; head={}\ntail={}",
+        bytes.len(),
+        bytes.len() <= 1024,
+        String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]),
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(1024)..]),
+    )
+    .expect("String writing cannot fail");
+    summary
+}
+
 /// Record nonzero status as actual diagnostic data. Incomplete output never
 /// becomes a successful empty observation, and an existing leaf is not replaced.
 pub fn retain_private_unit_diagnostic(
@@ -363,6 +408,19 @@ pub fn retain_private_unit_diagnostic(
                 "unit diagnostic output exceeds retained bound".into(),
             ));
         }
+        if matches!(kind, PrivateUnitDiagnostic::Journal) {
+            // Publish the original pre-cleanup worker error before artifact
+            // retention or uninstall can fail. This is a bounded diagnostic,
+            // not evidence of successful execution or complete journal history.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "private-unit-journal; pre-cleanup=true; operation-complete={complete}; readers={readers:?}; status={status:?}; stderr-observed-bytes={}; stderr-truncated={}; stderr={}\n{}",
+                stderr.len(),
+                stderr.len() > 512,
+                String::from_utf8_lossy(&stderr[..stderr.len().min(512)]),
+                private_unit_journal_excerpt(stdout),
+            );
+        }
         retain(stdout_name, stdout)?;
         retain(stderr_name, stderr)?;
     }
@@ -401,7 +459,11 @@ pub fn diagnose_then_cleanup<T>(
 }
 
 #[cfg(target_os = "linux")]
-fn capture_private_unit_diagnostics(cwd: &Path, output: &Path) -> Result<()> {
+fn capture_private_unit_diagnostics(
+    cwd: &Path,
+    output: &Path,
+    journal_diagnostic: &mut Option<String>,
+) -> Result<()> {
     let directory = output.join("pre-cleanup-units");
     fs::create_dir(&directory)?;
     let mut failures = Vec::new();
@@ -420,6 +482,29 @@ fn capture_private_unit_diagnostics(cwd: &Path, output: &Path) -> Result<()> {
                 std::io::Error::other(error.to_string()),
             )),
         };
+        if matches!(kind, PrivateUnitDiagnostic::Journal) {
+            // Keep the original capture in memory as well: later cleanup
+            // output must not displace it from the outer runner's error tail.
+            *journal_diagnostic = Some(match &observed {
+                Ok(value) => format!(
+                    "original-pre-cleanup-journal; operation-complete=true; status={:?}\n{}",
+                    value.status,
+                    private_unit_journal_excerpt(&value.stdout),
+                ),
+                Err(memcordon_testkit::ProcessTestError::Timeout {
+                    stdout,
+                    observation,
+                    ..
+                }) => format!(
+                    "original-pre-cleanup-journal; operation-complete=false; readers=({},{}) ; status={:?}\n{}",
+                    observation.stdout_reader_finished,
+                    observation.stderr_reader_finished,
+                    observation.observed_status,
+                    private_unit_journal_excerpt(stdout),
+                ),
+                Err(_) => "original-pre-cleanup-journal; streams-unavailable=true".into(),
+            });
+        }
         if let Err(error) = retain_private_unit_diagnostic(&directory, kind, observed) {
             failures.push(error.to_string());
         }
@@ -2997,9 +3082,10 @@ fn run_owned(
         }
         Ok(())
     })();
+    let mut original_journal_diagnostic = None;
     let (body, cleanup, unit_diagnostics) = diagnose_then_cleanup(
         body,
-        || capture_private_unit_diagnostics(work.path(), output),
+        || capture_private_unit_diagnostics(work.path(), output, &mut original_journal_diagnostic),
         || {
             let finalization = if let Some(extension) = extension.as_mut() {
                 extension.finalize_before_uninstall(payload, output)
@@ -3070,7 +3156,7 @@ fn run_owned(
         if !host_network_configuration_unchanged(&host_before, &after)? { return Err(CiError::Message("private installed execution changed host network namespace, links, routes or sysctls".into())); }
         Ok(())
     });
-    let failures = [
+    let mut failures = [
         ("installed case execution", body),
         ("installed finalization", cleanup.map(|_| ())),
         ("host network observation", host_after),
@@ -3085,6 +3171,9 @@ fn run_owned(
     if failures.is_empty() {
         Ok(())
     } else {
+        if let Some(journal) = original_journal_diagnostic {
+            failures.push(journal);
+        }
         Err(CiError::Message(failures.join("; ")))
     }
 }

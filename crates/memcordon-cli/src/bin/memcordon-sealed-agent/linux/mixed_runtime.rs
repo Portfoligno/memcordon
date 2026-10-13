@@ -155,12 +155,22 @@ fn outstanding(
 ) -> OutstandingMixedRetirementV2 {
     let mut obligations = memcordon_core::BoundedVec::default();
     for detail in details {
-        let bounded = memcordon_core::BoundedText::new(if detail.len() <= 256 {
-            &detail
+        let detail = if detail.len() <= 256 {
+            detail
         } else {
-            "native mixed ownership remains unresolved; inspect retained protected journal"
-        })
-        .expect("bounded native obligation");
+            let marker = "...[truncated]...";
+            let available = 256 - marker.len();
+            let mut head_end = available * 2 / 3;
+            while !detail.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            let mut tail_start = detail.len() - (available - available * 2 / 3);
+            while !detail.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            format!("{}{}{}", &detail[..head_end], marker, &detail[tail_start..])
+        };
+        let bounded = memcordon_core::BoundedText::new(&detail).expect("bounded native obligation");
         if obligations.try_push(bounded).is_err() {
             break;
         }

@@ -64,7 +64,7 @@ pub use linux_lifecycle::{
     LinuxDeliveryEvidence, LinuxLifecycleLossEvidence, validate_linux_lifecycle_intervention,
 };
 mod linux_refusal_census;
-pub use filter_anchor::frozen_linux_filter_program;
+pub use filter_anchor::{frozen_linux_filter_program, frozen_linux_filter_program_for_profile};
 pub use linux_build::{linux_image_reference, validate_linux_generated_lifecycle};
 pub use linux_component::{
     FilterObservation, FilterVector, Instruction, JournalProcess, LinuxFilterReceipt,
@@ -2760,7 +2760,10 @@ pub fn validate_manifest(bytes: &[u8]) -> VerificationResult<BTreeSet<CaseKey>> 
     if manifest.format != "memcordon.consumer-readiness"
         || manifest.revision != 1
         || manifest.profile != PROFILE
-        || manifest.linux_profile != "linux-tcp4-unix-private-v1"
+        || !matches!(
+            manifest.linux_profile.as_str(),
+            "linux-tcp4-unix-private-v1" | "linux-tcp4-unix-private-v2"
+        )
         || manifest.linux_request_revision != 3
         || manifest.linux_result_revision != 2
         || manifest.windows_profile != "windows-host-network-external-v1"
@@ -2946,6 +2949,9 @@ fn verify_index(
     artifact_root: &Path,
     scope: VerificationScope,
 ) -> VerificationResult<Verdict> {
+    let manifest: Manifest =
+        toml::from_str(std::str::from_utf8(manifest_bytes).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     header(
         &index.format,
         index.revision,
@@ -3050,7 +3056,7 @@ fn verify_index(
         if products.insert(product.key.clone(), product).is_some() {
             return Err("duplicate product cell".into());
         }
-        if let Err(error) = verify_product(index, product, &custody) {
+        if let Err(error) = verify_product(index, product, &custody, &manifest.linux_profile) {
             failures.push(format!("{:?}: {error}", product.key));
         }
     }
@@ -3417,6 +3423,7 @@ fn verify_product(
     index: &EvidenceIndex,
     product: &ProductObservation,
     custody: &custody::Custody,
+    linux_profile: &str,
 ) -> VerificationResult<()> {
     let origin = producer_origin(index, &product.key.target, Some(&product.key.channel))?;
     host(&product.host, &product.key.target)?;
@@ -3431,7 +3438,7 @@ fn verify_product(
         (
             3,
             2,
-            "linux-tcp4-unix-private-v1",
+            linux_profile,
             &["private-tcp", "sealed-runtime"],
             &["public-cli", "sealed-agent"],
         )

@@ -601,7 +601,8 @@ mod native {
             move |frontend_pid, _, _| {
                 let deadline = deadlines.work.min(Instant::now() + Duration::from_secs(60));
                 loop {
-                    let held = memcordon_testkit::windows_processes_for_image(&fixture)?;
+                    let held =
+                        memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?;
                     if transcript.is_file() && !held.is_empty() {
                         *captured_family
                             .lock()
@@ -684,7 +685,9 @@ mod native {
                     )
                     .map_err(io::Error::other)?
                     {
-                        let held = memcordon_testkit::windows_processes_for_image(&fixture)?;
+                        let held = memcordon_testkit::windows_processes_for_image_until(
+                            &fixture, deadline,
+                        )?;
                         if held.len() == 2
                             && held
                                 .iter()
@@ -1220,7 +1223,11 @@ mod native {
             || held
                 .iter()
                 .any(|process| !process.has_exited().unwrap_or(false))
-            || !memcordon_testkit::windows_processes_for_image(&config.fixture.path)?.is_empty()
+            || !memcordon_testkit::windows_processes_for_image_until(
+                &config.fixture.path,
+                deadlines.cleanup,
+            )?
+            .is_empty()
         {
             return Err(CiError::Message(
                 "loss fixture native held family did not retire".into(),

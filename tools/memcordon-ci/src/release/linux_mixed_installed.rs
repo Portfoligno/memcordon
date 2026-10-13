@@ -5583,14 +5583,23 @@ pub fn owned_fixture_recipes(cell: &ProductKey) -> Result<Vec<InstalledMixedReci
         },
         R::IntraAttemptDescriptorTransfer { id: id("rights")? },
     ];
+    let child_error_pair = R::UnixSeqpacketPair {
+        id: id("child-error-pair")?,
+    };
     let mut result = Vec::new();
     let mut add = |family: &str,
                    scenario: &str,
                    mode: &str,
                    args: Vec<std::ffi::OsString>,
-                   requirements: Vec<R>,
+                   mut requirements: Vec<R>,
                    outputs: Vec<RootRelativePath>,
                    deadline: &str| {
+        if requirements
+            .iter()
+            .any(|requirement| matches!(requirement, R::GeneratedExecutable { .. }))
+        {
+            requirements.push(child_error_pair.clone());
+        }
         result.push(InstalledMixedRecipe {
             key: CaseKey {
                 target: cell.target.clone(),
@@ -6886,6 +6895,59 @@ impl InstalledMixedLaunch {
         Ok(())
     }
 
+    fn capture_snapshot(path: &Path) -> String {
+        let observed = (|| -> std::io::Result<(u64, Vec<u8>)> {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o7777 != 0o600
+            {
+                return Err(std::io::Error::other("capture source custody differs"));
+            }
+            let named = std::fs::symlink_metadata(path)?;
+            if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
+                return Err(std::io::Error::other("capture source name differs"));
+            }
+            let length = metadata.len();
+            let mut bytes = vec![0; usize::try_from(length.min(4096)).expect("bounded tail")];
+            file.read_exact_at(&mut bytes, length.saturating_sub(4096))?;
+            let after = file.metadata()?;
+            let named = std::fs::symlink_metadata(path)?;
+            if after.dev() != metadata.dev()
+                || after.ino() != metadata.ino()
+                || after.uid() != 0
+                || after.nlink() != 1
+                || after.mode() & 0o7777 != 0o600
+                || named.dev() != after.dev()
+                || named.ino() != after.ino()
+            {
+                return Err(std::io::Error::other(
+                    "capture source changed during snapshot",
+                ));
+            }
+            Ok((length, bytes))
+        })();
+        let name: String = path.to_string_lossy().chars().take(256).collect();
+        match observed {
+            Ok((length, bytes)) => format!(
+                "path={name:?}; path-truncated={}; snapshot-complete=false; observed-bytes={length}; tail-truncated={}; tail={:?}",
+                path.to_string_lossy().chars().count() > 256,
+                length > bytes.len() as u64,
+                String::from_utf8_lossy(&bytes),
+            ),
+            Err(error) => format!(
+                "path={name:?}; snapshot-complete=false; unavailable(kind={:?},raw-os-error={:?})",
+                error.kind(),
+                error.raw_os_error(),
+            ),
+        }
+    }
+
     pub fn acquire_prepared(
         &mut self,
         provider: &memcordon_core::PublicProviderBindingV1,
@@ -6947,64 +7009,11 @@ impl InstalledMixedLaunch {
                         error.raw_os_error()
                     ),
                 };
-                let snapshot = |path: &Path| {
-                    let observed = (|| -> std::io::Result<(u64, Vec<u8>)> {
-                        let file = OpenOptions::new()
-                            .read(true)
-                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                            .open(path)?;
-                        let metadata = file.metadata()?;
-                        if !metadata.is_file()
-                            || metadata.uid() != 0
-                            || metadata.nlink() != 1
-                            || metadata.mode() & 0o7777 != 0o600
-                        {
-                            return Err(std::io::Error::other("capture source custody differs"));
-                        }
-                        let named = std::fs::symlink_metadata(path)?;
-                        if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
-                            return Err(std::io::Error::other("capture source name differs"));
-                        }
-                        let length = metadata.len();
-                        let mut bytes =
-                            vec![0; usize::try_from(length.min(4096)).expect("bounded tail")];
-                        file.read_exact_at(&mut bytes, length.saturating_sub(4096))?;
-                        let after = file.metadata()?;
-                        let named = std::fs::symlink_metadata(path)?;
-                        if after.dev() != metadata.dev()
-                            || after.ino() != metadata.ino()
-                            || after.uid() != 0
-                            || after.nlink() != 1
-                            || after.mode() & 0o7777 != 0o600
-                            || named.dev() != after.dev()
-                            || named.ino() != after.ino()
-                        {
-                            return Err(std::io::Error::other(
-                                "capture source changed during snapshot",
-                            ));
-                        }
-                        Ok((length, bytes))
-                    })();
-                    let name: String = path.to_string_lossy().chars().take(256).collect();
-                    match observed {
-                        Ok((length, bytes)) => format!(
-                            "path={name:?}; path-truncated={}; snapshot-complete=false; observed-bytes={length}; tail-truncated={}; tail={:?}",
-                            path.to_string_lossy().chars().count() > 256,
-                            length > bytes.len() as u64,
-                            String::from_utf8_lossy(&bytes),
-                        ),
-                        Err(error) => format!(
-                            "path={name:?}; snapshot-complete=false; unavailable(kind={:?},raw-os-error={:?})",
-                            error.kind(),
-                            error.raw_os_error(),
-                        ),
-                    }
-                };
                 return Err(CiError::Message(format!(
                     "no authenticated prepared observation before native timeout; launch owner retained; frontend-pid={}; observed-status={status}; stdout=[{}]; stderr=[{}]",
                     self.frontend.id(),
-                    snapshot(&self.stdout),
-                    snapshot(&self.stderr),
+                    Self::capture_snapshot(&self.stdout),
+                    Self::capture_snapshot(&self.stderr),
                 )));
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -7637,7 +7646,13 @@ impl InstalledMixedLaunch {
             std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
         let raw_result = crate::linux_consumer_readiness::measured(&self.result, 4 * 1024 * 1024)
-            .map_err(CiError::Message)?;
+            .map_err(|error| {
+            CiError::Message(format!(
+                "{error}; observed-frontend-status={status:?}; stdout=[{}]; stderr=[{}]",
+                Self::capture_snapshot(&self.stdout),
+                Self::capture_snapshot(&self.stderr),
+            ))
+        })?;
         let result =
             memcordon_core::result_v2::ResultV2::parse(&raw_result).map_err(CiError::Message)?;
         let frontend_status = status.code().ok_or_else(|| {
@@ -9210,7 +9225,15 @@ pub fn activate_owned_policy_staged_until(
     ))?;
     let approved_plan_digest = DiagnosticSha256::from_bytes(Sha256::digest(&approved).into());
     retain(&output.join("approved-plan.json"), &approved)?;
-    let profile = profile_reference();
+    let seqpacket = requirements
+        .as_slice()
+        .iter()
+        .any(|requirement| matches!(requirement, RequirementV3::UnixSeqpacketPair { .. }));
+    let profile = if seqpacket {
+        profile_reference_v2()
+    } else {
+        profile_reference()
+    };
     let grant = PolicyGrantV3 {
         id: id("owned-readiness-grant")?,
         revision: NonZeroU64::new(1).expect("one"),
@@ -9366,7 +9389,11 @@ pub fn activate_owned_policy_staged_until(
             grant_revision: NonZeroU64::new(1).expect("one"),
             approved_plan_digest,
         },
-        ceiling: MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain,
+        ceiling: if seqpacket {
+            MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsAndSeqpacketPairsIntraAttemptNoGain
+        } else {
+            MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain
+        },
         requirements,
         execution_identity,
         runtime_image,

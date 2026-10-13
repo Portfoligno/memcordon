@@ -1523,6 +1523,11 @@ fn tcp_http(
             {
                 return Err("owned compiler/input/output paths must be absolute".into());
             }
+            if linker.parent() != Some(std::path::Path::new("/usr/bin")) {
+                return Err(
+                    "owned compiler driver must use the immutable image program directory".into(),
+                );
+            }
             let config_path = directory.join("owned-cargo-config.toml");
             let mut config = std::fs::OpenOptions::new()
                 .write(true)
@@ -1532,6 +1537,13 @@ fn tcp_http(
             serde_json::to_writer(
                 &mut config,
                 linker.to_str().ok_or("owned linker path not UTF-8")?,
+            )?;
+            config.write_all(b"\nrustflags = ")?;
+            // GCC also needs an explicit search for its copied ld/as children;
+            // the compiler environment intentionally has no ambient PATH.
+            serde_json::to_writer(
+                &mut config,
+                &["-C", "link-arg=-B", "-C", "link-arg=/usr/bin/"],
             )?;
             config.write_all(b"\n")?;
             config.sync_all()?;
@@ -1658,14 +1670,31 @@ fn tcp_http(
                                     .ok_or("joint allocator unexpectedly returned")?,
                             ));
                         }
-                        let mut gate = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                            .open(directory.join("generated-child-controller-release"))?;
+                        let gate_directory = std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+                            .open(&directory)?;
+                        let pending = "generated-child-controller-release.pending";
+                        let mut gate = std::fs::File::from(rustix::fs::openat(
+                            &gate_directory,
+                            pending,
+                            rustix::fs::OFlags::WRONLY
+                                | rustix::fs::OFlags::CREATE
+                                | rustix::fs::OFlags::EXCL
+                                | rustix::fs::OFlags::NOFOLLOW
+                                | rustix::fs::OFlags::CLOEXEC,
+                            rustix::fs::Mode::from_raw_mode(0o666),
+                        )?);
                         gate.write_all(b"R")?;
                         gate.sync_all()?;
-                        std::fs::File::open(&directory)?.sync_all()?;
+                        rustix::fs::renameat_with(
+                            &gate_directory,
+                            pending,
+                            &gate_directory,
+                            "generated-child-controller-release",
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        )?;
+                        gate_directory.sync_all()?;
                         generated_held = true;
                     }
                 }

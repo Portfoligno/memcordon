@@ -1428,6 +1428,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                     {
                         Ok(()) => Ok(()),
                         Err(mut failure) => {
+                            let original_detail = failure.detail.clone();
                             if let Some(cleanup_failures) =
                                 take_fallback_cleanup_failures(&attempt_id)
                             {
@@ -1446,6 +1447,20 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                     Some(TerminalCandidate::Authoritative(_))
                                 )
                             {
+                                let diagnostic = super::record::bounded_terminalization_error(
+                                    memcordon_core::WindowsTerminalizationErrorStageV1::ReceiptBuild,
+                                    failure.code,
+                                    original_detail,
+                                    failure.os_code,
+                                );
+                                if let Err(error) = super::record::record_terminalization_failure(
+                                    &attempt_id,
+                                    memcordon_core::WindowsTerminalizationOwnerV1::LauncherWorker,
+                                    diagnostic,
+                                ) {
+                                    failure.detail.push_str("; secondary retained-attempt diagnostic persistence failure: ");
+                                    failure.detail.push_str(&error);
+                                }
                                 pipe::disconnect(connection);
                                 return Err(format!(
                                     "{}; postauthorization authority retained until authenticated terminal proof is available",
@@ -3360,21 +3375,41 @@ fn launch_attempt(
         process_observer.freeze(cleanup_guard.record.target_identity.clone(), None);
     super::diagnostics::merge_into(&mut cleanup_guard.record.causal_diagnostics);
     let primary_failure = if monitor_failure.is_some() {
+        let provider = super::package::installed_public_provider_binding().map_err(|error| {
+            cleanup_guard.record.persist_retirement_operation_failure(
+                memcordon_core::WindowsTerminalizationErrorStageV1::ReceiptBuild,
+                "MCSEALED-WINDOWS-RETIREMENT-PROVIDER-BINDING",
+                error,
+            )
+        })?;
         Some(
             memcordon_core::ProviderFailureDiagnosticV1::from_journal(
-                super::package::installed_public_provider_binding()?,
+                provider,
                 &cleanup_guard.record.attempt_id,
                 &cleanup_guard.record.request_sha256,
                 &cleanup_guard.record.causal_diagnostics,
             )
-            .map_err(str::to_owned)?,
+            .map_err(|error| {
+                cleanup_guard.record.persist_retirement_operation_failure(
+                    memcordon_core::WindowsTerminalizationErrorStageV1::ReceiptBuild,
+                    "MCSEALED-WINDOWS-RETIREMENT-FAILURE-DIAGNOSTIC",
+                    error.to_owned(),
+                )
+            })?,
         )
     } else {
         None
     };
     cleanup_guard
         .record
-        .freeze_terminal_seed(process_observation.clone(), primary_failure.clone())?;
+        .freeze_terminal_seed(process_observation.clone(), primary_failure.clone())
+        .map_err(|error| {
+            cleanup_guard.record.persist_retirement_operation_failure(
+                memcordon_core::WindowsTerminalizationErrorStageV1::ReceiptBuild,
+                "MCSEALED-WINDOWS-RETIREMENT-TERMINAL-SEED",
+                error,
+            )
+        })?;
     let child_pid = target.process_id;
     inject_fault(
         &request,

@@ -12,6 +12,11 @@ pub fn combined_catalog_digest() -> String {
             .semantic_digest
             .bytes(),
     );
+    bytes.extend_from_slice(
+        crate::workload_registry_v3::profile_reference_v2()
+            .semantic_digest
+            .bytes(),
+    );
     String::from(crate::workload_codec::hash_bytes(&bytes))
 }
 
@@ -213,6 +218,7 @@ impl RuntimeManifest {
         *workload_contract_schema = 3;
         *profile_catalog_sha256 = combined_catalog_digest();
         profiles.push("linux-tcp4-unix-private-v1".into());
+        profiles.push("linux-tcp4-unix-private-v2".into());
         value.validate()?;
         Ok(value)
     }
@@ -409,6 +415,7 @@ impl RuntimeManifest {
                             "linux-unix-create-v1",
                             "linux-tcp4-private-v1",
                             "linux-tcp4-unix-private-v1",
+                            "linux-tcp4-unix-private-v2",
                         ];
                 let matching_protocol = match native_protocols {
                     NativeProviderProtocols::Linux {

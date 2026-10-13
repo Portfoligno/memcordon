@@ -62,6 +62,50 @@ fn contract() -> WorkloadContractV3 {
 }
 
 #[test]
+fn seqpacket_authority_requires_distinct_profile_and_ceiling() {
+    use memcordon_core::workload_registry_v3::{
+        is_supported_profile, profile_reference, profile_reference_v2,
+    };
+    let original = profile_reference();
+    let expanded = profile_reference_v2();
+    assert_ne!(original.id, expanded.id);
+    assert_ne!(original.semantic_digest, expanded.semantic_digest);
+    assert!(is_supported_profile(&original));
+    assert!(is_supported_profile(&expanded));
+    let mut mixed = original.clone();
+    mixed.semantic_digest = expanded.semantic_digest.clone();
+    assert!(!is_supported_profile(&mixed));
+    let mut request = contract();
+    request.authorized_profile = original;
+    request.requirements = bounded(vec![RequirementV3::UnixSeqpacketPair {
+        id: id("spawn-channel"),
+    }]);
+    assert!(request.validate().is_err());
+    request.authorized_profile = expanded;
+    assert!(request.validate().is_err());
+    request.ceiling =
+        MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsAndSeqpacketPairsIntraAttemptNoGain;
+    assert!(request.validate().is_ok());
+    assert!(request.canonical_bytes().unwrap().ends_with(&[8]));
+    let mut snapshot = memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot {
+        format: "memcordon.private-admission-metadata".into(),
+        revision: 2,
+        attempt_id: memcordon_core::BoundedText::new(&"ab".repeat(16)).unwrap(),
+        request_sha256: request.digest().unwrap(),
+        request: request.clone(),
+        invocation_sha256: DiagnosticSha256::from_bytes([9; 32]),
+        caller_uid: 1000,
+        registry_digest: DiagnosticSha256::from_bytes([10; 32]),
+        epoch: request.expected_epoch.clone(),
+        admission_nonce: Nonce128([11; 16]),
+        profile_id: request.authorized_profile.clone(),
+    };
+    assert!(snapshot.validate().is_ok());
+    snapshot.profile_id = profile_reference();
+    assert!(snapshot.validate().is_err());
+}
+
+#[test]
 fn combined_canonical_bytes_match_independently_encoded_known_answer() {
     // Fixed wire vector assembled from the documented domain, big-endian
     // lengths/tags and explicit object markers; no producer codec computes it.

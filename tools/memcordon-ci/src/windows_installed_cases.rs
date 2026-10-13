@@ -976,7 +976,8 @@ mod native {
                 }
             };
             if ready {
-                let family = memcordon_testkit::windows_processes_for_image(fixture)?;
+                let family =
+                    memcordon_testkit::windows_processes_for_image_until(fixture, deadline)?;
                 let expected = if case == InstalledCase::SamplingPopulation {
                     acceptance::WINDOWS_CAUSAL_CONCURRENT_CHILDREN + 1
                 } else {
@@ -1284,8 +1285,11 @@ mod native {
                     .into_iter()
                     .all(|exited| exited);
                 if held_retired
-                    && memcordon_testkit::windows_processes_for_image(&config.fixture.path)?
-                        .is_empty()
+                    && memcordon_testkit::windows_processes_for_image_until(
+                        &config.fixture.path,
+                        deadline,
+                    )?
+                    .is_empty()
                 {
                     return Ok(());
                 }

@@ -312,7 +312,8 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
         [
             "linux-unix-create-v1",
             "linux-tcp4-private-v1",
-            "linux-tcp4-unix-private-v1"
+            "linux-tcp4-unix-private-v1",
+            "linux-tcp4-unix-private-v2"
         ]
     );
 }

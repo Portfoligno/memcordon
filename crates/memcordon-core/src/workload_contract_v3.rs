@@ -10,6 +10,7 @@ use crate::workload_contract::{
 use crate::{BoundedVec, DiagnosticSha256};
 
 pub const PROFILE: &str = "linux-tcp4-unix-private-v1";
+pub const PROFILE_V2: &str = "linux-tcp4-unix-private-v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -89,6 +90,7 @@ pub enum MixedPrivateCeiling {
     /// All IPv4 TCP addresses reachable in the loopback-only private stack;
     /// Unix streams and descriptor transfer only within the fresh attempt root.
     FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain,
+    FreshRootIpv4TcpUnixStreamsAndSeqpacketPairsIntraAttemptNoGain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,6 +145,9 @@ pub enum RequirementV3 {
     UnixStreamPair {
         id: LogicalId,
     },
+    UnixSeqpacketPair {
+        id: LogicalId,
+    },
     UnixPathStream {
         id: LogicalId,
         writable_root: LogicalId,
@@ -168,6 +173,7 @@ impl RequirementV3 {
         match self {
             Self::TcpListener { id, .. }
             | Self::UnixStreamPair { id }
+            | Self::UnixSeqpacketPair { id }
             | Self::UnixPathStream { id, .. }
             | Self::UnixAbstractStream { id }
             | Self::IntraAttemptDescriptorTransfer { id }
@@ -217,12 +223,29 @@ impl WorkloadContractV3 {
             return Err("workload plan differs from the authorized plan".into());
         }
         if self.schema_version != ContractVersionThree::new()
-            || self.authorized_profile.id.as_str() != PROFILE
+            || !matches!(self.authorized_profile.id.as_str(), PROFILE | PROFILE_V2)
         {
             return Err("V3 requires the exact combined profile version".into());
         }
         let mut ids = BTreeSet::new();
+        if !matches!(
+            (self.authorized_profile.id.as_str(), self.ceiling),
+            (
+                PROFILE,
+                MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain
+            ) | (
+                PROFILE_V2,
+                MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsAndSeqpacketPairsIntraAttemptNoGain
+            )
+        ) {
+            return Err("combined profile and declared ceiling differ".into());
+        }
         for requirement in self.requirements.as_slice() {
+            if matches!(requirement, RequirementV3::UnixSeqpacketPair { .. })
+                && self.authorized_profile.id.as_str() != PROFILE_V2
+            {
+                return Err("anonymous seqpacket pair requires combined profile v2".into());
+            }
             if !ids.insert(requirement.id()) {
                 return Err("duplicate V3 requirement id".into());
             }
@@ -243,7 +266,12 @@ impl WorkloadContractV3 {
         encoder.id(&self.authorization.grant_id)?;
         encoder.u64(self.authorization.grant_revision.get())?;
         encoder.digest(&self.authorization.approved_plan_digest)?;
-        encoder.byte(1)?;
+        encoder.byte(match self.ceiling {
+            MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain => 1,
+            MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsAndSeqpacketPairsIntraAttemptNoGain => {
+                2
+            }
+        })?;
         for object in [
             &self.execution_identity.identity,
             &self.execution_identity.exclusive_use_policy,
@@ -284,6 +312,7 @@ impl WorkloadContractV3 {
                     }
                 }
                 RequirementV3::UnixStreamPair { .. } => encoder.byte(2)?,
+                RequirementV3::UnixSeqpacketPair { .. } => encoder.byte(8)?,
                 RequirementV3::UnixPathStream { writable_root, .. } => {
                     encoder.byte(3)?;
                     encoder.id(writable_root)?;

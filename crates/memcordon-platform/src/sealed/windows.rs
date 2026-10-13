@@ -20,19 +20,20 @@ use memcordon_core::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, EqualSid, GetLengthSid, GetTokenInformation, IsValidSid,
-    LookupAccountNameW, PROTECTED_DACL_SECURITY_INFORMATION, SID, SID_AND_ATTRIBUTES,
+    CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetLengthSid, GetTokenInformation,
+    IsValidSid, PROTECTED_DACL_SECURITY_INFORMATION, SID, SID_AND_ATTRIBUTES,
     SetKernelObjectSecurity, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups,
-    TokenRestrictedSids, TokenUser,
+    TokenRestrictedSids, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalServiceSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FILE_TYPE_PIPE, GetFileType,
@@ -458,7 +459,8 @@ fn probe_with_binding() -> Result<
                     env!("CARGO_PKG_VERSION")
                 ) =>
         {
-            runtime::verify_binding(&observation.provider_binding)?;
+            runtime::verify_binding(&observation.provider_binding)
+                .map_err(|detail| format!("probe installed runtime binding: {detail}"))?;
             let provider_binding = observation.provider_binding.clone();
             Ok((observation, provider_binding))
         }
@@ -471,14 +473,12 @@ fn probe_with_binding() -> Result<
 
 fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
     let process = unsafe { GetCurrentProcess() };
-    let mut token = ptr::null_mut();
-    // SAFETY: the current-process pseudo-handle is valid and token receives an
-    // owned query handle.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(native_api_failure("OpenProcessToken(current, TOKEN_QUERY)"));
-    }
-    let token = OwnedHandle::new(token)?;
-    let user = token_user_sid_string(token.raw())
+    // Windows SDK GetCurrentProcessToken is an inline function returning -4.
+    // Query the actual primary process token through its query-only pseudo-handle:
+    // reopening the token object can fail its DACL check for a restricted caller.
+    // This borrowed pseudo-handle must not become an OwnedHandle or be duplicated.
+    let token = -4_isize as HANDLE;
+    let user = token_user_sid_string(token)
         .map_err(|detail| format!("current token user identity: {detail}"))?;
     // The broker opens this process while impersonating the authenticated
     // caller. A restricted token must satisfy the normal user and restricting
@@ -1472,13 +1472,8 @@ fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
         ));
     }
     let token = OwnedHandle::new(token)?;
-    let local_service = account_sid(r"NT AUTHORITY\LocalService")
-        .map_err(|detail| format!("resolve LocalService SID: {detail}"))?;
-    let control_service = account_sid(&format!(
-        r"NT SERVICE\{}",
-        memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
-    ))
-    .map_err(|detail| format!("resolve control service SID: {detail}"))?;
+    let local_service = well_known_sid(WinLocalServiceSid)?;
+    let control_service = control_service_sid()?;
     if !token_user_matches(token.raw(), &local_service)
         .map_err(|detail| format!("provider TokenUser identity: {detail}"))?
         || !token_groups_contain(token.raw(), TokenGroups, &control_service)
@@ -1494,45 +1489,64 @@ fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
     Ok(())
 }
 
-fn account_sid(account: &str) -> Result<Vec<u32>, String> {
-    let account = account
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u32>, String> {
     let mut sid_bytes = 0_u32;
-    let mut domain_chars = 0_u32;
-    let mut use_kind = 0_i32;
-    // SAFETY: documented sizing call with null output buffers.
-    unsafe {
-        LookupAccountNameW(
-            ptr::null(),
-            account.as_ptr(),
-            ptr::null_mut(),
-            &raw mut sid_bytes,
-            ptr::null_mut(),
-            &raw mut domain_chars,
-            &raw mut use_kind,
-        )
-    };
+    // SAFETY: fixed well-known identity, null domain and sizing output.
+    unsafe { CreateWellKnownSid(kind, ptr::null_mut(), ptr::null_mut(), &raw mut sid_bytes) };
     if sid_bytes == 0 {
-        return Err(native_api_failure("LookupAccountNameW(size)"));
+        return Err(native_api_failure("CreateWellKnownSid(size)"));
     }
     let mut sid = vec![0_u32; (sid_bytes as usize).div_ceil(std::mem::size_of::<u32>())];
-    let mut domain = vec![0_u16; domain_chars as usize];
-    // SAFETY: both buffers have the exact capacities returned by the sizing call.
+    // SAFETY: DWORD-aligned SID buffer has the capacity returned above.
     if unsafe {
-        LookupAccountNameW(
-            ptr::null(),
-            account.as_ptr(),
+        CreateWellKnownSid(
+            kind,
+            ptr::null_mut(),
             sid.as_mut_ptr().cast(),
             &raw mut sid_bytes,
-            domain.as_mut_ptr(),
-            &raw mut domain_chars,
-            &raw mut use_kind,
         )
     } == 0
     {
-        return Err(native_api_failure("LookupAccountNameW(data)"));
+        return Err(native_api_failure("CreateWellKnownSid(data)"));
+    }
+    Ok(sid)
+}
+
+fn control_service_sid() -> Result<Vec<u32>, String> {
+    // Derive the same virtual service identity used by native service hardening;
+    // fixed provider identities must not depend on caller account-lookup access.
+    let name = memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let length = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or("control service name exceeds UNICODE_STRING length")?;
+    let unicode = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let mut sid_bytes = 0_u32;
+    // SAFETY: live counted UTF-16 name and writable sizing output.
+    unsafe { RtlCreateServiceSid(&raw const unicode, ptr::null_mut(), &raw mut sid_bytes) };
+    if sid_bytes == 0 {
+        return Err("RtlCreateServiceSid(control, size) returned no SID capacity".into());
+    }
+    let mut sid = vec![0_u32; (sid_bytes as usize).div_ceil(std::mem::size_of::<u32>())];
+    // SAFETY: live name and aligned writable buffer sized by the native query.
+    let status = unsafe {
+        RtlCreateServiceSid(
+            &raw const unicode,
+            sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+        )
+    };
+    if status < 0 {
+        return Err(format!(
+            "RtlCreateServiceSid(control, data): NTSTATUS {status:#x}"
+        ));
     }
     Ok(sid)
 }
@@ -1792,7 +1806,7 @@ pub(crate) fn token_group_storage_contains(
             .cast_mut()
             .cast();
         // SAFETY: the validated entry SID and the trusted account SID returned
-        // by LookupAccountNameW remain live while EqualSid inspects them.
+        // by native SID construction remain live while EqualSid inspects them.
         if unsafe { EqualSid(sid, expected.as_ptr().cast_mut().cast()) } != 0
             && entry.Attributes & TOKEN_GROUP_ENABLED != 0
             && entry.Attributes & TOKEN_GROUP_USE_FOR_DENY_ONLY == 0

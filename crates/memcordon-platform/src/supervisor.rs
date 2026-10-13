@@ -1121,10 +1121,13 @@ fn validate_backend_execution(execution: &Execution) -> Result<(), Error> {
                 ) != execution.launch.target_released
         })
     {
-        return Err(Error::new(
-            ErrorCategory::Monitor,
-            "MCRESTART-AUTHORIZATION-EVIDENCE",
-            "backend release, target identity, and runtime evidence disagree",
+        return Err(authorization_evidence_failure(
+            match &execution.boundary_detail {
+                memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
+                    Some(&native.runtime)
+                }
+                _ => None,
+            },
         ));
     }
     if memcordon_core::boundary_evidence_is_consistent(
@@ -1140,6 +1143,48 @@ fn validate_backend_execution(execution: &Execution) -> Result<(), Error> {
             "backend returned contradictory launch or retirement evidence",
         ))
     }
+}
+
+fn authorization_evidence_failure(
+    carrier: Option<&memcordon_core::result_v2::MixedRuntimeCarrierV2>,
+) -> Error {
+    let mut detail = "backend release, target identity, and runtime evidence disagree".to_owned();
+    if let Some(carrier) = carrier.filter(|carrier| carrier.validate().is_ok()) {
+        if let memcordon_core::result_v2::MixedRuntimeOutcomeV2::Indeterminate {
+            attempt_id,
+            retained_obligations,
+            ..
+        } = &carrier.outcome
+        {
+            use std::fmt::Write;
+            let obligations = retained_obligations.obligations.as_slice();
+            let _ = write!(
+                detail,
+                "; native mixed indeterminate; attempt={}; authorization={:?}; obligations={}; omitted={}",
+                attempt_id.as_str(),
+                retained_obligations.authorization,
+                obligations.len(),
+                obligations.len().saturating_sub(6)
+            );
+            for (index, obligation) in obligations.iter().enumerate() {
+                if index < 4 || index >= obligations.len().saturating_sub(2) {
+                    let _ = write!(detail, "; obligation[{index}]={}", obligation.as_str());
+                }
+            }
+        }
+    }
+    Error::new(
+        ErrorCategory::Monitor,
+        "MCRESTART-AUTHORIZATION-EVIDENCE",
+        detail,
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn test_authorization_evidence_failure(
+    carrier: Option<&memcordon_core::result_v2::MixedRuntimeCarrierV2>,
+) -> Error {
+    authorization_evidence_failure(carrier)
 }
 
 fn supervision_remaining(

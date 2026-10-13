@@ -16,6 +16,8 @@ const VERSION: u16 = 3;
 mod mixed_observation_client;
 #[path = "private_client.rs"]
 mod private_client;
+#[cfg(feature = "test-support")]
+pub(crate) use private_client::incoming_reader_for_test;
 #[path = "private_relay.rs"]
 mod private_relay;
 pub use mixed_observation_client::MixedObservationScope;
@@ -1000,6 +1002,11 @@ fn encoded_frame(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     encoded_frame_for_version(VERSION, kind, nonce, attempt, payload)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn encoded_frame_for_test(kind: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+    encoded_frame_for_version(4, kind, [1; 16], [2; 16], payload)
 }
 
 fn encoded_frame_for_version(
