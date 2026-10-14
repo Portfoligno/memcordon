@@ -15,6 +15,8 @@ enum Operation {
         input: PathBuf,
         #[arg(long)]
         report_dir: PathBuf,
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+        jobs: u8,
     },
     #[command(hide = true)]
     Serve {
@@ -50,14 +52,16 @@ fn main() -> std::process::ExitCode {
             publisher,
             input,
             report_dir,
+            jobs,
         } => std::env::current_exe()
             .map_err(memcordon_ci::CiError::from)
             .and_then(|helper| {
-                memcordon_ci::rehearsal_support::coordinator::run(
+                memcordon_ci::rehearsal_support::coordinator::run_with_jobs(
                     &helper,
                     &publisher,
                     &input,
                     &report_dir,
+                    usize::from(jobs),
                 )
             }),
         Operation::Serve { case, state, ready } => {

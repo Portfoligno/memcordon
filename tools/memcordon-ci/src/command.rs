@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use memcordon_testkit::{ObservedOutput, run_with_deadline_output_limit};
+use memcordon_testkit::ObservedOutput;
 
 use crate::{CiError, Result};
 
@@ -36,6 +36,7 @@ pub struct CommandSpec {
     isolated_cargo_home: Option<PathBuf>,
     clear_environment: bool,
     output_limit: usize,
+    defer_group_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +102,7 @@ impl CommandSpec {
             isolated_cargo_home: None,
             clear_environment: false,
             output_limit: 16 * 1024 * 1024,
+            defer_group_failure: false,
         }
     }
 
@@ -136,6 +138,13 @@ impl CommandSpec {
 
     pub fn arg(mut self, argument: impl Into<OsString>) -> Self {
         self.arguments.push(argument.into());
+        self
+    }
+
+    /// Optional cache version probes can reject an image and rebuild it.
+    /// Their caller still propagates unknown native settlement as a failure.
+    pub fn defer_group_failure(mut self) -> Self {
+        self.defer_group_failure = true;
         self
     }
 
@@ -209,11 +218,12 @@ impl CommandSpec {
         command.env_remove("CARGO_REGISTRY_TOKEN");
         command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
         command.env_remove("GITHUB_TOKEN");
-        if matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
-            && self
-                .arguments
-                .first()
-                .is_some_and(|argument| argument == OsStr::new("test"))
+        if crate::preparation::active_group().is_some()
+            || matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+                && self
+                    .arguments
+                    .first()
+                    .is_some_and(|argument| argument == OsStr::new("test"))
         {
             // Test fixtures can call real release emitters concurrently. Their
             // observations must not enter the enclosing runner step's channels.
@@ -228,17 +238,12 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
-        let output = self.output()?;
+        let mut command = self.materialize()?;
+        let output = self.observe_with_progress(&mut command, true)?;
         if output.status.success() {
-            if !output.stdout.is_empty() {
-                print!("{}", String::from_utf8_lossy(&output.stdout));
-            }
-            if !output.stderr.is_empty() {
-                eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            }
             Ok(output.stdout)
         } else {
-            Err(CiError::Message(format!(
+            Err(CiError::SettledCommandFailure(format!(
                 "subprocess failed with {}; stdout={:?}; stderr={:?}",
                 output.status,
                 bounded_excerpt(&output.stdout),
@@ -450,8 +455,32 @@ impl CommandSpec {
     }
 
     fn observe(&self, command: &mut Command) -> Result<ObservedOutput> {
+        self.observe_with_progress(command, false)
+    }
+
+    fn observe_with_progress(
+        &self,
+        command: &mut Command,
+        progress: bool,
+    ) -> Result<ObservedOutput> {
+        let group = crate::preparation::active_group();
+        if group.as_ref().is_some_and(|group| !group.may_start()) {
+            return Err(CiError::NotStartedAfterFailure);
+        }
         let budget = self.available_budget()?;
         let started = Instant::now();
+        let diagnostic_directory = if self.phase.is_some() {
+            let directory = self.current_dir.join("target/ci/reports/execution");
+            std::fs::create_dir_all(&directory)?;
+            Some(
+                tempfile::Builder::new()
+                    .prefix("operation-")
+                    .tempdir_in(directory)?
+                    .keep(),
+            )
+        } else {
+            None
+        };
         let report = |state: &str,
                       observed_budget: Duration,
                       result: Option<
@@ -492,6 +521,34 @@ impl CommandSpec {
                         value["stderr"] = excerpt_json(stderr);
                         value["observation"] = serde_json::json!({"child-id": observation.child_id, "phase": "before-settlement", "clock-domain": "harness-monotonic", "timeout-observed-ms": observation.timeout_observed.as_millis(), "stdout-reader-finished": observation.stdout_reader_finished, "stderr-reader-finished": observation.stderr_reader_finished});
                     }
+                    Err(memcordon_testkit::ProcessTestError::Cancelled {
+                        stdout,
+                        stderr,
+                        cleanup,
+                        termination,
+                        observation,
+                    }) => {
+                        value["cancelled-by-peer"] = serde_json::json!(true);
+                        value["cleanup"] = serde_json::json!(if cleanup.is_ok()
+                            && observation.callback_completed
+                            && observation.stdout_reader_finished
+                            && observation.stderr_reader_finished
+                        {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        });
+                        value["termination"] = observation
+                            .observed_status
+                            .map(status_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        value["settlement-termination"] = termination
+                            .map(status_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        value["stdout"] = excerpt_json(stdout);
+                        value["stderr"] = excerpt_json(stderr);
+                        value["observation"] = serde_json::json!({"child-id": observation.child_id, "clock-domain": "harness-monotonic", "cancellation-observed-ms": observation.cancellation_observed.as_millis(), "callback-completed": observation.callback_completed, "stdout-reader-finished": observation.stdout_reader_finished, "stderr-reader-finished": observation.stderr_reader_finished});
+                    }
                     Err(memcordon_testkit::ProcessTestError::OutputLimit {
                         stdout,
                         stderr,
@@ -522,8 +579,9 @@ impl CommandSpec {
                     }
                 }
             }
-            let directory = self.current_dir.join("target/ci/reports/execution");
-            std::fs::create_dir_all(&directory)?;
+            let directory = diagnostic_directory
+                .as_ref()
+                .expect("phase diagnostics allocated");
             let temporary = directory.join(phase.name()).with_extension("tmp");
             let path = directory.join(phase.name()).with_extension("json");
             crate::release::source::write_diagnostic_json(&temporary, &value)?;
@@ -534,7 +592,150 @@ impl CommandSpec {
             eprintln!("diagnostic retention incomplete: {error}");
         }
         let budget = self.available_budget()?;
-        let result = run_with_deadline_output_limit(command, budget, self.output_limit);
+        let ordinary = (matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+            && self.arguments.first().is_some_and(|argument| {
+                matches!(
+                    argument.to_str(),
+                    Some(
+                        "build" | "check" | "clippy" | "rustdoc" | "fetch" | "metadata" | "install"
+                    )
+                ) || (argument == "test"
+                    && self.arguments.iter().any(|argument| argument == "--no-run"))
+            }))
+            || matches!(&self.toolchain,
+                Some(ToolchainInvocation::Program { executable, .. })
+                if executable.file_name().is_some_and(|name| matches!(name.to_str(), Some("cargo-audit" | "cargo-audit.exe" | "cargo-deny" | "cargo-deny.exe"))));
+        let cancellation = if ordinary {
+            group.as_ref().map(|group| group.requested.clone())
+        } else {
+            None
+        };
+        let result =
+            std::thread::scope(|scope| {
+                let lane = match std::thread::current().name() {
+                    Some("ci-source-lane") => "first",
+                    Some("ci-auxiliary-lane") => "second",
+                    _ => "owner",
+                };
+                let phase = self.phase.map_or("command", CiPhase::name);
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
+                let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let logger_done = done.clone();
+                let secrets: Vec<String> = [
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "CARGO_REGISTRY_TOKEN",
+                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok())
+                .filter(|value| !value.is_empty())
+                .collect();
+                let logger = scope.spawn(move || {
+                let mut pending = [Vec::new(), Vec::new()];
+                let mut discarding = [false, false];
+                let mut remaining: usize = 1024 * 1024;
+                let mut omitted_lines = 0;
+                let mut final_chunks = 0;
+                loop {
+                    let next = if logger_done.load(std::sync::atomic::Ordering::Acquire) {
+                        if final_chunks == 32 { break; }
+                        final_chunks += 1;
+                        receiver
+                            .try_recv()
+                            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        receiver.recv_timeout(Duration::from_millis(25))
+                    };
+                    let chunk = match next {
+                        Ok(chunk) => chunk,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    };
+                    let stream = match chunk.stream {
+                        memcordon_testkit::OutputStream::Stdout => 0,
+                        memcordon_testkit::OutputStream::Stderr => 1,
+                    };
+                    for byte in chunk.bytes {
+                        if byte == b'\n' {
+                            if !discarding[stream] && remaining > 0 {
+                                let mut text =
+                                    String::from_utf8_lossy(&pending[stream]).into_owned();
+                                for secret in &secrets {
+                                    text = text.replace(secret, "[redacted]");
+                                }
+                                let lower = text.to_ascii_lowercase();
+                                if [
+                                    "authorization:",
+                                    "access_token",
+                                    "refresh_token",
+                                    "password=",
+                                    "token=",
+                                ]
+                                .iter()
+                                .any(|field| lower.contains(field))
+                                {
+                                    text = "[sensitive HTTP material redacted]".into();
+                                }
+                                let safe: String =
+                                    text.chars().flat_map(char::escape_default).collect();
+                                remaining = remaining.saturating_sub(safe.len());
+                                eprintln!("[ci {lane} {phase} {:?}] {safe}", chunk.stream);
+                            } else if !discarding[stream] {
+                                omitted_lines += 1;
+                            }
+                            pending[stream].clear();
+                            discarding[stream] = false;
+                        } else if pending[stream].len() < 8192 && !discarding[stream] {
+                            pending[stream].push(byte);
+                        } else {
+                            // Discard an oversized whole line instead of leaking a
+                            // credential split at the progress/capture boundary.
+                            pending[stream].clear();
+                            discarding[stream] = true;
+                            omitted_lines += 1;
+                        }
+                    }
+                }
+                omitted_lines += pending.iter().filter(|line| !line.is_empty()).count();
+                if omitted_lines != 0 {
+                    eprintln!(
+                        "[ci child] omitted {omitted_lines} incomplete or oversized progress lines"
+                    );
+                }
+            });
+                let progress = progress.then(|| memcordon_testkit::ProgressOutput {
+                    sender,
+                    omitted: omitted.clone(),
+                });
+                let result = memcordon_testkit::run_with_deadline_controlled_output_limit(
+                    command,
+                    budget,
+                    self.output_limit,
+                    cancellation,
+                    progress,
+                );
+                done.store(true, std::sync::atomic::Ordering::Release);
+                // Incomplete reader settlement cannot keep the logger waiting for
+                // a sender forever. The native result remains authoritative.
+                logger.join().expect("bounded progress logger panicked");
+                let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
+                if omitted != 0 {
+                    eprintln!("[ci child] omitted {omitted} progress chunks");
+                }
+                result
+            });
+        if !self.defer_group_failure
+            && (result.as_ref().is_err()
+                || result.as_ref().is_ok_and(|output| !output.status.success()))
+        {
+            if let Some(group) = &group {
+                group.request_after_failure();
+            }
+        }
         let state = if result.as_ref().is_ok_and(|output| output.status.success()) {
             "completed"
         } else {
@@ -544,8 +745,14 @@ impl CommandSpec {
             eprintln!("diagnostic retention incomplete: {error}");
         }
         result.map_err(|error| match error {
+            memcordon_testkit::ProcessTestError::Spawn(error) => CiError::CommandSpawnFailure(error),
             memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, cleanup, termination } => CiError::Message(format!("subprocess output exceeds byte limit; cleanup={cleanup:?}; termination={termination:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr))),
             memcordon_testkit::ProcessTestError::Timeout { deadline, stdout, stderr, cleanup, observation } => CiError::Message(format!("subprocess exceeded {deadline:?}; cleanup={cleanup:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr))),
+            memcordon_testkit::ProcessTestError::Cancelled { stdout, stderr, cleanup, termination, observation } => {
+                let settled = cleanup.is_ok() && observation.callback_completed && observation.stdout_reader_finished && observation.stderr_reader_finished;
+                let details = format!("cleanup={cleanup:?}; termination={termination:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr));
+                if settled { CiError::SettledCancellation(details) } else { CiError::Cancelled(details) }
+            },
             error => CiError::Message(bounded_excerpt(error.to_string().as_bytes())),
         })
     }

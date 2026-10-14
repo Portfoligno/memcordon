@@ -25,6 +25,14 @@ pub fn package(root: &Path) -> Result<()> {
     package_file(&sibling, &root.join(".release/rehearsal-tool"))
 }
 
+/// Package the explicitly selected current helper, independently of driver location.
+pub fn package_selected(root: &Path, executable: Option<&Path>) -> Result<()> {
+    match executable {
+        Some(image) => package_file(image, &root.join(".release/rehearsal-tool")),
+        None => package(root),
+    }
+}
+
 /// The explicit path seam also permits archive-contract tests without a build.
 pub fn package_file(image: &Path, destination: &Path) -> Result<()> {
     if destination.try_exists()? {

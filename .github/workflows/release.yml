@@ -6,6 +6,11 @@ on:
     tags: ["[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
+      failure-mode:
+        description: Stop quickly or collect all native test failures
+        type: choice
+        default: stop-after-failure
+        options: [stop-after-failure, collect-all]
       preparation-mode:
         description: Candidate preparation or an existing tagged release
         required: true
@@ -51,7 +56,6 @@ jobs:
       preparation-kind: ${{ steps.source.outputs.preparation-kind }}
       selection-artifact-id: ${{ steps.selection.outputs.artifact-id }}
       preparation-tool-artifact-id: ${{ steps.tool.outputs.artifact-id }}
-      rehearsal-tool-artifact-id: ${{ steps.rehearsal-tool.outputs.artifact-id }}
     steps:
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -61,31 +65,27 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         id: deps
         with:
           path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: release-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin memcordon-release-rehearsal
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+      - name: Check formatting before driver compilation
+        if: github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare'
+        run: rustup run 1.97.1 cargo fmt --all -- --check
+      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - id: source
         run: ./target/ci/release/memcordon-ci release select-preparation
-      - name: Package the rehearsal helper
-        run: ./target/ci/release/memcordon-ci release rehearsal-tool
-      - id: rehearsal-tool
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: false
-      - if: steps.source.outputs.recovery-mode == 'reprepare'
-        run: ./target/ci/release/memcordon-ci release publication-tool
-      - id: selection
+      - name: Validate inexpensive preparation inputs
         if: steps.source.outputs.recovery-mode == 'reprepare'
+        run: ./target/ci/release/memcordon-ci release check-preparation --build-source .release/build-source.json --consumer-readiness
+      - run: ./target/ci/release/memcordon-ci release publication-tool
+      - id: selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: selected-source-${{ github.run_id }}-${{ github.run_attempt }}
@@ -96,7 +96,6 @@ jobs:
           include-hidden-files: true
           overwrite: false
       - id: tool
-        if: steps.source.outputs.recovery-mode == 'reprepare'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: preparation-tool-${{ github.run_id }}-${{ github.run_attempt }}
@@ -104,11 +103,11 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
-      - if: always() && steps.deps.outputs.cache-hit != 'true'
+      - if: always() && steps.deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
@@ -151,18 +150,26 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: &release-check-source-paths |
-            ~/.cargo/registry/index
+          path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
       - id: packages
-        run: ./target/ci/release/memcordon-ci release packages --build-source .release/build-source.json
+        run: ./.release/tool/memcordon-ci release packages --build-source .release/build-source.json
       - id: payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -171,10 +178,13 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
-      - if: always() && steps.packages.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
+      - if: always() && steps.packages.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
       - name: Retain bounded preparation diagnostics
@@ -192,7 +202,7 @@ jobs:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -206,67 +216,63 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
-          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
       - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
-      - run: ./target/ci/release/memcordon-ci suite policy
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
       - id: quality-context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose quality --shard complete
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose quality --shard complete
       - id: quality-products
+        continue-on-error: true
         if: steps.quality-context.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci/quality
+          path: ${{ steps.quality-context.outputs.product-paths }}
           key: ${{ steps.quality-context.outputs.product-key }}
+          restore-keys: ${{ steps.quality-context.outputs.product-restore-prefix }}
+      - name: Sanitize quality-products discard restore
+        if: steps.quality-products.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose quality --shard complete --mode discard
+      - name: Sanitize quality-products exact restore
+        if: steps.quality-products.outcome == 'success' && steps.quality-products.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose quality --shard complete --mode exact
+      - name: Sanitize quality-products compatible restore
+        if: steps.quality-products.outcome == 'success' && steps.quality-products.outputs.cache-matched-key != '' && steps.quality-products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose quality --shard complete --mode compatible
       - id: quality
-        run: ./target/ci/release/memcordon-ci suite quality
-      - run: rustup toolchain install 1.85.0 --profile minimal
-      - id: msrv-context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose msrv --shard complete
-      - id: msrv-products
-        if: steps.msrv-context.outputs.compiled-cache-usable == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci/msrv
-          key: ${{ steps.msrv-context.outputs.product-key }}
-      - id: msrv
-        run: ./target/ci/release/memcordon-ci suite msrv
-      - id: supply-context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose supply --shard complete
-      - id: supply-products
-        if: steps.supply-context.outputs.compiled-cache-usable == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: &release-check-tool-paths |
-            target/ci-tools/bin
-            target/ci-tools-build
-          key: ${{ steps.supply-context.outputs.product-key }}
-      - id: supply
-        run: ./target/ci/release/memcordon-ci suite supply-chain
-      - if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality.outputs.cache-quiescent == 'true' && steps.quality-products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci suite quality-compile
+      - id: quality-products-save-context
+        if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality.outputs.cache-quiescent == 'true' && steps.quality-products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose quality --shard complete
+      - if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality.outputs.cache-quiescent == 'true' && steps.quality-products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.quality-products.outputs.cache-primary-key != '' && steps.quality-products-save-context.outcome == 'success' && steps.quality-products-save-context.outputs.product-key == steps.quality-context.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci/quality
+          path: ${{ steps.quality-context.outputs.product-paths }}
           key: ${{ steps.quality-products.outputs.cache-primary-key }}
-      - if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.msrv-products.outputs.cache-hit != 'true'
+      - if: always() && steps.quality.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci/msrv
-          key: ${{ steps.msrv-products.outputs.cache-primary-key }}
-      - if: always() && steps.supply-context.outputs.compiled-cache-usable == 'true' && steps.supply.outputs.cache-quiescent == 'true' && steps.supply-products.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: *release-check-tool-paths
-          key: ${{ steps.supply-products.outputs.cache-primary-key }}
-      - if: always() && steps.quality.outputs.cache-quiescent == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.supply.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: *release-check-source-paths
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
+
 
       - name: Retain bounded preparation diagnostics
         if: always()
@@ -279,13 +285,322 @@ jobs:
           include-hidden-files: true
           overwrite: false
 
+  msrv:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 105
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+      - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - id: msrv-context
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose msrv --shard complete
+      - id: msrv-products
+        continue-on-error: true
+        if: steps.msrv-context.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.msrv-context.outputs.product-paths }}
+          key: ${{ steps.msrv-context.outputs.product-key }}
+          restore-keys: ${{ steps.msrv-context.outputs.product-restore-prefix }}
+      - name: Sanitize msrv-products discard restore
+        if: steps.msrv-products.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose msrv --shard complete --mode discard
+      - name: Sanitize msrv-products exact restore
+        if: steps.msrv-products.outcome == 'success' && steps.msrv-products.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose msrv --shard complete --mode exact
+      - name: Sanitize msrv-products compatible restore
+        if: steps.msrv-products.outcome == 'success' && steps.msrv-products.outputs.cache-matched-key != '' && steps.msrv-products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose msrv --shard complete --mode compatible
+      - id: msrv
+        run: ./.release/tool/memcordon-ci suite msrv
+      - id: msrv-products-save-context
+        if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.msrv-products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose msrv --shard complete
+      - if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv.outputs.cache-quiescent == 'true' && steps.msrv-products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.msrv-products.outputs.cache-primary-key != '' && steps.msrv-products-save-context.outcome == 'success' && steps.msrv-products-save-context.outputs.product-key == steps.msrv-context.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.msrv-context.outputs.product-paths }}
+          key: ${{ steps.msrv-products.outputs.cache-primary-key }}
+      - if: always() && steps.msrv.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
+  supply-chain:
+    needs: select
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+      - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
+      - id: supply-context
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose supply --shard complete
+      - id: cache-cargo-audit
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-audit --shard complete
+      - id: cache-cargo-audit-binary
+        if: steps.cache-cargo-audit.outputs.tool-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-audit.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-audit.outputs.tool-key }}
+      - id: cache-cargo-audit-build
+        if: steps.cache-cargo-audit.outputs.tool-build-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-audit.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-audit.outputs.tool-build-key }}
+      - id: cache-cargo-deny
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-deny --shard complete
+      - id: cache-cargo-deny-binary
+        if: steps.cache-cargo-deny.outputs.tool-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-deny.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-deny.outputs.tool-key }}
+      - id: cache-cargo-deny-build
+        if: steps.cache-cargo-deny.outputs.tool-build-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-deny.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-deny.outputs.tool-build-key }}
+      - id: supply
+        run: ./.release/tool/memcordon-ci suite supply-chain
+      - if: always() && steps.supply.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
+      - id: cache-cargo-audit-save-context
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true')
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-audit --shard complete
+      - name: Save cache-cargo-audit-binary
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-binary.outputs.cache-primary-key != '' && steps.cache-cargo-audit-binary.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-key == steps.cache-cargo-audit.outputs.tool-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-audit.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-audit-binary.outputs.cache-primary-key }}
+      - name: Save cache-cargo-audit-build
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-build.outputs.cache-primary-key != '' && steps.cache-cargo-audit-build.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-build-key == steps.cache-cargo-audit.outputs.tool-build-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-audit.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-audit-build.outputs.cache-primary-key }}
+      - id: cache-cargo-deny-save-context
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true')
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-deny --shard complete
+      - name: Save cache-cargo-deny-binary
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-binary.outputs.cache-primary-key != '' && steps.cache-cargo-deny-binary.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-key == steps.cache-cargo-deny.outputs.tool-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-deny.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-deny-binary.outputs.cache-primary-key }}
+      - name: Save cache-cargo-deny-build
+        if: always() && (steps.supply.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-build.outputs.cache-primary-key != '' && steps.cache-cargo-deny-build.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-build-key == steps.cache-cargo-deny.outputs.tool-build-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-deny.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-deny-build.outputs.cache-primary-key }}
+  rehearsal-tool:
+    needs: select
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact-id: ${{ steps.helper.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - id: helper-context
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose rehearsal-tool --shard complete
+      - id: helper-compiled
+        if: steps.helper-context.outputs.compiled-cache-usable == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.helper-context.outputs.product-paths }}
+          key: ${{ steps.helper-context.outputs.product-key }}
+          restore-keys: ${{ steps.helper-context.outputs.product-restore-prefix }}
+      - if: steps.helper-compiled.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose rehearsal-tool --shard complete --mode discard
+      - if: steps.helper-compiled.outcome == 'success' && steps.helper-compiled.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose rehearsal-tool --shard complete --mode exact
+      - if: steps.helper-compiled.outcome == 'success' && steps.helper-compiled.outputs.cache-matched-key != '' && steps.helper-compiled.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose rehearsal-tool --shard complete --mode compatible
+      - id: helper-build
+        run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci/rehearsal-build -p memcordon-ci --bin memcordon-release-rehearsal
+      - run: ./.release/tool/memcordon-ci release rehearsal-tool --executable target/ci/rehearsal-build/release/memcordon-release-rehearsal
+      - id: helper
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: false
+
+      - id: helper-save-context
+        if: always() && steps.helper-build.outcome == 'success'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose rehearsal-tool --shard complete
+      - name: Save settled helper compilation
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.helper-build.outcome == 'success' && steps.helper-save-context.outcome == 'success' && steps.helper-save-context.outputs.product-key == steps.helper-context.outputs.product-key && steps.helper-compiled.outputs.cache-primary-key != '' && steps.helper-compiled.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.helper-context.outputs.product-paths }}
+          key: ${{ steps.helper-compiled.outputs.cache-primary-key }}
+      - name: Save settled helper downloads
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.helper-build.outcome == 'success' && steps.deps.outputs.cache-primary-key != '' && steps.deps.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
   miri:
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
-      fail-fast: false
+      fail-fast: ${{ github.event_name != 'workflow_dispatch' }}
       matrix:
         shard: [first, second]
     steps:
@@ -301,37 +616,96 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
-          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
-      - run: ./target/ci/release/memcordon-ci ci prepare --profile miri
-      - id: context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard complete
-      - id: products
-        if: steps.context.outputs.compiled-cache-usable == 'true'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
+      - run: ./.release/tool/memcordon-ci ci prepare --profile miri
+      - id: context-first
+        if: matrix.shard == 'first'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose miri --shard first
+      - id: context-second
+        if: matrix.shard == 'second'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose miri --shard second
+      - id: products-first
+        continue-on-error: true
+        if: matrix.shard == 'first' && steps.context-first.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci/miri-*
-          key: ${{ steps.context.outputs.product-key }}-${{ matrix.shard }}
+          path: ${{ steps.context-first.outputs.product-paths }}
+          key: ${{ steps.context-first.outputs.product-key }}
+          restore-keys: ${{ steps.context-first.outputs.product-restore-prefix }}
+      - name: Sanitize products-first discard restore
+        if: steps.products-first.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode discard
+      - name: Sanitize products-first exact restore
+        if: steps.products-first.outcome == 'success' && steps.products-first.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode exact
+      - name: Sanitize products-first compatible restore
+        if: steps.products-first.outcome == 'success' && steps.products-first.outputs.cache-matched-key != '' && steps.products-first.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode compatible
+      - id: products-second
+        continue-on-error: true
+        if: matrix.shard == 'second' && steps.context-second.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.context-second.outputs.product-paths }}
+          key: ${{ steps.context-second.outputs.product-key }}
+          restore-keys: ${{ steps.context-second.outputs.product-restore-prefix }}
+      - name: Sanitize products-second discard restore
+        if: steps.products-second.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode discard
+      - name: Sanitize products-second exact restore
+        if: steps.products-second.outcome == 'success' && steps.products-second.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode exact
+      - name: Sanitize products-second compatible restore
+        if: steps.products-second.outcome == 'success' && steps.products-second.outputs.cache-matched-key != '' && steps.products-second.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode compatible
       - id: first
         if: matrix.shard == 'first'
-        run: ./target/ci/release/memcordon-ci suite miri-first
+        run: ./.release/tool/memcordon-ci suite miri-first
       - id: second
         if: matrix.shard == 'second'
-        run: ./target/ci/release/memcordon-ci suite miri-second
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci suite miri-second
+      - id: products-first-save-context
+        if: always() && steps.context-first.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-first.outputs.cache-hit != 'true' && matrix.shard == 'first'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose miri --shard first
+      - if: always() && steps.context-first.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-first.outputs.cache-hit != 'true' && matrix.shard == 'first' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products-first.outputs.cache-primary-key != '' && steps.products-first-save-context.outcome == 'success' && steps.products-first-save-context.outputs.product-key == steps.context-first.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci/miri-*
-          key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+          path: ${{ steps.context-first.outputs.product-paths }}
+          key: ${{ steps.products-first.outputs.cache-primary-key }}
+      - id: products-second-save-context
+        if: always() && steps.context-second.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-second.outputs.cache-hit != 'true' && matrix.shard == 'second'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose miri --shard second
+      - if: always() && steps.context-second.outputs.compiled-cache-usable == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-second.outputs.cache-hit != 'true' && matrix.shard == 'second' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products-second.outputs.cache-primary-key != '' && steps.products-second-save-context.outcome == 'success' && steps.products-second-save-context.outputs.product-key == steps.context-second.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
+          path: ${{ steps.context-second.outputs.product-paths }}
+          key: ${{ steps.products-second.outputs.cache-primary-key }}
+      - if: always() && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
       - name: Retain bounded preparation diagnostics
@@ -351,7 +725,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
-      fail-fast: false
+      fail-fast: ${{ github.event_name != 'workflow_dispatch' }}
       matrix:
         shard: [first, second]
     steps:
@@ -367,41 +741,113 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != '' && hashFiles('fuzz/Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
-          key: release-check-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/toolchains.toml', 'ci/tools.toml', 'rust-toolchain.toml') }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: mc-download-v4-${{ runner.os }}-fuzz-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-fuzz-
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json
-      - id: prepare
-        run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz
-      - id: context
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard complete
-      - id: products
-        if: steps.context.outputs.compiled-cache-usable == 'true'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json
+      - id: cache-cargo-fuzz
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete
+      - id: cache-cargo-fuzz-binary
+        if: steps.cache-cargo-fuzz.outputs.tool-key != ''
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: &release-fuzz-product-paths |
-            fuzz/target
-            target/ci-tools/bin
-            target/ci-tools-build
-          key: ${{ steps.context.outputs.product-key }}-${{ matrix.shard }}
+          path: ${{ steps.cache-cargo-fuzz.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-fuzz.outputs.tool-key }}
+      - id: cache-cargo-fuzz-build
+        if: steps.cache-cargo-fuzz.outputs.tool-build-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-fuzz.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-fuzz.outputs.tool-build-key }}
+      - id: prepare
+        run: ./.release/tool/memcordon-ci ci prepare --profile fuzz
+      - id: context-first
+        if: matrix.shard == 'first'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose fuzz --shard first
+      - id: context-second
+        if: matrix.shard == 'second'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose fuzz --shard second
+      - id: products-first
+        continue-on-error: true
+        if: matrix.shard == 'first' && steps.context-first.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.context-first.outputs.product-paths }}
+          key: ${{ steps.context-first.outputs.product-key }}
+          restore-keys: ${{ steps.context-first.outputs.product-restore-prefix }}
+      - name: Sanitize products-first discard restore
+        if: steps.products-first.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard first --mode discard
+      - name: Sanitize products-first exact restore
+        if: steps.products-first.outcome == 'success' && steps.products-first.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard first --mode exact
+      - name: Sanitize products-first compatible restore
+        if: steps.products-first.outcome == 'success' && steps.products-first.outputs.cache-matched-key != '' && steps.products-first.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard first --mode compatible
+      - id: products-second
+        continue-on-error: true
+        if: matrix.shard == 'second' && steps.context-second.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.context-second.outputs.product-paths }}
+          key: ${{ steps.context-second.outputs.product-key }}
+          restore-keys: ${{ steps.context-second.outputs.product-restore-prefix }}
+      - name: Sanitize products-second discard restore
+        if: steps.products-second.outcome == 'failure'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard second --mode discard
+      - name: Sanitize products-second exact restore
+        if: steps.products-second.outcome == 'success' && steps.products-second.outputs.cache-hit == 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard second --mode exact
+      - name: Sanitize products-second compatible restore
+        if: steps.products-second.outcome == 'success' && steps.products-second.outputs.cache-matched-key != '' && steps.products-second.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard second --mode compatible
       - id: first
         if: matrix.shard == 'first'
-        run: ./target/ci/release/memcordon-ci suite fuzz-first
+        run: ./.release/tool/memcordon-ci suite fuzz-first
       - id: second
         if: matrix.shard == 'second'
-        run: ./target/ci/release/memcordon-ci suite fuzz-second
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        run: ./.release/tool/memcordon-ci suite fuzz-second
+      - id: products-first-save-context
+        if: always() && steps.context-first.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-first.outputs.cache-hit != 'true' && matrix.shard == 'first'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose fuzz --shard first
+      - if: always() && steps.context-first.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-first.outputs.cache-hit != 'true' && matrix.shard == 'first' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products-first.outputs.cache-primary-key != '' && steps.products-first-save-context.outcome == 'success' && steps.products-first-save-context.outputs.product-key == steps.context-first.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-fuzz-product-paths
-          key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+          path: ${{ steps.context-first.outputs.product-paths }}
+          key: ${{ steps.products-first.outputs.cache-primary-key }}
+      - id: products-second-save-context
+        if: always() && steps.context-second.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-second.outputs.cache-hit != 'true' && matrix.shard == 'second'
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose fuzz --shard second
+      - if: always() && steps.context-second.outputs.compiled-cache-usable == 'true' && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.products-second.outputs.cache-hit != 'true' && matrix.shard == 'second' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products-second.outputs.cache-primary-key != '' && steps.products-second-save-context.outcome == 'success' && steps.products-second-save-context.outputs.product-key == steps.context-second.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: *release-check-source-paths
+          path: ${{ steps.context-second.outputs.product-paths }}
+          key: ${{ steps.products-second.outputs.cache-primary-key }}
+      - if: always() && steps.prepare.outputs.cache-quiescent == 'true' && (steps.first.conclusion == 'skipped' || steps.first.outputs.cache-quiescent == 'true') && (steps.second.conclusion == 'skipped' || steps.second.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
       - name: Retain bounded preparation diagnostics
@@ -415,6 +861,23 @@ jobs:
           include-hidden-files: true
           overwrite: false
 
+      - id: cache-cargo-fuzz-save-context
+        if: always() && (steps.first.outputs.cache-quiescent == 'true' || steps.second.outputs.cache-quiescent == 'true')
+        run: ./.release/tool/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete
+      - name: Save cache-cargo-fuzz-binary
+        if: always() && (steps.first.outputs.cache-quiescent == 'true' || steps.second.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-binary.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-binary.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-key == steps.cache-cargo-fuzz.outputs.tool-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-fuzz.outputs.tool-path }}
+          key: ${{ steps.cache-cargo-fuzz-binary.outputs.cache-primary-key }}
+      - name: Save cache-cargo-fuzz-build
+        if: always() && (steps.first.outputs.cache-quiescent == 'true' || steps.second.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-build.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-build.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-build-key == steps.cache-cargo-fuzz.outputs.tool-build-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.cache-cargo-fuzz.outputs.tool-build-path }}
+          key: ${{ steps.cache-cargo-fuzz-build.outputs.cache-primary-key }}
   native-linux-x64:
     name: native-linux-x64
     needs: select
@@ -444,27 +907,42 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: release-native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin consumer-readiness
       - id: cache
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-readiness --shard complete
       - id: products
+        continue-on-error: true
         if: steps.cache.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci-build
-            target/ci/native
+          path: ${{ steps.cache.outputs.product-paths }}
           key: ${{ steps.cache.outputs.product-key }}
+          restore-keys: ${{ steps.cache.outputs.product-restore-prefix }}
+      - name: Sanitize products discard restore
+        if: steps.products.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-readiness --shard complete --mode discard
+      - name: Sanitize products exact restore
+        if: steps.products.outcome == 'success' && steps.products.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-readiness --shard complete --mode exact
+      - name: Sanitize products compatible restore
+        if: steps.products.outcome == 'success' && steps.products.outputs.cache-matched-key != '' && steps.products.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-readiness --shard complete --mode compatible
       - id: build
+        if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
         run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness
+      - id: build-diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
+        run: ./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness --failure-mode collect-all
       - name: Bind original native readiness source
         if: runner.os == 'Linux' || runner.os == 'Windows'
         run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json
@@ -493,18 +971,20 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
-      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+      - id: products-save-context
+        if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-readiness --shard complete
+      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.cache.outputs.product-key
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: |
-            target/ci-build
-            target/ci/native
+          path: ${{ steps.cache.outputs.product-paths }}
           key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && steps.build.outputs.cache-quiescent == 'true' && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
+      - if: always() && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
@@ -629,13 +1109,15 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - id: deps
+        continue-on-error: true
+        if: hashFiles('Cargo.lock') != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: release-installed-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/toolchains.toml') }}
+          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - if: matrix.producer-job != ''
@@ -645,23 +1127,12 @@ jobs:
       - id: readiness-cache
         if: matrix.producer-job != ''
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard candidate
-      - id: readiness-consumers
-        if: matrix.producer-job != '' && steps.readiness-cache.outputs.compiled-cache-usable == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-consumers
-          key: ${{ steps.readiness-cache.outputs.consumer-key }}
       - id: readiness
         if: matrix.producer-job != ''
         run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
       - id: readiness-cleanup
         if: always() && matrix.producer-job != ''
         run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
-      - if: always() && matrix.producer-job != '' && steps.readiness-cache.outputs.compiled-cache-usable == 'true' && steps.readiness-cleanup.outputs.cache-quiescent == 'true' && steps.readiness-consumers.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-consumers
-          key: ${{ steps.readiness-consumers.outputs.cache-primary-key }}
       - if: always() && matrix.producer-job != ''
         run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
       - id: readiness-upload
@@ -674,16 +1145,11 @@ jobs:
           include-hidden-files: true
           overwrite: false
       - id: cache
-        if: matrix.producer-job == ''
-        run: ./target/ci/release/memcordon-ci release consumer-cache
-      - id: consumers
-        if: matrix.producer-job == '' && steps.cache.outputs.compiled-cache-usable == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci-consumers
-            target/ci-build/private-native-tests
-          key: ${{ steps.cache.outputs.consumer-key }}
+        if: matrix.producer-job == '' && matrix.channel == 'cargo'
+        run: ./target/ci/release/memcordon-ci release consumer-cache --channel cargo --profile readiness
+      - id: native-cache
+        if: matrix.producer-job == '' && matrix.channel != 'cargo'
+        run: ./target/ci/release/memcordon-ci release consumer-cache --channel native --profile readiness
       - id: native
         if: matrix.producer-job == '' && matrix.channel != 'cargo'
         run: ./target/ci/release/memcordon-ci release installed-consumers --channel native --destination .release/installed-results/native
@@ -699,18 +1165,11 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           overwrite: false
-      - if: always() && matrix.producer-job == '' && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.consumers.outputs.cache-hit != 'true'
+      - if: always() && matrix.producer-job == '' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            target/ci-consumers
-            target/ci-build/private-native-tests
-          key: ${{ steps.consumers.outputs.cache-primary-key }}
-      - if: always() && matrix.producer-job == '' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
@@ -765,28 +1224,6 @@ jobs:
     outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
-  installed-macos-x64:
-    needs: [select, packages, native-macos-x64]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, native-job: native-macos-x64, channel: both}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps: *installed-target-steps
-
-  installed-macos-arm64:
-    needs: [select, packages, native-macos-arm64]
-    if: needs.select.outputs.recovery-mode == 'reprepare'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{target: aarch64-apple-darwin, runner: macos-15, native-job: native-macos-arm64, channel: both}]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps: *installed-target-steps
-
   candidate-windows-x64-native:
     name: candidate-windows-x64-native
     needs: [select, packages, native-windows-x64]
@@ -839,15 +1276,13 @@ jobs:
     outputs: *readiness-producer-outputs
     steps: *installed-target-steps
 
-  assemble:
-    needs: [select, packages, source-checks, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, candidate-linux-x64-native, candidate-linux-x64-cargo, candidate-linux-arm64-native, candidate-linux-arm64-cargo, installed-macos-x64, installed-macos-arm64, candidate-windows-x64-native, candidate-windows-x64-cargo, candidate-windows-arm64-native, candidate-windows-arm64-cargo]
+  assemble-payload:
+    needs: [select, packages, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
-      candidate-artifact-id: ${{ steps.candidate.outputs.artifact-id }}
-      prepared-artifact-id: ${{ steps.prepared.outputs.artifact-id }}
-      publication-tool-artifact-id: ${{ steps.publication-tool.outputs.artifact-id }}
+      assembled-artifact-id: ${{ steps.assembled.outputs.artifact-id }}
     steps:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -910,13 +1345,69 @@ jobs:
           path: .release/targets/windows-arm64
           merge-multiple: true
           digest-mismatch: error
-      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness
+      - run: ./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness --destination .release/assembled
+      - id: assembled
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: assembled-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/assembled
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-assemble-payload-${{ github.run_id }}-${{ github.run_attempt }}
+          path: *diagnostic-paths
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+
+  assemble:
+    needs: [select, packages, source-checks, msrv, supply-chain, assemble-payload, rehearse, miri, fuzz, native-linux-x64, native-linux-arm64, native-macos-x64, native-macos-arm64, native-windows-x64, native-windows-arm64, candidate-linux-x64-native, candidate-linux-x64-cargo, candidate-linux-arm64-native, candidate-linux-arm64-cargo, installed-macos-x64-native, installed-macos-x64-cargo, installed-macos-arm64-native, installed-macos-arm64-cargo, candidate-windows-x64-native, candidate-windows-x64-cargo, candidate-windows-arm64-native, candidate-windows-arm64-cargo]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      candidate-artifact-id: ${{ steps.candidate.outputs.artifact-id }}
+      prepared-artifact-id: ${{ steps.prepared.outputs.artifact-id }}
+      publication-tool-artifact-id: ${{ steps.publication-tool.outputs.artifact-id }}
+    steps:
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.select.outputs.selected-commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.assemble-payload.outputs.assembled-artifact-id }}
+          path: .release/assembled
+          merge-multiple: true
+          digest-mismatch: error
+      - run: ./.release/tool/memcordon-ci release finalize-preparation --build-source .release/build-source.json --input .release/assembled --publisher-archive .release/tool/memcordon-publication-tool.tar.gz --destination .release/final
       - id: candidate
         if: needs.select.outputs.preparation-kind == 'candidate'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/prepared-candidate
+          path: .release/final/candidate
           if-no-files-found: error
           retention-days: 7
           include-hidden-files: true
@@ -926,7 +1417,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: prepared-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/prepared
+          path: .release/final/prepared
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
@@ -935,7 +1426,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: publication-tool-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/tool/memcordon-publication-tool.tar.gz
+          path: .release/final/tool/memcordon-publication-tool.tar.gz
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
@@ -953,7 +1444,7 @@ jobs:
 
   rehearse:
     name: Release rehearsal
-    needs: [select, assemble]
+    needs: [select, assemble-payload, rehearsal-tool]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -962,42 +1453,26 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.rehearsal-tool-artifact-id }}
+          artifact-ids: ${{ needs.rehearsal-tool.outputs.artifact-id }}
           path: .release/rehearsal-tool
           merge-multiple: true
           digest-mismatch: error
-      - if: needs.select.outputs.preparation-kind == 'candidate'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
           path: .release/tool
           merge-multiple: true
           digest-mismatch: error
-      - if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.assemble.outputs.publication-tool-artifact-id }}
-          path: .release/tool
-          merge-multiple: true
-          digest-mismatch: error
-      - if: needs.select.outputs.preparation-kind == 'candidate'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.assemble.outputs.candidate-artifact-id }}
-          path: .release/rehearsal-input
-          merge-multiple: true
-          digest-mismatch: error
-      - if: needs.select.outputs.preparation-kind == 'tagged'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          artifact-ids: ${{ needs.assemble.outputs.prepared-artifact-id }}
+          artifact-ids: ${{ needs.assemble-payload.outputs.assembled-artifact-id }}
           path: .release/rehearsal-input
           merge-multiple: true
           digest-mismatch: error
       - run: tar -xzf .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz -C .release/rehearsal-tool
       - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
       - id: rehearsal
-        run: ./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results
+        run: ./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results --jobs 2
       - name: Retain rehearsal diagnostics
         if: always()
         continue-on-error: true
@@ -1029,11 +1504,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
-      - run: ./target/ci/release/memcordon-ci release select-preparation
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.select.outputs.preparation-tool-artifact-id }}
+          path: .release/tool
+          merge-multiple: true
+          digest-mismatch: error
+      - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
+      - run: ./.release/tool/memcordon-ci release select-preparation
       - id: recovery
         name: Read original preparation artifacts
-        run: ./target/ci/release/memcordon-ci release recovery-inputs
+        run: ./.release/tool/memcordon-ci release recovery-inputs
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -1050,7 +1531,7 @@ jobs:
 
   recovery-rehearse:
     name: Release recovery rehearsal
-    needs: [select, recovery-inputs]
+    needs: [select, recovery-inputs, rehearsal-tool]
     if: needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1060,7 +1541,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: ${{ needs.select.outputs.rehearsal-tool-artifact-id }}
+          artifact-ids: ${{ needs.rehearsal-tool.outputs.artifact-id }}
           path: .release/rehearsal-tool
           merge-multiple: true
           digest-mismatch: error
@@ -1085,7 +1566,7 @@ jobs:
       - run: tar -xzf .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz -C .release/rehearsal-tool
       - run: tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool
       - id: rehearsal
-        run: ./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results
+        run: ./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results --jobs 2
       - name: Retain recovery rehearsal diagnostics
         if: always()
         continue-on-error: true
@@ -1227,21 +1708,10 @@ jobs:
       - run: ./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/readiness-identity.json
       - id: readiness-cache
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard public
-      - id: readiness-consumers
-        if: steps.readiness-cache.outputs.compiled-cache-usable == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-consumers
-          key: ${{ steps.readiness-cache.outputs.consumer-key }}
       - run: ./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
       - id: readiness-cleanup
         if: always()
         run: ./target/ci/release/consumer-readiness cleanup --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell
-      - if: always() && steps.readiness-cache.outputs.compiled-cache-usable == 'true' && steps.readiness-cleanup.outputs.cache-quiescent == 'true' && steps.readiness-consumers.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: target/ci-consumers
-          key: ${{ steps.readiness-consumers.outputs.cache-primary-key }}
       - if: always()
         run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/cell.json --output .release/readiness-cell/producer-manifest.json
       - id: readiness-upload
@@ -1496,3 +1966,46 @@ jobs:
           path: .release/prepared/public-consumer-results
           if-no-files-found: error
           include-hidden-files: true
+  installed-macos-x64-native:
+    needs: [select, packages, native-macos-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, native-job: native-macos-x64, channel: native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-macos-x64-cargo:
+    needs: [select, packages, native-macos-x64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: x86_64-apple-darwin, runner: macos-15-intel, native-job: native-macos-x64, channel: cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-macos-arm64-native:
+    needs: [select, packages, native-macos-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-apple-darwin, runner: macos-15, native-job: native-macos-arm64, channel: native}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps
+
+  installed-macos-arm64-cargo:
+    needs: [select, packages, native-macos-arm64]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{target: aarch64-apple-darwin, runner: macos-15, native-job: native-macos-arm64, channel: cargo}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps: *installed-target-steps

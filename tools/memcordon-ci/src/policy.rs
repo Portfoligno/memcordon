@@ -563,7 +563,7 @@ const NATIVE_MATRIX: [(&str, &str); 6] = [
     ("windows-arm64", "windows-11-arm"),
 ];
 const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
-const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 90;
+const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 120;
 const DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES: u64 = 120;
 fn check_runner_matrix(
     jobs: &Mapping,
@@ -768,11 +768,8 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
                 step.get(key("id")).and_then(Value::as_str) == Some("compiled")
                     || step.get(key("uses")).and_then(Value::as_str)
                         == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-                        && step
-                            .get(key("with"))
-                            .and_then(|with| with.get(key("path")))
-                            .and_then(Value::as_str)
-                            == Some(target)
+                        && step["with"]["key"].as_str()
+                            == Some("${{ steps.compiled.outputs.cache-primary-key }}")
             })
             .collect();
         if caches.len() != 2
@@ -780,10 +777,24 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
                 step.get(key("with"))
                     .and_then(|with| with.get(key("path")))
                     .and_then(Value::as_str)
-                    != Some(target)
+                    .is_none_or(|path| {
+                        path != target
+                            && path != "${{ steps.compiled-context.outputs.product-paths }}"
+                    })
             })
         {
             return Err(failure("stress phase compiled roots must remain isolated"));
+        }
+        let expected_context = format!(
+            "./target/ci/release/memcordon-ci ci cache-context --purpose {suite} --shard complete"
+        );
+        if !steps[..index].iter().any(|step| {
+            step["id"].as_str() == Some("compiled-context")
+                && step["run"].as_str() == Some(&expected_context)
+        }) {
+            return Err(failure(
+                "stress phase output mapping must match its actual recipe",
+            ));
         }
         let expected_name = if job_name == "stress" {
             "stress-combined-${{ matrix.id }}"
@@ -904,8 +915,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
 }
 
 const ORDINARY_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci";
-const ORDINARY_SOURCE_PATHS: &str =
-    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+const ORDINARY_SOURCE_PATHS: &str = "~/.cargo/registry/cache\n~/.cargo/git/db\n";
 
 fn check_scope_planner(planner: &Mapping, conditional_plan: bool) -> Result<()> {
     if scalar(planner, "if") != Some("github.event.deleted != true") {
@@ -969,7 +979,12 @@ fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
         .filter_map(|step| step.get(key("run")).and_then(Value::as_str))
         .filter(|run| run.split_whitespace().any(|part| part == "cache-context"))
         .collect::<Vec<_>>();
-    if contexts != [expected.as_str()] {
+    if contexts.iter().filter(|run| **run == expected).count() < 1
+        || contexts
+            .iter()
+            .any(|run| !run.contains(&format!("--purpose {purpose} --shard complete"))
+                && !(purpose == "native-debug" && *run == "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete"))
+    {
         return Err(failure("native debug/release cache role differs"));
     }
     Ok(())
@@ -990,7 +1005,10 @@ fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
                 .and_then(|with| with.get(key("if-no-files-found")))
                 .and_then(Value::as_str)
                 == Some("warn");
-        if step.contains_key(key("continue-on-error")) && !diagnostic
+        let optional_cache = scalar(step, "uses")
+            .is_some_and(|uses| uses.starts_with("actions/cache/"))
+            && step.get(key("continue-on-error")).and_then(Value::as_bool) == Some(true);
+        if step.contains_key(key("continue-on-error")) && !diagnostic && !optional_cache
             || context != "publisher" && step.contains_key(key("env"))
             || step.contains_key(key("shell"))
         {
@@ -1012,9 +1030,184 @@ fn ordinary_driver_before_suite(steps: &[Value], suite_index: usize) -> Result<(
         })
         .collect();
     if builds.len() != 1 || builds[0].0 >= suite_index || builds[0].1.get(key("if")).is_some() {
-        return Err(failure(
-            "exactly one unconditional ordinary driver build must precede its native suite",
-        ));
+        let downloads = steps[..suite_index]
+            .iter()
+            .filter(|step| {
+                step["uses"].as_str()
+                    == Some("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+                    && step["with"]["artifact-ids"].as_str()
+                        == Some("${{ needs.select.outputs.preparation-tool-artifact-id }}")
+                    && step["with"]["path"].as_str() == Some(".release/tool")
+                    && step["with"]["digest-mismatch"].as_str() == Some("error")
+                    && step["if"].is_null()
+            })
+            .count();
+        let extraction = steps[..suite_index]
+            .iter()
+            .filter(|step| {
+                step["run"].as_str()
+                    == Some(
+                        "tar -xzf .release/tool/memcordon-publication-tool.tar.gz -C .release/tool",
+                    )
+                    && step["if"].is_null()
+            })
+            .count();
+        if !builds.is_empty() || downloads != 1 || extraction != 1 {
+            return Err(failure(
+                "exactly one selected driver build or same-run immutable tool must precede work",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cache_output_reference<'a>(value: &'a str, output: &str) -> Option<&'a str> {
+    let (step, selected) = value
+        .strip_prefix("${{ steps.")?
+        .strip_suffix(" }}")?
+        .split_once(".outputs.")?;
+    (selected == output && !step.is_empty()).then_some(step)
+}
+
+fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
+    let mut restores = BTreeMap::new();
+    let mut saves = BTreeMap::<String, Vec<(usize, &Value)>>::new();
+    for (ordinal, step) in steps.iter().enumerate() {
+        let uses = step["uses"].as_str().unwrap_or_default();
+        if !uses.starts_with("actions/cache") {
+            continue;
+        }
+        let restore = uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+        if !restore && uses != "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
+            return Err(failure("cache must use pinned split restore/save"));
+        }
+        let path = step["with"]["path"]
+            .as_str()
+            .ok_or_else(|| failure("cache path absent"))?;
+        let paths: Vec<_> = path
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if paths.is_empty()
+            || paths.iter().any(|path| {
+                matches!(
+                    *path,
+                    "target"
+                        | "target/ci-build"
+                        | "target/ci-consumers"
+                        | "target/ci-tools/bin"
+                        | "target/ci-tools-build"
+                ) || path.contains('*')
+                    || [".release", "reports", "credentials", "installed"]
+                        .iter()
+                        .any(|excluded| path.contains(excluded))
+            })
+        {
+            return Err(failure(
+                "cache paths contain mixed ownership or runtime state",
+            ));
+        }
+        let selected = step["with"]["key"]
+            .as_str()
+            .ok_or_else(|| failure("cache key absent"))?;
+        if restore {
+            let id = step["id"]
+                .as_str()
+                .ok_or_else(|| failure("cache restore id absent"))?;
+            if restores.insert(id.to_owned(), (ordinal, step)).is_some() {
+                return Err(failure("duplicate cache restore id"));
+            }
+            if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"] {
+                if !selected.starts_with("mc-download-v4-${{ runner.os }}-")
+                    || selected.contains("runner.arch")
+                    || selected.contains("github.sha")
+                    || !step["if"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("hashFiles('Cargo.lock') != ''")
+                    || !step["with"]["restore-keys"].as_str().is_some_and(|prefix| {
+                        prefix.starts_with("mc-download-v4-${{ runner.os }}-")
+                    })
+                {
+                    return Err(failure(
+                        "download cache must use guarded common v4 identity",
+                    ));
+                }
+            } else if let Some(context) = cache_output_reference(selected, "product-key") {
+                let prefix = format!("${{{{ steps.{context}.outputs.product-restore-prefix }}}}");
+                if step["with"]["restore-keys"].as_str() != Some(prefix.as_str()) {
+                    return Err(failure("compiled cache compatibility boundary differs"));
+                }
+                for mode in ["discard", "exact", "compatible"] {
+                    if !steps.iter().skip(ordinal + 1).any(|candidate| {
+                        candidate["run"].as_str().is_some_and(|run| {
+                            run.contains(" ci prepare-restored-cache ")
+                                && run.ends_with(&format!("--mode {mode}"))
+                        }) && candidate["if"]
+                            .as_str()
+                            .is_some_and(|condition| condition.contains(&format!("steps.{id}.")))
+                    }) {
+                        return Err(failure(
+                            "compiled restore must sanitize transfer/exact/compatible outcomes",
+                        ));
+                    }
+                }
+            } else if !["tool-key", "tool-build-key", "index-key"]
+                .iter()
+                .any(|output| cache_output_reference(selected, output).is_some())
+            {
+                return Err(failure("legacy or unprojected cache namespace"));
+            }
+        } else {
+            let id = cache_output_reference(selected, "cache-primary-key")
+                .ok_or_else(|| failure("cache save must use originally requested exact key"))?;
+            saves
+                .entry(id.to_owned())
+                .or_default()
+                .push((ordinal, step));
+            let condition = step["if"].as_str().unwrap_or_default();
+            if !condition.contains("always()")
+                || !condition.contains("github.event_name == 'push'")
+                || !condition.contains("workflow_dispatch")
+                || !condition.contains("cache-primary-key != ''")
+                || (!condition.contains("cache-quiescent == 'true'")
+                    && !condition.contains("outcome == 'success'")
+                    && !(paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
+                        && condition.contains("success()")))
+            {
+                return Err(failure(
+                    "cache save needs trusted context, nonempty key and settled owner",
+                ));
+            }
+        }
+    }
+    for (id, (ordinal, restore)) in restores {
+        let selected = saves
+            .remove(&id)
+            .ok_or_else(|| failure("cache restore/save pairing absent"))?;
+        for (save_ordinal, save) in selected {
+            if save_ordinal <= ordinal || save["with"]["path"] != restore["with"]["path"] {
+                return Err(failure("cache restore/save roots or ordering differ"));
+            }
+            if cache_output_reference(
+                restore["with"]["key"].as_str().unwrap_or_default(),
+                "product-key",
+            )
+            .is_some()
+                && !save["if"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("outputs.product-key == steps.")
+            {
+                return Err(failure(
+                    "compiled cache save requires unchanged current inputs",
+                ));
+            }
+        }
+    }
+    if !saves.is_empty() {
+        return Err(failure("cache save references absent restore"));
     }
     Ok(())
 }
@@ -1058,16 +1251,13 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         shards,
         "complete shard inventory",
     )?;
-    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
+    if scalar(strategy, "fail-fast") != Some("${{ github.event_name != 'workflow_dispatch' }}")
         || scalar(job, "runs-on") != Some("ubuntu-24.04")
         || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout)
     {
         return Err(failure("deep shard runner or execution bounds differ"));
     }
     let steps = ordinary_steps(job, "deep shards")?;
-    if steps.len() != shards.len() + 10 {
-        return Err(failure("deep shard ordered step inventory differs"));
-    }
     let mut invocations = Vec::new();
     let mut restores = 0;
     let mut saves = 0;
@@ -1089,99 +1279,45 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                         .ok_or_else(|| failure("source cache inputs absent"))?,
                     "source cache",
                 )?;
-                exact_mapping_keys(with, &["path", "key"], "source cache")?;
-                let compiled_path = match family {
-                    "miri" => "target/ci/miri-*",
-                    "fuzz" => "fuzz/target\ntarget/ci-tools/bin\ntarget/ci-tools-build\n",
-                    _ => return Err(failure("unsupported shard family")),
-                };
-                if scalar(with, "path") == Some(compiled_path) {
-                    let context = mapping(&steps[5], "compiled input context")?;
-                    let expected_context = format!(
-                        "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard complete"
-                    );
-                    if scalar(context, "id") != Some("compiled-context")
-                        || scalar(context, "run") != Some(expected_context.as_str())
-                    {
-                        return Err(failure("compiled cache actual input context differs"));
-                    }
-                    if uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
-                        compiled_restores += 1;
-                        if ordinal != 6
-                            || scalar(step, "id") != Some("compiled")
-                            || scalar(step, "if")
-                                != Some(
-                                    "steps.compiled-context.outputs.compiled-cache-usable == 'true'",
-                                )
-                            || scalar(with, "key")
-                                != Some(
-                                    "${{ steps.compiled-context.outputs.product-key }}-${{ matrix.shard }}",
-                                )
-                        {
-                            return Err(failure("compiled shard restore identity/order differs"));
-                        }
-                    } else if uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
-                    {
-                        compiled_saves += 1;
-                        let condition = match family {
-                            "miri" => {
-                                "always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true'"
+                let selected_key = scalar(with, "key").unwrap_or_default();
+                let selected_path = scalar(with, "path").unwrap_or_default();
+                if selected_key.starts_with("mc-download-v4-")
+                    || selected_key.contains(".outputs.product-key")
+                    || selected_key.contains(".outputs.tool-key")
+                    || selected_key.contains(".outputs.tool-build-key")
+                    || selected_key.contains(".outputs.index-key")
+                    || selected_key.contains(".outputs.cache-primary-key")
+                {
+                    let restore = uses.contains("/restore@");
+                    if selected_path == ORDINARY_SOURCE_PATHS {
+                        if restore {
+                            if !selected_key.contains("hashFiles('Cargo.lock')") {
+                                return Err(failure(
+                                    "workspace source cache must include its lockfile",
+                                ));
                             }
-                            "fuzz" => {
-                                "always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true'"
+                            if family == "fuzz"
+                                && !selected_key.contains("hashFiles('fuzz/Cargo.lock')")
+                            {
+                                return Err(failure("fuzz manifest must include its lockfile"));
                             }
-                            _ => unreachable!(),
-                        };
-                        if ordinal != steps.len() - 2
-                            || scalar(step, "if") != Some(condition)
-                            || scalar(with, "key")
-                                != Some("${{ steps.compiled.outputs.cache-primary-key }}")
-                        {
-                            return Err(failure("compiled shard quiescent save differs"));
+                            restores += 1;
+                        } else {
+                            saves += 1;
                         }
-                    } else {
-                        return Err(failure("compiled shard cache action differs"));
+                    } else if selected_key.contains(".outputs.product-key")
+                        || selected_key.contains("steps.compiled")
+                            && selected_key.contains(".outputs.cache-primary-key")
+                    {
+                        if restore {
+                            compiled_restores += 1;
+                        } else {
+                            compiled_saves += 1;
+                        }
                     }
                     continue;
                 }
-                if scalar(with, "path") != Some(ORDINARY_SOURCE_PATHS) {
-                    return Err(failure("ordinary shard source cache paths differ"));
-                }
-                if uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
-                    restores += 1;
-                    if ordinal != 1
-                        || scalar(with, "key").is_none_or(|value| {
-                            !value.starts_with("ordinary-sources-v1-")
-                                || !value.contains("fuzz/Cargo.lock")
-                                || !value.contains("Cargo.lock")
-                        })
-                    {
-                        return Err(failure(
-                            "ordinary shard dependency identity or restore order differs",
-                        ));
-                    }
-                } else if uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" {
-                    saves += 1;
-                    let (condition, cache_key) = match family {
-                        "miri" => (
-                            "always() && matrix.shard == 'first' && steps.miri-deps.outputs.cache-hit != 'true'",
-                            "${{ steps.miri-deps.outputs.cache-primary-key }}",
-                        ),
-                        "fuzz" => (
-                            "always() && matrix.shard == 'quarter-one' && steps.fuzz-deps.outputs.cache-hit != 'true'",
-                            "${{ steps.fuzz-deps.outputs.cache-primary-key }}",
-                        ),
-                        _ => return Err(failure("unsupported shard family")),
-                    };
-                    if scalar(step, "if") != Some(condition)
-                        || scalar(with, "key") != Some(cache_key)
-                        || ordinal != steps.len() - 1
-                    {
-                        return Err(failure("ordinary shard source cache save differs"));
-                    }
-                } else {
-                    return Err(failure("ordinary source cache action differs"));
-                }
+                return Err(failure("deep shard cache must use the V4 lifecycle"));
             }
             if uses == UPLOAD_ARTIFACT_ACTION {
                 plans += 1;
@@ -1238,12 +1374,48 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         || restores != 1
         || saves != 1
         || plans != 1
-        || compiled_restores != 1
-        || compiled_saves != 1
+        || compiled_restores != shards.len()
+        || compiled_saves != shards.len()
     {
         return Err(failure(
             "ordinary shard invocation/cache/evidence coverage differs",
         ));
+    }
+    check_cache_lifecycle(steps)?;
+    for shard in shards {
+        let recipe = format!(
+            "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}"
+        );
+        let context = format!("compiled-context-{shard}");
+        let condition = format!("matrix.shard == '{shard}'");
+        if !steps.iter().any(|step| {
+            step["id"].as_str() == Some(context.as_str())
+                && step["run"].as_str() == Some(recipe.as_str())
+                && step["if"].as_str() == Some(condition.as_str())
+        }) {
+            return Err(failure("deep shard exact cache recipe differs"));
+        }
+    }
+    if family == "fuzz" {
+        let tool_context = steps
+            .iter()
+            .position(|step| {
+                step["run"].as_str().is_some_and(|run| {
+                    run.ends_with("ci cache-context --purpose cargo-fuzz --shard complete")
+                })
+            })
+            .ok_or_else(|| failure("fuzz installed-tool context absent"))?;
+        let prepare = steps
+            .iter()
+            .position(|step| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.ends_with("ci prepare --profile fuzz"))
+            })
+            .ok_or_else(|| failure("fuzz pinned tool preparation absent"))?;
+        if tool_context >= prepare {
+            return Err(failure("fuzz tool restore must precede installation"));
+        }
     }
     Ok(())
 }
@@ -1735,7 +1907,27 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
                     .is_some_and(|run| run.split_whitespace().any(|part| part == "suite"))
             })
             .collect::<Vec<_>>();
-        if suites.len() != 1
+        if name == "native" {
+            if suites.len() != 2
+                || suites[0]["run"].as_str() != Some(invocation.as_str())
+                || suites[0]["if"].as_str()
+                    != Some(
+                        "github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'",
+                    )
+                || suites[1]["run"].as_str()
+                    != Some(
+                        "./target/ci/release/memcordon-ci suite native --failure-mode collect-all",
+                    )
+                || suites[1]["if"].as_str()
+                    != Some(
+                        "github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'",
+                    )
+            {
+                return Err(failure(
+                    "native stop and explicit manual diagnostic branches differ",
+                ));
+            }
+        } else if suites.len() != 1
             || suites[0].get(key("run")).and_then(Value::as_str) != Some(invocation.as_str())
             || suites[0].get(key("if")).is_some()
         {
@@ -1867,8 +2059,8 @@ fn check_release_row(
     Ok(())
 }
 
-const REHEARSAL_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci --bin memcordon-release-rehearsal";
-const REHEARSAL_RUN: &str = "./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results";
+const REHEARSAL_DRIVER_BUILD: &str = "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci";
+const REHEARSAL_RUN: &str = "./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results --jobs 2";
 const RECOVERY_REHEARSAL_CONDITION: &str = "needs.select.outputs.preparation-kind == 'tagged' && needs.select.outputs.recovery-mode == 'publication-only' && github.event_name == 'workflow_dispatch' && inputs.preparation-mode == 'release' && startsWith(github.ref, 'refs/tags/')";
 
 fn check_rehearsal_download(
@@ -1972,9 +2164,9 @@ fn check_rehearsal_job(jobs: &Mapping, recovery: bool) -> Result<()> {
     exact_string_sequence(
         &value["needs"],
         if recovery {
-            &["select", "recovery-inputs"]
+            &["select", "recovery-inputs", "rehearsal-tool"]
         } else {
-            &["select", "assemble"]
+            &["select", "assemble-payload", "rehearsal-tool"]
         },
         "rehearsal successful prerequisites",
     )?;
@@ -1997,7 +2189,7 @@ fn check_rehearsal_job(jobs: &Mapping, recovery: bool) -> Result<()> {
         ));
     }
     let steps = ordinary_steps(job, "rehearsal steps")?;
-    let download_count = if recovery { 3 } else { 5 };
+    let download_count = 3;
     if steps.len() != download_count + 4 {
         return Err(failure(
             "rehearsal cannot compile, authenticate, cache or omit work",
@@ -2005,7 +2197,7 @@ fn check_rehearsal_job(jobs: &Mapping, recovery: bool) -> Result<()> {
     }
     check_rehearsal_download(
         &steps[0],
-        "${{ needs.select.outputs.rehearsal-tool-artifact-id }}",
+        "${{ needs.rehearsal-tool.outputs.artifact-id }}",
         ".release/rehearsal-tool",
         None,
         false,
@@ -2026,33 +2218,19 @@ fn check_rehearsal_job(jobs: &Mapping, recovery: bool) -> Result<()> {
             true,
         )?;
     } else {
-        for (index, artifact, path, condition) in [
+        for (index, artifact, path) in [
             (
                 1,
                 "${{ needs.select.outputs.preparation-tool-artifact-id }}",
                 ".release/tool",
-                "needs.select.outputs.preparation-kind == 'candidate'",
             ),
             (
                 2,
-                "${{ needs.assemble.outputs.publication-tool-artifact-id }}",
-                ".release/tool",
-                "needs.select.outputs.preparation-kind == 'tagged'",
-            ),
-            (
-                3,
-                "${{ needs.assemble.outputs.candidate-artifact-id }}",
+                "${{ needs.assemble-payload.outputs.assembled-artifact-id }}",
                 ".release/rehearsal-input",
-                "needs.select.outputs.preparation-kind == 'candidate'",
-            ),
-            (
-                4,
-                "${{ needs.assemble.outputs.prepared-artifact-id }}",
-                ".release/rehearsal-input",
-                "needs.select.outputs.preparation-kind == 'tagged'",
             ),
         ] {
-            check_rehearsal_download(&steps[index], artifact, path, Some(condition), false)?;
+            check_rehearsal_download(&steps[index], artifact, path, None, false)?;
         }
     }
     for (offset, run) in [
@@ -2084,35 +2262,77 @@ fn check_rehearsal_tool(jobs: &Mapping) -> Result<()> {
     let select = jobs
         .get(key("select"))
         .ok_or_else(|| failure("selection absent"))?;
-    if select["outputs"]["rehearsal-tool-artifact-id"].as_str()
-        != Some("${{ steps.rehearsal-tool.outputs.artifact-id }}")
-    {
+    if !select["outputs"]["rehearsal-tool-artifact-id"].is_null() {
         return Err(failure(
-            "selection must expose actual rehearsal helper artifact ID",
+            "selection cannot build the independent rehearsal helper",
         ));
     }
-    let steps = select["steps"]
+    let selection_steps = select["steps"]
+        .as_sequence()
+        .ok_or_else(|| failure("selection steps absent"))?;
+    if selection_steps
+        .iter()
+        .filter(|step| step["run"].as_str() == Some(REHEARSAL_DRIVER_BUILD))
+        .count()
+        != 1
+    {
+        return Err(failure("selection must build only its current main driver"));
+    }
+    let format = selection_steps.iter().position(|step| step["run"].as_str() == Some("rustup run 1.97.1 cargo fmt --all -- --check")
+        && step["if"].as_str() == Some("github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare'"))
+        .ok_or_else(|| failure("reprepare formatting must precede main driver compilation"))?;
+    let build = selection_steps
+        .iter()
+        .position(|step| step["run"].as_str() == Some(REHEARSAL_DRIVER_BUILD))
+        .expect("driver checked");
+    let selected = selection_steps
+        .iter()
+        .position(|step| step["id"].as_str() == Some("source"))
+        .ok_or_else(|| failure("source selection absent"))?;
+    let check = selection_steps.iter().position(|step| step["run"].as_str() == Some("./target/ci/release/memcordon-ci release check-preparation --build-source .release/build-source.json --consumer-readiness")
+        && step["if"].as_str() == Some("steps.source.outputs.recovery-mode == 'reprepare'"))
+        .ok_or_else(|| failure("selected preparation requires cheap policy/source checks"))?;
+    if !(format < build && build < selected && selected < check) {
+        return Err(failure("early preparation validation order differs"));
+    }
+    let selection_upload = selection_steps
+        .iter()
+        .find(|step| step["id"].as_str() == Some("selection"))
+        .ok_or_else(|| failure("selection handoff absent"))?;
+    if !selection_upload["if"].is_null() {
+        return Err(failure(
+            "recovery must also upload current selection metadata",
+        ));
+    }
+    let helper = jobs
+        .get(key("rehearsal-tool"))
+        .ok_or_else(|| failure("independent helper absent"))?;
+    if helper["needs"].as_str() != Some("select")
+        || helper["outputs"]["artifact-id"].as_str()
+            != Some("${{ steps.helper.outputs.artifact-id }}")
+    {
+        return Err(failure(
+            "independent helper must depend only on selection and expose its upload",
+        ));
+    }
+    let steps = helper["steps"]
         .as_sequence()
         .ok_or_else(|| failure("selection steps absent"))?;
     let build = steps
         .iter()
-        .position(|step| step["run"].as_str() == Some(REHEARSAL_DRIVER_BUILD))
-        .ok_or_else(|| failure("selection must build both CI binaries once"))?;
-    let selection = steps
-        .iter()
-        .position(|step| step["id"].as_str() == Some("source"))
-        .ok_or_else(|| failure("source selection absent"))?;
+        .position(|step| step["run"].as_str() == Some("rustup run 1.97.1 cargo build --locked --release --target-dir target/ci/rehearsal-build -p memcordon-ci --bin memcordon-release-rehearsal"))
+        .ok_or_else(|| failure("independent helper must build only the helper binary"))?;
     let pack = steps
         .iter()
         .position(|step| {
-            step["run"].as_str() == Some("./target/ci/release/memcordon-ci release rehearsal-tool")
+            step["run"].as_str() == Some("./.release/tool/memcordon-ci release rehearsal-tool --executable target/ci/rehearsal-build/release/memcordon-release-rehearsal")
         })
         .ok_or_else(|| failure("rehearsal helper packaging absent"))?;
     let upload = steps
         .iter()
-        .position(|step| step["id"].as_str() == Some("rehearsal-tool"))
+        .position(|step| step["id"].as_str() == Some("helper"))
         .ok_or_else(|| failure("rehearsal helper upload absent"))?;
-    if !(build < selection && selection < pack && pack < upload)
+    if !(build < pack && pack < upload)
         || steps
             .iter()
             .filter(|step| {
@@ -2130,7 +2350,7 @@ fn check_rehearsal_tool(jobs: &Mapping) -> Result<()> {
             "helper build/pack/upload must succeed in both recovery modes",
         ));
     }
-    let expected: Value = serde_yaml::from_str("id: rehearsal-tool\nuses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\nwith:\n  name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}\n  path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz\n  if-no-files-found: error\n  include-hidden-files: true\n  overwrite: false\n").map_err(|error| failure(format!("invalid helper upload contract: {error}")))?;
+    let expected: Value = serde_yaml::from_str("id: helper\nuses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\nwith:\n  name: rehearsal-tool-${{ github.run_id }}-${{ github.run_attempt }}\n  path: .release/rehearsal-tool/memcordon-release-rehearsal.tar.gz\n  if-no-files-found: error\n  include-hidden-files: true\n  overwrite: false\n").map_err(|error| failure(format!("invalid helper upload contract: {error}")))?;
     if steps[upload] != expected {
         return Err(failure(
             "helper must be a separate immutable single-executable archive",
@@ -2484,6 +2704,8 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                             || name.starts_with("public-")
                         {
                             180
+                        } else if matches!(name, "source-checks" | "msrv") {
+                            105
                         } else {
                             90
                         }
@@ -2496,6 +2718,10 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
         "select".to_owned(),
         "packages".into(),
         "source-checks".into(),
+        "msrv".into(),
+        "supply-chain".into(),
+        "assemble-payload".into(),
+        "rehearse".into(),
         "miri".into(),
         "fuzz".into(),
     ];
@@ -2533,8 +2759,24 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                     == Some("./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness")
             })
             .ok_or_else(|| failure("actual native build absent"))?;
-        if steps[build].get(key("if")).is_some() {
-            return Err(failure("native build cannot be skipped"));
+        if steps[build]["if"].as_str()
+            != Some(
+                "github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'",
+            )
+        {
+            return Err(failure("automated native build must retain stop mode"));
+        }
+        let diagnostics = steps.iter().enumerate().filter(|(_, step)| step["run"].as_str() == Some("./target/ci/release/memcordon-ci release build-target --build-source .release/build-source.json --consumer-readiness --failure-mode collect-all")).collect::<Vec<_>>();
+        if diagnostics.len() != 1
+            || diagnostics[0].0 <= build
+            || diagnostics[0].1["if"].as_str()
+                != Some(
+                    "github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'",
+                )
+        {
+            return Err(failure(
+                "native diagnostic branch must explicitly execute collect-all",
+            ));
         }
         ordinary_driver_before_suite(steps, build)?;
         if !id.starts_with("macos") {
@@ -2554,7 +2796,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                     always_selected,
                 ),
             ];
-            let mut previous = build;
+            let mut previous = diagnostics[0].0;
             for (run, condition) in expected {
                 let matching = steps
                     .iter()
@@ -2595,14 +2837,10 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 ));
             }
         }
-        let channels = if !id.starts_with("macos") {
-            vec!["native", "cargo"]
-        } else {
-            vec!["both"]
-        };
+        let channels = ["native", "cargo"];
         for channel in channels {
-            let name = if channel == "both" {
-                format!("installed-{id}")
+            let name = if id.starts_with("macos") {
+                format!("installed-{id}-{channel}")
             } else {
                 format!("candidate-{id}-{channel}")
             };
@@ -2618,14 +2856,14 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 &["select", "packages", &native_name],
                 "installed target-local dependencies",
             )?;
-            let selected_channel = if channel == "both" {
+            let selected_channel = if id.starts_with("macos") {
                 channel.to_owned()
             } else {
                 format!("candidate-{channel}")
             };
             check_release_row(job, target, runner, Some(&selected_channel))?;
             let steps = ordinary_steps(job, "installed channel")?;
-            if channel != "both" {
+            if !id.starts_with("macos") {
                 check_readiness_candidate_steps(job, steps, &name, &native_name)?;
                 continue;
             }
@@ -2686,7 +2924,14 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             }
         }
     }
-    for name in ["packages", "source-checks", "miri", "fuzz"] {
+    for name in [
+        "packages",
+        "source-checks",
+        "msrv",
+        "supply-chain",
+        "miri",
+        "fuzz",
+    ] {
         let job = mapping(
             jobs.get(key(name))
                 .ok_or_else(|| failure("release check descendant absent"))?,
@@ -2702,11 +2947,21 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             .iter()
             .position(|step| {
                 step.get(key("run")).and_then(Value::as_str)
-                    == Some("./target/ci/release/memcordon-ci release verify-source --build-source .release/build-source.json")
+                    == Some("./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json")
             })
             .ok_or_else(|| failure("release source identity recheck absent"))?;
         ordinary_driver_before_suite(steps, verify)?;
         if name == "miri" || name == "fuzz" {
+            if job
+                .get(key("strategy"))
+                .and_then(|strategy| strategy.get(key("fail-fast")))
+                .and_then(Value::as_str)
+                != Some("${{ github.event_name != 'workflow_dispatch' }}")
+            {
+                return Err(failure(
+                    "only automated disposable shard matrices use fail-fast",
+                ));
+            }
             let shards = job
                 .get(key("strategy"))
                 .and_then(|strategy| strategy.get(key("matrix")))
@@ -2714,7 +2969,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 .ok_or_else(|| failure("release shard inventory absent"))?;
             exact_string_sequence(shards, &["first", "second"], "release complete halves")?;
             for shard in ["first", "second"] {
-                let run = format!("./target/ci/release/memcordon-ci suite {name}-{shard}");
+                let run = format!("./.release/tool/memcordon-ci suite {name}-{shard}");
                 let expected = format!("matrix.shard == '{shard}'");
                 let matches: Vec<_> = steps
                     .iter()
@@ -2726,9 +2981,14 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                     return Err(failure("release complete shard coverage differs"));
                 }
             }
-        } else if name == "source-checks" {
-            for suite in ["policy", "quality", "msrv", "supply-chain"] {
-                let run = format!("./target/ci/release/memcordon-ci suite {suite}");
+        } else if matches!(name, "source-checks" | "msrv" | "supply-chain") {
+            let suite = if name == "source-checks" {
+                "quality-compile"
+            } else {
+                name
+            };
+            {
+                let run = format!("./.release/tool/memcordon-ci suite {suite}");
                 let matches: Vec<_> = steps
                     .iter()
                     .filter(|step| step.get(key("run")).and_then(Value::as_str) == Some(&run))
@@ -3036,6 +3296,29 @@ fn validate_workflow_bytes_into(
             .ok_or_else(|| failure("workflow has no jobs"))?,
         "jobs",
     )?;
+    if matches!(
+        relative.to_str(),
+        Some(".github/workflows/ci.yml" | ".github/workflows/release.yml")
+    ) {
+        let mode = workflow
+            .get(key("on"))
+            .and_then(|events| events.get("workflow_dispatch"))
+            .and_then(|dispatch| dispatch.get("inputs"))
+            .and_then(|inputs| inputs.get("failure-mode"))
+            .ok_or_else(|| failure("manual failure mode input absent"))?;
+        if mode["type"].as_str() != Some("choice")
+            || mode["default"].as_str() != Some("stop-after-failure")
+        {
+            return Err(failure(
+                "automated failure mode cannot default to diagnostic collection",
+            ));
+        }
+        exact_string_sequence(
+            &mode["options"],
+            &["stop-after-failure", "collect-all"],
+            "manual failure modes",
+        )?;
+    }
     for (job_name, job_value) in jobs {
         let job_name = job_name
             .as_str()
@@ -3060,6 +3343,7 @@ fn validate_workflow_bytes_into(
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
             continue;
         };
+        check_cache_lifecycle(steps)?;
         for step_value in steps {
             let step = mapping(step_value, "step")?;
             if step.contains_key(key("shell")) {
@@ -3352,15 +3636,16 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             let quality = steps
                 .iter()
                 .position(|step| {
-                    step["run"].as_str() == Some("./target/ci/release/memcordon-ci suite quality")
+                    step["run"].as_str()
+                        == Some("./.release/tool/memcordon-ci suite quality-compile")
                 })
                 .ok_or_else(|| failure("quality absent"))?;
             if !steps[..quality].iter().any(|step| step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt") && step["if"].is_null() && step["continue-on-error"].is_null()) {
                 return Err(failure("quality must provision pinned Clippy and rustfmt"));
             }
         }
-        if name == "assemble" {
-            let assembly = steps.iter().position(|step| step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness")).ok_or_else(|| failure("assembly absent"))?;
+        if name == "assemble-payload" {
+            let assembly = steps.iter().position(|step| step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness --destination .release/assembled")).ok_or_else(|| failure("assembly absent"))?;
             if !steps[..assembly].iter().any(|step| {
                 step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal")
                     && step["if"].is_null()
@@ -3418,6 +3703,7 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
                         scalar(step, "name"),
                         Some(
                             "Retain bounded preparation diagnostics"
+                                | "Retain bounded helper diagnostics"
                                 | "Retain rehearsal diagnostics"
                                 | "Retain recovery rehearsal diagnostics"
                         )
@@ -3456,7 +3742,21 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
                     ".release/target" => {
                         Some("${{ needs[matrix.native-job].outputs.artifact-id }}")
                     }
-                    ".release/tool" if name == "assemble" => {
+                    ".release/tool"
+                        if matches!(
+                            name,
+                            "assemble"
+                                | "assemble-payload"
+                                | "packages"
+                                | "source-checks"
+                                | "msrv"
+                                | "supply-chain"
+                                | "miri"
+                                | "fuzz"
+                                | "rehearsal-tool"
+                                | "recovery-inputs"
+                        ) =>
+                    {
                         Some("${{ needs.select.outputs.preparation-tool-artifact-id }}")
                     }
                     _ => None,
@@ -3551,10 +3851,10 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
         .as_sequence()
         .ok_or_else(|| failure("assembly steps absent"))?;
     for (id, path, role) in [
-        ("prepared", ".release/prepared", "prepared"),
+        ("prepared", ".release/final/prepared", "prepared"),
         (
             "publication-tool",
-            ".release/tool/memcordon-publication-tool.tar.gz",
+            ".release/final/tool/memcordon-publication-tool.tar.gz",
             "publication-tool",
         ),
     ] {
@@ -3575,6 +3875,53 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             ));
         }
     }
+    let finalize = "./.release/tool/memcordon-ci release finalize-preparation --build-source .release/build-source.json --input .release/assembled --publisher-archive .release/tool/memcordon-publication-tool.tar.gz --destination .release/final";
+    if steps
+        .iter()
+        .filter(|step| {
+            step["run"].as_str() == Some(finalize)
+                && step["if"].is_null()
+                && step["continue-on-error"].is_null()
+        })
+        .count()
+        != 1
+        || steps.iter().any(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("cargo ") || run.contains(" release assemble "))
+        })
+    {
+        return Err(failure(
+            "finalization must copy validated original bytes without rebuilding",
+        ));
+    }
+    let early = jobs
+        .get(key("assemble-payload"))
+        .ok_or_else(|| failure("early assembly absent"))?;
+    exact_string_sequence(
+        &early["needs"],
+        &[
+            "select",
+            "packages",
+            "native-linux-x64",
+            "native-linux-arm64",
+            "native-macos-x64",
+            "native-macos-arm64",
+            "native-windows-x64",
+            "native-windows-arm64",
+        ],
+        "early assembly producer inputs",
+    )?;
+    if early["outputs"]["assembled-artifact-id"].as_str()
+        != Some("${{ steps.assembled.outputs.artifact-id }}")
+    {
+        return Err(failure(
+            "early assembly must expose only its intermediate artifact",
+        ));
+    }
+    let steps = early["steps"]
+        .as_sequence()
+        .ok_or_else(|| failure("early assembly steps absent"))?;
     for platform in [
         "linux-x64",
         "linux-arm64",

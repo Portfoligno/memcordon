@@ -35,6 +35,8 @@ fn failure(message: &str) -> CiError {
 
 pub fn sanitize_child(command: &mut Command) {
     for name in [
+        "GITHUB_OUTPUT",
+        "GITHUB_STEP_SUMMARY",
         "GH_TOKEN",
         "GITHUB_TOKEN",
         "CARGO_REGISTRY_TOKEN",
@@ -668,6 +670,19 @@ pub fn assert_evidence(
 }
 
 pub fn run(helper: &Path, publisher_path: &Path, input: &Path, report_dir: &Path) -> Result<()> {
+    run_with_jobs(helper, publisher_path, input, report_dir, 2)
+}
+
+pub fn run_with_jobs(
+    helper: &Path,
+    publisher_path: &Path,
+    input: &Path,
+    report_dir: &Path,
+    jobs: usize,
+) -> Result<()> {
+    if !(1..=2).contains(&jobs) {
+        return Err(failure("rehearsal jobs must be one or two"));
+    }
     let started = Instant::now();
     let work_unix_ms = unix_ms()?
         .checked_add(49 * 60 * 1000)
@@ -739,62 +754,128 @@ pub fn run(helper: &Path, publisher_path: &Path, input: &Path, report_dir: &Path
     let temporary = tempfile::Builder::new()
         .prefix("memcordon-rehearsal-")
         .tempdir()?;
-    for (ordinal, case) in selected.iter().enumerate() {
+    let context = CaseContext {
+        helper,
+        publisher_path,
+        input,
+        selection: &selection,
+        work_unix_ms,
+        work,
+        retirement,
+        cancelled: cancelled.clone(),
+    };
+    let mut next = 0;
+    while next < selected.len() {
         verify_tool(publisher_path, &report.publisher_sha256)?;
         if cancelled.load(Ordering::SeqCst) || Instant::now() + Duration::from_secs(10) >= work {
             return Err(failure(
                 "remaining original work interval cannot admit next case",
             ));
         }
-        let state = temporary.path().join(ordinal.to_string());
-        fs::create_dir(&state)?;
-        let result = run_case(
-            &CaseContext {
-                helper,
-                publisher_path,
-                input,
-                selection: &selection,
-                work_unix_ms,
-                work,
-                retirement,
-                cancelled: cancelled.clone(),
-            },
-            &state,
-            case,
-        );
-        let diagnostic = retain_case(report_dir, &state, ordinal);
-        report.unexecuted -= 1;
-        match result {
-            Ok(value) => report.cases.push(value),
-            Err(error) => {
-                let observed = snapshot(&state).ok();
-                let primary = if let Err(secondary) = diagnostic {
-                    CiError::Message(format!("{error}; secondary diagnostics: {secondary}"))
-                } else {
-                    error
-                };
-                report.cases.push(CaseResult {
-                    group: case.group.into(),
-                    variant: case.variant.clone(),
-                    complete: false,
-                    fault_reached: observed.as_ref().is_some_and(|value| value.fault_reached),
-                    publisher_terminated: process_terminated(&state.join("result.process.json")),
-                    requests: observed.as_ref().map_or(0, |value| value.requests.len()),
-                    effects: observed.as_ref().map_or(0, |value| value.effects.len()),
-                    cleanup: state.join("server-settled.json").is_file()
-                        && process_terminated(&state.join("result.process.json")),
-                    error: Some(primary.to_string()),
-                });
-                let secondary = write_report(&report_path, &report);
-                if let Err(secondary) = secondary {
-                    eprintln!("secondary rehearsal diagnostic failure: {secondary}");
+        // The catalogue's real first case runs alone. Each later wave owns at most
+        // two independent directories; no fault/recovery transaction is split.
+        let count = if next == 0 { 1 } else { jobs }.min(selected.len() - next);
+        let mut completed = std::collections::BTreeMap::new();
+        let mut primary = None;
+        thread::scope(|scope| {
+            let (sender, receiver) = mpsc::sync_channel(2);
+            let mut admitted = 0;
+            for ordinal in next..next + count {
+                if cancelled.load(Ordering::SeqCst)
+                    || Instant::now() + Duration::from_secs(10) >= work
+                {
+                    primary = Some(failure(
+                        "remaining original work interval cannot admit next case",
+                    ));
+                    break;
                 }
-                return Err(primary);
+                let state = temporary.path().join(ordinal.to_string());
+                if let Err(error) = fs::create_dir(&state) {
+                    primary = Some(error.into());
+                    break;
+                }
+                let sender = sender.clone();
+                let case = &selected[ordinal];
+                let context = &context;
+                match thread::Builder::new().spawn_scoped(scope, move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_case(context, &state, case)
+                    }))
+                    .unwrap_or_else(|_| Err(failure("rehearsal case worker panicked")));
+                    let _ = sender.send((ordinal, state, result));
+                }) {
+                    Ok(_) => admitted += 1,
+                    Err(error) => {
+                        primary = Some(error.into());
+                        break;
+                    }
+                }
+            }
+            drop(sender);
+            for (ordinal, state, result) in receiver.iter().take(admitted) {
+                // Observe in completion order and announce failure before waiting
+                // for the peer. The peer keeps its original retirement ownership.
+                let case = &selected[ordinal];
+                if let Err(error) = &result {
+                    eprintln!("rehearsal case failed: {error}");
+                }
+                let diagnostic = retain_case(report_dir, &state, ordinal);
+                report.unexecuted -= 1;
+                let value = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        if primary.is_none() {
+                            primary = Some(error);
+                        } else {
+                            eprintln!("secondary rehearsal case failure: {error}");
+                        }
+                        let observed = snapshot(&state).ok();
+                        CaseResult {
+                            group: case.group.into(),
+                            variant: case.variant.clone(),
+                            complete: false,
+                            fault_reached: observed
+                                .as_ref()
+                                .is_some_and(|value| value.fault_reached),
+                            publisher_terminated: process_terminated(
+                                &state.join("result.process.json"),
+                            ),
+                            requests: observed.as_ref().map_or(0, |value| value.requests.len()),
+                            effects: observed.as_ref().map_or(0, |value| value.effects.len()),
+                            cleanup: state.join("server-settled.json").is_file()
+                                && process_terminated(&state.join("result.process.json")),
+                            error: Some(error_text),
+                        }
+                    }
+                };
+                completed.insert(ordinal, value);
+                if let Err(error) = diagnostic {
+                    if primary.is_none() {
+                        primary = Some(error);
+                    } else {
+                        eprintln!("secondary rehearsal diagnostic failure: {error}");
+                    }
+                }
+                if primary.is_none() {
+                    if let Err(error) = fs::remove_dir_all(&state) {
+                        primary = Some(error.into());
+                    }
+                }
+            }
+        });
+        report.cases.extend(completed.into_values());
+        if let Err(error) = write_report(&report_path, &report) {
+            if primary.is_none() {
+                primary = Some(error);
+            } else {
+                eprintln!("secondary rehearsal diagnostic failure: {error}");
             }
         }
-        diagnostic?;
-        write_report(&report_path, &report)?;
-        fs::remove_dir_all(&state)?;
+        if let Some(error) = primary {
+            return Err(error);
+        }
+        next += count;
     }
     if original_input != inventory(input)?
         || report.publisher_sha256 != artifacts::checksum(&artifacts::read_file(publisher_path)?)
@@ -1320,6 +1401,7 @@ fn input_controls(
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     let loaded = RehearsalInput::load(input)?;
+    assert_parallel_input_isolation(input)?;
     #[cfg(unix)]
     let temporary = tempfile::tempdir_in("/tmp")?;
     #[cfg(not(unix))]
@@ -1338,20 +1420,7 @@ fn input_controls(
     if RehearsalInput::load(directory).is_ok() {
         return Err(failure("missing-envelope control accepted"));
     }
-    for entry in fs::read_dir(input)? {
-        let entry = entry?;
-        let destination = directory.join(entry.file_name());
-        if fs::hard_link(entry.path(), &destination).is_err() {
-            // Files are already bounded by the validated original inventory;
-            // a different local filesystem must not disable mutation controls.
-            let size = entry.metadata()?.len();
-            let mut source = fs::File::open(entry.path())?.take(size + 1);
-            let mut copied = fs::File::create(&destination)?;
-            if std::io::copy(&mut source, &mut copied)? != size {
-                return Err(failure("input changed during bounded control copy"));
-            }
-        }
-    }
+    copy_input_view(input, directory)?;
     let envelope = directory.join(if loaded.kind() == "candidate" {
         "candidate.json"
     } else {
@@ -1429,6 +1498,90 @@ fn input_controls(
                 "production candidate reached credential acquisition",
             ));
         }
+    }
+    Ok(())
+}
+
+fn copy_input_view(input: &Path, directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(input)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(failure("input control contains nonfile"));
+        }
+        let destination = directory.join(entry.file_name());
+        if fs::hard_link(entry.path(), &destination).is_err() {
+            let size = entry.metadata()?.len();
+            let mut source = fs::File::open(entry.path())?.take(size + 1);
+            let mut copied = fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            if std::io::copy(&mut source, &mut copied)? != size {
+                return Err(failure("input changed during bounded control copy"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Real negative control: concurrent mutations must break hard links first.
+/// Both the original inode bytes and the other case's view stay unchanged.
+pub fn assert_parallel_input_isolation(input: &Path) -> Result<()> {
+    let before = inventory(input)?;
+    if before.len() < 2 {
+        return Err(failure(
+            "parallel input control requires envelope and payload",
+        ));
+    }
+    #[cfg(unix)]
+    let temporary = tempfile::tempdir_in("/tmp")?;
+    #[cfg(not(unix))]
+    let temporary = tempfile::tempdir()?;
+    let views = [
+        temporary.path().join("first"),
+        temporary.path().join("second"),
+    ];
+    for view in &views {
+        fs::create_dir(view)?;
+        copy_input_view(input, view)?;
+    }
+    thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::new();
+        for ordinal in 0..2 {
+            let views = &views;
+            let name = &before[ordinal].0;
+            workers.push(scope.spawn(move || -> Result<()> {
+                let original = artifacts::checksum(&artifacts::read_file(&input.join(name))?);
+                let path = views[ordinal].join(name);
+                // Replacing an entry, never opening the shared inode for writing.
+                fs::remove_file(&path)?;
+                fs::write(&path, b"parallel input mutation control\n")?;
+                if artifacts::checksum(&artifacts::read_file(&input.join(name))?) != original
+                    || artifacts::checksum(&artifacts::read_file(&views[1 - ordinal].join(name))?)
+                        != original
+                {
+                    return Err(failure(
+                        "parallel input control changed original or peer bytes",
+                    ));
+                }
+                Ok(())
+            }));
+        }
+        let mut primary = None;
+        for worker in workers {
+            let result = worker
+                .join()
+                .unwrap_or_else(|_| Err(failure("parallel input control panicked")));
+            if let Err(error) = result {
+                if primary.is_none() {
+                    primary = Some(error);
+                }
+            }
+        }
+        primary.map_or(Ok(()), Err)
+    })?;
+    if before != inventory(input)? {
+        return Err(failure("parallel input control mutated original inventory"));
     }
     Ok(())
 }

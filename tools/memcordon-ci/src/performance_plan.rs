@@ -138,6 +138,12 @@ pub struct Selection {
     pub experiment: Option<Experiment>,
 }
 impl Selection {
+    pub fn validate_layout(&self) -> Result<()> {
+        if let Some(experiment) = &self.experiment {
+            experiment.supports_parallel()?;
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
         if let Some(experiment) = &self.experiment {
             let eligible = experiment.supports_parallel()?;
@@ -221,9 +227,9 @@ impl PerformancePlan {
         for entry in &self.stress {
             entry.validate_layout()?;
         }
-        for selection in [&self.macos_release, &self.preparation, &self.quality] {
-            selection.validate()?;
-        }
+        self.macos_release.validate()?;
+        self.preparation.validate_layout()?;
+        self.quality.validate_layout()?;
         Ok(())
     }
     pub fn stress_cells(&self, layout: Layout) -> Result<Vec<serde_json::Value>> {

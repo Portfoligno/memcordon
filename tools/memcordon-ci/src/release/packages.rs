@@ -427,6 +427,7 @@ impl PackageConsumer {
         let install_root = directory.path().join("install");
         let cargo_home = directory.path().join("cargo-home");
         fs::create_dir(&cargo_home)?;
+        crate::cache_inputs::seed_current_downloads(&cargo_home, false)?;
         let mut value = Self {
             _directory: directory,
             manifest,
@@ -800,6 +801,7 @@ impl PackageConsumer {
             run = run.arg("--target").arg(selected);
         }
         run.run()?;
+        crate::cache_inputs::export_current_downloads(&self.cargo_home);
         self.verify_packaged_sources()?;
         self.verify_selected_graph(root, false)
     }
@@ -845,6 +847,7 @@ impl PackageConsumer {
             spec = spec.arg("--bin").arg(binary);
         }
         spec.run()?;
+        crate::cache_inputs::export_current_downloads(&self.cargo_home);
         self.verify_packaged_sources()?;
         self.verify_selected_graph(root, true)
     }

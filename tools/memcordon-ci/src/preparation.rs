@@ -11,44 +11,150 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Two scoped owners, with fixed result order and no abandoned second lane.
+#[derive(Clone, Debug)]
+pub struct GroupStop {
+    pub requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mode: crate::failure_mode::FailureMode,
+}
+
+thread_local! {
+    static ACTIVE_GROUP: std::cell::RefCell<Option<GroupStop>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn active_group() -> Option<GroupStop> {
+    ACTIVE_GROUP.with(|group| group.borrow().clone())
+}
+
+impl GroupStop {
+    pub fn may_start(&self) -> bool {
+        !self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn request_after_failure(&self) {
+        if self.mode == crate::failure_mode::FailureMode::StopAfterFailure {
+            self.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Two scoped owners, completion-order failures and no abandoned active lane.
 /// Native command supervision supplies cleanup; joining alone is not a deadline.
 pub fn complete_lanes(
     layout: Layout,
     first: impl FnOnce() -> Result<()> + Send,
     second: impl FnOnce() -> Result<()> + Send,
 ) -> Result<()> {
-    let run = |operation: Box<dyn FnOnce() -> Result<()> + Send + '_>| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
-            .unwrap_or_else(|_| Err(CiError::Message("scoped lane panicked".into())))
+    complete_lanes_with_failure(
+        layout,
+        crate::failure_mode::FailureMode::StopAfterFailure,
+        first,
+        second,
+    )
+}
+
+pub fn complete_lanes_with_failure(
+    layout: Layout,
+    mode: crate::failure_mode::FailureMode,
+    first: impl FnOnce() -> Result<()> + Send,
+    second: impl FnOnce() -> Result<()> + Send,
+) -> Result<()> {
+    let stop = GroupStop {
+        requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mode,
+    };
+    let run = |operation: Box<dyn FnOnce() -> Result<()> + Send + '_>, stop: GroupStop| {
+        if !stop.may_start() {
+            return Err(CiError::NotStartedAfterFailure);
+        }
+        let previous = ACTIVE_GROUP.with(|group| group.replace(Some(stop.clone())));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+            .unwrap_or_else(|_| Err(CiError::Message("scoped lane panicked".into())));
+        if result.is_err() {
+            stop.request_after_failure();
+        }
+        ACTIVE_GROUP.with(|group| *group.borrow_mut() = previous);
+        result
     };
     let (first, second) = match layout {
-        Layout::Serial => (run(Box::new(first)), run(Box::new(second))),
+        Layout::Serial => {
+            let first = run(Box::new(first), stop.clone());
+            if first.is_err() && mode == crate::failure_mode::FailureMode::StopAfterFailure {
+                return first;
+            }
+            (first, run(Box::new(second), stop.clone()))
+        }
         Layout::Parallel => std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+            let first_sender = sender.clone();
+            let first_stop = stop.clone();
+            let second_stop = stop.clone();
             let first = std::thread::Builder::new()
                 .name("ci-source-lane".into())
-                .spawn_scoped(scope, move || run(Box::new(first)));
+                .spawn_scoped(scope, move || {
+                    let result = run(Box::new(first), first_stop);
+                    let _ = first_sender.send((0, result));
+                });
+            if first.is_err() {
+                stop.request_after_failure();
+            }
             let second = std::thread::Builder::new()
                 .name("ci-auxiliary-lane".into())
-                .spawn_scoped(scope, move || run(Box::new(second)));
-            let finish = |owner: std::io::Result<std::thread::ScopedJoinHandle<'_, Result<()>>>| {
-                owner
-                    .map_err(CiError::Io)?
-                    .join()
-                    .unwrap_or_else(|_| Err(CiError::Message("scoped owner panicked".into())))
+                .spawn_scoped(scope, move || {
+                    let result = run(Box::new(second), second_stop);
+                    let _ = sender.send((1, result));
+                });
+            let mut results = [None, None];
+            let mut primary = if first.is_err() {
+                Some(0)
+            } else if second.is_err() {
+                stop.request_after_failure();
+                Some(1)
+            } else {
+                None
             };
-            let first = finish(first);
-            let second = finish(second);
-            (first, second)
+            for (ordinal, result) in receiver {
+                if let Err(error) = &result {
+                    for line in error.to_string().lines() {
+                        let safe: String = line.chars().flat_map(char::escape_default).collect();
+                        eprintln!("[ci lane {ordinal}] failed: {safe}");
+                    }
+                    if primary.is_none()
+                        && !matches!(
+                            error,
+                            CiError::Cancelled(_)
+                                | CiError::SettledCancellation(_)
+                                | CiError::NotStartedAfterFailure
+                        )
+                    {
+                        primary = Some(ordinal);
+                    }
+                }
+                results[ordinal] = Some(result);
+            }
+            for (ordinal, owner) in [first, second].into_iter().enumerate() {
+                if let Err(error) = owner.map_err(CiError::Io).and_then(|owner| {
+                    owner
+                        .join()
+                        .map_err(|_| CiError::Message("scoped owner panicked".into()))
+                }) {
+                    results[ordinal] = Some(Err(error));
+                }
+            }
+            let primary = primary.unwrap_or(0);
+            (
+                results[primary].take().expect("primary owner settled"),
+                results[1 - primary].take().expect("peer owner settled"),
+            )
         }),
     };
     match (first, second) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(first), Ok(())) => Err(first),
         (Ok(()), Err(second)) => Err(second),
-        (Err(first), Err(second)) => Err(CiError::Message(format!(
-            "first lane: {first}; second lane: {second}"
-        ))),
+        (Err(first), Err(second)) => Err(CiError::LaneFailures {
+            primary: Box::new(first),
+            secondary: Box::new(second),
+        }),
     }
 }
 
@@ -73,7 +179,7 @@ pub fn observed(command: CommandSpec, directory: &Path, name: &str) -> Result<()
         &result.stderr,
     );
     if !result.status.success() {
-        return Err(CiError::Message(format!(
+        return Err(CiError::SettledCommandFailure(format!(
             "operation {name} failed with {:?}; stdout collection={stdout:?}; stderr collection={stderr:?}\nstdout:\n{}\nstderr:\n{}",
             result.status,
             String::from_utf8_lossy(&result.stdout),
@@ -104,23 +210,27 @@ pub fn ensure_auxiliary_tool(
     name: &str,
     version: &str,
 ) -> Result<PathBuf> {
+    ensure_auxiliary_tool_until(
+        root,
+        profile,
+        name,
+        version,
+        Instant::now() + Duration::from_secs(45 * 60),
+    )
+}
+
+pub fn ensure_auxiliary_tool_until(
+    root: &Path,
+    profile: BootstrapProfile,
+    name: &str,
+    version: &str,
+    deadline: Instant,
+) -> Result<PathBuf> {
     let path = auxiliary_tool(root, name)?;
-    let valid = |path: &Path| -> Result<bool> {
-        if !path.is_file() {
-            return Ok(false);
-        }
-        let output = CommandSpec::new(path, root, Duration::from_secs(30))
-            .arg("--version")
-            .output_quiet()?;
-        Ok(output.status.success()
-            && std::str::from_utf8(&output.stdout)
-                .ok()
-                .is_some_and(|text| text.split_whitespace().any(|token| token == version)))
-    };
-    if !valid(&path)? {
-        prepare(root, profile)?;
+    if !valid_auxiliary_version(root, &path, version, deadline)? {
+        prepare_until(root, profile, deadline)?;
     }
-    if !valid(&path)? {
+    if !valid_auxiliary_version(root, &path, version, deadline)? {
         return Err(CiError::Message(
             "promoted auxiliary version differs from selected pin".into(),
         ));
@@ -128,8 +238,53 @@ pub fn ensure_auxiliary_tool(
     Ok(path)
 }
 
+fn valid_auxiliary_version(
+    root: &Path,
+    path: &Path,
+    version: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Ok(false);
+        }
+    }
+    let output = match CommandSpec::new(path, root, Duration::from_secs(30))
+        .arg("--version")
+        .bounded_until(deadline)
+        .defer_group_failure()
+        .output_quiet()
+    {
+        Ok(output) => output,
+        Err(CiError::CommandSpawnFailure(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(output.status.success()
+        && std::str::from_utf8(&output.stdout)
+            .ok()
+            .is_some_and(|text| text.split_whitespace().any(|token| token == version)))
+}
+
 pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(45 * 60);
+    prepare_until(root, profile, Instant::now() + Duration::from_secs(45 * 60))
+}
+
+pub fn prepare_until(
+    root: &Path,
+    profile: BootstrapProfile,
+    parent_deadline: Instant,
+) -> Result<()> {
+    let deadline = parent_deadline.min(Instant::now() + Duration::from_secs(45 * 60));
     let toolchains = crate::config::toolchains(root)?;
     let tools = crate::config::tools(root)?;
     let layout = PerformancePlan::read(root)?.preparation.selected;
@@ -159,7 +314,8 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                 root,
                 remaining(deadline, Duration::from_secs(900))?,
             )
-            .args(["toolchain", "install", toolchain, "--profile", "minimal"]),
+            .args(["toolchain", "install", toolchain, "--profile", "minimal"])
+            .bounded_until(deadline),
             &reports,
             &index.to_string(),
         )?;
@@ -194,7 +350,8 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                     &toolchains.stable,
                     ["fetch", "--locked"],
                     remaining(deadline, Duration::from_secs(900))?,
-                ),
+                )
+                .bounded_until(deadline),
                 &source_reports,
                 "fetch",
             )?;
@@ -204,7 +361,8 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                     &toolchains.stable,
                     ["metadata", "--locked", "--format-version", "1"],
                     remaining(deadline, Duration::from_secs(900))?,
-                ),
+                )
+                .bounded_until(deadline),
                 &source_reports,
                 "metadata",
             )
@@ -227,7 +385,8 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                         &toolchains.miri,
                         "miri",
                         "rust-src",
-                    ]),
+                    ])
+                    .bounded_until(deadline),
                     &auxiliary_reports,
                     "miri-component",
                 )?;
@@ -237,12 +396,25 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                         &toolchains.miri,
                         ["miri", "setup"],
                         remaining(deadline, Duration::from_secs(900))?,
-                    ),
+                    )
+                    .bounded_until(deadline),
                     &auxiliary_reports,
                     "miri-sysroot",
                 )?;
             }
             for (package, version) in &installs {
+                let restored = auxiliary_tool(root, package)?;
+                if valid_auxiliary_version(root, &restored, version, deadline)? {
+                    let destination = staging
+                        .path()
+                        .join("bin")
+                        .join(restored.file_name().expect("named auxiliary tool"));
+                    fs::create_dir_all(destination.parent().expect("staging bin"))?;
+                    let bytes = crate::release::artifacts::read_file(&restored)?;
+                    fs::write(&destination, bytes)?;
+                    fs::set_permissions(destination, fs::metadata(&restored)?.permissions())?;
+                    continue;
+                }
                 observed(
                     rustup_cargo(
                         root,
@@ -259,7 +431,8 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                     )
                     .arg(staging.path())
                     .arg("--target-dir")
-                    .arg(root.join("target/ci-tools-build")),
+                    .arg(root.join("target/ci-tools-build").join(package))
+                    .bounded_until(deadline),
                     &auxiliary_reports,
                     package,
                 )?;
@@ -276,6 +449,7 @@ pub fn prepare(root: &Path, profile: BootstrapProfile) -> Result<()> {
                     remaining(deadline, Duration::from_secs(30))?,
                 )
                 .arg("--version")
+                .bounded_until(deadline)
                 .output_quiet()?;
                 if !output.status.success()
                     || !std::str::from_utf8(&output.stdout)

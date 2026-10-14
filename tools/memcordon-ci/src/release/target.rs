@@ -354,6 +354,24 @@ pub fn build_selected_with_components(
     destination: &Path,
     consumer_readiness: bool,
 ) -> Result<()> {
+    build_selected_with_failure(
+        root,
+        selected,
+        distribution,
+        destination,
+        consumer_readiness,
+        crate::failure_mode::FailureMode::StopAfterFailure,
+    )
+}
+
+pub fn build_selected_with_failure(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    consumer_readiness: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
     selected.recheck(root)?;
     let operation_deadline = if consumer_readiness
         && matches!(
@@ -421,12 +439,39 @@ pub fn build_selected_with_components(
     for binary in &distribution.binaries {
         command = command.arg("--bin").arg(binary);
     }
-    command
+    let command = command
         .bounded_until(operation_deadline)
         .phase(crate::command::CiPhase::ProductBuild)
-        .selection(selected, Some(&distribution.target))
-        .run()?;
-    for phase in crate::native_test_plan::commands(true) {
+        .selection(selected, Some(&distribution.target));
+    let mut phases = crate::native_test_plan::commands_with_failure(true, failure_mode).into_iter();
+    let compile = phases.next().expect("native compile phase");
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    let layout = if workers > 1 {
+        crate::performance_plan::Layout::Parallel
+    } else {
+        crate::performance_plan::Layout::Serial
+    };
+    let product_jobs = (workers / 2).max(1).to_string();
+    let test_jobs = (workers - workers / 2).max(1).to_string();
+    crate::preparation::complete_lanes_with_failure(
+        layout,
+        failure_mode,
+        || command.arg("--jobs").arg(product_jobs).run().map(|_| ()),
+        || {
+            rustup_cargo(root, &toolchain, ["test"], compile.deadline)
+                .args(compile.arguments)
+                .arg("--jobs")
+                .arg(test_jobs)
+                .bounded_until(operation_deadline)
+                .phase(crate::command::CiPhase::NativeCompile)
+                .selection(selected, Some(&distribution.target))
+                .run()
+                .map(|_| ())
+        },
+    )?;
+    for phase in phases {
         let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
             crate::command::CiPhase::NativeCompile
         } else {

@@ -14,6 +14,16 @@ pub struct NativeTestCommand {
 }
 
 pub fn commands(release_mode: bool) -> Vec<NativeTestCommand> {
+    commands_with_failure(
+        release_mode,
+        crate::failure_mode::FailureMode::StopAfterFailure,
+    )
+}
+
+pub fn commands_with_failure(
+    release_mode: bool,
+    mode: crate::failure_mode::FailureMode,
+) -> Vec<NativeTestCommand> {
     let mut arguments = vec![
         "--target-dir",
         "target/ci/native",
@@ -30,9 +40,9 @@ pub fn commands(release_mode: bool) -> Vec<NativeTestCommand> {
     build_arguments.push("--no-run");
     // Bound cold compilation separately from execution on every native lane.
     // Both phases select the same targets, features, profile, and lockfile.
-    // Execute every selected test binary after a failure, but retain Cargo's
-    // nonzero final status and the existing whole-execution deadline.
-    arguments.push("--no-fail-fast");
+    if mode == crate::failure_mode::FailureMode::CollectAll {
+        arguments.push("--no-fail-fast");
+    }
     vec![
         NativeTestCommand {
             arguments: build_arguments,

@@ -62,6 +62,20 @@ fn state(
 }
 
 pub fn packages(root: &Path, stable: &str, target: &Path) -> Result<()> {
+    packages_until(
+        root,
+        stable,
+        target,
+        Instant::now() + Duration::from_secs(100 * 60),
+    )
+}
+
+fn packages_until(
+    root: &Path,
+    stable: &str,
+    target: &Path,
+    operation_deadline: Instant,
+) -> Result<()> {
     let started = Instant::now();
     state(
         root,
@@ -100,6 +114,7 @@ pub fn packages(root: &Path, stable: &str, target: &Path) -> Result<()> {
                     serde_json::json!({"package": package, "phase": if ordinal == 0 { "compile" } else { "execute" }, "budget_seconds": deadline.as_secs()}),
                 )?;
                 rustup_cargo(root, stable, arguments, deadline)
+                    .bounded_until(operation_deadline)
                     .run()
                     .map_err(|error| {
                         CiError::Message(format!(
@@ -180,6 +195,20 @@ fn finish<T>(
 }
 
 pub fn lifecycle(root: &Path, stable: &str, target: &Path) -> Result<LifecycleDisposition> {
+    lifecycle_until(
+        root,
+        stable,
+        target,
+        Instant::now() + Duration::from_secs(100 * 60),
+    )
+}
+
+fn lifecycle_until(
+    root: &Path,
+    stable: &str,
+    target: &Path,
+    operation_deadline: Instant,
+) -> Result<LifecycleDisposition> {
     let started = Instant::now();
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -201,7 +230,16 @@ pub fn lifecycle(root: &Path, stable: &str, target: &Path) -> Result<LifecycleDi
     let reports = root.join("target/ci/reports");
     let result = (|| {
         fs::write(reports.join("stress-seed.txt"), format!("{seed}\n"))?;
-        let probe = capability::probe(root, stable, target, Duration::from_secs(900))?;
+        let probe = capability::probe(
+            root,
+            stable,
+            target,
+            crate::command::remaining_budget(
+                Duration::from_secs(900),
+                operation_deadline.saturating_duration_since(Instant::now()),
+                Duration::from_secs(10),
+            )?,
+        )?;
         if cfg!(target_os = "linux") && capability::selected(&probe).is_none() {
             eprintln!("deep backend-dependent stress is unavailable on this runner: {probe}");
             return Ok(LifecycleDisposition::UnavailableOnLinux {
@@ -209,6 +247,29 @@ pub fn lifecycle(root: &Path, stable: &str, target: &Path) -> Result<LifecycleDi
             });
         }
         capability::require_selected(&probe)?;
+        // Cold compilation has its own allowance; the lifecycle interval is
+        // reserved for the actual seeded 4,096-iteration harness.
+        rustup_cargo(
+            root,
+            stable,
+            [
+                OsString::from("test"),
+                OsString::from("--target-dir"),
+                target.as_os_str().to_owned(),
+                OsString::from("--package"),
+                OsString::from("memcordon"),
+                OsString::from("--features"),
+                OsString::from("test-fixtures"),
+                OsString::from("--test"),
+                OsString::from("stress"),
+                OsString::from("--release"),
+                OsString::from("--locked"),
+                OsString::from("--no-run"),
+            ],
+            Duration::from_secs(40 * 60),
+        )
+        .bounded_until(operation_deadline)
+        .run()?;
         rustup_cargo(
             root,
             stable,
@@ -232,6 +293,7 @@ pub fn lifecycle(root: &Path, stable: &str, target: &Path) -> Result<LifecycleDi
             ],
             Duration::from_secs(35 * 60),
         )
+        .bounded_until(operation_deadline)
         .run()?;
         let report: serde_json::Value = serde_json::from_slice(&fs::read(
             reports.join("stress-deep_short_child_iterations.json"),
@@ -285,8 +347,9 @@ pub fn lifecycle(root: &Path, stable: &str, target: &Path) -> Result<LifecycleDi
 }
 
 pub fn combined(root: &Path, stable: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(100 * 60);
     let target = Path::new("target/ci/stress");
-    packages(root, stable, target)?;
-    lifecycle(root, stable, target)?;
+    packages_until(root, stable, target, deadline)?;
+    lifecycle_until(root, stable, target, deadline)?;
     Ok(())
 }

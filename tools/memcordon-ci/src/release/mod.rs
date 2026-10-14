@@ -4,6 +4,7 @@ pub mod bundle;
 pub mod compatibility;
 pub mod consumer_readiness_cell;
 pub mod distribution;
+pub mod finalize;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;
@@ -97,6 +98,22 @@ pub enum ConsumerChannel {
 pub enum ReleaseCommand {
     ConsumerReadinessReport(readiness_report::ReportArguments),
     SelectPreparation,
+    CheckPreparation {
+        #[arg(long)]
+        build_source: PathBuf,
+        #[arg(long)]
+        consumer_readiness: bool,
+    },
+    FinalizePreparation {
+        #[arg(long)]
+        build_source: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        publisher_archive: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     WorkingWindowsPrepare {
         #[arg(long, default_value = "target/ci/windows-prepared")]
         destination: PathBuf,
@@ -114,6 +131,10 @@ pub enum ReleaseCommand {
         target: PathBuf,
         #[arg(long, default_value = ".release/packages")]
         packages: PathBuf,
+        #[arg(long, value_enum, default_value = "cargo")]
+        channel: ConsumerChannel,
+        #[arg(long, value_enum, default_value = "ordinary")]
+        profile: crate::cache::ConsumerProfile,
     },
     VerifySource {
         #[arg(long, conflicts_with = "build_source")]
@@ -132,7 +153,10 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     RecoveryInputs,
-    RehearsalTool,
+    RehearsalTool {
+        #[arg(long)]
+        executable: Option<PathBuf>,
+    },
     #[command(hide = true)]
     RehearsalTransaction {
         #[arg(long)]
@@ -151,6 +175,8 @@ pub enum ReleaseCommand {
         prepared: PathBuf,
     },
     BuildTarget {
+        #[arg(long, value_enum, default_value = "stop-after-failure")]
+        failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
         consumer_readiness: bool,
         #[arg(long, conflicts_with = "build_source")]
@@ -245,6 +271,22 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
+        ReleaseCommand::CheckPreparation {
+            build_source,
+            consumer_readiness,
+        } => finalize::check_preparation(root, &build_source, consumer_readiness),
+        ReleaseCommand::FinalizePreparation {
+            build_source,
+            input,
+            publisher_archive,
+            destination,
+        } => finalize::finalize_preparation(
+            root,
+            &build_source,
+            &input,
+            &publisher_archive,
+            &destination,
+        ),
         ReleaseCommand::SelectPreparation => {
             let selected = preparation::select_preparation(root)?;
             preparation::write_preparation_files(root, &selected)
@@ -269,7 +311,12 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 }
             },
         ),
-        ReleaseCommand::ConsumerCache { target, packages } => {
+        ReleaseCommand::ConsumerCache {
+            target,
+            packages,
+            channel,
+            profile,
+        } => {
             let (native, _) = target::TargetBundle::load(&target)?;
             let (crates, _) = packages::PackageBundle::load(&packages)?;
             if native.source != crates.source {
@@ -277,11 +324,13 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                     "consumer cache source selections differ".into(),
                 ));
             }
-            let mut inputs = vec![target.join("target.json"), packages.join("packages.json")];
-            inputs.push(target.join(&native.archive.name));
-            inputs.push(target.join(&native.fixture.name));
-            inputs.extend(crates.files.iter().map(|file| packages.join(&file.name)));
-            crate::cache::emit(root, "installed", "complete", &inputs)
+            crate::cache::emit_consumer_downloads(
+                match channel {
+                    ConsumerChannel::Native => "native",
+                    ConsumerChannel::Cargo => "cargo",
+                },
+                profile,
+            )
         }
         ReleaseCommand::VerifySource {
             source,
@@ -347,7 +396,9 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             readiness_report::run(root, &arguments)
         }
         ReleaseCommand::RecoveryInputs => recovery::recovery_inputs(root),
-        ReleaseCommand::RehearsalTool => rehearsal_tool::package(root),
+        ReleaseCommand::RehearsalTool { executable } => {
+            rehearsal_tool::package_selected(root, executable.as_deref())
+        }
         ReleaseCommand::RehearsalTransaction {
             input,
             fixture,
@@ -356,6 +407,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Publish { prepared } => publish::run(&prepared, true),
         ReleaseCommand::Inspect { prepared } => publish::run(&prepared, false),
         ReleaseCommand::BuildTarget {
+            failure_mode,
             consumer_readiness,
             source,
             build_source,
@@ -370,12 +422,13 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 distribution
             };
             let distribution = distribution.native()?.clone();
-            target::build_selected_with_components(
+            target::build_selected_with_failure(
                 root,
                 &selected,
                 &distribution,
                 &destination,
                 consumer_readiness,
+                failure_mode,
             )
         }
         ReleaseCommand::Assemble {

@@ -81,12 +81,14 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         changed["on"]["push"][field] = serde_yaml::from_str(value).unwrap();
         assert!(validate(RELEASE, &changed).is_err(), "changed {field}");
     }
-    for suite in ["policy", "quality", "msrv", "supply-chain"] {
+    for (job, suite) in [
+        ("source-checks", "quality-compile"),
+        ("msrv", "msrv"),
+        ("supply-chain", "supply-chain"),
+    ] {
         let mut changed = exact.clone();
-        let command = ["./target/ci/release/memcordon-ci suite", suite].join(" ");
-        let steps = changed["jobs"]["source-checks"]["steps"]
-            .as_sequence_mut()
-            .unwrap();
+        let command = ["./.release/tool/memcordon-ci suite", suite].join(" ");
+        let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
         let index = steps
             .iter()
             .position(|step| step["run"].as_str() == Some(command.as_str()))
@@ -97,6 +99,19 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
             "removed executing owner {suite}"
         );
     }
+    let mut changed = exact.clone();
+    changed["jobs"]["select"]["steps"]
+        .as_sequence_mut()
+        .unwrap()
+        .retain(|step| {
+            !step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("release check-preparation"))
+        });
+    assert!(
+        validate(RELEASE, &changed).is_err(),
+        "removed inexpensive policy/source/notes owner"
+    );
     for family in ["miri", "fuzz"] {
         let mut changed = exact.clone();
         changed["jobs"][family]["strategy"]["matrix"]["shard"][1] = Value::String("first".into());
@@ -307,7 +322,10 @@ fn release_native_cache_and_phase_retention_cannot_fall_back_to_old_wrapper() {
 #[test]
 fn actual_release_native_owner_still_executes_optimized_tests_and_complete_backend() {
     let source = include_str!("../src/release/target.rs");
-    assert!(source.contains("for phase in crate::native_test_plan::commands(true)"));
+    assert!(source.contains("crate::native_test_plan::commands_with_failure(true, failure_mode)"));
+    assert!(source.contains(".bounded_until(operation_deadline)"));
+    assert!(source.contains("crate::preparation::complete_lanes_with_failure("));
+    assert!(source.contains("for phase in phases"));
     for backend in [
         "backend-linux-cgroup",
         "backend-windows-job",
@@ -317,7 +335,7 @@ fn actual_release_native_owner_still_executes_optimized_tests_and_complete_backe
     }
     assert!(source.contains(".args([\"suite\", backend])"));
     let suites = include_str!("../src/suites.rs");
-    assert!(suites.contains("Suite::Native => native(root, &toolchains.stable, false)"));
+    assert!(suites.contains("Suite::Native => native("));
     assert!(
         suites.contains("Suite::BackendMacosWatchdog => release_macos(root, &toolchains.stable)")
     );

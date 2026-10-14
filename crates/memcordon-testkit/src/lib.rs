@@ -22,7 +22,7 @@ pub use memcordon_platform::test_support::{
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -47,6 +47,41 @@ pub struct TimeoutObservation {
     pub spawn_returned: Duration,
     pub boundary_admitted: Duration,
     pub timeout_observed: Duration,
+    pub stdout_reader_finished: bool,
+    pub stderr_reader_finished: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+pub struct ProgressChunk {
+    pub stream: OutputStream,
+    pub bytes: Vec<u8>,
+}
+
+/// Observational only: a slow logger never blocks an output reader or retirement.
+#[derive(Clone)]
+pub struct ProgressOutput {
+    pub sender: mpsc::SyncSender<ProgressChunk>,
+    pub omitted: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct ProcessControl {
+    cancelled: Option<Arc<AtomicBool>>,
+    progress: Option<ProgressOutput>,
+}
+
+#[derive(Debug)]
+pub struct CancellationObservation {
+    pub child_id: u32,
+    pub observed_status: Option<ExitStatus>,
+    pub cancellation_observed: Duration,
+    pub callback_completed: bool,
     pub stdout_reader_finished: bool,
     pub stderr_reader_finished: bool,
 }
@@ -78,6 +113,13 @@ pub enum ProcessTestError {
         cleanup: Result<(), String>,
         observation: Box<TimeoutObservation>,
     },
+    Cancelled {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        cleanup: Result<(), String>,
+        termination: Option<ExitStatus>,
+        observation: Box<CancellationObservation>,
+    },
 }
 
 impl fmt::Display for ProcessTestError {
@@ -96,6 +138,15 @@ impl fmt::Display for ProcessTestError {
                 "test command callback failed: {error}; observed-status={observed_status:?}; termination={termination:?}; cleanup={cleanup:?}"
             ),
             Self::Output(error) => write!(formatter, "test output reader failed: {error}"),
+            Self::Cancelled {
+                cleanup,
+                termination,
+                observation,
+                ..
+            } => write!(
+                formatter,
+                "test command cancelled by peer; cleanup={cleanup:?}; termination={termination:?}; observation={observation:?}"
+            ),
             Self::OutputLimit {
                 stdout,
                 stderr,
@@ -168,7 +219,12 @@ impl OutputReader {
     }
 }
 
-fn reader(mut stream: impl Read + Send + 'static, limit: Option<usize>) -> OutputReader {
+fn reader(
+    mut stream: impl Read + Send + 'static,
+    limit: Option<usize>,
+    progress: Option<ProgressOutput>,
+    output_stream: OutputStream,
+) -> OutputReader {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&bytes);
     let output_limited = Arc::new(AtomicBool::new(false));
@@ -192,6 +248,19 @@ fn reader(mut stream: impl Read + Send + 'static, limit: Option<usize>) -> Outpu
                 return Err(io::Error::other("subprocess output exceeds byte limit"));
             }
             captured.extend_from_slice(&chunk[..length]);
+            drop(captured);
+            if let Some(progress) = &progress {
+                if progress
+                    .sender
+                    .try_send(ProgressChunk {
+                        stream: output_stream,
+                        bytes: chunk[..length].to_vec(),
+                    })
+                    .is_err()
+                {
+                    progress.omitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     });
     OutputReader {
@@ -253,6 +322,35 @@ fn run_with_deadline_after_limit(
         deadline,
         move |pid, _, _| after_spawn(pid),
         output_limit,
+        ProcessControl::default(),
+    )
+}
+
+/// Ordinary disposable subprocesses may settle early after a peer fails.
+/// Native operations with persistent host state must use between-command stopping instead.
+pub fn run_with_deadline_controlled_output_limit(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+    cancelled: Option<Arc<AtomicBool>>,
+    progress: Option<ProgressOutput>,
+) -> Result<ObservedOutput, ProcessTestError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OuterTestBoundary::configure(command).map_err(ProcessTestError::Spawn)?;
+    let started = Instant::now();
+    let child = command.spawn().map_err(ProcessTestError::Spawn)?;
+    let returned = started.elapsed();
+    observe_deadline_child(
+        child,
+        started,
+        returned,
+        deadline,
+        |_, _, _| Ok(()),
+        Some(limit),
+        ProcessControl {
+            cancelled,
+            progress,
+        },
     )
 }
 
@@ -277,6 +375,7 @@ pub fn run_with_deadline_owned_spawn_after_output_limit(
         deadline,
         move |pid, _, _| after_spawn(pid),
         Some(limit),
+        ProcessControl::default(),
     )
 }
 
@@ -296,7 +395,15 @@ pub fn run_with_deadline_owned_spawn_with_io_output_limit(
     let started = Instant::now();
     let child = spawn(command).map_err(ProcessTestError::Spawn)?;
     let returned = started.elapsed();
-    observe_deadline_child(child, started, returned, deadline, after_spawn, Some(limit))
+    observe_deadline_child(
+        child,
+        started,
+        returned,
+        deadline,
+        after_spawn,
+        Some(limit),
+        ProcessControl::default(),
+    )
 }
 
 fn observe_deadline_child(
@@ -308,7 +415,12 @@ fn observe_deadline_child(
     + Send
     + 'static,
     output_limit: Option<usize>,
+    control: ProcessControl,
 ) -> Result<ObservedOutput, ProcessTestError> {
+    let ProcessControl {
+        cancelled,
+        progress,
+    } = control;
     let boundary = match OuterTestBoundary::after_spawn(&child) {
         Ok(boundary) => boundary,
         Err(error) => {
@@ -321,10 +433,14 @@ fn observe_deadline_child(
     let stdout_reader = reader(
         child.stdout.take().expect("stdout was configured as piped"),
         output_limit,
+        progress.clone(),
+        OutputStream::Stdout,
     );
     let stderr_reader = reader(
         child.stderr.take().expect("stderr was configured as piped"),
         output_limit,
+        progress,
+        OutputStream::Stderr,
     );
     let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
     let child_id = child.id();
@@ -429,6 +545,61 @@ fn observe_deadline_child(
         if let (Some(status), Some(Ok(()))) = (observed_status, callback_result.as_ref()) {
             let _ = callback.join();
             break status;
+        }
+        if started.elapsed() < deadline
+            && cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            let mut observation = CancellationObservation {
+                child_id,
+                observed_status,
+                cancellation_observed: started.elapsed(),
+                callback_completed: callback_result.is_some(),
+                stdout_reader_finished: false,
+                stderr_reader_finished: false,
+            };
+            let cleanup = boundary
+                .terminate_and_reap(&mut child)
+                .map_err(|error| error.to_string());
+            if cleanup.is_err() {
+                let _ = child.kill();
+            }
+            let wait = child.wait().map_err(|error| error.to_string());
+            let mut stdout = stdout_reader.snapshot();
+            let mut stderr = stderr_reader.snapshot();
+            let mut reader_cleanup = Ok(());
+            if cleanup.is_ok() {
+                match stdout_reader.join() {
+                    Ok(Ok(bytes)) => {
+                        stdout = bytes;
+                        observation.stdout_reader_finished = true;
+                    }
+                    _ => reader_cleanup = Err("stdout reader did not settle successfully".into()),
+                }
+                match stderr_reader.join() {
+                    Ok(Ok(bytes)) => {
+                        stderr = bytes;
+                        observation.stderr_reader_finished = true;
+                    }
+                    _ => reader_cleanup = Err("stderr reader did not settle successfully".into()),
+                }
+            }
+            // This entrypoint admits only the trivial callback. Retain ownership anyway.
+            let callback_cleanup = callback
+                .join()
+                .map_err(|_| "after-spawn callback panicked".to_string());
+            observation.callback_completed = callback_cleanup.is_ok();
+            return Err(ProcessTestError::Cancelled {
+                stdout,
+                stderr,
+                termination: wait.as_ref().ok().copied(),
+                cleanup: cleanup
+                    .and(wait.map(|_| ()))
+                    .and(reader_cleanup)
+                    .and(callback_cleanup),
+                observation: Box::new(observation),
+            });
         }
         if started.elapsed() >= deadline {
             // Snapshot existing observations before cleanup changes process state. No extra

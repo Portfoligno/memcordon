@@ -381,6 +381,7 @@ pub fn acquire_cargo_predecessor(
     public_registry_location::require_independent(acquisition.path()).map_err(CiError::Message)?;
     let home = acquisition.path().join("cargo-home");
     fs::create_dir(&home)?;
+    crate::cache_inputs::seed_current_downloads(&home, true)?;
     let install = acquisition.path().join("install");
     let stable = crate::config::toolchains(root)?.stable;
     // A fresh target scope requires every selected executable to originate in
@@ -445,6 +446,7 @@ pub fn acquire_cargo_predecessor(
         &serde_json::json!({"source":selected,"target":current.distribution.target,"features":current.distribution.features,"binaries":current.distribution.binaries,"registry":"crates-io","locked":true,"patches":false}),
     )?;
     let observed = command.output_quiet()?;
+    crate::cache_inputs::export_current_downloads(&home);
     fs::write(
         receipts.join("predecessor-cargo.stdout.jsonl"),
         &observed.stdout,
@@ -521,6 +523,7 @@ pub fn materialize_public_cargo(
     public_registry_location::require_independent(acquisition.path()).map_err(CiError::Message)?;
     let home = acquisition.path().join("cargo-home");
     fs::create_dir(&home)?;
+    crate::cache_inputs::seed_current_downloads(&home, true)?;
     let install = acquisition.path().join("install");
     let stable = crate::config::toolchains(root)?.stable;
     fs::create_dir_all(cache)?;
@@ -578,6 +581,7 @@ pub fn materialize_public_cargo(
         command = command.arg("--bin").arg(binary);
     }
     let observed = command.output_quiet()?;
+    crate::cache_inputs::export_current_downloads(&home);
     for (name, bytes) in [
         ("public-cargo-install.stdout.jsonl", &observed.stdout),
         ("public-cargo-install.stderr.bin", &observed.stderr),

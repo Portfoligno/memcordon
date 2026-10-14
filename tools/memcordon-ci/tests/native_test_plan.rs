@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use memcordon_ci::native_test_plan::commands;
+use memcordon_ci::{
+    failure_mode::FailureMode,
+    native_test_plan::{commands, commands_with_failure},
+};
 
 #[test]
 fn native_build_and_execution_have_independent_deadlines_and_matching_targets() {
@@ -30,7 +33,7 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
         .collect();
     assert_eq!(build_inputs, execution_inputs);
     assert!(!release[0].arguments.contains(&"--no-fail-fast"));
-    assert_eq!(release[1].arguments.last(), Some(&"--no-fail-fast"));
+    assert!(!release[1].arguments.contains(&"--no-fail-fast"));
     assert!(release[1].arguments.contains(&"--release"));
     assert!(release[1].arguments.contains(&"--workspace"));
     assert!(release[1].arguments.contains(&"--all-targets"));
@@ -45,7 +48,7 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
     assert!(!ordinary[0].arguments.contains(&"--no-fail-fast"));
     assert!(!ordinary[0].arguments.contains(&"--release"));
     assert!(!ordinary[1].arguments.contains(&"--release"));
-    assert_eq!(ordinary[1].arguments.last(), Some(&"--no-fail-fast"));
+    assert!(!ordinary[1].arguments.contains(&"--no-fail-fast"));
     let ordinary_build_inputs: Vec<_> = ordinary[0]
         .arguments
         .iter()
@@ -66,9 +69,22 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
                 .iter()
                 .filter(|arg| **arg == "--no-fail-fast")
                 .count(),
-            1
+            0
         );
         assert!(!command.arguments.contains(&"--ignored"));
         assert!(!command.arguments.contains(&"--exclude"));
+    }
+}
+
+#[test]
+fn explicit_collect_all_only_changes_cargo_execution_policy() {
+    for release in [false, true] {
+        let stop = commands(release);
+        let collect = commands_with_failure(release, FailureMode::CollectAll);
+        assert_eq!(stop[0], collect[0]);
+        let mut expected = stop[1].arguments.clone();
+        expected.push("--no-fail-fast");
+        assert_eq!(collect[1].arguments, expected);
+        assert_eq!(stop[1].deadline, collect[1].deadline);
     }
 }

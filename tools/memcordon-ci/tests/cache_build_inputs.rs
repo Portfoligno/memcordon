@@ -1,202 +1,281 @@
 use memcordon_ci::{
-    cache, native_test_plan,
-    release::{distribution::Distribution, git::Git},
+    cache_inputs::{self, KeyInputs},
+    cache_restore,
+    release::git::Git,
 };
-use serde_yaml::Value;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
-fn repository() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[test]
-fn compilation_keys_cover_tracked_recipes_and_checkout_policy_without_runtime_state() {
-    #[cfg(unix)]
-    let directory = tempfile::Builder::new()
-        .prefix("memcordon-cache-inputs-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    #[cfg(not(unix))]
-    let directory = tempfile::Builder::new()
-        .prefix("memcordon-cache-inputs-")
-        .tempdir()
-        .unwrap();
+fn scoped_inputs_track_includes_modes_paths_without_commit_or_runtime_state() {
+    let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    fs::create_dir_all(root.join("ci")).unwrap();
+    fs::create_dir_all(root.join("crates/example")).unwrap();
     fs::create_dir_all(root.join(".github/workflows")).unwrap();
-    for file in ["toolchains.toml", "distribution.toml"] {
-        fs::copy(
-            repository().join("ci").join(file),
-            root.join("ci").join(file),
-        )
-        .unwrap();
-    }
-    fs::write(root.join("Cargo.lock"), "# Fixture lockfile\nversion = 4\n").unwrap();
-    fs::write(root.join(".gitattributes"), "*.rs text eol=lf\n").unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "version=4\n").unwrap();
+    fs::write(root.join("crates/example/lib.rs"), "pub fn current() {}\n").unwrap();
     fs::write(
         root.join(".github/workflows/release.yml"),
-        "name: Fixture\n",
+        "name: included\n",
     )
     .unwrap();
+    fs::write(root.join("README.md"), "Root documentation\n").unwrap();
     let git = Git::new(root).unwrap();
-    git.text(["init", "--quiet"]).unwrap();
-    git.text(["config", "user.name", "Cache fixture"]).unwrap();
-    git.text(["config", "user.email", "fixture@example.invalid"])
-        .unwrap();
-    git.text(["add", "."]).unwrap();
-    git.text(["commit", "--no-gpg-sign", "-m", "Fixture inputs"])
-        .unwrap();
-    let initial = cache::context(root, "native-debug", "complete", &[]).unwrap();
-    let release = cache::context(root, "native-release", "complete", &[]).unwrap();
-    let legacy = cache::context(root, "native", "complete", &[]).unwrap();
-    assert_eq!(legacy.revision, 1);
-    assert!(!legacy.inputs.contains_key("native-test-arguments"));
-    for (context, optimized, profile) in [
-        (&initial, false, "source-tests:dev"),
-        (&release, true, "source-tests:release;product:release"),
+    for arguments in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["add", "."],
+        vec!["commit", "--no-gpg-sign", "-m", "inputs"],
     ] {
-        assert_eq!(context.revision, 2);
-        assert_eq!(context.inputs["profile"], profile);
-        let actual: Vec<Vec<String>> =
-            serde_json::from_str(&context.inputs["native-test-arguments"]).unwrap();
-        let expected: Vec<_> = native_test_plan::commands(optimized)
-            .into_iter()
-            .map(|command| command.arguments)
-            .collect();
-        assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 2);
-        assert!(actual[0].iter().any(|argument| argument == "--no-run"));
-        assert!(
-            actual[1]
-                .iter()
-                .any(|argument| argument == "--no-fail-fast")
-        );
-        for command in actual {
-            assert_eq!(
-                command.iter().any(|argument| argument == "--release"),
-                optimized
-            );
-        }
+        git.text(arguments).unwrap();
     }
-    for partition in ["source", "product", "consumer"] {
-        assert_ne!(initial.partitions[partition], release.partitions[partition]);
-        assert_ne!(initial.partitions[partition], legacy.partitions[partition]);
-        assert_ne!(release.partitions[partition], legacy.partitions[partition]);
-    }
-    assert_eq!(initial.inputs["commit"], release.inputs["commit"]);
-    assert_eq!(initial.inputs["target"], release.inputs["target"]);
-    assert!(!initial.inputs.contains_key("product-distribution"));
-    assert_eq!(release.inputs["product-package"], "memcordon");
-    assert_eq!(release.inputs["product-profile"], "release");
-    let selected = Distribution::read(root).unwrap();
+    let initial = cache_inputs::local_files(root, "native-debug").unwrap();
+    git.text([
+        "commit",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        "new identity",
+    ])
+    .unwrap();
     assert_eq!(
-        release.inputs["product-distribution"],
-        serde_json::to_string(selected.native().unwrap()).unwrap()
+        initial,
+        cache_inputs::local_files(root, "native-debug").unwrap()
     );
-    for path in [
+    for name in [
+        "README.md",
         ".release/prepared/sentinel",
         "target/ci/reports/execution/sentinel",
         "target/ci/installed/sentinel",
     ] {
-        let path = root.join(path);
+        let path = root.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "Runtime state is excluded\n").unwrap();
+        fs::write(path, "Excluded runtime or root documentation\n").unwrap();
     }
-    let runtime = cache::context(root, "native-debug", "complete", &[]).unwrap();
-    assert_eq!(initial.partitions, runtime.partitions);
-    let mut previous = initial.partitions;
-    for (file, bytes) in [
-        (
-            ".github/workflows/release.yml",
-            "name: Changed setup recipe\n",
-        ),
-        (".gitattributes", "*.rs text eol=lf\n*.yml text eol=lf\n"),
-    ] {
-        fs::write(root.join(file), bytes).unwrap();
-        let dirty = cache::context(root, "native-debug", "complete", &[]).unwrap();
-        assert!(
-            !dirty.usable,
-            "dirty tracked inputs cannot restore compiled output"
-        );
-        git.text(["add", file]).unwrap();
-        git.text(["commit", "--no-gpg-sign", "-m", "Changed build input"])
-            .unwrap();
-        let changed = cache::context(root, "native-debug", "complete", &[]).unwrap();
-        for partition in ["source", "product", "consumer"] {
-            assert_ne!(previous[partition], changed.partitions[partition]);
-        }
-        previous = changed.partitions;
-    }
-    fs::write(root.join("ci/distribution.toml"), "invalid distribution\n").unwrap();
-    git.text(["add", "ci/distribution.toml"]).unwrap();
-    git.text(["commit", "--no-gpg-sign", "-m", "Unknown product selection"])
+    assert_eq!(
+        initial,
+        cache_inputs::local_files(root, "native-debug").unwrap()
+    );
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "name: changed include\n",
+    )
+    .unwrap();
+    assert_ne!(
+        initial,
+        cache_inputs::local_files(root, "native-debug").unwrap()
+    );
+    fs::write(
+        root.join(".github/workflows/release.yml"),
+        "name: included\n",
+    )
+    .unwrap();
+    git.text(["mv", "crates/example/lib.rs", "crates/example/main.rs"])
         .unwrap();
-    let unknown = cache::context(root, "native-release", "complete", &[]).unwrap();
-    assert!(!unknown.usable);
-    assert_eq!(unknown.inputs["product-distribution"], "unknown-selection");
+    assert_ne!(
+        initial,
+        cache_inputs::local_files(root, "native-debug").unwrap()
+    );
+    git.text(["mv", "crates/example/main.rs", "crates/example/lib.rs"])
+        .unwrap();
+    git.text(["update-index", "--chmod=+x", "crates/example/lib.rs"])
+        .unwrap();
+    assert_ne!(
+        initial,
+        cache_inputs::local_files(root, "native-debug").unwrap()
+    );
 }
 
 #[test]
-fn actual_native_owner_cache_paths_do_not_capture_staging_or_report_sentinels() {
-    #[cfg(unix)]
-    let directory = tempfile::Builder::new()
-        .prefix("memcordon-native-cache-paths-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    #[cfg(not(unix))]
-    let directory = tempfile::Builder::new()
-        .prefix("memcordon-native-cache-paths-")
-        .tempdir()
-        .unwrap();
-    let sentinels = [
+fn key_renderer_separates_content_from_full_compatibility() {
+    let mut inputs = KeyInputs {
+        family: "workspace".into(),
+        layout_revision: 4,
+        compatibility: BTreeMap::from([("compiler".into(), "stable-x64-debug".into())]),
+        content: BTreeMap::from([("source".into(), "first".into())]),
+    };
+    let first = cache_inputs::keys(&inputs).unwrap();
+    inputs.content.insert("source".into(), "second".into());
+    let second = cache_inputs::keys(&inputs).unwrap();
+    assert_ne!(first.0, second.0);
+    assert_eq!(first.1, second.1);
+    inputs
+        .compatibility
+        .insert("compiler".into(), "stable-arm-release".into());
+    assert_ne!(second.1, cache_inputs::keys(&inputs).unwrap().1);
+    inputs.family = "arbitrary".into();
+    assert!(cache_inputs::keys(&inputs).is_err());
+}
+
+#[test]
+fn finite_paths_exclude_runtime_capture_staging_tools_and_sibling_shards() {
+    let excluded = [
         ".release/prepared/sentinel",
+        ".release/native-readiness/sentinel",
         "target/ci/reports/execution/sentinel",
         "target/ci/deadline-evidence/sentinel",
         "target/ci/installed/sentinel",
-        ".cargo/credentials/sentinel",
+        "target/ci-build/package-staging/sentinel",
+        "target/ci-consumers/install-capture/sentinel",
+        "target/ci-tools/bin/unselected",
+        ".cargo/credentials",
     ];
-    for sentinel in sentinels {
-        let path = directory.path().join(sentinel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "Excluded state\n").unwrap();
-    }
-    for source in [
-        include_str!("../../../.github/workflows/ci.yml"),
-        include_str!("../../../.github/workflows/release.yml"),
+    for (purpose, shard) in [
+        ("native-debug", "complete"),
+        ("native-release", "complete"),
+        ("quality", "complete"),
+        ("miri", "first"),
     ] {
-        let workflow: Value = serde_yaml::from_str(source).unwrap();
-        for job in workflow["jobs"].as_mapping().unwrap().values() {
-            for step in job["steps"].as_sequence().unwrap() {
-                if !step["uses"]
-                    .as_str()
-                    .is_some_and(|action| action.starts_with("actions/cache/"))
-                {
-                    continue;
-                }
-                for cached in step["with"]["path"]
-                    .as_str()
-                    .unwrap()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                {
-                    let prefix = cached
-                        .split_once('*')
-                        .map_or(cached, |(prefix, _)| prefix)
-                        .trim_end_matches('/');
-                    let prefix = prefix.strip_prefix("~/").unwrap_or(prefix);
-                    let cached = directory.path().join(prefix);
-                    for sentinel in sentinels {
-                        assert!(
-                            !directory.path().join(sentinel).starts_with(&cached),
-                            "cache path captures excluded sentinel: {prefix}"
-                        );
-                    }
-                }
+        for root in cache_restore::roots(purpose, shard).unwrap() {
+            for sentinel in excluded {
+                assert!(
+                    !Path::new(sentinel).starts_with(&root),
+                    "{root:?} captures {sentinel}"
+                );
+            }
+            if purpose == "miri" {
+                assert!(!Path::new("target/ci/miri-second").starts_with(&root));
             }
         }
     }
+    assert!(cache_restore::roots("consumer-readiness", "public").is_err());
+    assert_eq!(
+        cache_restore::roots("private", "complete").unwrap().len(),
+        3
+    );
+    assert!(cache_restore::roots("native", "complete").is_err());
+}
+
+#[test]
+fn discard_refuses_links_and_unknown_roots_and_retains_reports() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("target/ci/quality")).unwrap();
+    fs::create_dir_all(directory.path().join("target/ci/reports")).unwrap();
+    fs::write(
+        directory.path().join("target/ci/reports/sentinel"),
+        "retain\n",
+    )
+    .unwrap();
+    cache_restore::prepare(
+        directory.path(),
+        "quality",
+        "complete",
+        cache_restore::RestoreMode::Discard,
+    )
+    .unwrap();
+    assert!(!directory.path().join("target/ci/quality").exists());
+    assert!(directory.path().join("target/ci/reports/sentinel").exists());
+    assert!(
+        cache_restore::prepare(
+            directory.path(),
+            "../",
+            "complete",
+            cache_restore::RestoreMode::Discard
+        )
+        .is_err()
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            directory.path().join("target/ci/reports"),
+            directory.path().join("target/ci/quality"),
+        )
+        .unwrap();
+        assert!(
+            cache_restore::prepare(
+                directory.path(),
+                "quality",
+                "complete",
+                cache_restore::RestoreMode::Discard
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn isolated_home_seeds_third_party_archives_without_credentials_or_public_images() {
+    let directory = tempfile::tempdir().unwrap();
+    let shared = directory.path().join("shared");
+    let fresh = directory.path().join("fresh");
+    fs::create_dir_all(shared.join("registry/cache/source")).unwrap();
+    fs::create_dir_all(&fresh).unwrap();
+    fs::write(
+        shared.join("registry/cache/source/third-party-1.0.crate"),
+        "download",
+    )
+    .unwrap();
+    fs::write(
+        shared.join("registry/cache/source/memcordon-1.0.crate"),
+        "selected public image",
+    )
+    .unwrap();
+    fs::write(shared.join("config.toml"), "secret").unwrap();
+    fs::write(shared.join("credentials.toml"), "secret").unwrap();
+    cache_inputs::seed_isolated_downloads(&shared, &fresh, true).unwrap();
+    assert!(
+        fresh
+            .join("registry/cache/source/third-party-1.0.crate")
+            .exists()
+    );
+    assert!(
+        !fresh
+            .join("registry/cache/source/memcordon-1.0.crate")
+            .exists()
+    );
+    assert!(!fresh.join("config.toml").exists());
+    assert!(!fresh.join("credentials.toml").exists());
+    assert!(!fresh.join("registry/src").exists());
+    let missing = directory.path().join("missing-shared");
+    let cold = directory.path().join("cold");
+    fs::create_dir(&cold).unwrap();
+    cache_inputs::seed_isolated_downloads(&missing, &cold, true).unwrap();
+    #[cfg(unix)]
+    {
+        let unsafe_home = directory.path().join("unsafe-home");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&unsafe_home).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, unsafe_home.join("registry")).unwrap();
+        assert!(cache_inputs::seed_isolated_downloads(&shared, &unsafe_home, true).is_err());
+        assert!(!outside.join("cache").exists());
+    }
+}
+
+#[test]
+fn external_or_untracked_local_dependencies_disable_workspace_projection() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("checkout");
+    let outside = fixture.path().join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("Cargo.toml"),
+        "[package]\nname=\"outside\"\nversion=\"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    let git = Git::new(&root).unwrap();
+    git.text(["init", "--quiet"]).unwrap();
+    git.text(["add", "Cargo.toml"]).unwrap();
+    assert!(cache_inputs::local_files(&root, "native-debug").is_ok());
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace.dependencies]\noutside={path=\"../outside\"}\n",
+    )
+    .unwrap();
+    assert!(cache_inputs::local_files(&root, "native-debug").is_err());
+    fs::create_dir(root.join("unmodeled")).unwrap();
+    fs::write(
+        root.join("unmodeled/Cargo.toml"),
+        "[package]\nname=\"unmodeled\"\nversion=\"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace.dependencies]\nunmodeled={path=\"unmodeled\"}\n",
+    )
+    .unwrap();
+    assert!(cache_inputs::local_files(&root, "native-debug").is_err());
 }

@@ -73,7 +73,10 @@ fn phases() -> Vec<StressPhaseObservation> {
 #[test]
 fn aggregation_requires_actual_complete_unique_source_bound_phases() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let plan = PerformancePlan::read(&root).unwrap();
+    let mut plan = PerformancePlan::read(&root).unwrap();
+    for selection in &mut plan.stress {
+        selection.selected = Layout::Serial;
+    }
     validate_stress_results(&plan, "linux-x64", "source", &phases()).unwrap();
     for case in [
         "omission",
@@ -116,6 +119,9 @@ fn aggregation_requires_actual_complete_unique_source_bound_phases() {
 fn split_selection_requires_distinct_actual_phase_roots() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut plan = PerformancePlan::read(&root).unwrap();
+    for selection in &mut plan.stress {
+        selection.selected = Layout::Serial;
+    }
     let selection = plan
         .stress
         .iter_mut()
@@ -134,11 +140,17 @@ fn split_selection_requires_distinct_actual_phase_roots() {
 }
 
 #[test]
-fn checked_in_stress_is_serial_while_other_selectors_require_measured_improvement() {
+fn checked_in_safe_groups_are_parallel_without_fabricated_speedup_measurements() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let plan = PerformancePlan::read(&root).unwrap();
-    assert_eq!(plan.stress_cells(Layout::Serial).unwrap().len(), 5);
-    assert!(plan.stress_cells(Layout::Parallel).unwrap().is_empty());
+    assert!(plan.stress_cells(Layout::Serial).unwrap().is_empty());
+    assert_eq!(plan.stress_cells(Layout::Parallel).unwrap().len(), 5);
+    assert_eq!(plan.preparation.selected, Layout::Parallel);
+    assert_eq!(plan.quality.selected, Layout::Parallel);
+    assert_eq!(plan.macos_release.selected, Layout::Serial);
+    assert!(plan.preparation.experiment.is_none() && plan.quality.experiment.is_none());
+    plan.preparation.validate_layout().unwrap();
+    plan.quality.validate_layout().unwrap();
     assert!(
         Selection {
             selected: Layout::Parallel,

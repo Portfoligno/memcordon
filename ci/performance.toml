@@ -4,22 +4,22 @@ revision = 1
 [macos_release]
 selected = "serial"
 [preparation]
-selected = "serial"
+selected = "parallel"
 [quality]
-selected = "serial"
+selected = "parallel"
 
 [[stress]]
 platform = "linux-x64"
-selected = "serial"
+selected = "parallel"
 [[stress]]
 platform = "macos-arm64"
-selected = "serial"
+selected = "parallel"
 [[stress]]
 platform = "macos-x64"
-selected = "serial"
+selected = "parallel"
 [[stress]]
 platform = "windows-x64"
-selected = "serial"
+selected = "parallel"
 [[stress]]
 platform = "windows-arm64"
-selected = "serial"
+selected = "parallel"

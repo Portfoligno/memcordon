@@ -51,10 +51,10 @@ fn text_fixture_rejects_bare_cr_missing_newline_and_invalid_utf8() {
 #[test]
 fn native_workspace_suite_retains_all_targets_and_features() {
     let suites_source = include_str!("../src/suites.rs");
-    assert!(suites_source.contains("Suite::Native => native(root, &toolchains.stable, false)"));
+    assert!(suites_source.contains("Suite::Native => native("));
     assert!(
         suites_source
-            .contains("for command in memcordon_ci::native_test_plan::commands(release_mode)")
+            .contains("memcordon_ci::native_test_plan::commands_with_failure(release_mode, mode)")
     );
     for release_mode in [false, true] {
         let commands = memcordon_ci::native_test_plan::commands(release_mode);
@@ -200,10 +200,12 @@ fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
         ("stress", 121),
         ("stress-packages", 89),
         ("stress-packages", 91),
-        ("stress-packages", 120),
+        ("stress-packages", 119),
+        ("stress-packages", 121),
         ("stress-lifecycle", 89),
         ("stress-lifecycle", 91),
-        ("stress-lifecycle", 120),
+        ("stress-lifecycle", 119),
+        ("stress-lifecycle", 121),
     ] {
         let invalid = workflow_with_job_timeout(fixture, job, timeout_minutes);
         let error = policy::validate_workflow_bytes(
@@ -263,7 +265,7 @@ fn fuzz_dependency_cache_keys_require_the_fuzz_lockfile() {
     let exact = std::fs::read_to_string(root.join(relative))
         .expect("workflow fixture should be readable")
         .replace("\r\n", "\n");
-    let invalid = exact.replacen("'fuzz/Cargo.lock', ", "", 1);
+    let invalid = exact.replacen("-${{ hashFiles('fuzz/Cargo.lock') }}", "", 1);
     assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
     let error = policy::validate_workflow_bytes(
         &root,

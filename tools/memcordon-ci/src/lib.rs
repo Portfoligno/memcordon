@@ -4,11 +4,14 @@
 
 pub mod bootstrap_profile;
 pub mod cache;
+pub mod cache_inputs;
+pub mod cache_restore;
 pub mod caller_observation;
 pub mod capability;
 pub mod command;
 pub mod config;
 pub mod consumer_readiness_ledger;
+pub mod failure_mode;
 pub mod fuzz_targets;
 pub mod line_evidence;
 #[cfg(target_os = "linux")]
@@ -62,6 +65,21 @@ use thiserror::Error;
 pub enum CiError {
     #[error("{0}")]
     Message(String),
+    #[error("subprocess cancelled by peer: {0}")]
+    Cancelled(String),
+    #[error("subprocess cancelled by peer after settlement: {0}")]
+    SettledCancellation(String),
+    #[error("{0}")]
+    SettledCommandFailure(String),
+    #[error("primary lane: {primary}; secondary lane: {secondary}")]
+    LaneFailures {
+        primary: Box<CiError>,
+        secondary: Box<CiError>,
+    },
+    #[error("not-run-after-failure")]
+    NotStartedAfterFailure,
+    #[error("subprocess could not be started: {0}")]
+    CommandSpawnFailure(std::io::Error),
     #[error("I/O operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON operation failed: {0}")]

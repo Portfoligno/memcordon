@@ -112,13 +112,14 @@ fn rehearsal_mode_truth_table_and_failed_prerequisites_preserve_the_actual_graph
         );
         assert!(baseline["jobs"][active]["continue-on-error"].is_null());
         let predecessor = if normal {
-            "assemble"
+            "assemble-payload"
         } else {
             "recovery-inputs"
         };
         assert_eq!(
             baseline["jobs"][active]["needs"],
-            serde_yaml::from_str::<Value>(&format!("[select, {predecessor}]")).unwrap()
+            serde_yaml::from_str::<Value>(&format!("[select, {predecessor}, rehearsal-tool]"))
+                .unwrap()
         );
     }
     assert!(
@@ -193,12 +194,12 @@ fn downloaded_tools_inputs_and_credentials_cannot_be_substituted_or_bypassed() {
                 }
                 "wildcard" => value["steps"][1]["with"]["pattern"] = "publication-tool-*".into(),
                 "changed-input" => {
-                    value["steps"][if job == "rehearse" { 3 } else { 2 }]["with"]["artifact-ids"] =
+                    value["steps"][2]["with"]["artifact-ids"] =
                         "${{ needs.select.outputs.selection-artifact-id }}".into()
                 }
                 "changed-publisher" => {
                     value["steps"][1]["with"]["artifact-ids"] =
-                        "${{ needs.select.outputs.rehearsal-tool-artifact-id }}".into()
+                        "${{ needs.rehearsal-tool.outputs.artifact-id }}".into()
                 }
                 "ignored-run" => value["steps"][count - 2]["continue-on-error"] = true.into(),
                 _ => unreachable!(),
@@ -246,11 +247,11 @@ fn recovery_routes_original_pair_and_helper_packing_is_required_in_both_modes() 
                     .remove(Value::String("candidate-artifact-id".into()));
             }
             other => {
-                let step = changed["jobs"]["select"]["steps"]
+                let step = changed["jobs"]["rehearsal-tool"]["steps"]
                     .as_sequence_mut()
                     .unwrap()
                     .iter_mut()
-                    .find(|step| step["id"].as_str() == Some("rehearsal-tool"))
+                    .find(|step| step["id"].as_str() == Some("helper"))
                     .unwrap();
                 match other {
                     "helper-kind-gate" => {

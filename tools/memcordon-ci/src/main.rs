@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use memcordon_ci::{CiError, Result, command, config, native_acceptance_catalogue, policy};
-pub use memcordon_ci::{bootstrap_profile, performance_plan, preparation};
+pub use memcordon_ci::{bootstrap_profile, failure_mode, performance_plan, preparation};
 
 #[derive(Parser)]
 #[command(name = "memcordon-ci", about = "Typed MemCordon product CI runner")]
@@ -50,6 +50,8 @@ enum TopLevel {
     Suite {
         #[arg(value_enum)]
         suite: Suite,
+        #[arg(long, value_enum, default_value = "stop-after-failure")]
+        failure_mode: memcordon_ci::failure_mode::FailureMode,
     },
 }
 
@@ -66,6 +68,14 @@ enum CiCommand {
         shard: String,
         #[arg(long)]
         external: Vec<PathBuf>,
+    },
+    PrepareRestoredCache {
+        #[arg(long)]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
+        #[arg(long, value_enum)]
+        mode: memcordon_ci::cache_restore::RestoreMode,
     },
     CheckWorkflows,
     PerformancePlan,
@@ -88,6 +98,7 @@ enum CiCommand {
 enum Suite {
     Policy,
     Quality,
+    QualityCompile,
     Msrv,
     Native,
     SupplyChain,
@@ -163,6 +174,11 @@ fn run() -> Result<()> {
                 shard,
                 external,
             } => memcordon_ci::cache::emit(&root, &purpose, &shard, &external),
+            CiCommand::PrepareRestoredCache {
+                purpose,
+                shard,
+                mode,
+            } => memcordon_ci::cache_restore::prepare(&root, &purpose, &shard, mode),
             CiCommand::CheckWorkflows => policy::run(&root),
             CiCommand::WorkflowScope => memcordon_ci::workflow_scope::emit_from_github(),
             CiCommand::PerformancePlan => {
@@ -190,7 +206,10 @@ fn run() -> Result<()> {
         Some(TopLevel::DelegatedLinuxBackend { rustup, uid }) => {
             suites::delegated_linux_backend(&root, &rustup, &uid)
         }
-        Some(TopLevel::Suite { suite }) => suites::run(&root, suite, suites::SuiteOptions),
+        Some(TopLevel::Suite {
+            suite,
+            failure_mode,
+        }) => suites::run(&root, suite, suites::SuiteOptions { failure_mode }),
         None => Err(CiError::Message(
             "exactly one CI command is required".to_owned(),
         )),

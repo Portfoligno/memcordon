@@ -3,8 +3,8 @@
 The Rust release workflow prepares exact public crate and native archive bytes
 from branch candidates or an existing unsigned annotated release tag. Only tagged
 preparation can be published. Source, package, native-test and installed-consumer
-checks gate preparation. Mandatory runner-local HTTP rehearsal follows assembly
-and gates publication.
+checks gate final preparation. Mandatory runner-local HTTP rehearsal starts from
+early assembled payloads and must pass before final preparation and publication.
 Installed workload permission is checked separately through live authentication
 and native resource checks, with local administrator grants for contract-bound
 launches.
@@ -53,6 +53,62 @@ archive it used together. Recovery accepts only a pair associated with the same
 successful final assembly attempt. Candidate artifacts have seven-day retention;
 tagged artifacts retain the repository's configured release retention. Expired
 bytes require tagged repreparation.
+
+## Failure scheduling and compilation reuse
+
+Selection checks formatting before compiling the main driver, then validates the
+selected source, configuration and notes. Quality compilation/documentation, MSRV,
+supply-chain checks, packages, shard tests, rehearsal-helper compilation and native
+producers start from their own prerequisites. The same-run Linux driver archive
+is reused only on compatible runners. Publication-only recovery keeps the original
+prepared bytes and original publisher; current selection metadata is still passed
+to public consumers.
+
+`assemble-payload` assembles native/package inputs without waiting for independent
+consumer checks. Rehearsal runs those actual bytes while consumers finish. Only
+the final `assemble` job, after all required checks and rehearsal pass, copies the
+unchanged input and publisher archive into the recoverable artifact pair. Early
+assembled input is never a publication-only recovery artifact. Four macOS
+installed jobs separately execute native and Cargo channels on both architectures;
+Linux/Windows candidate and public readiness coverage remains required.
+
+Native Cargo execution stops scheduling test executables after a failure by
+default. Local `suite native --failure-mode collect-all` retains diagnostic
+execution and still returns failure. Applicable suite and target commands expose
+the same typed failure choice. Automated Miri/fuzz matrices stop peer shards;
+manual matrices retain all shards. Native and publication jobs retain their own
+cleanup and original deadlines. Publication's shared concurrency group never
+cancels an active publisher.
+
+Independent compiler lanes use separate target directories and share a maximum
+of four Cargo workers, falling back to serial work on one CPU. Rehearsal accepts
+`--jobs 1` or `--jobs 2` (default two); each case owns its listener, store and
+ordered fault/recovery sequence. Failure stops new admissions and active owners
+settle before reporting. Stress packages and lifecycle use separate jobs; cold
+lifecycle compilation precedes its existing 35-minute seeded execution allowance.
+
+Cache V4 separates downloaded source data, Cargo index metadata, installed tools,
+tool compilation and workspace compilation. Keys describe relevant content and
+compiler/native compatibility; commit identity is diagnostic metadata, not a
+dependency cache invalidator. Every restored compiled output is prepared before
+use, including exact hits, and Cargo re-evaluates current inputs. Identity-bearing
+local packages are rebuilt. Fresh consumer homes receive only current downloaded
+source data, never old configuration, credentials, compiled output or success
+reports. Settled consumer builds may export eligible third-party downloads back
+to the shared store; selected public package images stay fresh. Native debug's
+auxiliary `target/debug` and `target/release` profiles have a separate cache role,
+with package cleanup that preserves driver and report siblings. Unknown
+compatibility runs clean. Saves require a settled owner and
+unchanged requested context; a cache hit never skips actual selected tests.
+
+Local compilation and bounded structural/process tests do not qualify all six
+native architectures, cold Windows/macOS hosts, real full-catalogue release
+rehearsal or healthy/failing Actions timings. Those acceptance runs belong in CI;
+no elapsed-time improvement is claimed before measurement. If concurrency fails
+native acceptance, select one-worker rehearsal or serial compilation while
+retaining coverage. If cache identity fails, disable compiled restoration and run
+clean. If early routing fails, restore late assembly ordering without bypassing
+rehearsal or accepting incomplete recovery artifacts.
 
 Normal publication and publication-only recovery have separate tag-only writer
 jobs. Original-artifact validation runs first in a read-only job. Writers receive

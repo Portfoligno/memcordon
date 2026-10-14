@@ -38,8 +38,13 @@ fn cargo_with_deadline(
     rustup_cargo(root, toolchain, cargo_arguments, deadline).run()
 }
 
-fn quality(root: &Path, stable: &str) -> Result<()> {
-    let directory = root.join("target/ci/reports/execution");
+fn quality(root: &Path, stable: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
+    let parent = root.join("target/ci/reports/execution");
+    fs::create_dir_all(&parent)?;
+    let directory = tempfile::Builder::new()
+        .prefix("quality-")
+        .tempdir_in(parent)?
+        .keep();
     let started = Instant::now();
     let record = |state: &str, error: Option<&CiError>| {
         let write = || -> Result<()> {
@@ -55,7 +60,7 @@ fn quality(root: &Path, stable: &str) -> Result<()> {
         }
     };
     record("in-progress", None);
-    let result = quality_inner(root, stable);
+    let result = quality_inner(root, stable, mode);
     record(
         if result.is_ok() {
             "completed"
@@ -67,45 +72,102 @@ fn quality(root: &Path, stable: &str) -> Result<()> {
     result
 }
 
-fn quality_inner(root: &Path, stable: &str) -> Result<()> {
+fn quality_inner(root: &Path, stable: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    rustup_cargo(
+        root,
+        stable,
+        ["fmt", "--all", "--", "--check"],
+        CARGO_DEADLINE,
+    )
+    .bounded_until(deadline)
+    .run()?;
+    rustup_cargo(
+        root,
+        stable,
+        ["metadata", "--locked", "--format-version", "1"],
+        CARGO_DEADLINE,
+    )
+    .bounded_until(deadline)
+    .run()?;
+    quality_compile_until(root, stable, mode, deadline)
+}
+
+fn quality_compile(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
+    quality_compile_until(
+        root,
+        stable,
+        mode,
+        Instant::now() + Duration::from_secs(90 * 60),
+    )
+}
+
+fn quality_compile_until(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+    deadline: Instant,
+) -> Result<()> {
     let layout = crate::performance_plan::PerformancePlan::read(root)?
         .quality
         .selected;
-    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    let layout = if workers == 1 {
+        crate::performance_plan::Layout::Serial
+    } else {
+        layout
+    };
+    let compiler_jobs = (workers / 2).max(1).to_string();
+    let doc_jobs = (workers - workers / 2).max(1).to_string();
     let reports = root.join("target/ci/reports/quality");
     fs::create_dir_all(&reports)?;
     let reports = tempfile::Builder::new()
         .prefix("operations-")
         .tempdir_in(&reports)?
         .keep();
-    let first = reports.join("metadata");
+    let first = reports.join("documentation");
     let second = reports.join("compile");
     fs::create_dir(&first)?;
     fs::create_dir(&second)?;
     let packages = config::policy(root)?.workspace.publish_packages;
-    crate::preparation::complete_lanes(
+    crate::preparation::complete_lanes_with_failure(
         layout,
+        mode,
         || {
-            crate::preparation::observed(
-                rustup_cargo(
-                    root,
-                    stable,
-                    ["fmt", "--all", "--", "--check"],
-                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                ),
-                &first,
-                "format",
-            )?;
-            crate::preparation::observed(
-                rustup_cargo(
-                    root,
-                    stable,
-                    ["metadata", "--locked", "--format-version", "1"],
-                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                ),
-                &first,
-                "metadata",
-            )
+            for package in packages {
+                crate::preparation::observed(
+                    rustup_cargo(
+                        root,
+                        stable,
+                        [
+                            "rustdoc",
+                            "--jobs",
+                            &doc_jobs,
+                            "--target-dir",
+                            "target/ci/quality-doc",
+                            "--package",
+                            &package,
+                            "--lib",
+                            "--all-features",
+                            "--locked",
+                            "--",
+                            "-D",
+                            "warnings",
+                        ],
+                        crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                    )
+                    .bounded_until(deadline),
+                    &first,
+                    &package,
+                )?;
+            }
+            Ok(())
         },
         || {
             crate::preparation::observed(
@@ -114,6 +176,8 @@ fn quality_inner(root: &Path, stable: &str) -> Result<()> {
                     stable,
                     [
                         "check",
+                        "--jobs",
+                        &compiler_jobs,
                         "--target-dir",
                         "target/ci/quality",
                         "--workspace",
@@ -122,7 +186,8 @@ fn quality_inner(root: &Path, stable: &str) -> Result<()> {
                         "--locked",
                     ],
                     crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                ),
+                )
+                .bounded_until(deadline),
                 &second,
                 "check",
             )?;
@@ -132,6 +197,8 @@ fn quality_inner(root: &Path, stable: &str) -> Result<()> {
                     stable,
                     [
                         "clippy",
+                        "--jobs",
+                        &compiler_jobs,
                         "--target-dir",
                         "target/ci/quality",
                         "--workspace",
@@ -143,45 +210,23 @@ fn quality_inner(root: &Path, stable: &str) -> Result<()> {
                         "warnings",
                     ],
                     crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                ),
+                )
+                .bounded_until(deadline),
                 &second,
                 "clippy",
             )?;
-            for package in packages {
-                let arguments = vec![
-                    OsString::from("rustdoc"),
-                    OsString::from("--target-dir"),
-                    OsString::from("target/ci/quality"),
-                    OsString::from("--package"),
-                    OsString::from(&package),
-                    OsString::from("--lib"),
-                    OsString::from("--all-features"),
-                    OsString::from("--locked"),
-                    OsString::from("--"),
-                    OsString::from("-D"),
-                    OsString::from("warnings"),
-                ];
-                crate::preparation::observed(
-                    rustup_cargo(
-                        root,
-                        stable,
-                        arguments,
-                        crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                    ),
-                    &second,
-                    &package,
-                )?;
-            }
             Ok(())
         },
     )
 }
 
 fn msrv(root: &Path, version: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
     let policy = config::policy(root)?;
     for package in policy.workspace.production_packages {
         for phase in ["check", "test"] {
             let arguments = vec![
+                OsString::from(phase),
                 OsString::from("--target-dir"),
                 OsString::from("target/ci/msrv"),
                 OsString::from("--package"),
@@ -190,45 +235,82 @@ fn msrv(root: &Path, version: &str) -> Result<()> {
                 OsString::from("--all-features"),
                 OsString::from("--locked"),
             ];
-            cargo(root, version, phase, arguments)?;
+            rustup_cargo(root, version, arguments, CARGO_DEADLINE)
+                .bounded_until(deadline)
+                .run()?;
         }
     }
     Ok(())
 }
 
-fn native(root: &Path, stable: &str, release_mode: bool) -> Result<()> {
-    for command in memcordon_ci::native_test_plan::commands(release_mode) {
+fn native(
+    root: &Path,
+    stable: &str,
+    release_mode: bool,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
+    for command in memcordon_ci::native_test_plan::commands_with_failure(release_mode, mode) {
         cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
     }
     Ok(())
 }
 
 fn install_tool(root: &Path, stable: &str, name: &str, version: &str) -> Result<()> {
+    install_tool_until(
+        root,
+        stable,
+        name,
+        version,
+        Instant::now() + Duration::from_secs(45 * 60),
+    )
+}
+
+fn install_tool_until(
+    root: &Path,
+    stable: &str,
+    name: &str,
+    version: &str,
+    deadline: Instant,
+) -> Result<()> {
     let _ = stable;
     let profile = match name {
         "cargo-fuzz" => crate::bootstrap_profile::BootstrapProfile::Fuzz,
         "cargo-audit" | "cargo-deny" => crate::bootstrap_profile::BootstrapProfile::SupplyChain,
         _ => return Err(CiError::Message("unsupported auxiliary tool".into())),
     };
-    crate::preparation::ensure_auxiliary_tool(root, profile, name, version)?;
+    crate::preparation::ensure_auxiliary_tool_until(root, profile, name, version, deadline)?;
     Ok(())
 }
 
-fn supply_chain(root: &Path, stable: &str) -> Result<()> {
+fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60 * 60);
     let lockfile = root.join("Cargo.lock");
     let lock_before = fs::read(&lockfile)?;
     let tools = config::tools(root)?;
-    install_tool(root, stable, "cargo-audit", &tools.cargo_audit)?;
-    install_tool(root, stable, "cargo-deny", &tools.cargo_deny)?;
-    for command in supply_chain_commands(root, stable) {
-        command.run()?;
-    }
+    install_tool_until(root, stable, "cargo-audit", &tools.cargo_audit, deadline)?;
+    install_tool_until(root, stable, "cargo-deny", &tools.cargo_deny, deadline)?;
+    let mut commands = supply_chain_commands(root, stable).into_iter();
+    let audit = commands
+        .next()
+        .expect("audit command")
+        .bounded_until(deadline);
+    let deny = commands
+        .next()
+        .expect("deny command")
+        .bounded_until(deadline);
+    assert!(commands.next().is_none(), "exact supply command inventory");
+    let checks = crate::preparation::complete_lanes_with_failure(
+        crate::performance_plan::Layout::Parallel,
+        mode,
+        || audit.run().map(|_| ()),
+        || deny.run().map(|_| ()),
+    );
     if fs::read(lockfile)? != lock_before {
         return Err(CiError::Message(
             "supply-chain operations changed Cargo.lock".to_owned(),
         ));
     }
-    Ok(())
+    checks
 }
 
 fn miri(
@@ -1061,16 +1143,29 @@ pub fn release_macos(root: &Path, stable: &str) -> Result<()> {
     )
 }
 
-pub(crate) struct SuiteOptions;
+pub(crate) struct SuiteOptions {
+    pub failure_mode: crate::failure_mode::FailureMode,
+}
 
-pub fn run(root: &Path, suite: Suite, _options: SuiteOptions) -> Result<()> {
+pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
+    if options.failure_mode == crate::failure_mode::FailureMode::CollectAll
+        && !matches!(
+            suite,
+            Suite::Native | Suite::Quality | Suite::QualityCompile | Suite::SupplyChain
+        )
+    {
+        return Err(CiError::Message(
+            "collect-all is supported for native, quality and supply-chain suites".into(),
+        ));
+    }
     let toolchains = config::toolchains(root)?;
     match suite {
         Suite::Policy => policy::run(root),
-        Suite::Quality => quality(root, &toolchains.stable),
+        Suite::Quality => quality(root, &toolchains.stable, options.failure_mode),
+        Suite::QualityCompile => quality_compile(root, &toolchains.stable, options.failure_mode),
         Suite::Msrv => msrv(root, &toolchains.msrv),
-        Suite::Native => native(root, &toolchains.stable, false),
-        Suite::SupplyChain => supply_chain(root, &toolchains.stable),
+        Suite::Native => native(root, &toolchains.stable, false, options.failure_mode),
+        Suite::SupplyChain => supply_chain(root, &toolchains.stable, options.failure_mode),
         Suite::Miri => miri(root, &toolchains.miri, None, Path::new("target/ci/miri")),
         Suite::MiriFirst => miri(
             root,

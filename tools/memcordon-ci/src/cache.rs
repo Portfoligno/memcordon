@@ -17,6 +17,59 @@ pub struct CacheContext {
     pub usable: bool,
     pub inputs: BTreeMap<String, String>,
     pub partitions: BTreeMap<String, String>,
+    pub entries: BTreeMap<String, OptionalCache>,
+    pub diagnostics: CacheDiagnostics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheEntry {
+    pub exact_key: String,
+    pub restore_prefix: Option<String>,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum OptionalCache {
+    Available { entry: CacheEntry },
+    Unavailable { reason: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheDiagnostics {
+    pub source_commit: String,
+    pub source_tree: String,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsumerProfile {
+    Ordinary,
+    Readiness,
+}
+
+pub fn emit_consumer_downloads(channel: &str, profile: ConsumerProfile) -> Result<()> {
+    // Current generated consumers own relocated temporary source/target roots.
+    // They deliberately use D downloads, not an unvalidated C target import.
+    // Public compiler-capture targets must also remain freshly compiled.
+    crate::workflow_output::write(&[
+        ("compiled-cache-usable", "false".into()),
+        ("product-key", String::new()),
+        ("consumer-key", String::new()),
+        ("product-restore-prefix", String::new()),
+        ("consumer-restore-prefix", String::new()),
+        ("product-paths", String::new()),
+        ("consumer-paths", String::new()),
+    ])?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "revision": 4, "channel": channel, "profile": profile,
+            "compiled": "unavailable: current generated source roots relocate; no established dependency freshness/import boundary",
+            "downloads": "seeded inside each newly owned Cargo home; selected public images excluded from public acquisition",
+        }))?
+    );
+    Ok(())
 }
 
 fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> Result<String> {
@@ -39,7 +92,7 @@ fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> 
 fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
     let release = match purpose {
         "native-debug" => false,
-        "native-release" | "native-readiness" => true,
+        "native-release" | "native-readiness" | "windows-working" | "private" => true,
         _ => return None,
     };
     Some(
@@ -67,53 +120,22 @@ pub fn context(
     }
     let mut inputs = BTreeMap::new();
     let mut usable = true;
-    // Cargo merges ancestor and user-home configuration with the checkout's
-    // own configuration. A repository tree hash does not identify these.
-    let mut config_roots: Vec<PathBuf> = root.ancestors().map(Path::to_path_buf).collect();
-    if let Some(home) = std::env::var_os("CARGO_HOME") {
-        config_roots.push(PathBuf::from(home));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        config_roots.push(PathBuf::from(home).join(".cargo"));
-    } else {
-        usable = false;
-    }
-    for directory in config_roots {
-        for path in [
-            directory.join(".cargo/config"),
-            directory.join(".cargo/config.toml"),
-            directory.join("config"),
-            directory.join("config.toml"),
-        ] {
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => match artifacts::read_file(&path) {
-                    Ok(bytes) => {
-                        inputs.insert(path.display().to_string(), artifacts::checksum(&bytes));
-                    }
-                    Err(_) => {
-                        usable = false;
-                    }
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(_) => {
-                    usable = false;
-                }
-            }
-        }
+    let mut local_usable = true;
+    let configurations = crate::cache_inputs::cargo_configs(root);
+    match &configurations {
+        Ok(configuration) => inputs.extend(configuration.clone()),
+        Err(_) => usable = false,
     }
     let git = Git::new(root)?;
-    inputs.insert(
-        "commit".into(),
-        git.text(["rev-parse", "--verify", "HEAD"])?,
-    );
-    inputs.insert(
-        "tree".into(),
-        git.text(["rev-parse", "--verify", "HEAD^{tree}"])?,
-    );
+    let diagnostics = CacheDiagnostics {
+        source_commit: git.text(["rev-parse", "--verify", "HEAD"])?,
+        source_tree: git.text(["rev-parse", "--verify", "HEAD^{tree}"])?,
+    };
     if !git
         .text(["status", "--porcelain=v1", "--untracked-files=no"])?
         .is_empty()
     {
-        usable = false;
+        local_usable = false;
     }
     let tracked = git.text(["ls-files", "--stage"])?;
     for line in tracked.lines() {
@@ -128,7 +150,7 @@ pub fn context(
             let actual = Git::new(&root.join(path))
                 .and_then(|submodule| submodule.text(["rev-parse", "HEAD"]));
             if actual.as_deref().ok() != Some(selected) {
-                usable = false;
+                local_usable = false;
             }
             inputs.insert(format!("submodule:{path}"), selected.into());
         }
@@ -138,7 +160,7 @@ pub fn context(
         && String::from_utf8_lossy(&artifacts::read_file(&root.join(".gitattributes"))?)
             .contains("filter=lfs")
     {
-        usable = false;
+        local_usable = false;
     }
     let pins = crate::config::toolchains(root)?;
     let selected_toolchain = if purpose.starts_with("miri") || purpose.starts_with("fuzz") {
@@ -160,7 +182,10 @@ pub fn context(
     inputs.insert("purpose".into(), purpose.into());
     inputs.insert("toolchain".into(), selected_toolchain.clone());
     inputs.insert("shard".into(), shard.into());
-    if purpose == "consumer-readiness" || purpose == "native-readiness" {
+    if matches!(
+        purpose,
+        "consumer-readiness" | "native-readiness" | "windows-working" | "private"
+    ) {
         let selected = distribution::Distribution::read(root)?
             .consumer_readiness()?
             .native()?
@@ -177,7 +202,7 @@ pub fn context(
         );
         inputs.insert("consumer-profile".into(), "selected-product:release;owned-fixture:release;driver:release;generated-consumer:dev+release".into());
     }
-    let revision = if let Some(recipe) = native_recipe(purpose) {
+    if let Some(recipe) = native_recipe(purpose) {
         inputs.insert(
             "native-test-arguments".into(),
             serde_json::to_string(&recipe)?,
@@ -191,15 +216,19 @@ pub fn context(
             }
             .into(),
         );
-        if purpose == "native-release" || purpose == "native-readiness" {
+        if matches!(
+            purpose,
+            "native-release" | "native-readiness" | "windows-working" | "private"
+        ) {
             inputs.insert("product-package".into(), "memcordon".into());
             inputs.insert("product-profile".into(), "release".into());
             match distribution::Distribution::read(root).and_then(|selected| {
-                let selected = if purpose == "native-readiness" {
-                    selected.consumer_readiness()?
-                } else {
-                    selected
-                };
+                let selected =
+                    if matches!(purpose, "native-readiness" | "windows-working" | "private") {
+                        selected.consumer_readiness()?
+                    } else {
+                        selected
+                    };
                 Ok(selected.native()?.clone())
             }) {
                 Ok(selected) => {
@@ -214,14 +243,12 @@ pub fn context(
                 }
             }
         }
-        2_u32
     } else {
         inputs.insert(
             "profile".into(),
             "source-tests:dev+release;product:release;consumer:dev+release;driver:dev".into(),
         );
-        1_u32
-    };
+    }
     inputs.insert(
         "distribution".into(),
         artifacts::checksum(&artifacts::read_file(&root.join("ci/distribution.toml"))?),
@@ -242,14 +269,6 @@ pub fn context(
             inputs.insert(name.into(), value.to_string_lossy().into_owned());
         }
     }
-    for path in [root.join(".cargo/config"), root.join(".cargo/config.toml")] {
-        if path.exists() {
-            inputs.insert(
-                path.display().to_string(),
-                artifacts::checksum(&artifacts::read_file(&path)?),
-            );
-        }
-    }
     for path in external {
         match artifacts::read_file(path) {
             Ok(bytes) => {
@@ -261,8 +280,11 @@ pub fn context(
             }
         }
     }
-    for (name, value) in std::env::vars_os() {
+    for (name, _value) in std::env::vars_os() {
         let name = name.to_string_lossy();
+        if name == "CARGO_BUILD_JOBS" {
+            continue;
+        }
         if matches!(
             name.as_ref(),
             "CC" | "CXX"
@@ -288,7 +310,6 @@ pub fn context(
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
         {
-            inputs.insert(name.into_owned(), value.to_string_lossy().into_owned());
             // Overrides may select otherwise unidentified tools/headers. They
             // remain usable for clean builds, with affected reuse disabled.
             usable = false;
@@ -364,20 +385,201 @@ pub fn context(
             _ => usable = false,
         }
     }
-    let mut partitions = BTreeMap::new();
-    for partition in ["source", "product", "consumer"] {
-        let mut selected = inputs.clone();
-        selected.insert("partition".into(), partition.into());
-        partitions.insert(
-            partition.into(),
-            artifacts::checksum(&serde_json::to_vec(&(revision, selected))?),
+    let revision = 4;
+    let mut entries: BTreeMap<String, OptionalCache> = BTreeMap::new();
+    if matches!(purpose, "cargo-audit" | "cargo-deny" | "cargo-fuzz") {
+        let pins = crate::config::tools(root)?;
+        let version = match purpose {
+            "cargo-audit" => pins.cargo_audit,
+            "cargo-deny" => pins.cargo_deny,
+            "cargo-fuzz" => pins.cargo_fuzz,
+            _ => unreachable!(),
+        };
+        let mut compatibility = inputs.clone();
+        for field in ["purpose", "shard", "lock", "distribution", "profile"] {
+            compatibility.remove(field);
+        }
+        compatibility.retain(|name, _| !name.starts_with("submodule:"));
+        let content = BTreeMap::from([
+            ("package".into(), purpose.into()),
+            ("version".into(), version),
+            ("recipe".into(), "cargo-install-locked-stable".into()),
+        ]);
+        for (name, family, path) in [
+            (
+                "tool",
+                "tool",
+                root.join("target/ci-tools/bin").join(if cfg!(windows) {
+                    format!("{purpose}.exe")
+                } else {
+                    purpose.into()
+                }),
+            ),
+            (
+                "tool-build",
+                "tool-build",
+                root.join("target/ci-tools-build").join(purpose),
+            ),
+        ] {
+            let entry = if usable {
+                let (exact_key, _) = crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
+                    family: family.into(),
+                    layout_revision: revision,
+                    compatibility: compatibility.clone(),
+                    content: content.clone(),
+                })?;
+                OptionalCache::Available {
+                    entry: CacheEntry {
+                        exact_key,
+                        restore_prefix: None,
+                        paths: vec![path],
+                    },
+                }
+            } else {
+                OptionalCache::Unavailable {
+                    reason: "unidentified tool compiler compatibility".into(),
+                }
+            };
+            entries.insert(name.into(), entry);
+        }
+    }
+    let mut download_content = BTreeMap::new();
+    download_content.insert(
+        "lock".into(),
+        artifacts::checksum(&artifacts::read_file(&root.join("Cargo.lock"))?),
+    );
+    if purpose.starts_with("fuzz") {
+        download_content.insert(
+            "fuzz-lock".into(),
+            artifacts::checksum(&artifacts::read_file(&root.join("fuzz/Cargo.lock"))?),
         );
     }
+    if let Ok(configuration) = &configurations {
+        download_content.extend(configuration.clone());
+    }
+    let (download_key, download_prefix) =
+        crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
+            family: "downloads".into(),
+            layout_revision: revision,
+            compatibility: BTreeMap::from([("archive-os".into(), std::env::consts::OS.into())]),
+            content: download_content,
+        })?;
+    entries.insert(
+        "source".into(),
+        OptionalCache::Available {
+            entry: CacheEntry {
+                exact_key: download_key,
+                restore_prefix: Some(download_prefix),
+                paths: vec!["~/.cargo/registry/cache".into(), "~/.cargo/git/db".into()],
+            },
+        },
+    );
+    if let Ok(configuration) = &configurations {
+        let stable_reader = query(root, "rustup", &["run", &pins.stable, "cargo", "-V"])?;
+        let readers = BTreeMap::from([
+            ("driver-reader".into(), stable_reader),
+            ("selected-reader".into(), inputs["cargo"].clone()),
+            ("index-os".into(), std::env::consts::OS.into()),
+        ]);
+        let (exact_key, _) = crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
+            family: "index".into(),
+            layout_revision: revision,
+            compatibility: readers,
+            content: configuration.clone(),
+        })?;
+        entries.insert(
+            "index".into(),
+            OptionalCache::Available {
+                entry: CacheEntry {
+                    exact_key,
+                    restore_prefix: None,
+                    paths: vec!["~/.cargo/registry/index".into()],
+                },
+            },
+        );
+    }
+    let local = crate::cache_inputs::local_files(root, purpose);
+    usable &= local_usable;
+    if local.is_err() {
+        usable = false;
+    }
+    let paths = crate::cache_restore::roots(purpose, shard);
+    if paths.is_err() || !external.is_empty() {
+        usable = false;
+    }
+    // Consumer archive envelopes are integrity inputs, not a compiler projection.
+    // No compiled consumer entry is emitted until its current builder owns a seed root.
+    entries.insert(
+        "consumer".into(),
+        OptionalCache::Unavailable {
+            reason: "fresh public capture or unassociated generated consumer root".into(),
+        },
+    );
+    let mut compatibility = inputs.clone();
+    compatibility.remove("lock");
+    compatibility.remove("distribution");
+    compatibility.remove("native-test-arguments");
+    if purpose == "native-auxiliary" {
+        compatibility.insert(
+            "profile".into(),
+            "nested-auxiliary:dev+release;implicit-host".into(),
+        );
+        compatibility.insert(
+            "compilation-arguments".into(),
+            "current-nested-workspace-cargo-build-recipes".into(),
+        );
+    }
+    if let Some(recipe) = native_recipe(purpose) {
+        let compilation = recipe.into_iter().next().unwrap_or_default();
+        compatibility.insert(
+            "compilation-arguments".into(),
+            serde_json::to_string(&compilation)?,
+        );
+    }
+    compatibility.insert(
+        "compiler-source-root".into(),
+        root.canonicalize()?.display().to_string(),
+    );
+    if usable {
+        let (exact_key, restore_prefix) =
+            crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
+                family: "workspace".into(),
+                layout_revision: revision,
+                compatibility,
+                content: local?,
+            })?;
+        entries.insert(
+            "product".into(),
+            OptionalCache::Available {
+                entry: CacheEntry {
+                    exact_key,
+                    restore_prefix: Some(restore_prefix),
+                    paths: paths?,
+                },
+            },
+        );
+    } else {
+        entries.insert(
+            "product".into(),
+            OptionalCache::Unavailable {
+                reason: "unidentified compiler inputs or output ownership".into(),
+            },
+        );
+    }
+    let partitions = entries
+        .iter()
+        .filter_map(|(name, optional)| match optional {
+            OptionalCache::Available { entry } => Some((name.clone(), entry.exact_key.clone())),
+            OptionalCache::Unavailable { .. } => None,
+        })
+        .collect();
     Ok(CacheContext {
         revision,
         usable,
         inputs,
         partitions,
+        entries,
+        diagnostics,
     })
 }
 
@@ -387,14 +589,72 @@ pub fn emit(root: &Path, purpose: &str, shard: &str, external: &[PathBuf]) -> Re
     if context.usable {
         outputs[0].1 = "true".into();
     }
-    for (partition, key) in &context.partitions {
-        let output = match partition.as_str() {
-            "source" => "source-key",
-            "product" => "product-key",
-            "consumer" => "consumer-key",
-            _ => unreachable!(),
+    for (partition, key_output, prefix_output, paths_output) in [
+        (
+            "source",
+            "source-key",
+            "source-restore-prefix",
+            "source-paths",
+        ),
+        (
+            "product",
+            "product-key",
+            "product-restore-prefix",
+            "product-paths",
+        ),
+        (
+            "consumer",
+            "consumer-key",
+            "consumer-restore-prefix",
+            "consumer-paths",
+        ),
+    ] {
+        let entry = match &context.entries[partition] {
+            OptionalCache::Available { entry } => Some(entry),
+            OptionalCache::Unavailable { .. } => None,
         };
-        outputs.push((output, key.clone()));
+        outputs.push((
+            key_output,
+            entry.map_or_else(String::new, |entry| entry.exact_key.clone()),
+        ));
+        outputs.push((
+            prefix_output,
+            entry
+                .and_then(|entry| entry.restore_prefix.clone())
+                .unwrap_or_default(),
+        ));
+        outputs.push((
+            paths_output,
+            entry.map_or_else(String::new, |entry| {
+                entry
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        ));
+    }
+    for (name, key_output, path_output) in [
+        ("tool", "tool-key", "tool-path"),
+        ("tool-build", "tool-build-key", "tool-build-path"),
+        ("index", "index-key", "index-path"),
+    ] {
+        if let Some(OptionalCache::Available { entry }) = context.entries.get(name) {
+            outputs.push((key_output, entry.exact_key.clone()));
+            outputs.push((
+                path_output,
+                entry
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        } else {
+            outputs.push((key_output, String::new()));
+            outputs.push((path_output, String::new()));
+        }
     }
     crate::workflow_output::write(&outputs)?;
     println!("{}", serde_json::to_string_pretty(&context)?);

@@ -2,7 +2,7 @@ use memcordon_ci::{
     CiError,
     command::CommandSpec,
     performance_plan::Layout,
-    preparation::{complete_lanes, observed, remaining},
+    preparation::{complete_lanes, complete_lanes_with_failure, observed, remaining},
 };
 use std::{
     sync::{Arc, Mutex},
@@ -10,13 +10,14 @@ use std::{
 };
 
 #[test]
-fn both_owners_finish_after_failure_or_panic_in_fixed_result_order() {
+fn collect_all_settles_both_owners_after_failure_or_panic() {
     for layout in [Layout::Serial, Layout::Parallel] {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let first = Arc::clone(&observed);
         let second = Arc::clone(&observed);
-        let error = complete_lanes(
+        let error = complete_lanes_with_failure(
             layout,
+            memcordon_ci::failure_mode::FailureMode::CollectAll,
             move || {
                 first.lock().unwrap().push("first");
                 Err(CiError::Message("first failure".into()))
@@ -28,15 +29,16 @@ fn both_owners_finish_after_failure_or_panic_in_fixed_result_order() {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.find("first failure").unwrap() < error.find("second failure").unwrap());
+        assert!(error.contains("first failure") && error.contains("second failure"));
         let mut completed = observed.lock().unwrap().clone();
         completed.sort();
         assert_eq!(completed, ["first", "second"]);
         let done = Arc::new(Mutex::new(false));
         let second = Arc::clone(&done);
         assert!(
-            complete_lanes(
+            complete_lanes_with_failure(
                 layout,
+                memcordon_ci::failure_mode::FailureMode::CollectAll,
                 || panic!("actual injected owner failure"),
                 move || {
                     *second.lock().unwrap() = true;
@@ -50,10 +52,106 @@ fn both_owners_finish_after_failure_or_panic_in_fixed_result_order() {
 }
 
 #[test]
+fn default_serial_failure_does_not_admit_second_lane() {
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let error = complete_lanes(
+        Layout::Serial,
+        || Err(CiError::Message("first cause".into())),
+        || {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("first cause"));
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn fast_second_failure_is_primary_after_slow_first_owner_settles() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let error = complete_lanes(
+        Layout::Parallel,
+        move || {
+            receiver.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            Err(CiError::Message("slow first failure".into()))
+        },
+        || {
+            sender.send(()).unwrap();
+            Err(CiError::Message("fast second failure".into()))
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.find("fast second failure").unwrap() < error.find("slow first failure").unwrap());
+}
+
+#[test]
 fn original_group_deadline_caps_each_command_without_renewal() {
     let end = Instant::now() + Duration::from_secs(2);
     assert!(remaining(end, Duration::from_secs(30)).unwrap() <= Duration::from_secs(2));
     assert!(remaining(Instant::now(), Duration::from_secs(30)).is_err());
+}
+
+#[test]
+fn invalid_cache_version_probe_can_rebuild_without_stopping_the_group() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    complete_lanes(
+        Layout::Serial,
+        || {
+            let output = CommandSpec::new(&executable, root.path(), Duration::from_secs(20))
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "failing_operation_child",
+                    "--nocapture",
+                ])
+                .defer_group_failure()
+                .output_quiet()?;
+            assert!(!output.status.success());
+            CommandSpec::new(&executable, root.path(), Duration::from_secs(20))
+                .arg("--list")
+                .run()
+                .map(|_| ())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn auxiliary_setup_never_renews_an_expired_supply_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("ci")).unwrap();
+    for (name, bytes) in [
+        (
+            "toolchains.toml",
+            include_str!("../../../ci/toolchains.toml"),
+        ),
+        ("tools.toml", include_str!("../../../ci/tools.toml")),
+        (
+            "performance.toml",
+            include_str!("../../../ci/performance.toml"),
+        ),
+    ] {
+        std::fs::write(root.path().join("ci").join(name), bytes).unwrap();
+    }
+    let error = memcordon_ci::preparation::ensure_auxiliary_tool_until(
+        root.path(),
+        memcordon_ci::bootstrap_profile::BootstrapProfile::SupplyChain,
+        "cargo-audit",
+        "0.0.0",
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("original operation group deadline expired"),
+        "{error}"
+    );
 }
 
 #[test]
