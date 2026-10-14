@@ -7,6 +7,22 @@ use memcordon_testkit::{ObservedOutput, run_with_deadline_output_limit};
 
 use crate::{CiError, Result};
 
+/// Reject native command failure before decoding its successful-response schema.
+pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let end = output.stderr.len().min(2048);
+    Err(CiError::Message(format!(
+        "{operation}: native command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}",
+        output.status,
+        output.stdout.len(),
+        output.stderr.len(),
+        end != output.stderr.len(),
+        String::from_utf8_lossy(&output.stderr[..end])
+    )))
+}
+
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     program: PathBuf,

@@ -2,6 +2,7 @@ use super::*;
 use memcordon_core::*;
 
 #[test]
+#[cfg(windows)]
 fn native_invalid_handle_capture_preserves_first_cause_across_phase_change() {
     let evidence = crate::windows::readiness_receipt::begin(
         "windows::diagnostics::causal_capture_tests::native_invalid_handle_capture_preserves_first_cause_across_phase_change",
@@ -84,6 +85,78 @@ fn failure(code: u32) -> CausalEventV1 {
 }
 
 #[test]
+fn fallback_and_late_source_captures_share_one_original_and_order() {
+    let _scope = AttemptDiagnosticScope::enter();
+    // Exercise the fallback's real purpose: source capture was unavailable.
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let _held = current.as_ref().unwrap().borrow_mut();
+        capture(failure(100));
+    });
+    let mut record = WindowsCausalDiagnosticsV1::default();
+    let mut original = failure(101);
+    original.observed_phase = AttemptObservationPhaseV1::AuthorizedBeforeResume;
+    observe_uncaptured_failure(&mut record, original);
+    let first = record.clone();
+    assert_eq!(first.sequence, 1);
+    assert!(first.loss.writer_unavailable);
+    set_phase(AttemptObservationPhaseV1::Cleaning);
+    capture(failure(202));
+    merge_into(&mut record);
+    let second = record.clone();
+    capture(failure(303));
+    merge_into(&mut record);
+    assert_eq!(first.original, second.original);
+    assert_eq!(first.original, record.original);
+    assert_eq!(record.sequence, 3);
+    assert_eq!(
+        second.secondary.as_slice(),
+        &record.secondary.as_slice()[..second.secondary.as_slice().len()]
+    );
+    assert_eq!(
+        record
+            .secondary
+            .as_slice()
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert!(
+        record
+            .secondary
+            .as_slice()
+            .iter()
+            .all(|event| event.observed_phase == AttemptObservationPhaseV1::Cleaning)
+    );
+    assert!(record.loss.writer_unavailable);
+    assert!(record.is_consistent());
+}
+
+#[test]
+fn fallback_does_not_duplicate_captured_source_and_works_without_scope() {
+    {
+        let _scope = AttemptDiagnosticScope::enter();
+        capture(failure(111));
+        let mut record = WindowsCausalDiagnosticsV1::default();
+        observe_uncaptured_failure(&mut record, failure(222));
+        assert_eq!(record.sequence, 1);
+        assert!(record.secondary.as_slice().is_empty());
+        assert!(
+            matches!(record.original, OriginalFailureV1::Observed { ref event } if event.native_code == Some(NativeFailureCodeV1::Win32(111)))
+        );
+    }
+    std::thread::spawn(|| {
+        let mut record = WindowsCausalDiagnosticsV1::default();
+        observe_uncaptured_failure(&mut record, failure(333));
+        assert_eq!(record.sequence, 1);
+        assert!(record.is_consistent());
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
 fn source_capture_and_record_cleanup_share_one_ordered_journal() {
     let _scope = AttemptDiagnosticScope::enter();
     capture(failure(1234));
@@ -100,7 +173,7 @@ fn source_capture_and_record_cleanup_share_one_ordered_journal() {
             .secondary
             .as_slice()
             .iter()
-            .map(|event| event.native_code.clone())
+            .map(|event| event.native_code)
             .collect::<Vec<_>>(),
         vec![
             Some(NativeFailureCodeV1::Win32(4321)),

@@ -66,6 +66,98 @@ enum TerminalCandidate {
     Authoritative(Box<memcordon_core::WindowsTerminalReceiptV2>),
 }
 
+struct LateControlLoss {
+    operation: memcordon_core::FailureOperationV1,
+    native_code: Option<u32>,
+    detail: String,
+}
+
+fn observed_late_control_loss(
+    loss: LateControlLoss,
+    selected: Option<WindowsSealedFault>,
+) -> LaunchAttemptError {
+    super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
+    let selected = selected.filter(|fault| {
+        matches!(
+            fault,
+            WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+                | WindowsSealedFault::FrontendKilledAfterAuthorization
+                | WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+        )
+    });
+    super::diagnostics::capture_native_with_injected_fault(
+        loss.operation,
+        loss.native_code
+            .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
+        memcordon_core::FailureCodeV1::ControlTransport,
+        selected,
+    );
+    LaunchAttemptError {
+        code: "MCSEALED-WINDOWS-AUTHORITY-LOSS",
+        detail: loss.detail,
+        os_code: loss
+            .native_code
+            .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
+        phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
+        connection_must_close: true,
+        mutant_observation: None,
+        loader_qualification: None,
+        terminal_candidate: None,
+        job_operation: None,
+        workload_admission: None,
+    }
+}
+
+fn failed_retirement_outcome(
+    failure: &LaunchAttemptError,
+    child: memcordon_core::ChildTermination,
+) -> RunOutcome {
+    RunOutcome::MonitorFailed {
+        error: failure.detail.clone(),
+        child_after_termination: Some(child),
+        cleanup: CleanupSummary {
+            force_attempted: true,
+            direct_child_reaped: true,
+            workload_empty: Some(true),
+            ..CleanupSummary::default()
+        },
+    }
+}
+
+fn retain_late_control_loss(
+    pending: &mut Option<LaunchAttemptError>,
+    loss: LateControlLoss,
+    selected: Option<WindowsSealedFault>,
+) {
+    let failure = observed_late_control_loss(loss, selected);
+    pending.get_or_insert(failure).connection_must_close = true;
+}
+
+fn observe_control_delivery(
+    delivery: Result<(), pipe::FrameWriteError>,
+    stage: &'static str,
+    pending: &mut Option<LaunchAttemptError>,
+    selected: Option<WindowsSealedFault>,
+) -> Result<bool, LaunchAttemptError> {
+    match delivery {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let peer_closed = error.peer_closed;
+            let loss = LateControlLoss {
+                operation: memcordon_core::FailureOperationV1::DeliverResponse,
+                native_code: error.native_code,
+                detail: format!("{stage} delivery failed: {error}"),
+            };
+            if !peer_closed {
+                return Err(observed_late_control_loss(loss, None));
+            }
+            retain_late_control_loss(pending, loss, selected);
+            Ok(false)
+        }
+    }
+}
+
 impl From<String> for LaunchAttemptError {
     fn from(detail: String) -> Self {
         Self {
@@ -1438,6 +1530,17 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                     cleanup_failures.join(" | ")
                                 );
                             }
+                            // launch_attempt has unwound its cleanup guard. Its
+                            // final queued snapshot must settle before either
+                            // durable read transfers this same owner's revision.
+                            if let Err(error) = super::attempt_store::wait_for_pending(&attempt_id)
+                            {
+                                pipe::disconnect(connection);
+                                return Err(format!(
+                                    "{}; post-cleanup publication handoff remains unconfirmed: {error}",
+                                    failure.detail
+                                ));
+                            }
                             let requires_receipt =
                                 super::record::attempt_requires_authoritative_terminal(&attempt_id)
                                     .unwrap_or(true);
@@ -1467,7 +1570,12 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                     failure.detail
                                 ));
                             }
-                            if failure.connection_must_close {
+                            if failure.connection_must_close
+                                && !matches!(
+                                    failure.terminal_candidate.as_ref(),
+                                    Some(TerminalCandidate::Authoritative(_))
+                                )
+                            {
                                 pipe::disconnect(connection);
                                 return Err(failure.detail);
                             }
@@ -1546,6 +1654,20 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                     "{primary_detail}; secondary terminal staging failure: {secondary}"
                                 )
                             })?;
+                            if failure.connection_must_close {
+                                if !terminal_staged {
+                                    pipe::disconnect(connection);
+                                    return Err(format!(
+                                        "{primary_detail}; bound rejection outbox staging unavailable after control-channel loss"
+                                    ));
+                                }
+                                // Proof-complete authority is durably retained;
+                                // an unusable channel neither receives nor ACKs it.
+                                pipe::disconnect(connection);
+                                return Err(format!(
+                                    "{primary_detail}; bound rejection outbox retained after control-channel loss"
+                                ));
+                            }
                             let terminal_response_sha256 = super::record::digest(
                                 response
                                     .terminal_authority_json()
@@ -3044,7 +3166,7 @@ fn launch_attempt(
             return Err(error.into());
         }
     }
-    pipe::write_frame(
+    let authorization_delivery = pipe::write_frame_detailed(
         connection,
         &WindowsLauncherResponseV3::TargetAuthorized {
             schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
@@ -3053,6 +3175,13 @@ fn launch_attempt(
             request_sha256: request.request_sha256.clone(),
             child_pid: target.process_id,
         },
+    );
+    let mut authorization_failure = None;
+    let authorization_connected = observe_control_delivery(
+        authorization_delivery,
+        "TargetAuthorized",
+        &mut authorization_failure,
+        request.certification_fault,
     )?;
     if request.certification_fault == Some(WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
     {
@@ -3063,7 +3192,7 @@ fn launch_attempt(
         cleanup_guard.record.store()?;
     }
 
-    let monitored = match stream_close_failure {
+    let monitored = match stream_close_failure.or(authorization_failure) {
         Some(failure) => Err(failure),
         None => monitor(
             workload_admission.as_ref(),
@@ -3076,7 +3205,7 @@ fn launch_attempt(
             &mut process_observer,
         ),
     };
-    let (monitor_observation, monitor_failure) = match monitored {
+    let (monitor_observation, mut monitor_failure) = match monitored {
         Ok(observation) => (Some(observation), None),
         Err(error)
             if request.certification_fault
@@ -3126,7 +3255,7 @@ fn launch_attempt(
             (None, Some(error))
         }
     };
-    let (reason, mut control_connected, peak_memory_bytes) = match monitor_observation {
+    let (reason, control_connected, peak_memory_bytes) = match monitor_observation {
         Some(observation) => (
             observation.reason,
             observation.control_connected,
@@ -3140,6 +3269,12 @@ fn launch_attempt(
             None,
         ),
     };
+    let mut control_connected = control_connected && authorization_connected;
+    if !authorization_connected {
+        if let Some(failure) = monitor_failure.as_mut() {
+            failure.connection_must_close = true;
+        }
+    }
     let mut mutant_candidate = None;
     if matches!(reason, TerminalReason::PolicyRevoked) {
         // Retain the original reason before fallible cleanup, without starting
@@ -3267,17 +3402,8 @@ fn launch_attempt(
         observation.final_active_processes_zero = true;
     }
     cleanup_guard.record.store()?;
-    let outcome = if let Some(failure) = monitor_failure.as_ref() {
-        RunOutcome::MonitorFailed {
-            error: failure.detail.clone(),
-            child_after_termination: Some(child_termination(target.exit_status()?)),
-            cleanup: CleanupSummary {
-                force_attempted: true,
-                direct_child_reaped: true,
-                workload_empty: Some(true),
-                ..CleanupSummary::default()
-            },
-        }
+    let mut outcome = if let Some(failure) = monitor_failure.as_ref() {
+        failed_retirement_outcome(failure, child_termination(target.exit_status()?))
     } else {
         build_outcome(
             reason,
@@ -3320,7 +3446,7 @@ fn launch_attempt(
             &[WindowsSealedFault::RelayRetire],
             memcordon_core::BoundarySetupPhase::Retirement,
         )?;
-        pipe::write_frame(
+        let delivered = pipe::write_frame_detailed(
             connection,
             &WindowsLauncherResponseV3::TargetRetired {
                 schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
@@ -3328,8 +3454,18 @@ fn launch_attempt(
                 nonce: request.launch.nonce.clone(),
                 request_sha256: request.request_sha256.clone(),
             },
+        );
+        control_connected = observe_control_delivery(
+            delivered,
+            "TargetRetired",
+            &mut monitor_failure,
+            request.certification_fault,
         )?;
-        if request.certification_mutant == Some(memcordon_core::WindowsSealedMutant::SkipRelayAck) {
+        if !control_connected {
+            // Native relay ownership still needs its separate held proof below.
+        } else if request.certification_mutant
+            == Some(memcordon_core::WindowsSealedMutant::SkipRelayAck)
+        {
             mutant_observation = Some(
                 memcordon_core::WindowsMutantNativeObservationV1::RelayAckSkipped {
                     target_retired_sent: true,
@@ -3337,14 +3473,29 @@ fn launch_attempt(
                 },
             );
         } else {
-            control_connected = wait_for_relays_retired(
+            match wait_for_relays_retired(
                 connection,
                 &request.attempt_id,
                 &request.launch.nonce,
                 &request.request_sha256,
                 frontend.raw(),
-            )?;
+            )? {
+                RelayRetirementAcknowledgment::Bound => (),
+                RelayRetirementAcknowledgment::PeerLost(loss) => {
+                    retain_late_control_loss(
+                        &mut monitor_failure,
+                        loss,
+                        request.certification_fault,
+                    );
+                    control_connected = false;
+                }
+            }
         }
+    }
+    if let Some(failure) = monitor_failure.as_ref() {
+        // The target's real status remains child information, never substitute
+        // authority for the transport failure observed after natural completion.
+        outcome = failed_retirement_outcome(failure, child_termination(target.exit_status()?));
     }
     wait_for_relay_retirement_proof(
         relay_retired_event.raw(),
@@ -4029,22 +4180,45 @@ fn wait_for_relays_ready(
     Err("frontend did not acknowledge relay readiness".to_owned())
 }
 
+enum RelayRetirementAcknowledgment {
+    Bound,
+    PeerLost(LateControlLoss),
+}
+
 fn wait_for_relays_retired(
     connection: HANDLE,
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
     frontend: HANDLE,
-) -> Result<bool, String> {
+) -> Result<RelayRetirementAcknowledgment, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         // SAFETY: frontend remains a live synchronization handle.
-        if unsafe { WaitForSingleObject(frontend, 0) } == WAIT_OBJECT_0 {
-            return Ok(false);
+        let frontend_state = unsafe { WaitForSingleObject(frontend, 0) };
+        if frontend_state == WAIT_OBJECT_0 {
+            return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+                operation: memcordon_core::FailureOperationV1::ReadControlFrame,
+                native_code: None,
+                detail: "held frontend became signaled before relay acknowledgment".into(),
+            }));
+        }
+        if frontend_state != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+            let error = io::Error::last_os_error();
+            return Err(format!(
+                "relay acknowledgment held frontend wait failed: wait={frontend_state}; native_code={:?}; {error}",
+                error.raw_os_error()
+            ));
         }
         let available = match pipe::frame_available_detailed(connection) {
             Ok(available) => available,
-            Err(pipe::FrameAvailabilityError::PeerClosed) => return Ok(false),
+            Err(pipe::FrameAvailabilityError::PeerClosed { code }) => {
+                return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+                    operation: memcordon_core::FailureOperationV1::ReadControlFrame,
+                    native_code: Some(code),
+                    detail: format!("relay acknowledgment peer closed: native_code={code}"),
+                }));
+            }
             Err(error) => {
                 return Err(format!("relay-retirement availability failed: {error}"));
             }
@@ -4052,8 +4226,12 @@ fn wait_for_relays_retired(
         if available {
             let frame = match pipe::read_frame_detailed::<WindowsLauncherRequestV3>(connection) {
                 Ok(frame) => frame,
-                Err(error) if error.peer_closed && error.transferred_bytes == 0 => {
-                    return Ok(false);
+                Err(error) if error.peer_closed => {
+                    return Ok(RelayRetirementAcknowledgment::PeerLost(LateControlLoss {
+                        operation: memcordon_core::FailureOperationV1::ReadControlFrame,
+                        native_code: error.native_code,
+                        detail: format!("relay acknowledgment peer closed: {error}"),
+                    }));
                 }
                 Err(error) => {
                     return Err(format!("relay-retirement frame failed: {error}"));
@@ -4070,7 +4248,7 @@ fn wait_for_relays_retired(
                     && received_nonce == nonce
                     && received_digest == request_sha256 =>
                 {
-                    Ok(true)
+                    Ok(RelayRetirementAcknowledgment::Bound)
                 }
                 _ => Err("invalid relay-retirement message".to_owned()),
             };
@@ -4823,7 +5001,9 @@ fn monitor(
                 Err(error) => {
                     let code = match error {
                         pipe::FrameAvailabilityError::Native { code, .. } => code,
-                        pipe::FrameAvailabilityError::PeerClosed => None,
+                        pipe::FrameAvailabilityError::PeerClosed { code } => {
+                            Some(i32::from_ne_bytes(code.to_ne_bytes()))
+                        }
                     };
                     super::diagnostics::capture_native_with_injected_fault(
                         memcordon_core::FailureOperationV1::ReadControlFrame,
@@ -5390,7 +5570,6 @@ impl<'a> AttemptCleanup<'a> {
         super::diagnostics::observe_record(&mut self.record.causal_diagnostics, event, true);
     }
     fn observe_failure(&mut self, failure: &LaunchAttemptError) {
-        super::diagnostics::merge_into(&mut self.record.causal_diagnostics);
         let mut observation = failure.observation();
         observation.observed_phase = if self.record.target_released {
             memcordon_core::AttemptObservationPhaseV1::Monitoring
@@ -5401,11 +5580,10 @@ impl<'a> AttemptCleanup<'a> {
         } else {
             memcordon_core::AttemptObservationPhaseV1::BeforeAuthorization
         };
-        if self.record.causal_diagnostics.sequence == 0
-            && self.record.causal_diagnostics.observe(observation).is_err()
-        {
-            self.record.causal_diagnostics.loss.writer_unavailable = true;
-        }
+        super::diagnostics::observe_uncaptured_failure(
+            &mut self.record.causal_diagnostics,
+            observation,
+        );
         // Initiate containment before submitting any diagnostic disk work.
         let _ = self.job.terminate(CANCEL_STATUS);
         if super::attempt_store::try_commit_diagnostics(&mut self.record).is_err() {

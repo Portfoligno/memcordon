@@ -1,7 +1,113 @@
 //! Held namespace-init status evidence required before Completed.
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
+
+pub(super) fn wait_and_publish_target_status(
+    child: libc::pid_t,
+    writer: &mut File,
+) -> Result<i32, String> {
+    if child <= 0 {
+        return Err("MCSEALED-PRIVATE-INIT: invalid exact target child".into());
+    }
+    let raw = loop {
+        let mut raw = 0;
+        // SAFETY: trusted init alone owns this exact direct child's wait.
+        let waited = unsafe { libc::waitpid(child, &raw mut raw, 0) };
+        if waited == child {
+            break raw;
+        }
+        if waited == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!(
+                "MCSEALED-PRIVATE-INIT: exact target wait failed: errno={:?}; {error}",
+                error.raw_os_error()
+            ));
+        }
+        return Err(format!(
+            "MCSEALED-PRIVATE-INIT: exact target wait returned unexpected child {waited}"
+        ));
+    };
+    if !libc::WIFEXITED(raw) && !libc::WIFSIGNALED(raw) {
+        return Err("MCSEALED-PRIVATE-INIT: exact target wait is not terminal".into());
+    }
+    writer.write_all(&raw.to_be_bytes()).map_err(|error| {
+        format!(
+            "MCSEALED-PRIVATE-INIT: publish actual target status: errno={:?}; {error}",
+            error.raw_os_error()
+        )
+    })?;
+    Ok(raw)
+}
+
+pub(super) fn publish_target_before_descendant_drain(
+    child: libc::pid_t,
+    writer: &mut File,
+    drain: impl FnOnce() -> Result<(), String>,
+) -> Result<i32, String> {
+    let raw = wait_and_publish_target_status(child, writer)?;
+    drain()?;
+    Ok(raw)
+}
+
+pub(super) fn bounded_retirement_detail(detail: &str, limit: usize) -> String {
+    if detail.len() <= limit {
+        return detail.to_owned();
+    }
+    let marker = "...[truncated]...";
+    let available = limit
+        .checked_sub(marker.len())
+        .filter(|available| *available > 0)
+        .expect("retirement diagnostic bound must accommodate truncation marker");
+    let mut head = available * 2 / 3;
+    while !detail.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = detail.len() - (available - available * 2 / 3);
+    while !detail.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{}{}", &detail[..head], marker, &detail[tail..])
+}
+
+pub(super) fn capture_target_status_until(
+    observed: &mut Option<i32>,
+    channel: &mut Option<File>,
+    deadline: Instant,
+) -> Result<Option<i32>, String> {
+    if let Some(raw) = *observed {
+        return Ok(Some(raw));
+    }
+    let captured = match channel.take() {
+        Some(status) => read_status_until(status, deadline)?,
+        None => None,
+    };
+    *observed = captured;
+    Ok(captured)
+}
+
+pub(super) fn preserve_status_through_containment<T>(
+    captured: Result<T, String>,
+    contain: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    // Never let status loss bypass the existing immediate containment action,
+    // even when its original observation deadline has already expired.
+    let containment = contain();
+    match (captured, containment) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(status), Ok(())) => Err(bounded_retirement_detail(&status, 256)),
+        (Ok(_), Err(cleanup)) => Err(bounded_retirement_detail(&cleanup, 1024)),
+        (Err(status), Err(cleanup)) => Err(format!(
+            "{}; native containment also failed: {}",
+            bounded_retirement_detail(&status, 256),
+            bounded_retirement_detail(&cleanup, 1024)
+        )),
+    }
+}
 
 pub(super) fn require_target_status(
     observed: &mut Option<i32>,

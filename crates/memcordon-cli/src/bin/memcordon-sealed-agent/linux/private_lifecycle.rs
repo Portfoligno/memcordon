@@ -39,7 +39,10 @@ use super::private_target::{
     PRIVATE_EXEC_ARMED_PACKET, PrivateControlObservation, PrivateGatedReadback, PrivateGatedTarget,
     PrivateNetworkNamespaceOwner, decode_private_control_packet, observe_private_gated_target,
 };
-use super::private_wait_status::{read_status_until, require_target_status};
+use super::private_wait_status::{
+    bounded_retirement_detail, capture_target_status_until, preserve_status_through_containment,
+    require_target_status,
+};
 use crate::request::NamespaceIdentity;
 
 pub struct PrivateObservedTarget {
@@ -576,6 +579,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             layout,
             root_identity,
             &entry,
+            deadline,
         )
         .map_err(|root_error| {
             let startup = self.startup.as_ref().ok_or_else(|| "mixed startup channel absent".to_owned())
@@ -1741,7 +1745,9 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         self.record_mut().begin_mixed_retirement()?;
         let cleanup = (|| -> Result<_, String> {
             if self.mixed_native_retired.is_none() {
-                let candidate_exit_code = self.settle_native_resources(deadline)?;
+                let candidate_exit_code = self
+                    .settle_native_resources(deadline)
+                    .map_err(|error| format!("settle mixed native resources: {error}"))?;
                 self.mixed_native_retired = Some(PrivateRetirementObservation {
                     attempt_id: self.record_mut().record().attempt_id.as_str().to_owned(),
                     retired: None,
@@ -1815,7 +1821,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
                         self.mixed_staging = Some(failure.staging);
                         self.mixed_export_path = failure.exported;
                         self.mixed_export_destination = Some(failure.destination);
-                        return Err(failure.detail);
+                        return Err(format!("export mixed private root: {}", failure.detail));
                     }
                 };
                 self.mixed_root_retired = Some(root_retired);
@@ -1838,12 +1844,15 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
                 &export_path.join("export-receipt.json"),
                 memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
                 None,
-            )?;
+            )
+            .map_err(|error| format!("read mixed export receipt: {error}"))?;
             #[cfg(test)]
             if let Some(callback) = before_account.as_mut() {
                 callback(self, admission)?;
             }
-            admission.retire_after_native_root_and_account_quiescence(native, root_retired)?;
+            admission
+                .retire_after_native_root_and_account_quiescence(native, root_retired)
+                .map_err(|error| format!("retire mixed account reservation: {error}"))?;
             // Reached only after every owned native retirement operation above
             // returned its observed-success proof; none is inferred from JSON.
             let retired_fact = VerifiedTrue::observed(true).map_err(str::to_owned)?;
@@ -1863,7 +1872,8 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             };
             let permit = VerifiedPrivateRetirement::observed(self.record_mut().record());
             self.record_mut()
-                .retire_mixed_after_native_cleanup(permit)?;
+                .retire_mixed_after_native_cleanup(permit)
+                .map_err(|error| format!("retire mixed native journal: {error}"))?;
             self.record.take();
             let native = self
                 .mixed_native_retired
@@ -1936,31 +1946,108 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     /// This consumes only observed native resources. It does not remove a
     /// durable record, release a policy reference, or claim terminal success.
     fn settle_native_resources(&mut self, deadline: Instant) -> Result<Option<i32>, String> {
-        if let Some(cgroup) = self.cgroup.as_ref() {
-            let observed = cgroup.clone().kill_and_retire_observed(deadline)?;
-            self.cgroup_retirement_raw = Some(observed);
-            self.cgroup.take();
-        }
-        if let Some(target) = self.target_pidfd.as_ref() {
-            wait_pidfd(target.as_fd(), deadline)?;
-        }
-        self.target_pidfd.take();
-        if let Some(init) = self.namespace_init.as_ref() {
-            wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline)?;
-        }
-        self.namespace_init.take();
-        self.startup.take();
-        let candidate_exit_code = self.observed_native_wait_status.or(self
-            .status
-            .take()
-            .map(|status| read_status_until(status, deadline))
-            .transpose()?
-            .flatten());
-        if self.monitor_outcome == Some(PrivateMonitorOutcome::Completed)
-            && candidate_exit_code.is_none()
-        {
+        let captured = if self.native_exec_observed {
+            let captured = (|| {
+                if self.observed_native_wait_status.is_none() {
+                    let target = self.target_pidfd.as_ref().ok_or("MCSEALED-PRIVATE-OWNER: executed target pidfd absent before status capture")?;
+                    if !pidfd_exited(target.as_fd())? {
+                        // SAFETY: authenticated startup transferred this exact
+                        // held target pidfd; no numeric PID/group lookup occurs.
+                        if unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                target.as_raw_fd(),
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        } == -1
+                        {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::ESRCH) {
+                                return Err(format!(
+                                    "MCSEALED-PRIVATE-OWNER: signal held target before status capture: errno={:?}; {error}",
+                                    error.raw_os_error()
+                                ));
+                            }
+                        }
+                    }
+                }
+                let status = capture_target_status_until(
+                    &mut self.observed_native_wait_status,
+                    &mut self.status,
+                    deadline,
+                )?;
+                if self.mixed_staging.is_some() && status.is_none() {
+                    return Err("MCSEALED-PRIVATE-OWNER: executed mixed target status absent before containment".into());
+                }
+                Ok(status)
+            })();
+            Some(captured)
+        } else {
+            None
+        };
+        let candidate = match captured {
+            Some(captured) => preserve_status_through_containment(captured, || {
+                self.contain_native_resources(deadline)
+            })?,
+            None => {
+                self.contain_native_resources(deadline)?;
+                capture_target_status_until(
+                    &mut self.observed_native_wait_status,
+                    &mut self.status,
+                    deadline,
+                )?
+            }
+        };
+        if self.monitor_outcome == Some(PrivateMonitorOutcome::Completed) && candidate.is_none() {
             return Err("MCSEALED-PRIVATE-OWNER: completed target status absent".into());
         }
+        Ok(candidate)
+    }
+
+    fn contain_native_resources(&mut self, deadline: Instant) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Some(cgroup) = self.cgroup.as_ref() {
+            match cgroup.clone().kill_and_retire_observed(deadline) {
+                Ok(observed) => {
+                    self.cgroup_retirement_raw = Some(observed);
+                    self.cgroup.take();
+                }
+                Err(error) => failures.push(format!(
+                    "cgroup containment: {}",
+                    bounded_retirement_detail(&error, 256)
+                )),
+            }
+        }
+        if let Some(target) = self.target_pidfd.as_ref() {
+            match wait_pidfd(target.as_fd(), deadline) {
+                Ok(()) => {
+                    self.target_pidfd.take();
+                }
+                Err(error) => failures.push(format!(
+                    "held target settlement: {}",
+                    bounded_retirement_detail(&error, 256)
+                )),
+            }
+        }
+        if let Some(init) = self.namespace_init.as_ref() {
+            match wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline) {
+                Ok(()) => {
+                    self.namespace_init.take();
+                }
+                Err(error) => failures.push(format!(
+                    "exact init settlement: {}",
+                    bounded_retirement_detail(&error, 256)
+                )),
+            }
+        }
+        if !failures.is_empty() {
+            // Keep failed owners and the armed guardian; no downstream proof
+            // or authority release is available from partial containment.
+            return Err(failures.join("; "));
+        }
+        self.startup.take();
         self.control.take();
         self.expected_descriptors.take();
         self.stdio.take();
@@ -1993,7 +2080,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 guardian.stop(deadline)?;
             }
         }
-        Ok(candidate_exit_code)
+        Ok(())
     }
 }
 

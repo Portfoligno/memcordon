@@ -90,7 +90,8 @@ pub(crate) fn capture_native_with_injected_fault(
             | memcordon_core::FailureOperationV1::VerifyPolicy => {
                 memcordon_core::FailureCategoryV1::Admission
             }
-            memcordon_core::FailureOperationV1::ReadControlFrame => {
+            memcordon_core::FailureOperationV1::ReadControlFrame
+            | memcordon_core::FailureOperationV1::DeliverResponse => {
                 memcordon_core::FailureCategoryV1::Transport
             }
             memcordon_core::FailureOperationV1::VerifySuspendedTarget => {
@@ -174,4 +175,15 @@ pub(super) fn observe_record(
         };
         target.copy_into_reserved(&mut journal);
     });
+}
+
+/// Fallback observations must join the source journal's sequence owner too.
+pub(super) fn observe_uncaptured_failure(
+    target: &mut WindowsCausalDiagnosticsV1,
+    event: CausalEventV1,
+) {
+    merge_into(target);
+    if target.sequence == 0 {
+        observe_record(target, event, false);
+    }
 }

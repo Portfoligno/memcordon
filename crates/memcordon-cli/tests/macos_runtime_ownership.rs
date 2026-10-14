@@ -86,12 +86,21 @@ fn isolated_runtime_resource_baseline() {
 fn native_terminal_observation_does_not_reap_and_repeated_wait_is_cached() {
     let runtime = MacosLaunchRuntime::new(1).unwrap();
     let mut child = runtime.test_native_child(false).unwrap();
+    let original_slot = child.creation_observation();
     let limit = Instant::now() + Duration::from_secs(5);
     while child.observe().unwrap().is_none() {
         assert!(Instant::now() < limit);
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(runtime.outstanding(), 1);
+    assert!(
+        child.stop_until(limit).is_err(),
+        "terminal observation is not a live stop target"
+    );
+    assert!(
+        child.retirement_pending(),
+        "stop refusal must not reap terminal child"
+    );
     assert_eq!(
         runtime.test_native_child(false).err().unwrap().kind(),
         std::io::ErrorKind::WouldBlock
@@ -101,6 +110,18 @@ fn native_terminal_observation_does_not_reap_and_repeated_wait_is_cached() {
     assert_eq!(child.try_wait().unwrap().unwrap(), first);
     assert_eq!(runtime.outstanding(), 0);
     let mut reused = runtime.test_native_child(false).unwrap();
+    assert!(
+        child
+            .stop_until(Instant::now() + Duration::from_secs(1))
+            .is_err()
+    );
+    let sample: serde_json::Value = serde_json::from_str(&original_slot.slot_diagnostic()).unwrap();
+    assert_ne!(sample["expected_generation"], sample["generation_before"]);
+    assert_ne!(sample["expected_generation"], sample["generation_after"]);
+    assert!(
+        original_slot.settled_until(Instant::now()),
+        "new generation is not the original obligation"
+    );
     assert!(
         !child.retirement_pending(),
         "old generation must not observe the reused slot's obligation"
@@ -129,6 +150,35 @@ fn live_child_drop_returns_promptly_and_native_reaper_recovers_capacity() {
 }
 
 #[test]
+fn owned_stop_keeps_wait_pin_and_reaper_cancels_stopped_child() {
+    let runtime = MacosLaunchRuntime::new(1).unwrap();
+    let child = runtime.test_native_child(true).unwrap();
+    let obligation = child.creation_observation();
+    assert_eq!(
+        child.stop_until(Instant::now()).unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    child
+        .stop_until(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        child.observe().unwrap().is_none(),
+        "stopped observation must not reap"
+    );
+    let sample: serde_json::Value = serde_json::from_str(&obligation.slot_diagnostic()).unwrap();
+    assert_eq!(sample["state_before"], "Owned");
+    assert_eq!(sample["state_after"], "Owned");
+    assert_eq!(sample["expected_generation"], sample["generation_before"]);
+    drop(child);
+    assert!(
+        obligation.settled_until(Instant::now() + Duration::from_secs(1)),
+        "{}",
+        obligation.slot_diagnostic()
+    );
+    assert_eq!(runtime.outstanding(), 0);
+}
+
+#[test]
 fn native_drop_return_oracle_detects_deliberate_blocking_drop_mutation() {
     struct BlockingDrop<T>(Option<T>);
     impl<T> Drop for BlockingDrop<T> {
@@ -150,12 +200,23 @@ fn native_drop_return_oracle_detects_deliberate_blocking_drop_mutation() {
 fn external_waiter_loss_stays_charged_and_refuses_pid_signalling() {
     let runtime = MacosLaunchRuntime::new(1).unwrap();
     let mut child = runtime.test_native_child(false).unwrap();
+    let obligation = child.creation_observation();
     child.consume_by_external_waiter().unwrap();
     assert_eq!(
         child.terminate().unwrap_err().raw_os_error(),
         Some(libc::ECHILD)
     );
     assert!(child.try_wait().is_err());
+    assert!(
+        child
+            .stop_until(Instant::now() + Duration::from_secs(1))
+            .is_err()
+    );
+    let sample: serde_json::Value = serde_json::from_str(&obligation.slot_diagnostic()).unwrap();
+    assert_eq!(sample["state_before"], "OwnershipLost");
+    assert_eq!(sample["state_after"], "OwnershipLost");
+    assert_eq!(sample["cleanup_errno"], libc::ECHILD);
+    assert!(!obligation.settled_until(Instant::now()));
     drop(child);
     assert_eq!(
         runtime.outstanding(),
@@ -174,6 +235,28 @@ fn external_waiter_loss_stays_charged_and_refuses_pid_signalling() {
             .unwrap()
             .success()
     );
+}
+
+#[test]
+fn owned_stop_rejects_external_reap_before_pid_signal() {
+    let runtime = MacosLaunchRuntime::new(1).unwrap();
+    let child = runtime.test_native_child(false).unwrap();
+    let obligation = child.creation_observation();
+    child.consume_by_external_waiter().unwrap();
+    assert_eq!(
+        child
+            .stop_until(Instant::now() + Duration::from_secs(1))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    let sample: serde_json::Value = serde_json::from_str(&obligation.slot_diagnostic()).unwrap();
+    assert_eq!(sample["state_before"], "OwnershipLost");
+    assert_eq!(sample["state_after"], "OwnershipLost");
+    assert_eq!(sample["cleanup_errno"], libc::ECHILD);
+    drop(child);
+    assert_eq!(runtime.outstanding(), 1);
+    assert!(!obligation.settled_until(Instant::now()));
 }
 
 #[test]

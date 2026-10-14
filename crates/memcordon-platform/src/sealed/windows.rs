@@ -58,6 +58,32 @@ use crate::backend::{BackendInfo, Execution, SealedAvailability};
 mod runtime;
 
 #[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn open_protected_runtime_for_test(path: &std::path::Path) -> Result<std::fs::File, String> {
+    runtime::open_protected_for_test(path)
+}
+
+#[cfg(feature = "test-support")]
+pub fn runtime_security_descriptor_bounds_for_test(bytes: &[u8]) -> Result<(), String> {
+    runtime::relative_descriptor_bounds_for_test(bytes)
+}
+
+#[cfg(feature = "test-support")]
+pub fn protected_runtime_descriptor_for_test(bytes: &[u8]) -> Result<(), String> {
+    runtime::protected_descriptor_for_test(bytes)
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn direct_runtime_volume_target_for_test(
+    buffer: &[u16],
+    length: u16,
+    maximum: u16,
+) -> Result<Vec<u16>, String> {
+    runtime::direct_volume_target_for_test(buffer, length, maximum)
+}
+
+#[cfg(feature = "test-support")]
 #[path = "windows_certification_observation.rs"]
 mod certification_observation;
 #[path = "windows_terminal_observation.rs"]

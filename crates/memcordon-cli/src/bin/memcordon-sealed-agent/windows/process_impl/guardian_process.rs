@@ -1167,7 +1167,7 @@ pub(super) fn read_guardian_bootstrap_frame(
                     "guardian bootstrap frame timed out",
                 ));
             }
-            Err(super::pipe::FrameAvailabilityError::PeerClosed) => {
+            Err(super::pipe::FrameAvailabilityError::PeerClosed { .. }) => {
                 return Err(guardian_bootstrap_after_channel_close(
                     process,
                     guardian_identity,

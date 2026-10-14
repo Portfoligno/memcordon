@@ -29,8 +29,13 @@ pub use inspector_retirement_support::inspector_eof_retirement;
 mod runtime;
 pub use runtime::LaunchRuntime;
 #[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_owned_stop.rs"]
+mod owned_stop;
+#[cfg(feature = "test-support")]
 #[path = "../tests/support/macos_runtime_fixture.rs"]
 mod runtime_fixture;
+#[cfg(feature = "test-support")]
+pub use owned_stop::classify_stop as owned_stop_observation;
 #[cfg(feature = "test-support")]
 #[path = "../tests/support/macos_startup_deadline.rs"]
 mod startup_deadline_fixture;
@@ -3857,10 +3862,7 @@ fn guardian_main(
                             Message::StallInspectors { both } => {
                                 for (index, lane) in inventory_lanes.iter_mut().enumerate() {
                                     if index == 0 || both {
-                                        if unsafe { libc::kill(lane.child.pid, libc::SIGSTOP) } != 0
-                                        {
-                                            return Err(io::Error::last_os_error());
-                                        }
+                                        owned_stop::stop_owned(&lane.child, response_deadline)?;
                                         if !lane.pending {
                                             lane.submit((
                                                 target.as_ref().expect("fixture target").pid,
@@ -4492,33 +4494,44 @@ pub fn disarm_timeout(image: &Path) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut launch =
         launch(&command, image, deadline, deadline).map_err(|error| error.error.to_string())?;
+    let child_retirement_deadline = Instant::now() + Duration::from_secs(1);
     launch
         .child
-        .retire(Instant::now() + Duration::from_secs(1))
+        .retire(child_retirement_deadline)
         .map_err(|error| error.to_string())?;
-    let pid = launch.guardian.child.pid;
     let obligation = match &launch.guardian.child.owner {
         ChildOwner::Local(local) => local.retirement.observer(),
         ChildOwner::Guardian(_) => unreachable!("guardian process is a local child"),
     };
-    // SAFETY: fixture owns the live guardian and pins it through its runtime slot.
-    if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
+    owned_stop::stop_owned(&launch.guardian.child, child_retirement_deadline).map_err(|error| {
+        format!(
+            "guardian stop setup: kind={:?}; errno={:?}; {error}; slot={:?}",
+            error.kind(),
+            error.raw_os_error(),
+            obligation.diagnostic()
+        )
+    })?;
+    let before = obligation.diagnostic();
     let started = Instant::now();
     let result = launch.guardian.disarm(started + Duration::from_millis(20));
     let elapsed = started.elapsed();
-    // SAFETY: resume the deliberately stopped, still-unreaped fixture guardian.
-    unsafe { libc::kill(pid, libc::SIGCONT) };
     let deadline = Instant::now() + Duration::from_secs(1);
-    while obligation.pending() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
+    let settled = obligation.settled_until(deadline);
+    let after = obligation.diagnostic();
+    let expected_timeout = result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut);
+    if !expected_timeout || elapsed > Duration::from_millis(250) {
+        return Err(format!(
+            "disarm timeout fell through to blocking destruction or unexpected failure: result={result:?}; kind={:?}; errno={:?}; elapsed={elapsed:?}; before={before:?}; after={after:?}",
+            result.as_ref().err().map(io::Error::kind),
+            result.as_ref().err().and_then(io::Error::raw_os_error)
+        ));
     }
-    if result.is_ok() || elapsed > Duration::from_millis(250) {
-        return Err("disarm timeout fell through to blocking destruction".into());
-    }
-    if obligation.pending() {
-        return Err("runtime did not discharge abandoned guardian reaping".into());
+    if !settled {
+        return Err(format!(
+            "runtime did not discharge abandoned guardian reaping: result={result:?}; elapsed={elapsed:?}; before={before:?}; after={after:?}"
+        ));
     }
     Ok(())
 }
@@ -4826,12 +4839,13 @@ fn process_inspector_stall(image: &Path) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         // Deliberately freeze the process containing the normal native calls.
         // Only the independent emergency process can complete the next request.
-        if unsafe { libc::kill(normal.child.pid, libc::SIGSTOP) } != 0 {
-            return Err(format!(
-                "stalled inspector normal lane SIGSTOP: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        owned_stop::stop_owned(&normal.child, deadline).map_err(|error| {
+            format!(
+                "stalled inspector normal lane stop: kind={:?}; errno={:?}; {error}",
+                error.kind(),
+                error.raw_os_error()
+            )
+        })?;
         let root = i32::try_from(std::process::id())
             .map_err(|error| format!("stalled inspector request root identity: {error}"))?;
         normal
@@ -5029,10 +5043,13 @@ pub fn custody_wrapper(
             deadline,
         )
         .map_err(|error| error.to_string())?;
-    // SAFETY: owned unreaped guardian identity remains pinned while deliberately stopped.
-    if unsafe { libc::kill(launch.guardian.child.pid, libc::SIGSTOP) } != 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
+    owned_stop::stop_owned(&launch.guardian.child, deadline).map_err(|error| {
+        format!(
+            "custody guardian stop: kind={:?}; errno={:?}; {error}",
+            error.kind(),
+            error.raw_os_error()
+        )
+    })?;
     std::fs::write(exit_gate, b"exit\n").map_err(|error| error.to_string())?;
     // The stopped guardian owns the root. Observe its zombie state without sending a
     // reap request: custody must remain pinned until the descendant is reconciled.

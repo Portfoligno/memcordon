@@ -3,6 +3,9 @@
 #[path = "../src/bin/memcordon-sealed-agent/linux/private_lifetime.rs"]
 mod private_lifetime;
 #[allow(dead_code)]
+#[path = "../src/bin/memcordon-sealed-agent/linux/private_wait_status.rs"]
+mod private_wait_status;
+#[allow(dead_code)]
 #[path = "../src/bin/memcordon-sealed-agent/request.rs"]
 mod request;
 
@@ -39,6 +42,85 @@ fn command_lifetime_returns_before_held_descendant_completes() {
 #[test]
 fn workload_lifetime_waits_for_actual_descendant_completion() {
     run_isolated_helper("workload_lifetime_helper");
+}
+
+#[test]
+fn actual_target_status_precedes_held_descendant_retirement() {
+    run_isolated_helper("early_target_status_helper");
+}
+
+#[test]
+#[ignore = "isolated actual target and descendant wait custody"]
+fn early_target_status_helper() {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    use std::time::Instant;
+    let target = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "reserved_exit_helper", "--ignored"])
+        .spawn()
+        .unwrap();
+    let (mut descendant, mut gate, _stdout) = held_child();
+    let mut descriptors = [-1; 2];
+    // SAFETY: pipe initializes two fresh owned descriptors.
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    // SAFETY: each fresh descriptor is adopted exactly once.
+    let (reader, mut writer) = unsafe {
+        (
+            File::from_raw_fd(descriptors[0]),
+            File::from_raw_fd(descriptors[1]),
+        )
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let result = private_wait_status::publish_target_before_descendant_drain(
+                target.id().try_into().unwrap(),
+                &mut writer,
+                || {
+                    entered_tx.send(()).unwrap();
+                    reap_private_descendants(Lifetime::Workload).map(|_| ())
+                },
+            );
+            finished_tx.send(result).unwrap();
+        });
+        let mut observed = None;
+        let mut channel = Some(reader);
+        let raw = private_wait_status::capture_target_status_until(
+            &mut observed,
+            &mut channel,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(libc::WIFEXITED(raw));
+        assert_eq!(libc::WEXITSTATUS(raw), 125);
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(descendant.try_wait().unwrap().is_none());
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        gate.write_all(b"x").unwrap();
+        assert_eq!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            raw
+        );
+        worker.join().unwrap();
+    });
+    assert_eq!(
+        descendant.wait().unwrap_err().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
+#[ignore = "actual reserved native exit code fixture"]
+fn reserved_exit_helper() {
+    std::process::exit(125);
 }
 
 fn held_child() -> (Child, ChildStdin, BufReader<ChildStdout>) {

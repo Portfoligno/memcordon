@@ -5,7 +5,6 @@
 //! object and complete its checkpoint and lifecycle obligations.
 
 use std::fs::File;
-use std::io::Write;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
@@ -935,16 +934,15 @@ fn run_namespace_init(
         return 125;
     }
     drop(startup);
-    let mut raw = 0_i32;
-    // SAFETY: waitpid observes only this init's exact direct child.
-    if unsafe { libc::waitpid(child, &raw mut raw, 0) } == -1 {
-        return 125;
-    }
-    if let Err(error) = super::private_lifetime::reap_private_descendants(lifetime) {
+    // Publish the direct target's actual terminal wait before descendant drain.
+    // This status alone proves neither namespace nor workload retirement.
+    if let Err(error) = super::private_wait_status::publish_target_before_descendant_drain(
+        child,
+        &mut status,
+        || super::private_lifetime::reap_private_descendants(lifetime).map(|_| ()),
+    ) {
         eprintln!("{error}");
         return 125;
     }
-    // Preserve exit-versus-signal identity for the provider's native outcome.
-    let _ = status.write_all(&raw.to_be_bytes());
     0
 }

@@ -18,6 +18,9 @@ pub struct NativeCreationObservation {
     observation: runtime::RetirementObservation,
 }
 impl NativeCreationObservation {
+    pub fn slot_diagnostic(&self) -> String {
+        serde_json::to_string(&self.observation.diagnostic()).expect("finite slot diagnostic")
+    }
     pub fn settled_until(&self, deadline: Instant) -> bool {
         self.observation.settled_until(deadline)
     }
@@ -34,6 +37,9 @@ impl NativeCreationObservation {
     }
 }
 impl NativeChildProbe {
+    pub fn stop_until(&self, deadline: Instant) -> io::Result<()> {
+        super::owned_stop::stop_owned(&self.child, deadline)
+    }
     pub fn creation_observation(&self) -> NativeCreationObservation {
         let ChildOwner::Local(local) = &self.child.owner else {
             unreachable!()

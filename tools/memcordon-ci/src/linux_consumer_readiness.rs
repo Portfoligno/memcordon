@@ -869,7 +869,6 @@ impl PreparedLinuxObserver {
     /// Publishes only an observation barrier after real native acquisition.
     /// The provider's retained policy lease remains the release authority.
     pub fn acknowledge(&self, directory: &Path) -> Result<(), String> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         if self.target.exited()? || self.namespace_init.exited()? || self.guardian.exited()? {
             return Err("prepared native family exited before observer acknowledgment".into());
         }
@@ -890,39 +889,7 @@ impl PreparedLinuxObserver {
             .with_extension("observer-ack.json");
         let mut bytes = serde_json::to_vec(&acknowledgment).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&output)
-            .map_err(|e| e.to_string())?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        let owner = std::fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
-        if !owner.is_dir()
-            || owner.uid() != self.observation.admission.caller_uid
-            || owner.mode() & 0o022 != 0
-        {
-            return Err(
-                "observer directory does not belong to authenticated frontend caller".into(),
-            );
-        }
-        rustix::fs::fchown(
-            &file,
-            Some(rustix::process::Uid::from_raw(owner.uid())),
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        if measured(&output, 64 * 1024)? != bytes {
-            return Err("observer ACK named custody differs".into());
-        }
-        File::open(directory)
-            .map_err(|e| e.to_string())?
-            .sync_all()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        crate::caller_observation::publish(&output, &bytes, self.observation.admission.caller_uid)
     }
 
     /// Caller supplies bytes received through the authenticated mixed frame,

@@ -270,9 +270,11 @@ mod native {
             revoked_admissions:
                 memcordon_core::BoundedVec<memcordon_core::workload_contract::Nonce128, 256>,
         }
-        let activation: Activation = serde_json::from_slice(&output.stdout)?;
-        if !output.status.success()
-            || activation.format != "memcordon.local-activation"
+        crate::command::require_successful_output("refusal policy activation", &output)?;
+        let activation: Activation = serde_json::from_slice(&output.stdout).map_err(|error| {
+            CiError::Message(format!("successful refusal activation decode: {error}"))
+        })?;
+        if activation.format != "memcordon.local-activation"
             || activation.revision != 1
             || activation.registry != configured
             || activation.registry_digest

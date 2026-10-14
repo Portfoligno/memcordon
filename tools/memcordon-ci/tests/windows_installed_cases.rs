@@ -195,6 +195,95 @@ fn provider() -> PublicProviderBindingV1 {
 }
 
 #[test]
+fn late_transport_authority_requires_actual_bound_operation_and_peer_code() {
+    use memcordon_ci::windows_readiness_components::transport_injection_authority;
+    use memcordon_core::WindowsSealedFault;
+    let selected = WindowsSealedFault::FrontendDisconnectedAfterAuthorization;
+    let attempt = "02".repeat(32);
+    let request = "03".repeat(32);
+    let evaluate = |operation, phase, native_code, fault, actual_attempt: &str| {
+        let mut journal = WindowsCausalDiagnosticsV1::default();
+        journal
+            .observe(CausalEventV1 {
+                sequence: 0,
+                origin: DiagnosticOriginV1::Launcher,
+                category: FailureCategoryV1::Transport,
+                operation,
+                code: FailureCodeV1::ControlTransport,
+                native_code,
+                observed_phase: phase,
+                safe_detail: SafeDiagnosticDetailV1::InjectedWindowsFault { fault },
+                detail_redacted: true,
+                detail_truncated: false,
+                terminalization_reference: None,
+            })
+            .unwrap();
+        let diagnostic =
+            ProviderFailureDiagnosticV1::from_journal(provider(), &attempt, &request, &journal)
+                .unwrap();
+        transport_injection_authority(&diagnostic, selected, &provider(), actual_attempt, &request)
+    };
+    for code in [109, 232, 233] {
+        assert!(evaluate(
+            FailureOperationV1::DeliverResponse,
+            AttemptObservationPhaseV1::Cleaning,
+            Some(NativeFailureCodeV1::Win32(code)),
+            selected,
+            &attempt
+        ));
+        assert!(evaluate(
+            FailureOperationV1::ReadControlFrame,
+            AttemptObservationPhaseV1::Cleaning,
+            Some(NativeFailureCodeV1::Win32(code)),
+            selected,
+            &attempt
+        ));
+    }
+    assert!(evaluate(
+        FailureOperationV1::ReadControlFrame,
+        AttemptObservationPhaseV1::Cleaning,
+        None,
+        selected,
+        &attempt
+    ));
+    assert!(!evaluate(
+        FailureOperationV1::DeliverResponse,
+        AttemptObservationPhaseV1::Cleaning,
+        None,
+        selected,
+        &attempt
+    ));
+    assert!(!evaluate(
+        FailureOperationV1::DeliverResponse,
+        AttemptObservationPhaseV1::Cleaning,
+        Some(NativeFailureCodeV1::Win32(5)),
+        selected,
+        &attempt
+    ));
+    assert!(!evaluate(
+        FailureOperationV1::DeliverResponse,
+        AttemptObservationPhaseV1::Monitoring,
+        Some(NativeFailureCodeV1::Win32(232)),
+        selected,
+        &attempt
+    ));
+    assert!(!evaluate(
+        FailureOperationV1::DeliverResponse,
+        AttemptObservationPhaseV1::Cleaning,
+        Some(NativeFailureCodeV1::Win32(232)),
+        selected,
+        &"04".repeat(32)
+    ));
+    assert!(!evaluate(
+        FailureOperationV1::DeliverResponse,
+        AttemptObservationPhaseV1::Cleaning,
+        Some(NativeFailureCodeV1::Win32(232)),
+        WindowsSealedFault::FrontendKilledAfterAuthorization,
+        &attempt
+    ));
+}
+
+#[test]
 fn report_from_another_invocation_cannot_replace_independently_observed_live_association() {
     let observed = memcordon_core::WindowsGuardianAttemptObservation {
         format: "memcordon.windows-live-guardian-observation".into(),

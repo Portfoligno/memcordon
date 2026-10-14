@@ -4335,10 +4335,14 @@ pub fn recover_and_observe_quiescence(
                     sha256: crate::windows_causal_acceptance::sha256(bytes),
                 });
         }
+        crate::command::require_successful_output("actual native recovery", &output)?;
         let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
-            serde_json::from_slice(&output.stdout)?;
-        if !output.status.success()
-            || !inventory.is_consistent()
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                crate::CiError::Message(format!(
+                    "successful native recovery inventory decode: {error}"
+                ))
+            })?;
+        if !inventory.is_consistent()
             || inventory.provider_generation != config.provider.generation.as_str()
             || inventory.executing != 0
             || inventory.incomplete_proof != 0

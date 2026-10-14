@@ -421,6 +421,7 @@ pub use crate::macos_launch::timer_mutation_detected as macos_timer_mutation_det
 pub use crate::macos_launch::{
     LaunchFault as MacosLaunchFault, StartupDeadlineObservations,
     cancellation_fault as macos_cancellation_fault, disarm_timeout as macos_disarm_timeout,
+    owned_stop_observation as macos_owned_stop_observation,
     rejects_protocol as macos_rejects_protocol,
     startup_deadline_fault as macos_startup_deadline_fault,
     startup_deadline_fault_observations as macos_startup_deadline_fault_observations,

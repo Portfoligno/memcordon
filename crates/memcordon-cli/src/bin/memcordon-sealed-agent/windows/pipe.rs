@@ -137,9 +137,16 @@ impl TargetDesktopBootstrapPipeOperation {
 }
 
 #[derive(Debug)]
+enum BootstrapPipeFailureSource {
+    Protocol,
+    Win32(Option<i32>),
+    PeerExit(u32),
+}
+
+#[derive(Debug)]
 pub struct TargetDesktopBootstrapPipeError {
     detail: String,
-    native_code: Option<i32>,
+    source: BootstrapPipeFailureSource,
     bytes_transferred: usize,
 }
 
@@ -150,11 +157,11 @@ impl TargetDesktopBootstrapPipeError {
     ) -> Self {
         Self {
             detail: format!(
-                "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment=protocol native_code=none detail={}",
+                "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment=protocol origin=protocol native_code=none detail={}",
                 operation.name(),
                 detail.to_string()
             ),
-            native_code: None,
+            source: BootstrapPipeFailureSource::Protocol,
             bytes_transferred: 0,
         }
     }
@@ -166,13 +173,13 @@ impl TargetDesktopBootstrapPipeError {
     ) -> Self {
         Self {
             detail: format!(
-                "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment={segment} native_code={} detail={error}",
+                "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment={segment} origin=win32-api native_code={} detail={error}",
                 operation.name(),
                 error
                     .raw_os_error()
                     .map_or_else(|| "unavailable".to_owned(), |code| code.to_string())
             ),
-            native_code: error.raw_os_error(),
+            source: BootstrapPipeFailureSource::Win32(error.raw_os_error()),
             bytes_transferred: 0,
         }
     }
@@ -183,7 +190,26 @@ impl TargetDesktopBootstrapPipeError {
     }
 
     pub const fn native_code(&self) -> Option<i32> {
-        self.native_code
+        match self.source {
+            BootstrapPipeFailureSource::Win32(code) => code,
+            BootstrapPipeFailureSource::Protocol | BootstrapPipeFailureSource::PeerExit(_) => None,
+        }
+    }
+
+    pub fn native_status(&self) -> Option<memcordon_windows_launch_core::NativeStatusV1> {
+        use memcordon_windows_launch_core::NativeStatusV1;
+        match self.source {
+            BootstrapPipeFailureSource::Win32(Some(code)) => {
+                Some(NativeStatusV1::Win32 { code: code as u32 })
+            }
+            BootstrapPipeFailureSource::PeerExit(code) => Some(NativeStatusV1::TargetExit { code }),
+            BootstrapPipeFailureSource::Protocol | BootstrapPipeFailureSource::Win32(None) => None,
+        }
+    }
+
+    fn is_lifetime_pipe_closure(&self) -> bool {
+        matches!(self.source, BootstrapPipeFailureSource::Win32(Some(code))
+            if matches!(code as u32, ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED))
     }
 
     pub const fn bytes_transferred(&self) -> usize {
@@ -205,13 +231,23 @@ pub(crate) fn target_desktop_bootstrap_peer_exit_error(
 ) -> TargetDesktopBootstrapPipeError {
     TargetDesktopBootstrapPipeError {
         detail: format!(
-            "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment={segment} requested={requested} native_code={} child_exit_code_decimal={exit_code} child_exit_code_hex=0x{exit_code:08X} detail=target desktop bootstrap peer exited during pipe operation",
+            "MCSEALED-WINDOWS-BOOTSTRAP-PIPE: operation={} segment={segment} requested={requested} origin=held-peer-exit child_exit_code_decimal={exit_code} child_exit_code_hex=0x{exit_code:08X} detail=target desktop bootstrap peer exited during pipe operation",
             operation.name(),
-            exit_code as i32,
         ),
-        native_code: Some(exit_code as i32),
+        source: BootstrapPipeFailureSource::PeerExit(exit_code),
         bytes_transferred: 0,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn target_desktop_bootstrap_api_error_for_test(
+    code: i32,
+) -> TargetDesktopBootstrapPipeError {
+    TargetDesktopBootstrapPipeError::native(
+        TargetDesktopBootstrapPipeOperation::Accept,
+        "connect",
+        &io::Error::from_raw_os_error(code),
+    )
 }
 
 #[cfg(test)]
@@ -1100,13 +1136,7 @@ pub fn wait_for_target_desktop_bootstrap_release(
                         )
                     } == WAIT_TIMEOUT => {}
             Err(error) => {
-                let code = error
-                    .native_code()
-                    .and_then(|value| u32::try_from(value).ok());
-                if matches!(
-                    code,
-                    Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
-                ) {
+                if error.is_lifetime_pipe_closure() {
                     return Ok(());
                 }
                 return Err(error);
@@ -1139,24 +1169,173 @@ pub fn finish_server_response(handle: HANDLE) -> Result<(), String> {
 }
 
 pub fn write_frame<T: Serialize>(handle: HANDLE, value: &T) -> Result<(), String> {
-    let payload = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    write_frame_detailed(handle, value).map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameWritePhase {
+    Serialize,
+    Length,
+    Payload,
+}
+
+#[derive(Debug)]
+pub struct FrameWriteError {
+    pub phase: FrameWritePhase,
+    pub expected_bytes: usize,
+    pub transferred_bytes: usize,
+    pub native_code: Option<u32>,
+    pub peer_closed: bool,
+    detail: String,
+}
+
+impl std::fmt::Display for FrameWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "MCSEALED-WINDOWS-PIPE-WRITE: phase={:?} expected_bytes={} transferred_bytes={} native_code={:?} peer_closed={} detail={}",
+            self.phase,
+            self.expected_bytes,
+            self.transferred_bytes,
+            self.native_code,
+            self.peer_closed,
+            self.detail
+        )
+    }
+}
+
+fn frame_write_error(
+    phase: FrameWritePhase,
+    expected_bytes: usize,
+    transferred_bytes: usize,
+    native_code: Option<u32>,
+    detail: String,
+) -> FrameWriteError {
+    FrameWriteError {
+        phase,
+        expected_bytes,
+        transferred_bytes,
+        native_code,
+        peer_closed: native_code.is_some_and(|code| {
+            matches!(
+                code,
+                ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+            )
+        }),
+        detail,
+    }
+}
+
+pub fn write_frame_detailed<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+) -> Result<(), FrameWriteError> {
+    write_frame_using(value, |bytes| {
+        let requested = u32::try_from(bytes.len()).expect("bounded frame segment");
+        let mut written = 0u32;
+        // SAFETY: this synchronous call borrows live bytes and writable count;
+        // native last-error is retained immediately, before formatting.
+        if unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                requested,
+                &raw mut written,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            Err((
+                error
+                    .raw_os_error()
+                    .map(|code| u32::from_ne_bytes(code.to_ne_bytes())),
+                written as usize,
+                error.to_string(),
+            ))
+        } else {
+            Ok(written as usize)
+        }
+    })
+}
+
+fn write_frame_using<T: Serialize>(
+    value: &T,
+    mut write: impl FnMut(&[u8]) -> Result<usize, (Option<u32>, usize, String)>,
+) -> Result<(), FrameWriteError> {
+    let payload = serde_json::to_vec(value).map_err(|error| {
+        frame_write_error(FrameWritePhase::Serialize, 0, 0, None, error.to_string())
+    })?;
     if let Ok(limit) = memcordon_core::windows_response_frame_limit(
         &payload[..payload
             .len()
             .min(memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES)],
     ) {
         if payload.len() > limit {
-            return Err("diagnostic control frame exceeds its reserved bound".to_owned());
+            return Err(frame_write_error(
+                FrameWritePhase::Serialize,
+                payload.len(),
+                0,
+                None,
+                "diagnostic control frame exceeds its reserved bound".into(),
+            ));
         }
     }
     if payload.len() > WINDOWS_MAX_FRAME_BYTES {
-        return Err("Windows provider frame exceeds the protocol bound".to_owned());
+        return Err(frame_write_error(
+            FrameWritePhase::Serialize,
+            payload.len(),
+            0,
+            None,
+            "Windows provider frame exceeds the protocol bound".into(),
+        ));
     }
-    let length = u32::try_from(payload.len())
-        .map_err(|_| "Windows provider frame length is not representable".to_owned())?;
-    write_all(handle, &length.to_le_bytes())?;
-    write_all(handle, &payload)
+    let length = u32::try_from(payload.len()).map_err(|_| {
+        frame_write_error(
+            FrameWritePhase::Serialize,
+            payload.len(),
+            0,
+            None,
+            "Windows provider frame length is not representable".into(),
+        )
+    })?;
+    let header = length.to_le_bytes();
+    for (phase, segment) in [
+        (FrameWritePhase::Length, header.as_slice()),
+        (FrameWritePhase::Payload, payload.as_slice()),
+    ] {
+        let mut transferred = 0;
+        while transferred < segment.len() {
+            let remaining = &segment[transferred..];
+            match write(remaining) {
+                Ok(written) if written > 0 && written <= remaining.len() => transferred += written,
+                Ok(_) => {
+                    return Err(frame_write_error(
+                        phase,
+                        segment.len(),
+                        transferred,
+                        None,
+                        "zero-progress or invalid native write count".into(),
+                    ));
+                }
+                Err((code, written, detail)) => {
+                    return Err(frame_write_error(
+                        phase,
+                        segment.len(),
+                        transferred.saturating_add(written),
+                        code,
+                        detail,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_pipe_write.rs"]
+mod frame_write_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameReadPhase {
@@ -1299,14 +1478,17 @@ fn read_frame_with_kind_limit<T: DeserializeOwned>(
 
 #[derive(Debug)]
 pub enum FrameAvailabilityError {
-    PeerClosed,
+    PeerClosed { code: u32 },
     Native { code: Option<i32>, detail: String },
 }
 
 impl std::fmt::Display for FrameAvailabilityError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PeerClosed => formatter.write_str("named-pipe peer disconnected"),
+            Self::PeerClosed { code } => write!(
+                formatter,
+                "named-pipe peer disconnected; native_code={code}"
+            ),
             Self::Native { detail, .. } => formatter.write_str(detail),
         }
     }
@@ -1342,7 +1524,10 @@ pub fn frame_available_detailed(handle: HANDLE) -> Result<bool, FrameAvailabilit
                 )
             })
         {
-            return Err(FrameAvailabilityError::PeerClosed);
+            return Err(FrameAvailabilityError::PeerClosed {
+                code: u32::try_from(error.raw_os_error().expect("matched native error"))
+                    .expect("matched positive pipe error"),
+            });
         }
         return Err(FrameAvailabilityError::Native {
             code: error.raw_os_error(),

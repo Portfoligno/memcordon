@@ -540,15 +540,21 @@ pub(super) fn execute_brokered(
                     .ok_or("mixed release deadline exceeds native range")?,
             );
         }
-        match owner.observe_exec(
-            execution_deadline.map_or(setup_deadline, |deadline| deadline.min(setup_deadline)),
-        )? {
+        match owner
+            .observe_exec(
+                execution_deadline.map_or(setup_deadline, |deadline| deadline.min(setup_deadline)),
+            )
+            .map_err(|error| format!("observe mixed native exec: {error}"))?
+        {
             PrivateExecObservation::ExecObservedAndDetached => executed = true,
             PrivateExecObservation::Failed { phase, detail } => {
                 return Err(format!("mixed native exec phase {phase}: {detail}"));
             }
         }
-        origin = match owner.monitor_mixed(&mut admission, execution_deadline, stream)? {
+        origin = match owner
+            .monitor_mixed(&mut admission, execution_deadline, stream)
+            .map_err(|error| format!("monitor mixed native execution: {error}"))?
+        {
             PrivateMonitorOutcome::Completed => MixedOutcomeOriginV2::NativeExit,
             PrivateMonitorOutcome::DeadlineExceeded => MixedOutcomeOriginV2::Deadline,
             PrivateMonitorOutcome::MemoryOom => MixedOutcomeOriginV2::MemoryOom,
@@ -606,7 +612,9 @@ pub(super) fn execute_brokered(
             ),
         };
     }
-    let cleanup = owner.retire_mixed(&mut admission, Instant::now() + cleanup_budget);
+    let cleanup = owner
+        .retire_mixed(&mut admission, Instant::now() + cleanup_budget)
+        .map_err(|error| format!("retire mixed native execution: {error}"));
     match (setup, cleanup) {
         (Err(error), Ok(_))
             if matches!(

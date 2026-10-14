@@ -162,6 +162,45 @@ enum PublicationPhase {
     Readback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotInvariant {
+    ExpectedRevision,
+    FrozenWorkloadCheckpoint,
+    AuthorizedWorkloadCheckpoint,
+    FrozenWorkloadAdmission,
+    AuthorizedWorkloadAdmission,
+    RetentionAdmittedTime,
+    RetentionExpiresTime,
+    RetentionTombstone,
+    ProviderIncarnation,
+    LaunchIncarnation,
+    Nonce,
+    OwnerManifest,
+    RecoveryAuthorization,
+    PublicationReservation,
+    TerminalSeed,
+    RetirementProof,
+    RequestDigest,
+    CallerProcess,
+    CallerToken,
+    JobIdentity,
+    WorkerProcess,
+    WorkerThread,
+    BootIdentity,
+    AuthorizationTime,
+    ResumeRegression,
+    ReleaseRegression,
+    TerminationRegression,
+    ActiveZeroRegression,
+    GuardianReapedRegression,
+    FinalHandlesRegression,
+    CausalSecondaryPrefix,
+    StateTransition,
+    CausalSequenceRegression,
+    OriginalFailureReplacement,
+    TerminalOutbox,
+}
+
 fn publication_io_error(error: io::Error) -> String {
     super::diagnostics::capture(memcordon_core::CausalEventV1 {
         sequence: 0,
@@ -312,10 +351,220 @@ impl WindowsAttemptRecordV1 {
         self.store()
     }
 
+    fn snapshot_violation(
+        &self,
+        previous: &Self,
+        expected_revision: u64,
+    ) -> Option<SnapshotInvariant> {
+        let expiry = previous.diagnostic_retention.tombstone.is_none()
+            && self.diagnostic_retention.tombstone
+                == Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired)
+            && !diagnostic_export_eligible(previous)
+            && self.causal_diagnostics.sequence == 0
+            && self.causal_diagnostics.secondary.as_slice().is_empty()
+            && self.causal_diagnostics.original
+                == memcordon_core::OriginalFailureV1::Unavailable {
+                    reason: memcordon_core::OriginalUnavailableReasonV1::RetentionExpired,
+                };
+        macro_rules! refuse {
+            ($condition:expr, $kind:ident) => {
+                if $condition {
+                    return Some(SnapshotInvariant::$kind);
+                }
+            };
+        }
+        refuse!(
+            previous.record_revision != expected_revision,
+            ExpectedRevision
+        );
+        refuse!(
+            previous.workload_checkpoint.is_some()
+                && previous.workload_checkpoint != self.workload_checkpoint,
+            FrozenWorkloadCheckpoint
+        );
+        refuse!(
+            previous.authorization_unix_millis.is_some()
+                && previous.workload_checkpoint != self.workload_checkpoint,
+            AuthorizedWorkloadCheckpoint
+        );
+        refuse!(
+            previous.workload_admission.is_some()
+                && previous.workload_admission != self.workload_admission,
+            FrozenWorkloadAdmission
+        );
+        refuse!(
+            previous.authorization_unix_millis.is_some()
+                && previous.workload_admission != self.workload_admission,
+            AuthorizedWorkloadAdmission
+        );
+        refuse!(
+            previous.diagnostic_retention.admitted_monotonic_millis
+                != self.diagnostic_retention.admitted_monotonic_millis,
+            RetentionAdmittedTime
+        );
+        refuse!(
+            previous.diagnostic_retention.expires_monotonic_millis
+                != self.diagnostic_retention.expires_monotonic_millis,
+            RetentionExpiresTime
+        );
+        refuse!(
+            previous.diagnostic_retention.tombstone != self.diagnostic_retention.tombstone
+                && !expiry,
+            RetentionTombstone
+        );
+        refuse!(
+            previous.provider_incarnation != self.provider_incarnation,
+            ProviderIncarnation
+        );
+        refuse!(
+            previous.launch_incarnation != self.launch_incarnation,
+            LaunchIncarnation
+        );
+        refuse!(previous.nonce != self.nonce, Nonce);
+        refuse!(
+            previous
+                .owner_manifest
+                .as_ref()
+                .is_some_and(|manifest| self.owner_manifest.as_ref() != Some(manifest)),
+            OwnerManifest
+        );
+        refuse!(
+            previous
+                .recovery_authorization
+                .as_ref()
+                .is_some_and(
+                    |authorization| self.recovery_authorization.as_ref() != Some(authorization)
+                ),
+            RecoveryAuthorization
+        );
+        refuse!(
+            previous.terminal_publication_reserved && !self.terminal_publication_reserved,
+            PublicationReservation
+        );
+        refuse!(
+            previous
+                .terminal_seed
+                .as_ref()
+                .is_some_and(|seed| self.terminal_seed.as_ref() != Some(seed)),
+            TerminalSeed
+        );
+        refuse!(
+            previous
+                .retirement_proof
+                .as_ref()
+                .is_some_and(|proof| self.retirement_proof.as_ref() != Some(proof)),
+            RetirementProof
+        );
+        refuse!(
+            previous.request_sha256 != self.request_sha256,
+            RequestDigest
+        );
+        refuse!(
+            previous.caller_process_identity != self.caller_process_identity,
+            CallerProcess
+        );
+        refuse!(
+            previous.caller_token_sha256 != self.caller_token_sha256,
+            CallerToken
+        );
+        refuse!(
+            previous.job_identity_sha256 != self.job_identity_sha256,
+            JobIdentity
+        );
+        refuse!(
+            previous
+                .worker_identity
+                .as_ref()
+                .is_some_and(|identity| self.worker_identity.as_ref() != Some(identity)),
+            WorkerProcess
+        );
+        refuse!(
+            previous
+                .worker_thread_identity
+                .is_some_and(|identity| self.worker_thread_identity != Some(identity)),
+            WorkerThread
+        );
+        refuse!(previous.boot_identity != self.boot_identity, BootIdentity);
+        refuse!(
+            previous
+                .authorization_unix_millis
+                .is_some_and(|authorization| self.authorization_unix_millis != Some(authorization)),
+            AuthorizationTime
+        );
+        refuse!(
+            previous.resume_attempted && !self.resume_attempted,
+            ResumeRegression
+        );
+        refuse!(
+            previous.target_released && !self.target_released,
+            ReleaseRegression
+        );
+        refuse!(
+            previous.cleanup_state.termination_requested
+                && !self.cleanup_state.termination_requested,
+            TerminationRegression
+        );
+        refuse!(
+            previous.cleanup_state.active_processes_zero
+                && !self.cleanup_state.active_processes_zero,
+            ActiveZeroRegression
+        );
+        refuse!(
+            previous.cleanup_state.guardian_reaped && !self.cleanup_state.guardian_reaped,
+            GuardianReapedRegression
+        );
+        refuse!(
+            previous.cleanup_state.final_handles_closed && !self.cleanup_state.final_handles_closed,
+            FinalHandlesRegression
+        );
+        refuse!(
+            !expiry
+                && !self
+                    .causal_diagnostics
+                    .secondary
+                    .as_slice()
+                    .starts_with(previous.causal_diagnostics.secondary.as_slice()),
+            CausalSecondaryPrefix
+        );
+        refuse!(
+            previous.state != self.state
+                && !windows_attempt_transition_allowed(previous.state, self.state),
+            StateTransition
+        );
+        refuse!(
+            !expiry && previous.causal_diagnostics.sequence > self.causal_diagnostics.sequence,
+            CausalSequenceRegression
+        );
+        refuse!(
+            !expiry
+                && matches!(
+                    previous.causal_diagnostics.original,
+                    memcordon_core::OriginalFailureV1::Observed { .. }
+                )
+                && previous.causal_diagnostics.original != self.causal_diagnostics.original,
+            OriginalFailureReplacement
+        );
+        refuse!(
+            previous
+                .terminal_response_json
+                .as_ref()
+                .is_some_and(|outbox| self.terminal_response_json.as_ref() != Some(outbox)),
+            TerminalOutbox
+        );
+        None
+    }
+
     pub(super) fn publish_exclusive(&mut self, expected_revision: u64) -> Result<(), String> {
-        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
-        let path = record_path(&self.attempt_id)?;
-        self.publish_at(&path, expected_revision, |_| Ok(()))
+        let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)
+            .map_err(|error| format!("publication guard acquisition: {error}"))?;
+        let path = record_path(&self.attempt_id)
+            .map_err(|error| format!("publication record path: {error}"))?;
+        let mut phase = PublicationPhase::ReadPrevious;
+        self.publish_at(&path, expected_revision, |next| {
+            phase = next;
+            Ok(())
+        })
+        .map_err(|error| format!("publication phase={phase:?}: {error}"))
     }
 
     fn publish_at(
@@ -331,107 +580,18 @@ impl WindowsAttemptRecordV1 {
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
                 drop(bytes);
                 authenticate(&previous, &self.attempt_id)?;
-                let expiry = previous.diagnostic_retention.tombstone.is_none()
-                    && self.diagnostic_retention.tombstone
-                        == Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired)
-                    && !diagnostic_export_eligible(&previous)
-                    && self.causal_diagnostics.sequence == 0
-                    && self.causal_diagnostics.secondary.as_slice().is_empty()
-                    && self.causal_diagnostics.original
-                        == memcordon_core::OriginalFailureV1::Unavailable {
-                            reason: memcordon_core::OriginalUnavailableReasonV1::RetentionExpired,
-                        };
-                if previous.record_revision != expected_revision
-                    || (previous.workload_checkpoint.is_some()
-                        && previous.workload_checkpoint != self.workload_checkpoint)
-                    || (previous.authorization_unix_millis.is_some()
-                        && previous.workload_checkpoint != self.workload_checkpoint)
-                    || (previous.workload_admission.is_some()
-                        && previous.workload_admission != self.workload_admission)
-                    || (previous.authorization_unix_millis.is_some()
-                        && previous.workload_admission != self.workload_admission)
-                    || previous.diagnostic_retention.admitted_monotonic_millis
-                        != self.diagnostic_retention.admitted_monotonic_millis
-                    || previous.diagnostic_retention.expires_monotonic_millis
-                        != self.diagnostic_retention.expires_monotonic_millis
-                    || (previous.diagnostic_retention.tombstone
-                        != self.diagnostic_retention.tombstone
-                        && !expiry)
-                    || previous.provider_incarnation != self.provider_incarnation
-                    || previous.launch_incarnation != self.launch_incarnation
-                    || previous.nonce != self.nonce
-                    || previous
-                        .owner_manifest
-                        .as_ref()
-                        .is_some_and(|manifest| self.owner_manifest.as_ref() != Some(manifest))
-                    || previous
-                        .recovery_authorization
-                        .as_ref()
-                        .is_some_and(|authorization| {
-                            self.recovery_authorization.as_ref() != Some(authorization)
-                        })
-                    || (previous.terminal_publication_reserved
-                        && !self.terminal_publication_reserved)
-                    || previous
-                        .terminal_seed
-                        .as_ref()
-                        .is_some_and(|seed| self.terminal_seed.as_ref() != Some(seed))
-                    || previous
-                        .retirement_proof
-                        .as_ref()
-                        .is_some_and(|proof| self.retirement_proof.as_ref() != Some(proof))
-                    || previous.request_sha256 != self.request_sha256
-                    || previous.caller_process_identity != self.caller_process_identity
-                    || previous.caller_token_sha256 != self.caller_token_sha256
-                    || previous.job_identity_sha256 != self.job_identity_sha256
-                    || previous
-                        .worker_identity
-                        .as_ref()
-                        .is_some_and(|identity| self.worker_identity.as_ref() != Some(identity))
-                    || previous
-                        .worker_thread_identity
-                        .is_some_and(|identity| self.worker_thread_identity != Some(identity))
-                    || previous.boot_identity != self.boot_identity
-                    || previous
-                        .authorization_unix_millis
-                        .is_some_and(|authorization| {
-                            self.authorization_unix_millis != Some(authorization)
-                        })
-                    || (previous.resume_attempted && !self.resume_attempted)
-                    || (previous.target_released && !self.target_released)
-                    || (previous.cleanup_state.termination_requested
-                        && !self.cleanup_state.termination_requested)
-                    || (previous.cleanup_state.active_processes_zero
-                        && !self.cleanup_state.active_processes_zero)
-                    || (previous.cleanup_state.guardian_reaped
-                        && !self.cleanup_state.guardian_reaped)
-                    || (previous.cleanup_state.final_handles_closed
-                        && !self.cleanup_state.final_handles_closed)
-                    || (!expiry
-                        && !self
-                            .causal_diagnostics
-                            .secondary
-                            .as_slice()
-                            .starts_with(previous.causal_diagnostics.secondary.as_slice()))
-                    || (previous.state != self.state
-                        && !windows_attempt_transition_allowed(previous.state, self.state))
-                    || (!expiry
-                        && previous.causal_diagnostics.sequence > self.causal_diagnostics.sequence)
-                    || (!expiry
-                        && matches!(
-                            previous.causal_diagnostics.original,
-                            memcordon_core::OriginalFailureV1::Observed { .. }
-                        )
-                        && previous.causal_diagnostics.original != self.causal_diagnostics.original)
-                    || previous
-                        .terminal_response_json
-                        .as_ref()
-                        .is_some_and(|outbox| self.terminal_response_json.as_ref() != Some(outbox))
-                {
-                    return Err(
-                        "attempt snapshot violates exclusive revision or immutable evidence"
-                            .to_owned(),
-                    );
+                if let Some(invariant) = self.snapshot_violation(&previous, expected_revision) {
+                    return Err(format!(
+                        "attempt snapshot violates exclusive revision or immutable evidence; invariant={invariant:?}; previous-revision={}; expected-revision={expected_revision}; candidate-revision={}; previous-state={:?}; candidate-state={:?}; previous-sequence={}; candidate-sequence={}; previous-secondary={}; candidate-secondary={}",
+                        previous.record_revision,
+                        self.record_revision,
+                        previous.state,
+                        self.state,
+                        previous.causal_diagnostics.sequence,
+                        self.causal_diagnostics.sequence,
+                        previous.causal_diagnostics.secondary.as_slice().len(),
+                        self.causal_diagnostics.secondary.as_slice().len()
+                    ));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound && expected_revision == 0 => {}
@@ -442,7 +602,10 @@ impl WindowsAttemptRecordV1 {
                 .checked_add(1)
                 .ok_or_else(|| "attempt revision exhausted".to_owned())?
         {
-            return Err("attempt revision is not contiguous".to_owned());
+            return Err(format!(
+                "attempt revision is not contiguous; expected-revision={expected_revision}; candidate-revision={}",
+                self.record_revision
+            ));
         }
         // The durable image establishes this watermark only when publication
         // succeeds; the caller receives it exclusively through completion.

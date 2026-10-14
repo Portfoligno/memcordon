@@ -430,7 +430,21 @@ fn main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+#[path = "../../tests/support/windows_cold_runtime.rs"]
+pub mod cold_runtime;
+
+#[cfg(windows)]
+fn main() {
+    let arguments = std::env::args_os().skip(1).take(2).collect::<Vec<_>>();
+    if let Err(error) = cold_runtime::validate_cold_runtime_mode(&arguments) {
+        eprintln!("sealed Windows fixture: {error}");
+        std::process::exit(125);
+    }
+    cold_runtime::run_child();
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
     std::process::exit(125);
 }

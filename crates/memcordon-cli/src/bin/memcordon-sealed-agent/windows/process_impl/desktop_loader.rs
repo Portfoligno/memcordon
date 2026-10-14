@@ -801,13 +801,11 @@ impl TargetDesktopBootstrapLaunchContext {
     ) -> TargetDesktopLeaseCreateError {
         TargetDesktopLeaseCreateError {
             os_code: error.native_code(),
-            native_status: error
-                .native_code()
-                .map(|code| NativeStatusV1::Win32 { code: code as u32 }),
+            native_status: error.native_status(),
             loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
             loader_qualification: None,
             detail: format!(
-                "bootstrap_role={} policy_role={} scenario={} launch_phase=resumed bootstrap_pid={bootstrap_pid} bootstrap_image_sha256={bootstrap_image_sha256} target_token_restricted={} target_token_write_restricted={} target_integrity={} target_restricting_sid_sha256={} desktop_mode={desktop_mode} {evidence} detail={error}",
+                "primitive={error}; bootstrap_role={} policy_role={} scenario={} launch_phase=resumed bootstrap_pid={bootstrap_pid} target_token_restricted={} target_token_write_restricted={} target_integrity={} desktop_mode={desktop_mode} target_restricting_sid_sha256={} bootstrap_image_sha256={bootstrap_image_sha256} {evidence}",
                 role.diagnostic(),
                 self.policy_role.diagnostic(),
                 self.scenario,
@@ -819,6 +817,65 @@ impl TargetDesktopBootstrapLaunchContext {
         }
     }
 }
+
+fn qualification_failure_native_status(
+    win32: Option<u32>,
+    nt_status: Option<u32>,
+    target_exit: Option<u32>,
+) -> Result<Option<NativeStatusV1>, TargetDesktopLeaseCreateError> {
+    match (win32, nt_status, target_exit) {
+        (None, None, None) => Ok(None),
+        (Some(code), None, None) => Ok(Some(NativeStatusV1::Win32 { code })),
+        (None, Some(code), None) => Ok(Some(NativeStatusV1::NtStatus { code })),
+        (None, None, Some(code)) => Ok(Some(NativeStatusV1::TargetExit { code })),
+        _ => Err(
+            "production loader failure has contradictory native status domains"
+                .to_owned()
+                .into(),
+        ),
+    }
+}
+
+fn lease_error_from_qualification(
+    failure: &memcordon_windows_launch_core::WindowsLoaderQualificationFailureV2,
+) -> Result<TargetDesktopLeaseCreateError, TargetDesktopLeaseCreateError> {
+    let loader_phase = match failure.stage {
+        LaunchQualificationStageV2::PlanValidation
+        | LaunchQualificationStageV2::DesktopPreflight => LoaderLaunchFailurePhaseV1::PreCreate,
+        LaunchQualificationStageV2::ProcessCreate => {
+            LoaderLaunchFailurePhaseV1::CreateProcessReturn
+        }
+        LaunchQualificationStageV2::SuspendedAttestation => {
+            LoaderLaunchFailurePhaseV1::PreResumeAttestation
+        }
+        LaunchQualificationStageV2::Resume => LoaderLaunchFailurePhaseV1::Resume,
+        LaunchQualificationStageV2::LoaderReadyHandshake => {
+            LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady
+        }
+        LaunchQualificationStageV2::ContainmentReadback => {
+            LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment
+        }
+        LaunchQualificationStageV2::ExitDrain => LoaderLaunchFailurePhaseV1::ExitDrain,
+    };
+    let native_status = qualification_failure_native_status(
+        failure.win32_error,
+        failure.nt_status,
+        failure.target_exit_code,
+    )?;
+    Ok(TargetDesktopLeaseCreateError {
+        detail: failure.detail.clone(),
+        os_code: failure.win32_error.map(|code| code as i32),
+        loader_phase,
+        native_status: Some(native_status.unwrap_or_else(|| NativeStatusV1::Stable {
+            code: failure.stable_code.clone(),
+        })),
+        loader_qualification: None,
+    })
+}
+
+#[cfg(test)]
+#[path = "../../../../../tests/sealed_agent/windows_bootstrap_provenance.rs"]
+mod bootstrap_provenance_tests;
 
 impl From<String> for TargetDesktopLeaseCreateError {
     fn from(detail: String) -> Self {
@@ -884,9 +941,7 @@ impl From<super::pipe::TargetDesktopBootstrapPipeError> for TargetDesktopLeaseCr
             os_code: error.native_code(),
             detail: error.to_string(),
             loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
-            native_status: error
-                .native_code()
-                .map(|code| NativeStatusV1::Win32 { code: code as u32 }),
+            native_status: error.native_status(),
             loader_qualification: None,
         }
     }
@@ -1492,6 +1547,81 @@ pub(super) enum TargetDesktopBootstrapMessageV1 {
     },
 }
 
+fn combine_desktop_retirement_error(release: Result<(), String>, later: String) -> String {
+    match release {
+        Ok(()) => later,
+        Err(first) => format!(
+            "desktop holder connection release failed: {first}; settlement also failed: {later}"
+        ),
+    }
+}
+
+fn close_desktop_holder_handles(
+    connection: &mut Option<OwnedHandle>,
+    job: &mut Job,
+    process: &mut OwnedHandle,
+) -> Result<bool, String> {
+    let connection_result = connection
+        .as_mut()
+        .map_or(Ok(()), OwnedHandle::close_checked);
+    if connection_result.is_ok() {
+        *connection = None;
+    }
+    // Connection EOF is the normal release signal; retain both native
+    // authority handles until the exact holder process has signaled.
+    // SAFETY: process remains owned throughout both original bounded waits.
+    let wait = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+    if wait == WAIT_TIMEOUT {
+        if let Err(error) = job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS) {
+            return Err(combine_desktop_retirement_error(connection_result, error));
+        }
+        // SAFETY: this is the same retained process handle.
+        let retired = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        if retired != WAIT_OBJECT_0 {
+            return Err(combine_desktop_retirement_error(
+                connection_result,
+                desktop_holder_wait_error("after Job termination", retired),
+            ));
+        }
+    } else if wait != WAIT_OBJECT_0 {
+        return Err(combine_desktop_retirement_error(
+            connection_result,
+            desktop_holder_wait_error("after connection release", wait),
+        ));
+    }
+    let job_result = job.close_checked();
+    let process_result = process.close_checked();
+    let mut failure = connection_result.err();
+    for (stage, result) in [("Job close", job_result), ("process close", process_result)] {
+        if let Err(error) = result {
+            failure = Some(match failure {
+                Some(first) => format!("{first}; desktop holder {stage} also failed: {error}"),
+                None => format!("desktop holder {stage} failed: {error}"),
+            });
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(wait == WAIT_TIMEOUT),
+    }
+}
+
+fn desktop_holder_wait_error(stage: &str, result: u32) -> String {
+    let native = if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    format!(
+        "target desktop bootstrap wait {stage}: result={result}; raw-os-error={:?}; detail={native:?}",
+        native.as_ref().and_then(std::io::Error::raw_os_error)
+    )
+}
+
+#[cfg(test)]
+#[path = "../../../../../tests/sealed_agent/windows_desktop_retirement.rs"]
+mod desktop_retirement_tests;
+
 impl TargetDesktopLease {
     pub(super) fn owner_binding(&self) -> (WindowsProcessIdentityV1, String, u64, u64) {
         (
@@ -1503,33 +1633,12 @@ impl TargetDesktopLease {
     }
 
     pub(super) fn close_checked(&mut self) -> Result<(), String> {
-        // The bootstrap is a separate Job/owner. Its signaled process handle
-        // must be observed before either native authority handle is closed.
-        // SAFETY: this lease owns the live bootstrap process handle.
-        let wait = unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) };
-        if wait == WAIT_TIMEOUT {
-            self.bootstrap_job
-                .terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)?;
-            // SAFETY: same owned process handle remains live.
-            if unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) } != WAIT_OBJECT_0
-            {
-                return Err("target desktop bootstrap did not retire".to_owned());
-            }
-        } else if wait != WAIT_OBJECT_0 {
-            return Err("target desktop bootstrap wait failed".to_owned());
-        }
-        let connection_result = self
-            .connection_lease
-            .as_mut()
-            .map_or(Ok(()), OwnedHandle::close_checked);
-        if connection_result.is_ok() {
-            self.connection_lease = None;
-        }
-        let job_result = self.bootstrap_job.close_checked();
-        let process_result = self.bootstrap_process.close_checked();
-        connection_result?;
-        job_result?;
-        process_result
+        close_desktop_holder_handles(
+            &mut self.connection_lease,
+            &mut self.bootstrap_job,
+            &mut self.bootstrap_process,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn loader_qualification(
@@ -3102,73 +3211,7 @@ pub(super) fn launch_target_desktop_loader_control_inner(
     let mut result = match &outcome {
         LaunchQualificationOutcomeV2::Ready(evidence) => Ok(evidence.clone()),
         LaunchQualificationOutcomeV2::Failed(failure) => {
-            let (loader_phase, native_status, os_code) = match failure.stage {
-                LaunchQualificationStageV2::PlanValidation
-                | LaunchQualificationStageV2::DesktopPreflight => {
-                    (LoaderLaunchFailurePhaseV1::PreCreate, None, None)
-                }
-                LaunchQualificationStageV2::ProcessCreate => (
-                    LoaderLaunchFailurePhaseV1::CreateProcessReturn,
-                    failure
-                        .win32_error
-                        .map(|code| NativeStatusV1::Win32 { code }),
-                    failure.win32_error.map(|code| code as i32),
-                ),
-                LaunchQualificationStageV2::SuspendedAttestation => (
-                    LoaderLaunchFailurePhaseV1::PreResumeAttestation,
-                    failure
-                        .win32_error
-                        .map(|code| NativeStatusV1::Win32 { code }),
-                    failure.win32_error.map(|code| code as i32),
-                ),
-                LaunchQualificationStageV2::Resume => (
-                    LoaderLaunchFailurePhaseV1::Resume,
-                    failure
-                        .win32_error
-                        .map(|code| NativeStatusV1::Win32 { code }),
-                    failure.win32_error.map(|code| code as i32),
-                ),
-                LaunchQualificationStageV2::LoaderReadyHandshake => (
-                    LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
-                    failure
-                        .win32_error
-                        .map(|code| NativeStatusV1::Win32 { code }),
-                    failure.win32_error.map(|code| code as i32),
-                ),
-                LaunchQualificationStageV2::ContainmentReadback => (
-                    LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment,
-                    failure
-                        .win32_error
-                        .map(|code| NativeStatusV1::Win32 { code }),
-                    failure.win32_error.map(|code| code as i32),
-                ),
-                LaunchQualificationStageV2::ExitDrain => (
-                    LoaderLaunchFailurePhaseV1::ExitDrain,
-                    failure
-                        .target_exit_code
-                        .map(|code| NativeStatusV1::TargetExit { code })
-                        .or_else(|| {
-                            failure
-                                .win32_error
-                                .map(|code| NativeStatusV1::Win32 { code })
-                        }),
-                    failure
-                        .target_exit_code
-                        .or(failure.win32_error)
-                        .map(|code| code as i32),
-                ),
-            };
-            Err(TargetDesktopLeaseCreateError {
-                detail: failure.detail.clone(),
-                os_code,
-                loader_phase,
-                native_status: native_status.or_else(|| {
-                    Some(NativeStatusV1::Stable {
-                        code: failure.stable_code.clone(),
-                    })
-                }),
-                loader_qualification: None,
-            })
+            Err(lease_error_from_qualification(failure)?)
         }
     };
     let plan_json = serde_json::to_string(&production)

@@ -4,6 +4,7 @@
 
 pub mod bootstrap_profile;
 pub mod cache;
+pub mod caller_observation;
 pub mod capability;
 pub mod command;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod public_reads;
 pub mod rehearsal_support;
 pub mod release;
 pub mod reparse_diagnostic;
+pub mod retained_build_source;
 pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
@@ -93,5 +95,6 @@ pub mod arm32_abi_helper;
 pub mod exact_harness;
 pub mod external_consumer;
 pub mod macos_performance;
+pub mod mixed_collection_diagnostics;
 pub mod native_acceptance_catalogue;
 pub mod performance_plan;

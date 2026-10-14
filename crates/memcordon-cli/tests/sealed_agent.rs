@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+#[path = "../../../tools/memcordon-ci/tests/caller_observation.rs"]
+mod caller_observation_publication;
+
 #[path = "../src/bin/memcordon-sealed-agent/network_readiness.rs"]
 mod network_readiness;
 
@@ -100,6 +104,9 @@ mod native_private_tcp;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/native_versions.rs"]
 mod native_versions;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_writable_mounts.rs"]
+mod native_writable_mounts;
 #[path = "sealed_agent/package.rs"]
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]

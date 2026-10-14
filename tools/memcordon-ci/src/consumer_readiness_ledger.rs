@@ -14,6 +14,11 @@ use std::{
 
 pub type LedgerResult<T> = Result<T, String>;
 
+/// Presentation of the exact authenticated nonce; its wire representation stays bytes.
+pub fn admission_nonce_text(nonce: memcordon_core::workload_contract::Nonce128) -> String {
+    hex::encode(nonce.0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExclusiveAccount {

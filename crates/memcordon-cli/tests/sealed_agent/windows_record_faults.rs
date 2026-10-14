@@ -3,6 +3,303 @@ use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 
+#[path = "windows_v3_fixture.rs"]
+mod terminal_fixture;
+
+fn snapshot_predicate_fixture() -> WindowsAttemptRecordV1 {
+    use memcordon_core::workload_contract::*;
+    use memcordon_core::workload_evidence::*;
+    use memcordon_core::workload_registry::*;
+    use std::num::NonZeroU64;
+    let mut record = observed_record();
+    let _rejection = terminal_fixture::postauthorization_failure(
+        &mut record,
+        WindowsProcessIdentityV1 {
+            process_id: 2,
+            creation_time_100ns: 2,
+        },
+        true,
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+        memcordon_core::BoundarySetupPhase::TargetCreation,
+    );
+    let profile = BaselineProfile::WindowsHostNetworkExternal;
+    let digest = memcordon_core::DiagnosticSha256::from_bytes([7; 32]);
+    let request = WorkloadContractV1 {
+        schema_version: ContractVersionOne::default(),
+        workload_plan_digest: digest.clone(),
+        authorized_profile: profile.reference(),
+        authorization: AuthorizationRef {
+            grant_id: LogicalId::new("fixture".into()).unwrap(),
+            grant_revision: NonZeroU64::MIN,
+            approved_plan_digest: digest.clone(),
+        },
+        ceiling: profile.ceiling(),
+        requirements: memcordon_core::BoundedVec::default(),
+        endpoints: memcordon_core::BoundedVec::default(),
+        expected_epoch: PolicyEpoch {
+            service_instance: Nonce128([1; 16]),
+            revision: NonZeroU64::MIN,
+        },
+    };
+    let provider = serde_json::from_value(serde_json::json!({"generation":"fixture-generation", "source_commit":"ab".repeat(20), "runtime_manifest_sha256":"cd".repeat(32)})).unwrap();
+    let binding = RuntimeAttemptBinding {
+        format: "memcordon.local-attempt-binding".into(),
+        revision: 1,
+        plan: RuntimePlanBinding::from_local_grant(
+            &request,
+            digest.clone(),
+            provider,
+            memcordon_core::BoundedText::new(&record.boot_identity).unwrap(),
+        )
+        .unwrap(),
+        attempt_id: memcordon_core::BoundedText::new(&record.attempt_id).unwrap(),
+        restart_attempt: 0,
+        admission_nonce: Nonce128([2; 16]),
+        caller_invocation_reference: Nonce128([3; 16]),
+    };
+    let checkpoint = VerifiedCheckpointV1::observed(
+        &binding,
+        baseline_observation(profile),
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap();
+    record.workload_checkpoint = Some((binding, checkpoint));
+    record.workload_admission = Some(RuntimeAdmissionSnapshot {
+        format: "memcordon.local-admission".into(),
+        revision: 1,
+        private_invocation_digest: digest.clone(),
+        caller_invocation_reference: Nonce128([3; 16]),
+        request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
+        request,
+        registry_digest: digest,
+        admission_nonce: Nonce128([2; 16]),
+        caller: CallerSelector::Windows {
+            sid: memcordon_core::BoundedText::new("S-1-5-21-1").unwrap(),
+        },
+        native_profile: profile,
+    });
+    record.authorization_unix_millis = Some(1);
+    record.worker_thread_identity = Some(memcordon_core::WindowsWorkerThreadIdentityV1 {
+        thread_id: 1,
+        creation_time_100ns: 1,
+    });
+    record
+}
+
+#[test]
+fn snapshot_classifier_distinguishes_every_ordered_invariant_without_values() {
+    let base = snapshot_predicate_fixture();
+    assert_eq!(base.snapshot_violation(&base, base.record_revision), None);
+    assert_eq!(
+        base.snapshot_violation(&base, base.record_revision + 1),
+        Some(SnapshotInvariant::ExpectedRevision)
+    );
+    macro_rules! case {
+        ($kind:ident, |$previous:ident, $candidate:ident| $change:block) => {{
+            #[allow(unused_mut)]
+            let mut $previous = base.clone();
+            #[allow(unused_mut)]
+            let mut $candidate = base.clone();
+            $candidate.record_revision += 1;
+            $change
+            assert_eq!($candidate.snapshot_violation(&$previous, $previous.record_revision), Some(SnapshotInvariant::$kind), stringify!($kind));
+        }};
+    }
+    case!(FrozenWorkloadCheckpoint, |p, c| {
+        c.workload_checkpoint = None;
+    });
+    case!(AuthorizedWorkloadCheckpoint, |p, c| {
+        p.workload_checkpoint = None;
+    });
+    case!(FrozenWorkloadAdmission, |p, c| {
+        c.workload_admission = None;
+    });
+    case!(AuthorizedWorkloadAdmission, |p, c| {
+        p.workload_admission = None;
+    });
+    case!(RetentionAdmittedTime, |p, c| {
+        c.diagnostic_retention.admitted_monotonic_millis += 1;
+    });
+    case!(RetentionExpiresTime, |p, c| {
+        c.diagnostic_retention.expires_monotonic_millis += 1;
+    });
+    case!(RetentionTombstone, |p, c| {
+        c.diagnostic_retention.tombstone =
+            Some(memcordon_core::OriginalUnavailableReasonV1::RecordUnavailable);
+    });
+    case!(ProviderIncarnation, |p, c| {
+        c.provider_incarnation = "different".into();
+    });
+    case!(LaunchIncarnation, |p, c| {
+        c.launch_incarnation = "different".into();
+    });
+    case!(Nonce, |p, c| {
+        c.nonce = "different".into();
+    });
+    case!(OwnerManifest, |p, c| {
+        c.owner_manifest = None;
+    });
+    case!(RecoveryAuthorization, |p, c| {
+        c.recovery_authorization = None;
+    });
+    case!(PublicationReservation, |p, c| {
+        c.terminal_publication_reserved = false;
+    });
+    case!(TerminalSeed, |p, c| {
+        c.terminal_seed = None;
+    });
+    case!(RetirementProof, |p, c| {
+        c.retirement_proof = None;
+    });
+    case!(RequestDigest, |p, c| {
+        c.request_sha256 = "different".into();
+    });
+    case!(CallerProcess, |p, c| {
+        c.caller_process_identity.process_id += 1;
+    });
+    case!(CallerToken, |p, c| {
+        c.caller_token_sha256 = "different".into();
+    });
+    case!(JobIdentity, |p, c| {
+        c.job_identity_sha256 = "different".into();
+    });
+    case!(WorkerProcess, |p, c| {
+        c.worker_identity = None;
+    });
+    case!(WorkerThread, |p, c| {
+        c.worker_thread_identity = None;
+    });
+    case!(BootIdentity, |p, c| {
+        c.boot_identity = "different".into();
+    });
+    case!(AuthorizationTime, |p, c| {
+        c.authorization_unix_millis = None;
+    });
+    case!(ResumeRegression, |p, c| {
+        p.resume_attempted = true;
+    });
+    case!(ReleaseRegression, |p, c| {
+        p.target_released = true;
+    });
+    case!(TerminationRegression, |p, c| {
+        p.cleanup_state.termination_requested = true;
+    });
+    case!(ActiveZeroRegression, |p, c| {
+        p.cleanup_state.active_processes_zero = true;
+    });
+    case!(GuardianReapedRegression, |p, c| {
+        p.cleanup_state.guardian_reaped = true;
+    });
+    case!(FinalHandlesRegression, |p, c| {
+        p.cleanup_state.final_handles_closed = true;
+    });
+    case!(CausalSecondaryPrefix, |p, c| {
+        let memcordon_core::OriginalFailureV1::Observed { event } =
+            p.causal_diagnostics.original.clone()
+        else {
+            panic!("fixture original absent")
+        };
+        p.causal_diagnostics.observe_secondary(event).unwrap();
+    });
+    case!(StateTransition, |p, c| {
+        p.state = WindowsAttemptStateV1::Authorized;
+        c.state = WindowsAttemptStateV1::BoundaryCreated;
+    });
+    case!(CausalSequenceRegression, |p, c| {
+        c.causal_diagnostics = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    });
+    case!(OriginalFailureReplacement, |p, c| {
+        let memcordon_core::OriginalFailureV1::Observed { event } =
+            &mut c.causal_diagnostics.original
+        else {
+            panic!("fixture original absent")
+        };
+        event.native_code = Some(memcordon_core::NativeFailureCodeV1::Win32(4321));
+    });
+    case!(TerminalOutbox, |p, c| {
+        p.terminal_response_json = Some(std::sync::Arc::from(
+            serde_json::to_string(&serde_json::json!({"fixture":"retained-terminal-outbox"}))
+                .unwrap(),
+        ));
+    });
+}
+
+#[test]
+fn snapshot_retention_expiry_exception_remains_narrow() {
+    let mut previous = observed_record();
+    previous.boot_identity = "original-boot-no-longer-current".into();
+    let mut expired = previous.clone();
+    expired.causal_diagnostics = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    expired.causal_diagnostics.original = memcordon_core::OriginalFailureV1::Unavailable {
+        reason: memcordon_core::OriginalUnavailableReasonV1::RetentionExpired,
+    };
+    expired.diagnostic_retention.tombstone =
+        Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
+    assert_eq!(
+        expired.snapshot_violation(&previous, previous.record_revision),
+        None
+    );
+    let eligible = observed_record();
+    assert!(diagnostic_export_eligible(&eligible));
+    let mut refused = eligible.clone();
+    refused.causal_diagnostics = expired.causal_diagnostics.clone();
+    refused.diagnostic_retention.tombstone = expired.diagnostic_retention.tombstone;
+    assert_eq!(
+        refused.snapshot_violation(&eligible, eligible.record_revision),
+        Some(SnapshotInvariant::RetentionTombstone)
+    );
+    expired.diagnostic_retention.expires_monotonic_millis += 1;
+    assert_eq!(
+        expired.snapshot_violation(&previous, previous.record_revision),
+        Some(SnapshotInvariant::RetentionExpiresTime)
+    );
+}
+
+#[test]
+fn fallback_original_survives_authenticated_successive_publications() {
+    use super::super::diagnostics;
+    let _scope = diagnostics::AttemptDiagnosticScope::enter();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attempt.json");
+    let mut record = observed_record();
+    let memcordon_core::OriginalFailureV1::Observed { event } =
+        record.causal_diagnostics.original.clone()
+    else {
+        panic!("fixture original absent")
+    };
+    record.causal_diagnostics = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    diagnostics::observe_uncaptured_failure(&mut record.causal_diagnostics, event.clone());
+    record.publish_at(&path, 0, |_| Ok(())).unwrap();
+    let original = record.causal_diagnostics.original.clone();
+    for expected in [1, 2] {
+        let bytes = read_record_bounded(&path).unwrap();
+        let previous: WindowsAttemptRecordV1 = serde_json::from_slice(&bytes).unwrap();
+        authenticate(&previous, &record.attempt_id).unwrap();
+        diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
+        diagnostics::capture(event.clone());
+        let mut next = previous.clone();
+        diagnostics::merge_into(&mut next.causal_diagnostics);
+        next.record_revision = expected + 1;
+        next.publish_at(&path, expected, |_| Ok(())).unwrap();
+        assert_eq!(next.causal_diagnostics.original, original);
+        assert!(
+            next.causal_diagnostics
+                .secondary
+                .as_slice()
+                .starts_with(previous.causal_diagnostics.secondary.as_slice())
+        );
+        assert_eq!(next.causal_diagnostics.sequence, expected + 1);
+        record = next;
+    }
+    assert_eq!(record.causal_diagnostics.sequence, 3);
+    assert!(!path.with_extension("json.new").exists());
+}
+
 const CHILD_FIXTURE: &str = "windows::record::record_fault_tests::native_lifetime_child";
 
 #[test]
@@ -453,12 +750,24 @@ fn stale_revision_original_replacement_and_staging_collision_never_publish() {
     let before = read_record_bounded(&path).unwrap();
     let mut stale = record.clone();
     stale.record_revision = 2;
-    assert!(stale.publish_at(&path, 0, |_| Ok(())).is_err());
+    assert!(
+        stale
+            .publish_at(&path, 0, |_| Ok(()))
+            .unwrap_err()
+            .contains("invariant=ExpectedRevision;")
+    );
+    assert!(!path.with_extension("json.new").exists());
     let mut replacement = stale.clone();
     replacement.causal_diagnostics.original = memcordon_core::OriginalFailureV1::Unavailable {
         reason: memcordon_core::OriginalUnavailableReasonV1::RecordUnavailable,
     };
-    assert!(replacement.publish_at(&path, 1, |_| Ok(())).is_err());
+    assert!(
+        replacement
+            .publish_at(&path, 1, |_| Ok(()))
+            .unwrap_err()
+            .contains("invariant=OriginalFailureReplacement;")
+    );
+    assert!(!path.with_extension("json.new").exists());
     let staged = path.with_extension("json.new");
     fs::create_dir(&staged).unwrap();
     assert!(stale.publish_at(&path, 1, |_| Ok(())).is_err());
@@ -733,9 +1042,10 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         if guardian_cleanup {
             publication.unwrap();
         } else {
-            assert_eq!(
-                publication.unwrap_err(),
-                "attempt cleanup publication is unconfirmed"
+            let error = publication.unwrap_err();
+            assert!(error.starts_with("attempt cleanup publication is unconfirmed;"));
+            assert!(
+                error.contains("first-publisher-error=attempt publication owner is unavailable")
             );
         }
         let committed: WindowsAttemptRecordV1 = serde_json::from_slice(

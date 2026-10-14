@@ -163,10 +163,17 @@ impl NativeRootStaging {
 /// No deserializer or public constructor: this is the actual mounted root inode.
 pub struct MountedPrivateRoot {
     root: File,
+    // Only the provider exports after namespace retirement. Init owns no extra
+    // pins, so its target descriptor seal and transfer inventory stay exact.
+    writable_mounts: Option<Vec<HeldWritableMount>>,
     layout: RootLayoutDefinitionV1,
     attempt_id: String,
     identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
     init_nondumpable: bool,
+}
+struct HeldWritableMount {
+    definition: memcordon_core::workload_registry_v3::WritableRootV1,
+    directory: File,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -550,6 +557,7 @@ impl MountedPrivateRoot {
         layout: RootLayoutDefinitionV1,
         identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
         entry: &ImageEntryV1,
+        deadline: std::time::Instant,
     ) -> Result<(Self, super::entrypoint::VerifiedEntrypoint), String> {
         use std::os::unix::fs::MetadataExt;
         let observe = || {
@@ -622,13 +630,15 @@ impl MountedPrivateRoot {
         if !transfer.init_nondumpable {
             return Err("native namespace init was dumpable at root publication".into());
         }
-        let root = Self {
+        let mut root = Self {
             root,
+            writable_mounts: None,
             layout,
             attempt_id,
             identity,
             init_nondumpable: transfer.init_nondumpable,
         };
+        root.writable_mounts = Some(root.capture_writable_mounts(deadline)?);
         let independently_opened = root.open_entrypoint(entry)?;
         let expected = File::from(
             independently_opened
@@ -644,7 +654,205 @@ impl MountedPrivateRoot {
         }
         let executable =
             super::entrypoint::VerifiedEntrypoint::from_private_root_image(executable, entry)?;
+        if std::time::Instant::now() >= deadline {
+            return Err("native root writable mount capture exceeded original setup cutoff".into());
+        }
+        if observe()? != *init {
+            return Err("native root init birth differs after writable mount capture".into());
+        }
         Ok((root, executable))
+    }
+    fn capture_writable_mounts(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<HeldWritableMount>, String> {
+        let mut mounts = Vec::new();
+        for definition in self.layout.writable_roots.as_slice() {
+            let capture = (|| -> Result<File, String> {
+                if std::time::Instant::now() >= deadline {
+                    return Err("original setup cutoff expired".into());
+                }
+                let mut directory = self.root.try_clone().map_err(io)?;
+                for component in definition.path.as_str().split('/') {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("original setup cutoff expired".into());
+                    }
+                    directory = directory_at(directory.as_fd(), component, false)?;
+                }
+                if !directory.metadata().map_err(io)?.is_dir() {
+                    return Err("declared writable mount is not a directory".into());
+                }
+                let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } < 0 {
+                    return Err(io(std::io::Error::last_os_error()));
+                }
+                if unsafe { filesystem.assume_init() }.f_type != libc::TMPFS_MAGIC {
+                    return Err("declared writable mount is not tmpfs".into());
+                }
+                let mut flags = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                if unsafe { libc::fstatvfs(directory.as_raw_fd(), flags.as_mut_ptr()) } < 0 {
+                    return Err(io(std::io::Error::last_os_error()));
+                }
+                let flags = unsafe { flags.assume_init() }.f_flag;
+                let required = libc::ST_NOSUID
+                    | libc::ST_NODEV
+                    | if definition.generated_execution {
+                        0
+                    } else {
+                        libc::ST_NOEXEC
+                    };
+                if flags & libc::ST_RDONLY != 0
+                    || flags & required != required
+                    || (definition.generated_execution && flags & libc::ST_NOEXEC != 0)
+                {
+                    return Err("declared writable mount flags differ".into());
+                }
+                Ok(directory)
+            })()
+            .map_err(|error| {
+                format!(
+                    "capture writable mount {} at {}: {error}",
+                    definition.id.as_str(),
+                    definition.path.as_str()
+                )
+            })?;
+            mounts.push(HeldWritableMount {
+                definition: definition.clone(),
+                directory: capture,
+            });
+        }
+        Ok(mounts)
+    }
+    fn held_writable_mount(
+        &self,
+        definition: &memcordon_core::workload_registry_v3::WritableRootV1,
+    ) -> Result<&File, String> {
+        let mounts = self.validated_writable_mounts()?;
+        mounts
+            .iter()
+            .find(|held| held.definition == *definition)
+            .map(|held| &held.directory)
+            .ok_or_else(|| {
+                format!(
+                    "held writable mount {} at {} absent",
+                    definition.id.as_str(),
+                    definition.path.as_str()
+                )
+            })
+    }
+    fn validated_writable_mounts(&self) -> Result<&[HeldWritableMount], String> {
+        let mounts = self
+            .writable_mounts
+            .as_ref()
+            .ok_or("provider writable mount pins absent")?;
+        if mounts.len() != self.layout.writable_roots.as_slice().len()
+            || mounts
+                .iter()
+                .zip(self.layout.writable_roots.as_slice())
+                .any(|(held, declared)| held.definition != *declared)
+        {
+            return Err("provider writable mount pins differ from immutable layout".into());
+        }
+        Ok(mounts)
+    }
+    fn open_pinned_output(
+        &self,
+        writable: &memcordon_core::workload_registry_v3::WritableRootV1,
+        selected: &RootRelativePath,
+        uid: u32,
+    ) -> Result<(File, std::fs::Metadata), String> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let source_root = self.held_writable_mount(writable)?;
+        let relative = selected
+            .as_str()
+            .strip_prefix(writable.path.as_str())
+            .and_then(|value| value.strip_prefix('/'))
+            .ok_or("output relative path differs")?;
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: 0x08 | 0x02 | 0x04 | 0x01,
+        };
+        let member = CString::new(relative).map_err(|_| "output path contains NUL")?;
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                source_root.as_raw_fd(),
+                member.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        } as i32;
+        if raw < 0 {
+            return Err(format!(
+                "openat2 selected output {} from writable mount {}: {}",
+                selected.as_str(),
+                writable.id.as_str(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        let source = unsafe { File::from_raw_fd(raw) };
+        let before = source.metadata().map_err(io)?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != uid
+            || before.mode() & 0o6000 != 0
+        {
+            return Err("selected output lacks exclusive regular-file custody".into());
+        }
+        Ok((source, before))
+    }
+    #[cfg(test)]
+    pub(crate) fn capture_for_test(
+        root: File,
+        layout: RootLayoutDefinitionV1,
+        identity: memcordon_core::workload_contract_v3::ExclusiveAdministratorIdentityRef,
+        deadline: std::time::Instant,
+    ) -> Result<Self, String> {
+        layout.validate()?;
+        let mut value = Self {
+            root,
+            writable_mounts: None,
+            layout,
+            attempt_id: "test-mount-owner".into(),
+            identity,
+            init_nondumpable: true,
+        };
+        value.writable_mounts = Some(value.capture_writable_mounts(deadline)?);
+        Ok(value)
+    }
+    #[cfg(test)]
+    pub(crate) fn open_output_for_test(
+        &self,
+        selected: &RootRelativePath,
+        uid: u32,
+    ) -> Result<File, String> {
+        let writable = self
+            .layout
+            .writable_roots
+            .as_slice()
+            .iter()
+            .find(|root| memcordon_core::workload_registry_v3::is_beneath(selected, &root.path))
+            .ok_or("test output outside declared roots")?;
+        self.open_pinned_output(writable, selected, uid)
+            .map(|(file, _)| file)
+    }
+    #[cfg(test)]
+    pub(crate) fn invalidate_pin_for_test(&mut self, mismatch: bool) {
+        if mismatch {
+            self.writable_mounts.as_mut().expect("captured pins")[0]
+                .definition
+                .generated_execution ^= true;
+        } else {
+            self.writable_mounts = None;
+        }
     }
     pub(super) fn open_entrypoint(
         &self,
@@ -674,9 +882,13 @@ impl MountedPrivateRoot {
             if self.attempt_id != retirement.attempt_id() || self.identity != identity_reference {
                 return Err("root export originating attempt/identity differs".into());
             }
-            let path = self.export_selected(retirement, identity, &staging, &mut destination)?;
+            let path = self
+                .export_selected(retirement, identity, &staging, &mut destination)
+                .map_err(|error| format!("export selected private root outputs: {error}"))?;
             exported = Some(path.clone());
-            staging.retire_path()?;
+            staging
+                .retire_path()
+                .map_err(|error| format!("retire private root staging: {error}"))?;
             Ok((layout, identity_reference, path))
         })();
         let (layout, identity, path) = match publish {
@@ -716,6 +928,7 @@ impl MountedPrivateRoot {
         if !identity.enabled {
             return Err("export identity is disabled".into());
         }
+        self.validated_writable_mounts()?;
         let identity_reference = identity.reference()?;
         let layout_reference = self.layout.reference()?;
         super::runtime_image::protected_directory(&staging.held)?;
@@ -793,51 +1006,10 @@ impl MountedPrivateRoot {
                 .iter()
                 .find(|root| memcordon_core::workload_registry_v3::is_beneath(selected, &root.path))
                 .ok_or("selected output is outside writable roots")?;
-            let mut source_root = self.root.try_clone().map_err(io)?;
-            // Crossing into the single declared work mount is intentional. All
-            // subsequent member traversal is confined to that held mount.
-            for component in writable.path.as_str().split('/') {
-                source_root = directory_at(source_root.as_fd(), component, false)?;
-            }
-            let relative = selected
-                .as_str()
-                .strip_prefix(writable.path.as_str())
-                .and_then(|value| value.strip_prefix('/'))
-                .ok_or("output relative path differs")?;
-            #[repr(C)]
-            struct OpenHow {
-                flags: u64,
-                mode: u64,
-                resolve: u64,
-            }
-            let how = OpenHow {
-                flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
-                mode: 0,
-                resolve: 0x08 | 0x02 | 0x04 | 0x01,
-            };
-            let member = CString::new(relative).map_err(|_| "output path contains NUL")?;
-            let raw = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    source_root.as_raw_fd(),
-                    member.as_ptr(),
-                    &how,
-                    std::mem::size_of::<OpenHow>(),
-                )
-            } as i32;
-            if raw < 0 {
-                return Err(io(std::io::Error::last_os_error()));
-            }
-            use std::os::fd::FromRawFd;
-            let mut source = unsafe { File::from_raw_fd(raw) };
-            let before = source.metadata().map_err(io)?;
-            if !before.is_file()
-                || before.nlink() != 1
-                || before.uid() != identity.uid.get()
-                || before.mode() & 0o6000 != 0
-            {
-                return Err("selected output lacks exclusive regular-file custody".into());
-            }
+            // Namespace teardown may disconnect this submount from self.root.
+            // Resolve only from its original provider-owned pre-release pin.
+            let (mut source, before) =
+                self.open_pinned_output(writable, selected, identity.uid.get())?;
             let used = budgets.entry(writable.id.as_str().to_owned()).or_default();
             *used = used
                 .checked_add(before.len())
@@ -846,9 +1018,13 @@ impl MountedPrivateRoot {
                 return Err("selected outputs exceed work-root bound".into());
             }
             let mut output = if destination.published {
-                open_relative(output_root.as_fd(), selected, false)?
+                open_relative(output_root.as_fd(), selected, false).map_err(|error| {
+                    format!("open published export {}: {error}", selected.as_str())
+                })?
             } else {
-                open_relative(output_root.as_fd(), selected, true)?
+                open_relative(output_root.as_fd(), selected, true).map_err(|error| {
+                    format!("create export output {}: {error}", selected.as_str())
+                })?
             };
             let mut hash = Sha256::new();
             let mut copied = 0_u64;
@@ -927,7 +1103,8 @@ impl MountedPrivateRoot {
         let receipt=serde_json::to_vec(&serde_json::json!({"format":"memcordon.private-export","revision":1,"attempt_id":retirement.attempt_id(),"root_layout":layout_reference,"identity":identity_reference,"files":receipts})).map_err(|error|error.to_string())?;
         let receipt_path = RootRelativePath::new("export-receipt.json".to_owned())?;
         let mut receipt_file =
-            open_relative(output_root.as_fd(), &receipt_path, !destination.published)?;
+            open_relative(output_root.as_fd(), &receipt_path, !destination.published)
+                .map_err(|error| format!("publish export receipt: {error}"))?;
         if destination.published {
             let metadata = receipt_file.metadata().map_err(io)?;
             let mut bytes = Vec::new();
@@ -1245,6 +1422,7 @@ impl MountedPrivateRoot {
         let attempt_id = attempt.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Self {
             root,
+            writable_mounts: None,
             layout,
             attempt_id,
             identity,

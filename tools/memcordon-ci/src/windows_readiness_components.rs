@@ -74,6 +74,56 @@ pub fn guardian_injection_authority(
         })
 }
 
+/// Only factual, bound control loss can explain a selected transport fault.
+pub fn transport_injection_authority(
+    failure: &memcordon_core::ProviderFailureDiagnosticV1,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+) -> bool {
+    use memcordon_core::*;
+    if !matches!(
+        selected,
+        WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+            | WindowsSealedFault::FrontendKilledAfterAuthorization
+            | WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+            | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+    ) || !failure.is_consistent()
+        || &failure.provider_binding != provider
+        || String::from(failure.attempt_id.clone()) != attempt
+        || String::from(failure.request_sha256.clone()) != request
+    {
+        return false;
+    }
+    let OriginalFailureV1::Observed { event } = &failure.original else {
+        return false;
+    };
+    if event.sequence == 0
+        || event.origin != DiagnosticOriginV1::Launcher
+        || event.category != FailureCategoryV1::Transport
+        || event.code != FailureCodeV1::ControlTransport
+        || event.safe_detail != (SafeDiagnosticDetailV1::InjectedWindowsFault { fault: selected })
+    {
+        return false;
+    }
+    match (event.operation, event.observed_phase) {
+        (FailureOperationV1::ReadControlFrame, AttemptObservationPhaseV1::Monitoring) => matches!(
+            event.native_code,
+            None | Some(NativeFailureCodeV1::Win32(1..=u32::MAX))
+        ),
+        (FailureOperationV1::ReadControlFrame, AttemptObservationPhaseV1::Cleaning) => matches!(
+            event.native_code,
+            None | Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
+        ),
+        (FailureOperationV1::DeliverResponse, AttemptObservationPhaseV1::Cleaning) => matches!(
+            event.native_code,
+            Some(NativeFailureCodeV1::Win32(109 | 232 | 233))
+        ),
+        _ => false,
+    }
+}
+
 /// These are actual native injection points, not installed-product case rows.
 pub fn fault_selectors() -> Vec<memcordon_core::WindowsSealedFault> {
     use memcordon_core::WindowsSealedFault::*;
@@ -355,7 +405,19 @@ mod native {
             256 * 1024,
         )
         .map_err(|error| CiError::Message(error.to_string()))?;
-        let activation: serde_json::Value = serde_json::from_slice(&activated.stdout)?;
+        let _activation_stdout = crate::windows_readiness_adapter::publish_receipt(
+            &config.output_directory.join("policy-activation.stdout.bin"),
+            &activated.stdout,
+        )?;
+        let _activation_stderr = crate::windows_readiness_adapter::publish_receipt(
+            &config.output_directory.join("policy-activation.stderr.bin"),
+            &activated.stderr,
+        )?;
+        crate::command::require_successful_output("component policy activation", &activated)?;
+        let activation: serde_json::Value =
+            serde_json::from_slice(&activated.stdout).map_err(|error| {
+                CiError::Message(format!("successful component activation decode: {error}"))
+            })?;
         let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(&read(
             &suite.local_policy,
             256 * 1024,
@@ -365,8 +427,7 @@ mod native {
             serde_json::from_value(activation.get("registry").cloned().ok_or_else(|| {
                 CiError::Message("component activation omitted registry".into())
             })?)?;
-        if !activated.status.success()
-            || configured != registry
+        if configured != registry
             || activation.get("format").and_then(serde_json::Value::as_str)
                 != Some("memcordon.local-activation")
             || activation
@@ -1118,6 +1179,7 @@ mod native {
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| CiError::Message("component native frames absent".into()))?;
             let mut rejected = false;
+            let mut recovery_failure = None;
             for raw in frames {
                 let bytes: Vec<u8> = serde_json::from_value(raw.clone())?;
                 let response: memcordon_core::WindowsProviderResponseV3 =
@@ -1208,6 +1270,12 @@ mod native {
                     }))?,
                     record,
                 )?;
+                if let Err(error) = crate::command::require_successful_output(
+                    "terminal authority recovery",
+                    &output,
+                ) {
+                    recovery_failure = Some(error.to_string());
+                }
                 if output.status.success() || (fault==Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
                     &&output.status.code()==Some(1)) {
                     let recovered: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -1231,21 +1299,10 @@ mod native {
                         memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => rejection.terminal_receipt(),
                         _ => None,
                     };
-                    let selected_transport_original = fault.is_some_and(|selected| {
-                        use memcordon_core::WindowsSealedFault::*;
-                        matches!(selected, FrontendDisconnectedAfterAuthorization | FrontendKilledAfterAuthorization
-                            | ControlWorkerKilledAfterAuthorization | ControlServiceKilledAfterAuthorization)
-                            && matches!(&response, memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. }
-                                if rejection.provider_failure.as_ref().is_some_and(|failure|
-                                    matches!(&failure.original, memcordon_core::OriginalFailureV1::Observed { event }
-                                        if event.sequence > 0
-                                            && event.category == memcordon_core::FailureCategoryV1::Transport
-                                            && event.operation == memcordon_core::FailureOperationV1::ReadControlFrame
-                                            && event.code == memcordon_core::FailureCodeV1::ControlTransport
-                                            && event.observed_phase == memcordon_core::AttemptObservationPhaseV1::Monitoring
-                                            && event.safe_detail == (memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault { fault:selected })
-                                            && matches!(event.native_code, None | Some(memcordon_core::NativeFailureCodeV1::Win32(1..=u32::MAX))))))
-                    });
+                    let selected_transport_original = fault.is_some_and(|selected|
+                        matches!(&response, memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. }
+                            if rejection.provider_failure.as_ref().is_some_and(|failure|
+                                transport_injection_authority(failure, selected, &config.provider, attempt, request))));
                     if let Some(receipt) = receipt {
                         receipt.validate_for_attempt().map_err(|error| CiError::Message(error.into()))?;
                         if receipt.attempt_id == attempt && receipt.nonce == nonce && receipt.request_sha256 == request
@@ -1284,7 +1341,12 @@ mod native {
                 }
             }
             if !rejected {
-                return Err(CiError::Message("native injected fault lacks bound failure authority; natural/policy completion cannot substitute".into()));
+                return Err(CiError::Message(format!(
+                    "native injected fault lacks bound failure authority; natural/policy completion cannot substitute; recovery-context={}",
+                    recovery_failure
+                        .as_deref()
+                        .unwrap_or("no nonzero recovery command observed")
+                )));
             }
             record.collection = Ok(());
             record.behavior = Ok(());

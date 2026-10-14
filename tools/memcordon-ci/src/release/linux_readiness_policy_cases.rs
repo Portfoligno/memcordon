@@ -2652,34 +2652,5 @@ fn hold_admin_directory(path: &Path) -> Result<File> {
 }
 
 fn publish_caller_observation(path: &Path, bytes: &[u8], uid: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    rustix::fs::fchown(&file, Some(rustix::process::Uid::from_raw(uid)), None)
-        .map_err(|error| CiError::Message(error.to_string()))?;
-    file.sync_all()?;
-    let held = file.metadata()?;
-    let named = std::fs::symlink_metadata(path)?;
-    if held.uid() != uid
-        || held.mode() & 0o077 != 0
-        || held.nlink() != 1
-        || !named.is_file()
-        || (held.dev(), held.ino()) != (named.dev(), named.ino())
-        || read_named(path, bytes.len() as u64)? != bytes
-    {
-        return Err(CiError::Message(
-            "caller observation publication custody differs".into(),
-        ));
-    }
-    File::open(
-        path.parent()
-            .ok_or_else(|| CiError::Message("caller observation parent absent".into()))?,
-    )?
-    .sync_all()?;
-    Ok(())
+    crate::caller_observation::publish(path, bytes, uid).map_err(CiError::Message)
 }

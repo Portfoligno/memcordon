@@ -463,7 +463,45 @@ pub(crate) struct RetirementObservation {
     inner: Arc<Inner>,
     key: SlotKey,
 }
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetirementSlotObservation {
+    expected_index: usize,
+    expected_generation: u64,
+    ownership_before: u64,
+    ownership_after: u64,
+    generation_before: u64,
+    generation_after: u64,
+    state_before: String,
+    state_after: String,
+    pid: i32,
+    cleanup_errno: i32,
+    cancellation: bool,
+}
 impl RetirementObservation {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn diagnostic(&self) -> RetirementSlotObservation {
+        // Supplementary concurrent samples, not an atomic ownership/reap receipt.
+        let slot = &self.inner.slots[self.key.index];
+        let before = slot.state.load(Ordering::Acquire);
+        let pid = slot.pid.load(Ordering::Acquire);
+        let cleanup_errno = slot.cleanup_errno.load(Ordering::Acquire);
+        let cancellation = slot.cancellation.load(Ordering::Acquire);
+        let after = slot.state.load(Ordering::Acquire);
+        RetirementSlotObservation {
+            expected_index: self.key.index,
+            expected_generation: self.key.generation,
+            ownership_before: before,
+            ownership_after: after,
+            generation_before: before >> STATE_BITS,
+            generation_after: after >> STATE_BITS,
+            state_before: state_name(before).into(),
+            state_after: state_name(after).into(),
+            pid,
+            cleanup_errno,
+            cancellation,
+        }
+    }
     pub(crate) fn pending(&self) -> bool {
         let value = self.inner.slots[self.key.index]
             .state

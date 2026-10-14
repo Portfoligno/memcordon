@@ -267,6 +267,22 @@ fn disarm_timeout_has_nonblocking_drop_and_eventual_owned_reap() {
 }
 
 #[test]
+fn owned_stop_acknowledgment_requires_exact_stopped_identity_and_signal() {
+    use memcordon_platform::test_support::macos_owned_stop_observation as classify;
+    assert!(!classify(17, 0, 0, 0).unwrap());
+    assert!(classify(17, 17, libc::CLD_STOPPED, libc::SIGSTOP).unwrap());
+    for (pid, code, signal) in [
+        (18, libc::CLD_STOPPED, libc::SIGSTOP),
+        (17, libc::CLD_CONTINUED, libc::SIGCONT),
+        (17, libc::CLD_EXITED, 0),
+        (17, libc::CLD_STOPPED, libc::SIGTSTP),
+    ] {
+        assert!(classify(17, pid, code, signal).is_err());
+    }
+    assert!(classify(0, 0, 0, 0).is_err());
+}
+
+#[test]
 fn private_protocol_rejects_truncation_duplicates_and_wrong_binding() {
     let _runtime = native_runtime();
     let body = br#"{"version":2,"run":7,"sequence":0,"message":{"kind":"Ready"}}"#;

@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::record::WindowsAttemptRecordV1;
@@ -26,11 +26,37 @@ struct Snapshot {
 }
 
 struct Lane {
+    publisher_error: Arc<OnceLock<PublisherError>>,
     sender: SyncSender<Snapshot>,
     quarantined: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
     completion_signal: Arc<(Mutex<()>, Condvar)>,
     failure: Arc<Mutex<Option<memcordon_core::CausalEventV1>>>,
+}
+
+struct PublisherError {
+    detail: String,
+    truncated: bool,
+    event: memcordon_core::CausalEventV1,
+}
+
+fn quarantine_detail(lane: &Lane) -> String {
+    match lane.publisher_error.get() {
+        Some(error) => format!(
+            "native-code={:?}; detail-truncated={}; first-publisher-error={}",
+            error.event.native_code, error.truncated, error.detail
+        ),
+        None => {
+            "publisher-error=unobserved; timeout-or-pending-publication-remains-uncertain".into()
+        }
+    }
+}
+
+fn quarantined_error(lane: &Lane, attempt_id: &str) -> String {
+    format!(
+        "attempt writer is quarantined; attempt={attempt_id}; {}",
+        quarantine_detail(lane)
+    )
 }
 
 static LANES: LazyLock<Mutex<BTreeMap<String, Arc<Lane>>>> =
@@ -64,6 +90,8 @@ fn new_lane(
     let worker_completion = Arc::clone(&completion_signal);
     let failure = Arc::new(Mutex::new(None));
     let worker_failure = Arc::clone(&failure);
+    let publisher_error = Arc::new(OnceLock::new());
+    let worker_publisher_error = Arc::clone(&publisher_error);
     std::thread::Builder::new()
         .name("memcordon-attempt-writer".to_owned())
         .spawn(move || {
@@ -76,7 +104,7 @@ fn new_lane(
                     memcordon_core::AttemptObservationPhaseV1::Terminalizing,
                 );
                 let result = publish(&mut next.record, next.expected_revision);
-                if result.is_err() {
+                if let Err(error) = &result {
                     let mut observations = memcordon_core::WindowsCausalDiagnosticsV1::default();
                     super::diagnostics::merge_into(&mut observations);
                     let event = match observations.original {
@@ -98,6 +126,17 @@ fn new_lane(
                             terminalization_reference: None,
                         },
                     };
+                    if worker_publisher_error.get().is_none() {
+                        let mut end = error.len().min(2048);
+                        while !error.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let _ = worker_publisher_error.set(PublisherError {
+                            detail: error[..end].to_owned(),
+                            truncated: end != error.len(),
+                            event: event.clone(),
+                        });
+                    }
                     if let Ok(mut failure) = worker_failure.lock() {
                         *failure = Some(event);
                     }
@@ -121,6 +160,7 @@ fn new_lane(
         pending,
         completion_signal,
         failure,
+        publisher_error,
     });
     Ok(lane)
 }
@@ -171,6 +211,18 @@ pub(super) fn wait_for_pending(attempt_id: &str) -> Result<(), String> {
     let Some(lane) = lane else {
         return Ok(());
     };
+    wait_for_lane(&lane, attempt_id)
+}
+
+fn wait_for_lane(lane: &Lane, attempt_id: &str) -> Result<(), String> {
+    wait_for_lane_observed(lane, attempt_id, || {})
+}
+
+fn wait_for_lane_observed(
+    lane: &Lane,
+    attempt_id: &str,
+    mut pending_observed: impl FnMut(),
+) -> Result<(), String> {
     let guard = lane
         .completion_signal
         .0
@@ -180,7 +232,12 @@ pub(super) fn wait_for_pending(attempt_id: &str) -> Result<(), String> {
         .completion_signal
         .1
         .wait_timeout_while(guard, COMMIT_OBSERVATION_DEADLINE, |_| {
-            lane.pending.load(Ordering::Acquire) != 0 && !lane.quarantined.load(Ordering::Acquire)
+            let pending = lane.pending.load(Ordering::Acquire) != 0
+                && !lane.quarantined.load(Ordering::Acquire);
+            if pending {
+                pending_observed();
+            }
+            pending
         })
         .map_err(|_| "attempt writer completion unavailable".to_owned())?;
     if timeout.timed_out() || lane.quarantined.load(Ordering::Acquire) {
@@ -188,7 +245,10 @@ pub(super) fn wait_for_pending(attempt_id: &str) -> Result<(), String> {
         if let Some(event) = take_failure(&lane) {
             super::diagnostics::capture(event);
         }
-        return Err("attempt cleanup publication is unconfirmed".to_owned());
+        return Err(format!(
+            "attempt cleanup publication is unconfirmed; attempt={attempt_id}; {}",
+            quarantine_detail(&lane)
+        ));
     }
     Ok(())
 }
@@ -207,7 +267,7 @@ fn try_submit(lane: &Lane, snapshot: Snapshot) -> Result<(), String> {
         .try_lock()
         .map_err(|_| "attempt writer completion is busy".to_owned())?;
     if lane.quarantined.load(Ordering::Acquire) {
-        return Err("attempt writer is quarantined".to_owned());
+        return Err(quarantined_error(lane, &snapshot.record.attempt_id));
     }
     lane.pending.fetch_add(1, Ordering::AcqRel);
     lane.sender.try_send(snapshot).map_err(|error| {
@@ -223,7 +283,7 @@ fn try_submit(lane: &Lane, snapshot: Snapshot) -> Result<(), String> {
 pub(super) fn commit(record: &mut WindowsAttemptRecordV1) -> Result<(), String> {
     let lane = lane(record)?;
     if lane.quarantined.load(Ordering::Acquire) {
-        return Err("attempt writer is quarantined".to_owned());
+        return Err(quarantined_error(&lane, &record.attempt_id));
     }
     let expected_revision = record.record_revision;
     let mut snapshot = record.clone();
@@ -262,7 +322,7 @@ pub(super) fn commit(record: &mut WindowsAttemptRecordV1) -> Result<(), String> 
 pub(super) fn try_commit_diagnostics(record: &mut WindowsAttemptRecordV1) -> Result<(), String> {
     let lane = lane(record)?;
     if lane.quarantined.load(Ordering::Acquire) {
-        return Err("attempt writer is quarantined".to_owned());
+        return Err(quarantined_error(&lane, &record.attempt_id));
     }
     let mut snapshot = record.clone();
     snapshot.record_revision = record
@@ -288,11 +348,14 @@ pub(super) fn ensure_no_quarantined_writer() -> Result<(), String> {
     let lanes = LANES
         .try_lock()
         .map_err(|_| "attempt writer registry unavailable".to_owned())?;
-    if lanes
-        .values()
-        .any(|lane| lane.quarantined.load(Ordering::Acquire))
+    if let Some((attempt_id, lane)) = lanes
+        .iter()
+        .find(|(_, lane)| lane.quarantined.load(Ordering::Acquire))
     {
-        return Err("attempt writer publication remains unconfirmed".to_owned());
+        return Err(format!(
+            "attempt writer publication remains unconfirmed; attempt={attempt_id}; {}",
+            quarantine_detail(lane)
+        ));
     }
     Ok(())
 }

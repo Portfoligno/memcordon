@@ -4036,12 +4036,9 @@ pub fn completed_case_base(
         attempt_id: Some(admission.attempt_id.as_str().into()),
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
-        attempt_nonce: Some(
-            serde_json::to_value(admission.admission_nonce)?
-                .as_str()
-                .ok_or_else(|| CiError::Message("completed nonce encoding differs".into()))?
-                .into(),
-        ),
+        attempt_nonce: Some(crate::consumer_readiness_ledger::admission_nonce_text(
+            admission.admission_nonce,
+        )),
         held_processes: collection.held_processes.clone(),
         frontend_status: collection.frontend_status,
         origin,
@@ -4452,12 +4449,9 @@ fn normalize_completed_case(
         attempt_id: Some(admission.attempt_id.as_str().into()),
         root_pid: Some(execution.target.pid),
         root_birth: Some(execution.target.birth),
-        attempt_nonce: Some(
-            serde_json::to_value(admission.admission_nonce)?
-                .as_str()
-                .ok_or_else(|| CiError::Message("actual admission nonce encoding differs".into()))?
-                .into(),
-        ),
+        attempt_nonce: Some(crate::consumer_readiness_ledger::admission_nonce_text(
+            admission.admission_nonce,
+        )),
         held_processes: collection.held_processes.clone(),
         frontend_status: collection.frontend_status,
         origin: if endpoint_mismatch {
@@ -5056,6 +5050,8 @@ fn normalize_completed_case(
             role: "build-request".into(),
             path: format!("{prefix}/contract.json"),
         });
+        crate::retained_build_source::prepare_locked_source_tree(&input.artifact_root.join(prefix))
+            .map_err(CiError::Message)?;
         for relative in [
             "Cargo.toml",
             "Cargo.lock",
@@ -7674,9 +7670,12 @@ impl InstalledMixedLaunch {
             ..
         } = &result.runtime.outcome
         else {
-            return Err(CiError::Message(
-                "executed collection cannot substitute a rejected or indeterminate carrier".into(),
-            ));
+            return Err(CiError::Message(format!(
+                "executed collection cannot substitute a rejected or indeterminate carrier; {}",
+                crate::mixed_collection_diagnostics::refused_carrier_detail(
+                    &result.runtime.outcome
+                )
+            )));
         };
         if admission != &observer.observation.admission
             || provider != &observer.observation.provider

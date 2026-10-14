@@ -3,6 +3,617 @@ use std::os::windows::fs::MetadataExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[test]
+fn protected_runtime_descriptor_rejects_unprotected_and_malformed_authority() {
+    use memcordon_platform::{
+        protected_runtime_descriptor_for_test, runtime_security_descriptor_bounds_for_test,
+    };
+    fn encoded(sddl: &str) -> Vec<u8> {
+        struct NativeDescriptor(*mut c_void);
+        impl Drop for NativeDescriptor {
+            fn drop(&mut self) {
+                // SAFETY: native conversion transfers this one LocalAlloc allocation.
+                unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+            }
+        }
+        let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut descriptor = ptr::null_mut();
+        let mut length = 0;
+        // Negative binary fixtures deliberately bypass the independent text
+        // policy constructor, which correctly forbids absent/null DACLs.
+        // SAFETY: initialized native outputs and live NUL-terminated input.
+        let converted = unsafe {
+            windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), windows_sys::Win32::Security::Authorization::SDDL_REVISION_1, &raw mut descriptor, &raw mut length)
+        };
+        let error = std::io::Error::last_os_error();
+        let owned = NativeDescriptor(descriptor);
+        assert_ne!(
+            converted,
+            0,
+            "native fixture {sddl:?}: raw-os-error={:?}; {error}",
+            error.raw_os_error()
+        );
+        assert!(!owned.0.is_null());
+        let length = usize::try_from(length).unwrap();
+        assert!(
+            length
+                >= std::mem::size_of::<windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE>(
+                )
+                && length <= 64 * 1024
+        );
+        // SAFETY: native conversion returned this complete owned self-relative extent.
+        unsafe { std::slice::from_raw_parts(owned.0.cast::<u8>(), length) }.to_vec()
+    }
+    fn header(bytes: &[u8]) -> windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE {
+        assert!(
+            bytes.len()
+                >= std::mem::size_of::<windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE>(
+                )
+        );
+        // SAFETY: complete header extent checked; no alignment assumption.
+        unsafe { ptr::read_unaligned(bytes.as_ptr().cast()) }
+    }
+    let protected = encoded("O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GR;;;RC)");
+    protected_runtime_descriptor_for_test(&protected).unwrap();
+    let optional_omitted = encoded("O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GR;;;RC)");
+    let omitted = header(&optional_omitted);
+    assert_eq!(omitted.Group, 0);
+    assert_eq!(omitted.Sacl, 0);
+    protected_runtime_descriptor_for_test(&optional_omitted).unwrap();
+    let mut malformed_optional = optional_omitted;
+    let group_offset = std::mem::offset_of!(
+        windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE,
+        Group
+    );
+    let outside = u32::try_from(malformed_optional.len())
+        .unwrap()
+        .checked_add(u32::try_from(std::mem::align_of::<u32>()).unwrap())
+        .unwrap();
+    malformed_optional[group_offset..group_offset + std::mem::size_of::<u32>()]
+        .copy_from_slice(&outside.to_ne_bytes());
+    assert!(runtime_security_descriptor_bounds_for_test(&malformed_optional).is_err());
+    for (sddl, present) in [("O:BAG:BA", false), ("O:BAG:BAD:NO_ACCESS_CONTROL", true)] {
+        let bytes = encoded(sddl);
+        let descriptor = header(&bytes);
+        assert_eq!(
+            descriptor.Control & windows_sys::Win32::Security::SE_DACL_PRESENT != 0,
+            present
+        );
+        assert_eq!(descriptor.Dacl, 0);
+        assert!(
+            protected_runtime_descriptor_for_test(&bytes)
+                .unwrap_err()
+                .contains("ownership or DACL is not protected")
+        );
+    }
+    for sddl in [
+        "O:WDG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)",
+        "O:BAG:BAD:P(A;;FA;;;BA)(A;;GW;;;WD)",
+        "O:BAG:BAD:P(D;;GW;;;WD)(A;;FA;;;BA)",
+    ] {
+        assert!(
+            protected_runtime_descriptor_for_test(&encoded(sddl)).is_err(),
+            "{sddl}"
+        );
+    }
+    assert!(
+        runtime_security_descriptor_bounds_for_test(
+            &protected[..std::mem::size_of::<
+                windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE,
+            >() - 1]
+        )
+        .is_err()
+    );
+    let mut malformed = protected.clone();
+    // SAFETY: complete self-relative header is present; copied without alignment assumptions.
+    let header = unsafe {
+        std::ptr::read_unaligned(
+            malformed
+                .as_ptr()
+                .cast::<windows_sys::Win32::Security::SECURITY_DESCRIPTOR_RELATIVE>(),
+        )
+    };
+    let acl_offset = usize::try_from(header.Dacl).unwrap();
+    let ace_offset = acl_offset + std::mem::size_of::<windows_sys::Win32::Security::ACL>();
+    let size_offset =
+        ace_offset + std::mem::offset_of!(windows_sys::Win32::Security::ACE_HEADER, AceSize);
+    malformed[size_offset..size_offset + std::mem::size_of::<u16>()]
+        .copy_from_slice(&u16::MAX.to_ne_bytes());
+    assert!(runtime_security_descriptor_bounds_for_test(&malformed).is_err());
+    malformed = protected;
+    let sid_count = ace_offset
+        + std::mem::offset_of!(windows_sys::Win32::Security::ACCESS_ALLOWED_ACE, SidStart)
+        + std::mem::offset_of!(windows_sys::Win32::Security::SID, SubAuthorityCount);
+    malformed[sid_count] = u8::MAX;
+    assert!(runtime_security_descriptor_bounds_for_test(&malformed).is_err());
+}
+
+#[path = "../support/windows_cold_runtime.rs"]
+mod cold_runtime;
+use cold_runtime::{ColdRuntimeStage, cold_runtime_stage_record, write_cold_runtime_stage};
+
+fn decode_cold_runtime_stage(bytes: &[u8]) -> Result<ColdRuntimeStage, String> {
+    let Some((&revision, rest)) = bytes.split_first() else {
+        return Err("missing progress record".into());
+    };
+    if revision != 1 {
+        return Err("unknown progress revision".into());
+    }
+    let Some((&stage, trailing)) = rest.split_first() else {
+        return Err("truncated progress record".into());
+    };
+    if !trailing.is_empty() {
+        return Err("excessive progress record".into());
+    }
+    match stage {
+        0 => Ok(ColdRuntimeStage::NotEntered),
+        1 => Ok(ColdRuntimeStage::Entered),
+        2 => Ok(ColdRuntimeStage::RestrictedTokenConfirmed),
+        3 => Ok(ColdRuntimeStage::BeforeRuntimeOpen),
+        4 => Ok(ColdRuntimeStage::RuntimeOpened),
+        5 => Ok(ColdRuntimeStage::BytesVerified),
+        6 => Ok(ColdRuntimeStage::HashVerified),
+        _ => Err("unknown progress stage".into()),
+    }
+}
+
+fn read_cold_runtime_stage(file: &mut std::fs::File) -> Result<ColdRuntimeStage, String> {
+    use std::io::{Read, Seek};
+    file.rewind()
+        .map_err(|error| format!("progress seek failed: {error}"))?;
+    let bound = cold_runtime_stage_record(ColdRuntimeStage::NotEntered).len() + 1;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(bound).unwrap())
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("progress read failed: {error}"))?;
+    decode_cold_runtime_stage(&bytes)
+}
+
+fn cold_runtime_child_completed(status: u32, stage: &Result<ColdRuntimeStage, String>) -> bool {
+    status == 37 && stage.as_ref() == Ok(&ColdRuntimeStage::HashVerified)
+}
+
+fn cold_fixture_import_inventory(file: &mut std::fs::File) -> String {
+    use std::io::{Read, Seek};
+    const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_IMPORT_NAMES: usize = 24;
+    const MAX_NAME_BYTES: usize = 96;
+    fn bounded(value: &str, maximum: usize) -> (&str, bool) {
+        let mut end = value.len().min(maximum);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&value[..end], end != value.len())
+    }
+    let inspected = (|| -> Result<String, String> {
+        file.rewind().map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if u64::try_from(bytes.len()).unwrap() > MAX_IMAGE_BYTES {
+            return Err("staged fixture exceeds PE inspection bound".into());
+        }
+        let imports = memcordon_core::parse_windows_pe_imports(&bytes)?;
+        let names = |values: &[String]| {
+            let selected = values
+                .iter()
+                .take(MAX_IMPORT_NAMES)
+                .map(|name| {
+                    let (name, truncated) = bounded(name, MAX_NAME_BYTES);
+                    format!("{name:?}(truncated={truncated})")
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "count={} omitted={} names=[{}]",
+                values.len(),
+                values.len().saturating_sub(selected.len()),
+                selected.join(", ")
+            )
+        };
+        Ok(format!(
+            "machine={:#06x}; image-bytes={}; normal: {}; delayed: {}",
+            imports.machine,
+            bytes.len(),
+            names(&imports.normal),
+            names(&imports.delayed)
+        ))
+    })();
+    match inspected {
+        Ok(detail) => detail,
+        Err(error) => {
+            let (error, truncated) = bounded(&error, MAX_NAME_BYTES);
+            format!("inspection-unavailable={error:?}; detail-truncated={truncated}")
+        }
+    }
+}
+
+#[test]
+fn cold_runtime_progress_is_bounded_and_cannot_replace_child_completion() {
+    for stage in [
+        ColdRuntimeStage::NotEntered,
+        ColdRuntimeStage::Entered,
+        ColdRuntimeStage::RestrictedTokenConfirmed,
+        ColdRuntimeStage::BeforeRuntimeOpen,
+        ColdRuntimeStage::RuntimeOpened,
+        ColdRuntimeStage::BytesVerified,
+        ColdRuntimeStage::HashVerified,
+    ] {
+        let decoded = decode_cold_runtime_stage(&cold_runtime_stage_record(stage));
+        assert_eq!(decoded, Ok(stage));
+        assert!(!cold_runtime_child_completed(0, &decoded));
+        assert!(!cold_runtime_child_completed(0xc000_0135, &decoded));
+        assert_eq!(
+            cold_runtime_child_completed(37, &decoded),
+            stage == ColdRuntimeStage::HashVerified
+        );
+    }
+    for bytes in [vec![], vec![1], vec![0, 0], vec![1, u8::MAX], vec![1, 6, 0]] {
+        let decoded = decode_cold_runtime_stage(&bytes);
+        assert!(decoded.is_err());
+        assert!(!cold_runtime_child_completed(37, &decoded));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("progress");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .access_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA
+                | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+        )
+        .open(&path)
+        .unwrap();
+    write_cold_runtime_stage(&mut writer, ColdRuntimeStage::BeforeRuntimeOpen);
+    drop(writer);
+    assert_eq!(
+        read_cold_runtime_stage(&mut file),
+        Ok(ColdRuntimeStage::BeforeRuntimeOpen)
+    );
+}
+
+#[test]
+fn protected_runtime_open_succeeds_in_fresh_restricted_primary_child() {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let token = crate::windows::token::restricted_current_primary().unwrap();
+    let user = crate::windows::token::token_user_sid(token.raw()).unwrap();
+    let runtime = root.path().join("cold-runtime.bin");
+    std::fs::write(&runtime, b"cold restricted runtime security descriptor").unwrap();
+    let child = root.path().join("cold-runtime-child.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_memcordon-sealed-test-fixture"), &child).unwrap();
+    let mut staged_image = std::fs::File::open(&child).unwrap();
+    let progress_path = root.path().join("cold-runtime.progress");
+    let mut progress = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&progress_path)
+        .unwrap();
+    progress
+        .write_all(&cold_runtime_stage_record(ColdRuntimeStage::NotEntered))
+        .unwrap();
+    progress.sync_all().unwrap();
+    // Only this existing diagnostic file gains minimal data-write access. The
+    // directory, executable and runtime keep the original read/execute policy.
+    SecurityDescriptor::from_sddl(&format!(
+        "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x80100002;;;{user})(A;;0x80100002;;;RC)"
+    ))
+    .unwrap()
+    .apply_to_path(&progress_path)
+    .unwrap();
+    let protection = SecurityDescriptor::from_sddl(&format!(
+        "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;{user})(A;;GRGX;;;RC)"
+    ))
+    .unwrap();
+    protection.apply_to_path(&runtime).unwrap();
+    protection.apply_to_path(&child).unwrap();
+    protection.apply_to_path(root.path()).unwrap();
+    let argv = [
+        child.as_os_str().to_os_string(),
+        "cold-runtime-probe".into(),
+    ];
+    let encoded: Vec<Vec<u16>> = argv.iter().map(|arg| arg.encode_wide().collect()).collect();
+    let mut command = memcordon_core::encode_windows_command_line(&encoded);
+    command.push(0);
+    let application = child
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let cwd = root
+        .path()
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap(),
+        ..STARTUPINFOW::default()
+    };
+    let mut created = PROCESS_INFORMATION::default();
+    // SAFETY: typed native argv, held restricted primary token, no inherited
+    // handles or custom environment; all native storage lives through creation.
+    assert_ne!(
+        unsafe {
+            memcordon_windows_launch_core::create_process_as_user_native(
+                token.raw(),
+                application.as_ptr(),
+                command.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                0,
+                ptr::null(),
+                cwd.as_ptr(),
+                &startup,
+                &raw mut created,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let process = crate::windows::pipe::OwnedHandle::new(created.hProcess).unwrap();
+    let thread = crate::windows::pipe::OwnedHandle::new(created.hThread).unwrap();
+    // SAFETY: exact held child process with a bounded test wait.
+    let waited = unsafe { WaitForSingleObject(process.raw(), 30_000) };
+    let wait_error = (waited == windows_sys::Win32::Foundation::WAIT_FAILED)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    let retired = if waited != WAIT_OBJECT_0 {
+        // SAFETY: terminate only this owned child before reporting timeout.
+        unsafe {
+            TerminateProcess(process.raw(), 125);
+            WaitForSingleObject(process.raw(), 30_000) == WAIT_OBJECT_0
+        }
+    } else {
+        true
+    };
+    let mut status = 0;
+    let observed_status = unsafe { GetExitCodeProcess(process.raw(), &raw mut status) };
+    let status_error = std::io::Error::last_os_error();
+    let stage = if retired {
+        read_cold_runtime_stage(&mut progress)
+    } else {
+        Err("progress not read: held child retirement unconfirmed".into())
+    };
+    let imports = if waited != WAIT_OBJECT_0
+        || observed_status == 0
+        || !cold_runtime_child_completed(status, &stage)
+    {
+        cold_fixture_import_inventory(&mut staged_image)
+    } else {
+        "not inspected: child completed".into()
+    };
+    assert_eq!(
+        waited, WAIT_OBJECT_0,
+        "cold restricted child wait={waited}; raw-os-error={wait_error:?}; status={status} ({status:#010x}); last-stage={stage:?}; staged-imports={imports}"
+    );
+    assert_ne!(
+        observed_status,
+        0,
+        "cold child exit query: raw-os-error={:?}; last-stage={stage:?}; staged-imports={imports}",
+        status_error.raw_os_error()
+    );
+    assert!(
+        cold_runtime_child_completed(status, &stage),
+        "cold restricted child fixture did not complete: status={status} ({status:#010x}); last-stage={stage:?}; staged-imports={imports}"
+    );
+    drop(thread);
+}
+
+#[test]
+#[ignore = "fresh restricted-primary child only"]
+fn cold_restricted_runtime_child_fixture() {
+    cold_runtime::run_child();
+}
+
+#[test]
+fn cold_runtime_fixture_mode_rejects_missing_unknown_and_extra_arguments() {
+    use std::ffi::OsString;
+    assert!(
+        cold_runtime::validate_cold_runtime_mode(&[OsString::from("cold-runtime-probe")]).is_ok()
+    );
+    for arguments in [
+        vec![],
+        vec![OsString::from("unknown")],
+        vec![
+            OsString::from("cold-runtime-probe"),
+            OsString::from("extra"),
+        ],
+    ] {
+        assert!(cold_runtime::validate_cold_runtime_mode(&arguments).is_err());
+    }
+}
+
+#[test]
+fn protected_runtime_open_rejects_reparses_without_reading_ancestor_attributes() {
+    use memcordon_platform::open_protected_runtime_for_test;
+    use std::io::Read;
+    use std::os::windows::ffi::OsStrExt;
+
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: restores only this test thread's impersonation state.
+            assert_ne!(unsafe { RevertToSelf() }, 0);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = crate::windows::token::restricted_current_primary().unwrap();
+    let user = crate::windows::token::token_user_sid(source.raw()).unwrap();
+    let parent = root.path().join("restricted-ancestor");
+    std::fs::create_dir(&parent).unwrap();
+    let file = parent.join("runtime-界.bin");
+    std::fs::write(&file, b"held protected runtime").unwrap();
+    let denied = parent.join("denied-runtime.bin");
+    std::fs::write(&denied, b"must not be readable").unwrap();
+    SecurityDescriptor::from_sddl("O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)")
+        .unwrap()
+        .apply_to_path(&denied)
+        .unwrap();
+    SecurityDescriptor::from_sddl(&format!(
+        "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GR;;;{user})(A;;GR;;;RC)"
+    ))
+    .unwrap()
+    .apply_to_path(&file)
+    .unwrap();
+    // The final file has its own protected DACL, so this ancestor denial does
+    // not become a denial on the file. Traversal remains permitted.
+    SecurityDescriptor::from_sddl(&format!(
+        "O:BAG:BAD:P(D;;0x80;;;RC)(A;;FA;;;BA)(A;;FA;;;SY)(A;;GX;;;{user})(A;;GX;;;RC)"
+    ))
+    .unwrap()
+    .apply_to_path(&parent)
+    .unwrap();
+    let leaf_link = root.path().join("runtime-link");
+    std::os::windows::fs::symlink_file(&file, &leaf_link).unwrap();
+    let parent_link = root.path().join("parent-link");
+    std::os::windows::fs::symlink_dir(&parent, &parent_link).unwrap();
+    assert!(
+        open_protected_runtime_for_test(&leaf_link)
+            .unwrap_err()
+            .contains("reparse-encountered=true")
+    );
+    assert!(
+        open_protected_runtime_for_test(&parent_link.join("runtime-界.bin"))
+            .unwrap_err()
+            .contains("reparse-encountered=true")
+    );
+    for invalid in [
+        "relative.bin",
+        "C:relative.bin",
+        "C:\\",
+        "C:\\a\\..\\b",
+        "C:\\a\\.\\b",
+        "C:\\a:stream",
+        "\\\\server\\share\\file",
+        "\\\\.\\C:\\file",
+        "C:\\nul\0file",
+    ] {
+        assert!(open_protected_runtime_for_test(std::path::Path::new(invalid)).is_err());
+    }
+    let verbatim = std::fs::canonicalize(&file).unwrap();
+    let mut token = ptr::null_mut();
+    // SAFETY: live source token, private impersonation output owned below.
+    assert_ne!(
+        unsafe {
+            DuplicateTokenEx(
+                source.raw(),
+                TOKEN_ALL_ACCESS,
+                ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &raw mut token,
+            )
+        },
+        0
+    );
+    let token = crate::windows::pipe::OwnedHandle::new(token).unwrap();
+    // SAFETY: null thread selects only the current test thread.
+    assert_ne!(unsafe { SetThreadToken(ptr::null(), token.raw()) }, 0);
+    let revert = Revert;
+    let wide = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: NUL-terminated fixture path is live through this query.
+    assert_eq!(
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(wide.as_ptr()) },
+        windows_sys::Win32::Storage::FileSystem::INVALID_FILE_ATTRIBUTES
+    );
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(5));
+    let mut held = open_protected_runtime_for_test(&file).unwrap();
+    let mut bytes = Vec::new();
+    held.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"held protected runtime");
+    // The exact same restricted device-map lookup must reach filesystem
+    // reparse refusal, rather than satisfy these assertions with access denial.
+    for path in [&leaf_link, &parent_link.join("runtime-界.bin")] {
+        assert!(
+            open_protected_runtime_for_test(path)
+                .unwrap_err()
+                .contains("reparse-encountered=true")
+        );
+    }
+    let denial = open_protected_runtime_for_test(&denied).unwrap_err();
+    assert!(denial.contains("NtCreateFile(protected runtime"));
+    assert!(denial.contains("raw-os-error=5"));
+    assert!(denial.contains("reparse-encountered=false"));
+    assert!(open_protected_runtime_for_test(&verbatim).is_ok());
+    drop(held);
+    drop(revert);
+}
+
+#[test]
+fn runtime_drive_target_uses_exact_counted_native_volume_name() {
+    use memcordon_platform::direct_runtime_volume_target_for_test;
+    fn bytes(units: &[u16]) -> u16 {
+        u16::try_from(units.len() * std::mem::size_of::<u16>()).unwrap()
+    }
+    let target = "\\Device\\HarddiskVolume123"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct_runtime_volume_target_for_test(&target, bytes(&target), bytes(&target)).unwrap(),
+        target
+    );
+    let mut stale = target.clone();
+    stale.extend("unconsumed suffix".encode_utf16());
+    assert_eq!(
+        direct_runtime_volume_target_for_test(&stale, bytes(&target), bytes(&stale)).unwrap(),
+        target
+    );
+    for malformed in [
+        "",
+        "\\Device\\HarddiskVolume",
+        "\\Device\\HarddiskVolume12x",
+        "\\Device\\HarddiskVolume1\\path",
+        "\\??\\C:",
+        "\\Device\\Mup\\server",
+        "\\Device\\HarddiskVolume1\0",
+    ] {
+        let units = malformed.encode_utf16().collect::<Vec<_>>();
+        assert!(
+            direct_runtime_volume_target_for_test(&units, bytes(&units), bytes(&units)).is_err()
+        );
+    }
+    assert!(
+        direct_runtime_volume_target_for_test(&target, bytes(&target) - 1, bytes(&target)).is_err()
+    );
+    assert!(
+        direct_runtime_volume_target_for_test(&target, bytes(&target), bytes(&target) - 1).is_err()
+    );
+    assert!(
+        direct_runtime_volume_target_for_test(
+            &target,
+            bytes(&target),
+            bytes(&target) + u16::try_from(std::mem::size_of::<u16>()).unwrap()
+        )
+        .is_err()
+    );
+    assert!(
+        direct_runtime_volume_target_for_test(
+            &target,
+            bytes(&target) + u16::try_from(std::mem::size_of::<u16>()).unwrap(),
+            bytes(&target)
+        )
+        .is_err()
+    );
+}
+
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetLastError,
     WAIT_OBJECT_0,
@@ -4075,7 +4686,7 @@ fn target_desktop_bootstrap_peer_exit_diagnostic_preserves_operation_and_status(
             4,
             0xED14_0000,
         );
-    assert_eq!(native_code, Some(0xED14_0000_u32 as i32));
+    assert_eq!(native_code, None, "held peer exit is not a Win32 API error");
     assert!(detail.contains("operation=started-read"));
     assert!(detail.contains("segment=length"));
     assert!(detail.contains("requested=4"));

@@ -90,6 +90,9 @@ fn run_recovery_component(lost_terminal: bool) {
                 .try_into()
                 .unwrap(),
         );
+    if !lost_terminal {
+        crate::native_writable_mounts::writable_submounts_survive_namespace_reap(work);
+    }
     let hex = |bytes: &[u8]| {
         bytes
             .iter()
