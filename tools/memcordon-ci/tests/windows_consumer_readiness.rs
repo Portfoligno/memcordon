@@ -2,8 +2,34 @@ use memcordon_ci::windows_consumer_readiness::descriptor::{
     CHURN_CREATIONS, CHURN_LIVE, Case, Descriptor, Toolchain,
 };
 use memcordon_ci::windows_consumer_readiness::{
-    CaseAssessment, SuiteInput, accepted, positive_keys, validate_suite,
+    CaseAssessment, SuiteInput, accepted, check_positive_barrier_result, positive_keys,
+    validate_suite,
 };
+
+#[test]
+fn completed_restricted_launch_failure_cannot_wait_for_a_positive_fixture() {
+    let bytes = include_bytes!("fixtures/windows_restricted_launch_failure.json");
+    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
+    let provider = &result.provider_association.as_ref().unwrap().provider;
+    let failure = check_positive_barrier_result(bytes, provider)
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("positive fixture launch already failed"));
+    assert!(failure.contains("MCSPAWN-FAILED"));
+    assert!(failure.contains("0xC0000142"));
+    assert!(failure.contains("wrapper-status=125"));
+    let mut foreign = provider.clone();
+    foreign.generation = memcordon_core::BoundedText::new("foreign-generation").unwrap();
+    assert!(
+        check_positive_barrier_result(bytes, &foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("provider binding")
+    );
+    assert!(check_positive_barrier_result(&bytes[..bytes.len() / 2], provider).is_err());
+    let unbound = include_bytes!("fixtures/private_worker_loss_result.json");
+    assert!(check_positive_barrier_result(unbound, provider).is_err());
+}
 
 fn descriptor() -> Descriptor {
     let root = std::env::temp_dir().join("memcordon-readiness-input-oracle");
@@ -43,6 +69,67 @@ fn descriptor() -> Descriptor {
             loader_source: root.join("loader.rs"),
             target: "x86_64-pc-windows-msvc".into(),
         }),
+    }
+}
+
+#[test]
+fn separate_loader_command_selects_only_the_restricted_envelope_route() {
+    use memcordon_ci::windows_consumer_readiness::{
+        CaseInput, CaseKey, TokenObservation, support_loader_command,
+    };
+    let root = std::env::temp_dir().join("support-loader-argv-oracle");
+    let mut descriptor = descriptor();
+    descriptor.case = Case::Envelope;
+    let mut case = CaseInput {
+        key: CaseKey {
+            family: "W-ENVELOPE".into(),
+            scenario: "restricted".into(),
+        },
+        descriptor,
+        descriptor_path: root.join("input.json"),
+        workload_contract: root.join("contract.json"),
+        expected_token: TokenObservation {
+            user_sid: vec![1],
+            restricted: true,
+            integrity_rid: 12288,
+            elevated: true,
+            restricting_sids: vec![vec![2]],
+        },
+    };
+    let build = |case: &CaseInput| {
+        support_loader_command(
+            &root.join("measured-cli.exe"),
+            &root.join("measured-wrapper.exe"),
+            &root,
+            &root.join("result.json"),
+            case,
+            &root.join("selection.json"),
+            &root.join("observation.json"),
+        )
+    };
+    let command = build(&case).unwrap().materialize().unwrap();
+    let args: Vec<_> = command.get_args().map(std::ffi::OsStr::to_owned).collect();
+    assert_eq!(command.get_program(), root.join("measured-wrapper.exe"));
+    assert!(args.starts_with(&[
+        "consumer-readiness-windows".into(),
+        "restricted-frontend".into(),
+        root.join("measured-cli.exe").into_os_string(),
+        "__windows-loader-diagnostic".into(),
+        root.join("selection.json").into_os_string(),
+        root.join("observation.json").into_os_string()
+    ]));
+    assert!(!args.iter().any(|arg| arg == "__windows-certification"));
+    for field in ["scenario", "restricted", "workload", "arguments"] {
+        let original = case.clone();
+        match field {
+            "scenario" => case.key.scenario = "ordinary".into(),
+            "restricted" => case.expected_token.restricted = false,
+            "workload" => case.descriptor.case = Case::Churn,
+            "arguments" => case.descriptor.arguments.push("foreign".into()),
+            _ => unreachable!(),
+        }
+        assert!(build(&case).is_err(), "accepted {field}");
+        case = original;
     }
 }
 

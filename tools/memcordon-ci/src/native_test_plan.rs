@@ -7,6 +7,28 @@ const STANDARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
 const DESKTOP_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(40 * 60);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAllocation {
+    pub layout: crate::performance_plan::Layout,
+    pub product_jobs: usize,
+    pub native_jobs: usize,
+}
+
+/// Reserve one worker for the selected product while prioritizing the broader
+/// native test graph, within the existing four-worker admission cap.
+pub fn build_allocation(available: usize) -> BuildAllocation {
+    let workers = available.clamp(1, 4);
+    BuildAllocation {
+        layout: if workers == 1 {
+            crate::performance_plan::Layout::Serial
+        } else {
+            crate::performance_plan::Layout::Parallel
+        },
+        product_jobs: 1,
+        native_jobs: workers.saturating_sub(1).max(1),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeTestCommand {
     pub arguments: Vec<&'static str>,

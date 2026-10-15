@@ -108,6 +108,7 @@ pub fn rejection() -> WindowsProviderRejectionV2 {
         schema_version: 2,
         workload_admission: None,
         provider_failure: Some(diagnostic),
+        guardian_causal_receipt: None,
         code: "MCSEALED-WINDOWS-GUARDIAN-LOSS".into(),
         phase: BoundarySetupPhase::Monitoring,
         detail: "guardian exited while the target was released".into(),

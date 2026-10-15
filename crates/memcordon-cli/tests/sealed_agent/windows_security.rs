@@ -6471,3 +6471,78 @@ fn control_authentication_rejection_codes_are_typed() {
         );
     }
 }
+#[cfg(feature = "test-support")]
+#[test]
+fn support_control_release_reads_only_complete_bounded_frames_before_original_cutoff() {
+    use crate::windows::pipe::{OwnedHandle, read_control_release};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::{Pipes::CreatePipe, Threading::GetCurrentProcess};
+    let pair = || {
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        // SAFETY: output pointers remain valid; default noninheritable handles.
+        assert_ne!(
+            unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 4096) },
+            0
+        );
+        (
+            OwnedHandle::new(read).unwrap(),
+            OwnedHandle::new(write).unwrap(),
+        )
+    };
+    let write_bytes = |handle, bytes: &[u8]| {
+        let mut written = 0;
+        // SAFETY: live owned pipe and initialized bounded buffer/output.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
+                    handle,
+                    bytes.as_ptr(),
+                    u32::try_from(bytes.len()).unwrap(),
+                    &raw mut written,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written as usize, bytes.len());
+    };
+    // SAFETY: this pseudo handle denotes the live original test process.
+    let peer = unsafe { GetCurrentProcess() };
+    for bytes in [&[1_u8, 0][..], &[4_u8, 0, 0, 0, b'{'][..]] {
+        let (read, write) = pair();
+        write_bytes(write.raw(), bytes);
+        let cutoff = Instant::now() + Duration::from_millis(100);
+        assert!(
+            read_control_release(read.raw(), peer, cutoff)
+                .unwrap_err()
+                .contains("deadline expired")
+        );
+    }
+    let (read, write) = pair();
+    write_bytes(write.raw(), &4097_u32.to_le_bytes());
+    assert!(
+        read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1))
+            .unwrap_err()
+            .contains("frame bound")
+    );
+    assert!(
+        read_control_release(read.raw(), peer, Instant::now())
+            .unwrap_err()
+            .contains("deadline expired")
+    );
+    let (read, write) = pair();
+    drop(write);
+    assert!(
+        read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1)).is_err()
+    );
+    let (read, write) = pair();
+    let message = memcordon_core::WindowsProviderRequestV3::Probe {
+        schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    };
+    crate::windows::pipe::write_frame(write.raw(), &message).unwrap();
+    assert_eq!(
+        read_control_release(read.raw(), peer, Instant::now() + Duration::from_secs(1)).unwrap(),
+        message
+    );
+}

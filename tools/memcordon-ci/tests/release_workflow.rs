@@ -14,17 +14,31 @@ fn check(document: &Value) -> memcordon_ci::Result<()> {
     )
 }
 
+fn unique_step(steps: &[Value], role: &str, predicate: impl Fn(&Value) -> bool) -> usize {
+    let matches: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| predicate(step))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(matches.len(), 1, "{role} must identify exactly one step");
+    matches[0]
+}
+
 #[test]
 fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_source() {
     let workflow: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
-    let steps = workflow["jobs"]["assemble"]["steps"].as_sequence().unwrap();
-    let assembly = steps
-        .iter()
-        .position(|step| {
-            step["run"].as_str() == Some("./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness")
-        })
+    check(&workflow).unwrap();
+    let steps = workflow["jobs"]["assemble-payload"]["steps"]
+        .as_sequence()
         .unwrap();
+    let assembly = unique_step(steps, "early assembly", |step| {
+        step["run"].as_str()
+            == Some(
+                "./.release/tool/memcordon-ci release assemble --build-source .release/build-source.json --consumer-readiness --destination .release/assembled",
+            )
+    });
     let stable = memcordon_ci::config::toolchains(&root()).unwrap().stable;
     assert!(
         steps[..assembly].iter().any(|step| {
@@ -43,6 +57,45 @@ fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_sou
         }),
         "assembly must install the pinned Cargo toolchain before source metadata validation"
     );
+    for target in [
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64",
+        "windows-x64",
+        "windows-arm64",
+    ] {
+        let path = format!(".release/targets/{target}");
+        let download = unique_step(steps, &path, |step| {
+            step["with"]["path"].as_str() == Some(&path)
+        });
+        assert!(download < assembly);
+        assert_eq!(
+            steps[download]["with"]["artifact-ids"],
+            format!("${{{{ needs.native-{target}.outputs.artifact-id }}}}")
+        );
+        assert_eq!(steps[download]["with"]["digest-mismatch"], "error");
+    }
+    let final_steps = workflow["jobs"]["assemble"]["steps"].as_sequence().unwrap();
+    let finalize = unique_step(final_steps, "final handoff", |step| {
+        step["run"].as_str()
+            == Some(
+                "./.release/tool/memcordon-ci release finalize-preparation --build-source .release/build-source.json --input .release/assembled --publisher-archive .release/tool/memcordon-publication-tool.tar.gz --destination .release/final",
+            )
+    });
+    let input = unique_step(final_steps, "assembled input", |step| {
+        step["with"]["path"] == ".release/assembled"
+    });
+    assert!(input < finalize);
+    assert_eq!(
+        final_steps[input]["with"]["artifact-ids"],
+        "${{ needs.assemble-payload.outputs.assembled-artifact-id }}"
+    );
+    assert!(final_steps.iter().all(|step| {
+        step["run"]
+            .as_str()
+            .is_none_or(|run| !run.contains("cargo ") && !run.contains(" release assemble "))
+    }));
 }
 
 #[test]
@@ -117,12 +170,10 @@ fn release_quality_installs_required_components_before_running_the_suite() {
     let steps = workflow["jobs"]["source-checks"]["steps"]
         .as_sequence()
         .unwrap();
-    let quality = steps
-        .iter()
-        .position(|step| {
-            step["run"].as_str() == Some("./target/ci/release/memcordon-ci suite quality")
-        })
-        .unwrap();
+    check(&workflow).unwrap();
+    let quality = unique_step(steps, "quality compilation", |step| {
+        step["run"].as_str() == Some("./.release/tool/memcordon-ci suite quality-compile")
+    });
     assert!(steps[..quality].iter().any(|step| {
         step["run"].as_str()
             == Some(
@@ -218,29 +269,51 @@ fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
 fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
     let baseline: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
-    for case in [
-        "sourcechecks",
+    check(&baseline).unwrap();
+    for leaf in [
+        "select",
+        "packages",
+        "source-checks",
+        "msrv",
+        "supply-chain",
+        "assemble-payload",
+        "rehearse",
         "miri",
         "fuzz",
-        "installed",
-        "serialproducer",
-        "wrongtarget",
-        "partialshards",
-        "sharedcacheuncertain",
+        "native-linux-x64",
+        "native-linux-arm64",
+        "native-macos-x64",
+        "native-macos-arm64",
+        "native-windows-x64",
+        "native-windows-arm64",
+        "candidate-linux-x64-native",
+        "candidate-linux-x64-cargo",
+        "candidate-linux-arm64-native",
+        "candidate-linux-arm64-cargo",
+        "installed-macos-x64-native",
+        "installed-macos-x64-cargo",
+        "installed-macos-arm64-native",
+        "installed-macos-arm64-cargo",
+        "candidate-windows-x64-native",
+        "candidate-windows-x64-cargo",
+        "candidate-windows-arm64-native",
+        "candidate-windows-arm64-cargo",
     ] {
         let mut changed = baseline.clone();
+        let needs = changed["jobs"]["assemble"]["needs"]
+            .as_sequence_mut()
+            .unwrap();
+        let index = unique_step(needs, leaf, |need| need.as_str() == Some(leaf));
+        needs.remove(index);
+        assert_ne!(changed, baseline, "missing {leaf} mutation was empty");
+        assert!(
+            check(&changed).is_err(),
+            "final handoff accepted missing {leaf}"
+        );
+    }
+    for case in ["serialproducer", "wrongtarget", "partialshards"] {
+        let mut changed = baseline.clone();
         match case {
-            "sourcechecks" | "miri" | "fuzz" | "installed" => {
-                let missing = match case {
-                    "sourcechecks" => "source-checks",
-                    "installed" => "candidate-windows-arm64-cargo",
-                    other => other,
-                };
-                changed["jobs"]["assemble"]["needs"]
-                    .as_sequence_mut()
-                    .unwrap()
-                    .retain(|need| need.as_str() != Some(missing));
-            }
             "serialproducer" => {
                 changed["jobs"]["native-linux-x64"]["needs"] =
                     serde_yaml::from_str("[select, packages]").unwrap()
@@ -255,24 +328,52 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
                     .unwrap()
                     .pop();
             }
-            "sharedcacheuncertain" => {
-                for step in changed["jobs"]["installed-macos-x64"]["steps"]
-                    .as_sequence_mut()
-                    .unwrap()
-                {
-                    if step["uses"]
-                        .as_str()
-                        .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-                    {
-                        step["if"] = Value::String(
-                            "always() && steps.native.outputs.cache-quiescent == 'true'".into(),
-                        );
-                    }
-                }
-            }
             _ => unreachable!(),
         }
+        assert_ne!(changed, baseline, "{case} mutation was empty");
         assert!(check(&changed).is_err(), "{case}");
+    }
+    for (job, target, channel) in [
+        ("installed-macos-x64-native", "macos-x64", "native"),
+        ("installed-macos-x64-cargo", "macos-x64", "cargo"),
+        ("installed-macos-arm64-native", "macos-arm64", "native"),
+        ("installed-macos-arm64-cargo", "macos-arm64", "cargo"),
+    ] {
+        let matrix = baseline["jobs"][job]["strategy"]["matrix"]["include"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(matrix[0]["channel"], channel);
+        assert_eq!(matrix[0]["native-job"], format!("native-{target}"));
+        let steps = baseline["jobs"][job]["steps"].as_sequence().unwrap();
+        let saves: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(!saves.is_empty(), "{job} cache owner must be exercised");
+        for index in saves {
+            let guard = format!(
+                "(steps.{channel}.conclusion == 'skipped' || steps.{channel}.outputs.cache-quiescent == 'true')"
+            );
+            let original = steps[index]["if"].as_str().unwrap();
+            assert!(
+                original.contains(&guard),
+                "{job} selected owner guard absent"
+            );
+            let mut changed = baseline.clone();
+            changed["jobs"][job]["steps"][index]["if"] = original.replace(&guard, "true").into();
+            assert_ne!(changed, baseline);
+            assert!(
+                check(&changed).is_err(),
+                "{job} accepted unsettled selected owner"
+            );
+        }
     }
 }
 
@@ -300,29 +401,41 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
         match case {
             "branches" => changed["on"]["push"]["branches"] = Value::Null,
             "moving-ref" => {
-                changed["jobs"]["select"]["steps"][1]["with"]["ref"] =
-                    Value::String("${{ github.ref }}".into())
+                let steps = changed["jobs"]["select"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap();
+                let checkout = unique_step(steps, "selected checkout", |step| {
+                    step["uses"]
+                        .as_str()
+                        .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+                });
+                assert_eq!(steps[checkout]["with"]["ref"], "${{ github.sha }}");
+                steps[checkout]["with"]["ref"] = Value::String("${{ github.ref }}".into())
             }
             "lf" => {
-                changed["jobs"]["native-windows-arm64"]["steps"]
+                let steps = changed["jobs"]["native-windows-arm64"]["steps"]
                     .as_sequence_mut()
-                    .unwrap()
-                    .remove(0);
+                    .unwrap();
+                let configure = unique_step(steps, "Windows LF configuration", |step| {
+                    step["run"] == "git config --global core.autocrlf false"
+                });
+                steps.remove(configure);
             }
             "quality-components" | "assembly-toolchain" => {
                 let job = if case == "quality-components" {
                     "source-checks"
                 } else {
-                    "assemble"
+                    "assemble-payload"
                 };
-                changed["jobs"][job]["steps"]
-                    .as_sequence_mut()
-                    .unwrap()
-                    .retain(|step| {
-                        !step["run"]
-                            .as_str()
-                            .is_some_and(|run| run.starts_with("rustup toolchain install 1.97.1"))
-                    });
+                let command = if case == "quality-components" {
+                    "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt"
+                } else {
+                    "rustup toolchain install 1.97.1 --profile minimal"
+                };
+                let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
+                let install =
+                    unique_step(steps, case, |step| step["run"].as_str() == Some(command));
+                steps.remove(install);
             }
             "native-budget" => {
                 changed["jobs"]["native-linux-x64"]["timeout-minutes"] = Value::Number(90.into())
@@ -336,15 +449,13 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
                 changed["jobs"][job]["if"] = Value::String("always()".into());
             }
             "wildcard" => {
-                let step = changed["jobs"]["assemble"]["steps"]
+                let steps = changed["jobs"]["assemble-payload"]["steps"]
                     .as_sequence_mut()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|step| {
-                        step["with"]["path"].as_str() == Some(".release/targets/linux-x64")
-                    })
                     .unwrap();
-                step["with"]["pattern"] = Value::String("native-*".into());
+                let download = unique_step(steps, "immutable Linux input", |step| {
+                    step["with"]["path"] == ".release/targets/linux-x64"
+                });
+                steps[download]["with"]["pattern"] = Value::String("native-*".into());
             }
             "overwrite" | "hidden" => {
                 let step = changed["jobs"]["packages"]["steps"]
@@ -360,28 +471,111 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
                 }] = Value::Bool(case == "overwrite");
             }
             "diagnostic-fatal" => {
-                let step = changed["jobs"]["source-checks"]["steps"]
+                let steps = changed["jobs"]["source-checks"]["steps"]
                     .as_sequence_mut()
-                    .unwrap()
-                    .last_mut()
                     .unwrap();
-                step["continue-on-error"] = Value::Bool(false);
+                let diagnostic = unique_step(steps, "bounded source diagnostics", |step| {
+                    step["name"] == "Retain bounded preparation diagnostics"
+                });
+                assert_eq!(steps[diagnostic]["continue-on-error"], true);
+                steps[diagnostic]["continue-on-error"] = Value::Bool(false);
             }
             "staging-cache" => {
-                let step = changed["jobs"]["packages"]["steps"]
+                let steps = changed["jobs"]["packages"]["steps"]
                     .as_sequence_mut()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|step| {
-                        step["uses"]
+                    .unwrap();
+                let restore = unique_step(steps, "package download cache", |step| {
+                    step["id"] == "deps"
+                        && step["uses"]
                             .as_str()
                             .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
-                    })
-                    .unwrap();
-                step["with"]["path"] = Value::String(".release/prepared".into());
+                });
+                steps[restore]["with"]["path"] = Value::String(".release/prepared".into());
             }
             _ => unreachable!(),
         }
+        assert_ne!(changed, baseline, "mutation {case} was empty");
         assert!(check(&changed).is_err(), "mutation {case} must fail");
+    }
+    for target in [
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64",
+        "windows-x64",
+        "windows-arm64",
+    ] {
+        let mut changed = baseline.clone();
+        let steps = changed["jobs"]["assemble-payload"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        let path = format!(".release/targets/{target}");
+        let download = unique_step(steps, &path, |step| {
+            step["with"]["path"].as_str() == Some(&path)
+        });
+        assert_eq!(
+            steps[download]["with"]["artifact-ids"],
+            format!("${{{{ needs.native-{target}.outputs.artifact-id }}}}")
+        );
+        steps[download]["with"]["artifact-ids"] =
+            "${{ needs.packages.outputs.artifact-id }}".into();
+        assert_ne!(changed, baseline);
+        assert!(
+            check(&changed).is_err(),
+            "accepted wrong immutable producer for {target}"
+        );
+    }
+    for case in [
+        "assembled-route",
+        "assembled-missing",
+        "assembled-duplicate",
+        "assembled-after-finalize",
+        "assembled-optional",
+        "assembled-skipped",
+        "assembled-digest",
+        "finalizer-rebuild",
+    ] {
+        let mut changed = baseline.clone();
+        let steps = changed["jobs"]["assemble"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        if case != "finalizer-rebuild" {
+            let download = unique_step(steps, "assembled input", |step| {
+                step["with"]["path"] == ".release/assembled"
+            });
+            assert_eq!(
+                steps[download]["with"]["artifact-ids"],
+                "${{ needs.assemble-payload.outputs.assembled-artifact-id }}"
+            );
+            match case {
+                "assembled-route" => {
+                    steps[download]["with"]["artifact-ids"] =
+                        "${{ needs.packages.outputs.artifact-id }}".into()
+                }
+                "assembled-missing" => {
+                    steps.remove(download);
+                }
+                "assembled-duplicate" => steps.push(steps[download].clone()),
+                "assembled-after-finalize" => {
+                    let finalize = unique_step(steps, "final handoff", |step| {
+                        step["run"]
+                            .as_str()
+                            .is_some_and(|run| run.contains(" release finalize-preparation "))
+                    });
+                    steps.swap(download, finalize);
+                }
+                "assembled-optional" => steps[download]["continue-on-error"] = true.into(),
+                "assembled-skipped" => steps[download]["if"] = false.into(),
+                "assembled-digest" => steps[download]["with"]["digest-mismatch"] = "warn".into(),
+                _ => unreachable!(),
+            }
+        } else {
+            steps.push(
+                serde_yaml::from_str("run: rustup run 1.97.1 cargo check --locked --workspace")
+                    .unwrap(),
+            );
+        }
+        assert_ne!(changed, baseline);
+        assert!(check(&changed).is_err(), "accepted {case}");
     }
 }

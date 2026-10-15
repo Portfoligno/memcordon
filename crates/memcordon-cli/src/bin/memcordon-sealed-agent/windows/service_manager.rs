@@ -1170,6 +1170,7 @@ fn configure_no_failure_actions(service: &ScHandle) -> Result<(), String> {
 }
 
 pub fn start(service: &ScHandle, name: &str) -> Result<(), String> {
+    require_support_work_admission()?;
     // SAFETY: service is live; zero arguments permits a null argument vector.
     if unsafe { StartServiceW(service.raw(), 0, ptr::null()) } == 0 {
         let error = io::Error::last_os_error();
@@ -1202,6 +1203,7 @@ pub fn start_with_arguments(
     } else {
         pointers.as_ptr()
     };
+    require_support_work_admission()?;
     // SAFETY: each argument is NUL-terminated and all storage lives through
     // the synchronous call. StartServiceW accepts only additional arguments;
     // SCM supplies the service identity as ServiceMain argv[0].
@@ -1336,6 +1338,7 @@ fn capture_service_process(
     timeout: Duration,
 ) -> Result<Option<PinnedServiceProcess>, String> {
     let started = Instant::now();
+    let deadline = original_service_cutoff(started + timeout, false);
     loop {
         let status = query_status(service).map_err(|error| {
             format!(
@@ -1347,7 +1350,7 @@ fn capture_service_process(
             if status.dwCurrentState == SERVICE_STOPPED {
                 return Ok(None);
             }
-            if started.elapsed() >= timeout {
+            if Instant::now() >= deadline {
                 return Err(format!(
                     "MCSEALED-WINDOWS-SERVICE-PROCESS-WAIT: service={name} phase=capture-process elapsed_ms={} state={} pid=0",
                     started.elapsed().as_millis(),
@@ -1438,8 +1441,14 @@ pub(crate) fn wait_service_process_exit(
     name: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
     let started = Instant::now();
+    let deadline = original_service_cutoff(started + timeout, true);
+    let timeout_ms = u32::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .unwrap_or(u32::MAX);
     // SAFETY: process owns the exact process object captured before stop.
     let result = unsafe { WaitForSingleObject(process.handle.raw(), timeout_ms) };
     match result {
@@ -1612,6 +1621,32 @@ pub(crate) fn demand_start_stopped_diagnostic_for_test(
     stopped_before_running_diagnostic(name, status, ServiceStatePhase::DemandStart, elapsed_millis)
 }
 
+fn original_service_cutoff(fallback: Instant, cleanup: bool) -> Instant {
+    #[cfg(feature = "test-support")]
+    {
+        if cleanup {
+            super::support_loader_diagnostic::cleanup_cutoff(fallback)
+        } else {
+            super::support_loader_diagnostic::work_cutoff(fallback)
+        }
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        let _ = cleanup;
+        fallback
+    }
+}
+
+fn require_support_work_admission() -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    if super::support_loader_diagnostic::current()
+        .is_some_and(|execution| Instant::now() >= execution.work)
+    {
+        return Err("original support work cutoff exhausted before service start".into());
+    }
+    Ok(())
+}
+
 fn wait_state(
     service: &ScHandle,
     name: &str,
@@ -1620,7 +1655,7 @@ fn wait_state(
     phase: ServiceStatePhase,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let deadline = started + timeout;
+    let deadline = original_service_cutoff(started + timeout, expected == SERVICE_STOPPED);
     loop {
         let status = query_status(service).map_err(|error| {
             format!(

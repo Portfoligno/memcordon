@@ -1340,7 +1340,17 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
         {
             let _settlement = SETTLEMENT.enter()?;
             if let Some(error) = terminalization_error {
-                super::record::record_terminalization_diagnostic(&attempt_id, error)?;
+                let retained = super::record::replay_relay_failure_evidence(
+                    (&attempt_id, &nonce, &request_sha256),
+                    relay_phase,
+                    &caller_process_identity,
+                    &caller_token_sha256,
+                    &error,
+                )?;
+                return pipe::write_frame(
+                    connection,
+                    &WindowsLauncherResponseV3::AttemptRetainedV2(retained),
+                );
             }
             match super::record::acknowledged_terminal_from_tombstone(
                 &attempt_id,
@@ -1481,7 +1491,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
         } => {
             // This lease spans the following Launch request, including rejection
             // staging performed after launch_attempt returns an error.
-            let _settlement = SETTLEMENT.enter()?;
+            let mut _settlement = Some(SETTLEMENT.enter()?);
             let process = OwnedHandle::new(remote_process_handle as usize as HANDLE)?;
             if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
                 || attempt_id.is_empty()
@@ -1514,10 +1524,67 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             let launch: WindowsLauncherRequestV3 = pipe::read_frame(connection)?;
             match launch {
                 WindowsLauncherRequestV3::Launch(request) => {
+                    let transferred = LaunchTransferredHandles::adopt(&request)?;
+                    #[cfg(feature = "test-support")]
+                    let mut _diagnostic_settlement = None;
+                    #[cfg(feature = "test-support")]
+                    let mut _loader_debug_scope = None;
+                    if let Some(selection) = request.launch.loader_diagnostic.as_deref() {
+                        #[cfg(not(feature = "test-support"))]
+                        return Err("production launcher refuses loader diagnostics".into());
+                        #[cfg(feature = "test-support")]
+                        {
+                            if request.certification_fault.is_some()
+                                || request.certification_mutant.is_some()
+                                || request.attempt_id != attempt_id
+                                || request.launch.nonce != nonce
+                                || request.request_sha256 != request_sha256
+                                || super::record::digest(
+                                    &serde_json::to_vec(&request.launch)
+                                        .map_err(|error| error.to_string())?,
+                                ) != request_sha256
+                                || request.launch.expected_provider_binding
+                                    != super::package::installed_public_provider_binding()?
+                            {
+                                return Err(
+                                    "loader diagnostic canonical membership binding differs".into(),
+                                );
+                            }
+                            let execution =
+                                super::support_loader_diagnostic::Execution::new(selection)?;
+                            drop(_settlement.take());
+                            let lease = SETTLEMENT.settle_until(execution.work, || {
+                                Ok(ACTIVE_JOBS
+                                    .lock()
+                                    .map_err(|_| "active Job registry poisoned".to_owned())?
+                                    .is_empty()
+                                    && super::record::diagnostic_admission_is_exclusive(
+                                        &attempt_id,
+                                        &request_sha256,
+                                    )?)
+                            })?;
+                            if !ACTIVE_JOBS.lock().map_err(|_| "active Job registry poisoned".to_owned())?.is_empty()
+                                || !super::record::diagnostic_admission_is_exclusive(&attempt_id, &request_sha256)?
+                                || selection.support_bootstrap_sha256
+                                    != super::package::validate_installed_target_desktop_bootstrap_loader_control()?
+                            {
+                                return Err("loader diagnostic isolated measured provider changed".into());
+                            }
+                            _diagnostic_settlement = Some(lease);
+                            _loader_debug_scope =
+                                Some(super::support_loader_diagnostic::Scope::enter(execution)?);
+                        }
+                    }
                     let _diagnostic_scope = super::diagnostics::AttemptDiagnosticScope::enter();
                     let certification_mutant = request.certification_mutant;
-                    match launch_attempt(connection, request, &attempt_id, &nonce, &request_sha256)
-                    {
+                    match launch_attempt(
+                        connection,
+                        request,
+                        transferred,
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                    ) {
                         Ok(()) => Ok(()),
                         Err(mut failure) => {
                             let original_detail = failure.detail.clone();
@@ -2142,23 +2209,55 @@ pub(crate) fn guardian_state_after_observation_for_test(
     }
 }
 
+struct LaunchTransferredHandles {
+    primary_token: OwnedHandle,
+    frontend: OwnedHandle,
+    frontend_canaries: Vec<OwnedHandle>,
+}
+
+impl LaunchTransferredHandles {
+    fn adopt(request: &WindowsLaunchBrokerRequestV1) -> Result<Self, String> {
+        let primary_token =
+            OwnedHandle::new(request.remote_primary_token_handle as usize as HANDLE);
+        let frontend = OwnedHandle::new(request.remote_frontend_process_handle as usize as HANDLE);
+        // Adopt the entire vector even if one raw value is invalid, so the
+        // remaining valid transferred handles still have closing owners.
+        let mut frontend_canaries = Vec::new();
+        let mut invalid = None;
+        for &raw in &request.remote_frontend_canary_handles {
+            match OwnedHandle::new(raw as usize as HANDLE) {
+                Ok(handle) => frontend_canaries.push(handle),
+                Err(error) => {
+                    invalid.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = invalid {
+            return Err(error);
+        }
+        Ok(Self {
+            primary_token: primary_token?,
+            frontend: frontend?,
+            frontend_canaries,
+        })
+    }
+}
+
 fn launch_attempt(
     connection: HANDLE,
     request: WindowsLaunchBrokerRequestV1,
+    transferred: LaunchTransferredHandles,
     expected_attempt_id: &str,
     expected_nonce: &str,
     expected_request_sha256: &str,
 ) -> Result<(), LaunchAttemptError> {
     // Adopt every transferred handle before any fallible validation so every
     // rejection path closes the launcher's copies.
-    let primary_token = OwnedHandle::new(request.remote_primary_token_handle as usize as HANDLE)?;
-    let frontend = OwnedHandle::new(request.remote_frontend_process_handle as usize as HANDLE)?;
-    let frontend_canaries = request
-        .remote_frontend_canary_handles
-        .iter()
-        .copied()
-        .map(|raw| OwnedHandle::new(raw as usize as HANDLE))
-        .collect::<Result<Vec<_>, _>>()?;
+    let LaunchTransferredHandles {
+        primary_token,
+        frontend,
+        frontend_canaries,
+    } = transferred;
     if request.attempt_id != expected_attempt_id
         || request.launch.nonce != expected_nonce
         || request.request_sha256 != expected_request_sha256
@@ -2184,6 +2283,24 @@ fn launch_attempt(
             .into());
     }
     let launch_bytes = serde_json::to_vec(&request.launch).map_err(|error| error.to_string())?;
+    if request.launch.loader_diagnostic.is_some() {
+        #[cfg(not(feature = "test-support"))]
+        return Err("production launcher refuses loader diagnostics"
+            .to_owned()
+            .into());
+        #[cfg(feature = "test-support")]
+        if super::support_loader_diagnostic::current()
+            .as_ref()
+            .is_none_or(|execution| {
+                request.launch.loader_diagnostic.as_deref() != Some(&execution.selection)
+                    || Instant::now() >= execution.work
+            })
+        {
+            return Err("loader diagnostic lacks exclusive original execution scope"
+                .to_owned()
+                .into());
+        }
+    }
     let request_sha256 = super::record::digest(&launch_bytes);
     let mut attempt_identity = request.launch.nonce.as_bytes().to_vec();
     attempt_identity.extend_from_slice(&request.caller_process_identity.process_id.to_le_bytes());

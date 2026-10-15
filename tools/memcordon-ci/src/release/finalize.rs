@@ -18,16 +18,13 @@ pub fn check_preparation(root: &Path, build_source: &Path, consumer_readiness: b
     selected.recheck(root)?;
     crate::policy::run(root)?;
     let metadata = crate::policy::workspace_metadata(root)?;
-    let order = source::public_order(&metadata, selected.version())?;
     let distribution = Distribution::read(root)?;
     let distribution = if consumer_readiness {
         distribution.consumer_readiness()?
     } else {
         distribution
     };
-    if distribution.packages != order {
-        return Err(failure("preparation public package order differs"));
-    }
+    validate_public_package_inventory(&metadata, selected.version(), &distribution.packages)?;
     match &selected {
         BuildSourceIdentity::Tagged { .. } => {
             bundle::changelog_notes(root, selected.version())?;
@@ -35,6 +32,22 @@ pub fn check_preparation(root: &Path, build_source: &Path, consumer_readiness: b
         BuildSourceIdentity::Working { .. } => {
             bundle::candidate_notes(root, selected.version())?;
         }
+    }
+    Ok(())
+}
+
+/// Distribution order is presentation data; package production uses the
+/// independently validated dependency order returned by `public_order`.
+pub fn validate_public_package_inventory(
+    metadata: &cargo_metadata::Metadata,
+    version: &semver::Version,
+    packages: &[String],
+) -> Result<()> {
+    let order = source::public_order(metadata, version)?;
+    let selected: std::collections::BTreeSet<_> = packages.iter().collect();
+    let expected: std::collections::BTreeSet<_> = order.iter().collect();
+    if packages.len() != order.len() || selected.len() != packages.len() || selected != expected {
+        return Err(failure("preparation public package inventory differs"));
     }
     Ok(())
 }

@@ -156,6 +156,60 @@ fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
     Ok(locks)
 }
 
+fn cargo_marker_present(target: &Path) -> Result<bool> {
+    use std::io::Read;
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let marker = target.join("CACHEDIR.TAG");
+    let metadata = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CiError::Message("unsafe Cargo marker file kind".into()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(CiError::Message("Cargo marker is a reparse point".into()));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(&marker) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(CiError::Message("Cargo marker is a reparse point".into()));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(CiError::Message(
+            "unsafe opened Cargo marker file kind".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(SIGNATURE.len());
+    file.take(SIGNATURE.len() as u64).read_to_end(&mut bytes)?;
+    Ok(bytes == SIGNATURE)
+}
+
 pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Result<()> {
     let roots = roots(purpose, shard)?;
     // Validate every root before making the first mutation.
@@ -178,6 +232,20 @@ pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Re
         #[cfg(not(windows))]
         drop(locks);
         return Ok(());
+    }
+    let cleanup_targets = if purpose == "native-auxiliary" {
+        // These payloads contain profiles only; Cargo's genuine marker belongs
+        // to their common parent, which is never a disposal root.
+        vec![root.join("target")]
+    } else {
+        targets
+    };
+    for target in &cleanup_targets {
+        if target.try_exists()? && !cargo_marker_present(target)? {
+            // An optional seed without Cargo's marker cannot authorize cleanup.
+            // Discard only this role's prevalidated payloads before cold work.
+            return prepare(root, purpose, shard, RestoreMode::Discard);
+        }
     }
     let pins = crate::config::toolchains(root)?;
     let toolchain = if purpose == "msrv" {
@@ -208,23 +276,7 @@ pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Re
         packages.push(name.to_owned());
     }
     let deadline = Instant::now() + Duration::from_secs(5 * 60);
-    let targets = if purpose == "native-auxiliary" {
-        let marker = crate::release::artifacts::read_file(&root.join("target/CACHEDIR.TAG"));
-        if !marker
-            .is_ok_and(|bytes| bytes.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
-        {
-            // Profile-only restores do not carry Cargo's parent-directory
-            // marker. Never manufacture it to authorize parent cleanup.
-            return prepare(root, purpose, shard, RestoreMode::Discard);
-        }
-        // Cargo's default dev/release layout has two declared cache profiles.
-        // Package-targeted cleanup uses their common Cargo target directory;
-        // it does not recursively clean sibling CI-driver/report directories.
-        vec![root.join("target")]
-    } else {
-        targets
-    };
-    for target in targets {
+    for target in cleanup_targets {
         if !target.try_exists()? {
             continue;
         }

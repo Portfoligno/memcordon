@@ -13,6 +13,9 @@ use std::time::Duration;
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/descriptor.rs"]
 pub mod descriptor;
 
+#[path = "windows_loader_event_diagnostics.rs"]
+pub mod loader_event_diagnostics;
+
 #[cfg(windows)]
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/fixture_environment.rs"]
 pub(crate) mod fixture_environment;
@@ -398,7 +401,14 @@ pub fn public_command(
     report: &Path,
     case: &CaseInput,
 ) -> Result<crate::command::CommandSpec> {
-    public_command_observation(cli, fixture, directory, report, case, true, false)
+    public_command_observation(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        FrontendObservation::Terminal,
+    )
 }
 
 #[cfg(windows)]
@@ -409,7 +419,14 @@ pub(crate) fn public_refusal_command(
     report: &Path,
     case: &CaseInput,
 ) -> Result<crate::command::CommandSpec> {
-    public_command_observation(cli, fixture, directory, report, case, false, true)
+    public_command_observation(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        FrontendObservation::Request,
+    )
 }
 
 #[cfg(windows)]
@@ -420,7 +437,67 @@ pub(crate) fn public_component_command(
     report: &Path,
     case: &CaseInput,
 ) -> Result<crate::command::CommandSpec> {
-    public_command_observation(cli, fixture, directory, report, case, false, false)
+    public_command_observation(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        FrontendObservation::None,
+    )
+}
+
+enum FrontendObservation<'a> {
+    Terminal,
+    #[cfg(windows)]
+    Request,
+    #[cfg(windows)]
+    None,
+    Diagnostic {
+        selection: &'a Path,
+        observation: &'a Path,
+    },
+}
+
+pub fn support_loader_command(
+    cli: &Path,
+    fixture: &Path,
+    directory: &Path,
+    report: &Path,
+    case: &CaseInput,
+    selection: &Path,
+    observation: &Path,
+) -> Result<crate::command::CommandSpec> {
+    if case.key.family != "W-ENVELOPE"
+        || case.key.scenario != "restricted"
+        || !case.expected_token.restricted
+        || case.descriptor.case != descriptor::Case::Envelope
+        || !case.descriptor.arguments.is_empty()
+        || !case.descriptor.stdout.is_empty()
+        || !case.descriptor.stderr.is_empty()
+        || case.descriptor.application_status != 0
+    {
+        return Err(CiError::Message(
+            "loader diagnostic requires the exact restricted envelope case".into(),
+        ));
+    }
+    case.descriptor.validate().map_err(CiError::Message)?;
+    if !case.workload_contract.is_absolute() || !case.descriptor_path.is_absolute() {
+        return Err(CiError::Message(
+            "diagnostic contract/input paths are not selected absolute paths".into(),
+        ));
+    }
+    public_command_observation(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        FrontendObservation::Diagnostic {
+            selection,
+            observation,
+        },
+    )
 }
 
 fn public_command_observation(
@@ -429,9 +506,13 @@ fn public_command_observation(
     directory: &Path,
     report: &Path,
     case: &CaseInput,
-    terminal_observation: bool,
-    request_observation: bool,
+    observation: FrontendObservation<'_>,
 ) -> Result<crate::command::CommandSpec> {
+    let terminal_observation = matches!(observation, FrontendObservation::Terminal);
+    #[cfg(windows)]
+    let request_observation = matches!(observation, FrontendObservation::Request);
+    #[cfg(not(windows))]
+    let request_observation = false;
     let mut args: Vec<OsString> = ["+4GiB", "+600s"].into_iter().map(OsString::from).collect();
     // A strict contract on the ordinary backend is a deliberately unsupported
     // public request. Every other readiness operation selects sealed runtime.
@@ -468,6 +549,20 @@ fn public_command_observation(
     args.push("consumer-readiness-windows".into());
     args.push(case.descriptor_path.clone().into_os_string());
     args.extend(case.descriptor.arguments.iter().map(OsString::from));
+    if let FrontendObservation::Diagnostic {
+        selection,
+        observation,
+    } = observation
+    {
+        args = [
+            OsString::from("__windows-loader-diagnostic"),
+            selection.as_os_str().to_owned(),
+            observation.as_os_str().to_owned(),
+        ]
+        .into_iter()
+        .chain(args)
+        .collect();
+    }
     let cli = std::path::absolute(cli)?;
     if case.expected_token.restricted {
         let mut restricted: Vec<OsString> = vec![
@@ -611,6 +706,54 @@ fn decode_events(bytes: &[u8], live: bool) -> Result<Vec<Event>> {
         remaining = &remaining[length..];
     }
     Ok(result)
+}
+
+/// A completed launch refusal cannot satisfy the live positive-fixture barrier.
+/// This observation only rejects; it never supplies accepted workload authority.
+pub fn check_positive_barrier_result(
+    bytes: &[u8],
+    provider: &memcordon_core::PublicProviderBindingV1,
+) -> Result<()> {
+    let result = ResultV1::parse(bytes).map_err(CiError::Message)?;
+    if result
+        .provider_association
+        .as_ref()
+        .map(|association| &association.provider)
+        != Some(provider)
+    {
+        return Err(CiError::Message(
+            "positive barrier result has no matching selected provider binding".into(),
+        ));
+    }
+    if matches!(
+        result.outcome.kind,
+        OutcomeKindV1::LaunchFailure | OutcomeKindV1::ProviderFailure
+    ) || result.authorization == AuthorizationV1::RejectedBeforeRelease
+        || matches!(
+            result.launch.state,
+            LaunchStateV1::NotCreated | LaunchStateV1::ExecFailed
+        )
+    {
+        let original = result
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.error.as_ref());
+        return Err(CiError::Message(format!(
+            "positive fixture launch already failed; wrapper-status={}; authorization={:?}; launch={:?}; original={}",
+            result.outcome.wrapper_status,
+            result.authorization,
+            result.launch.state,
+            original.map_or_else(
+                || "no original attempt error".into(),
+                |error| format!(
+                    "{}: {}",
+                    error.code,
+                    error.message.chars().take(1024).collect::<String>()
+                )
+            ),
+        )));
+    }
+    Ok(())
 }
 
 pub fn assess(
@@ -2923,12 +3066,14 @@ pub(crate) mod native {
         let cli = config.cli.path.clone();
         let directory = report.parent().expect("case report has parent").to_owned();
         let expected_provider = config.provider.clone();
+        let barrier_report = public_report.clone();
         let descendant_gate = input.descriptor.descendant_gate.clone();
         let intermediate_first = input.descriptor.case == descriptor::Case::IntermediateFirst;
         let owns_tcp = matches!(
             input.descriptor.case,
             descriptor::Case::Joint | descriptor::Case::Churn | descriptor::Case::EndpointMismatch
         );
+        let native_started_utc = std::time::SystemTime::now();
         let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
             command,
             work_budget,
@@ -2937,6 +3082,22 @@ pub(crate) mod native {
             move |_, _, _| {
                 let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                 let (held, root_pid) = loop {
+                    if barrier_report.try_exists()? {
+                        super::check_positive_barrier_result(
+                            &read(
+                                &barrier_report,
+                                crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+                            )
+                            .map_err(io::Error::other)?,
+                            &expected_provider,
+                        )
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "{error}; retained-result={}",
+                                barrier_report.display()
+                            ))
+                        })?;
+                    }
                     let mut held =
                         memcordon_testkit::windows_processes_for_image_until(&fixture, deadline)?;
                     if transcript.is_file() && !held.is_empty() {
@@ -3800,6 +3961,99 @@ pub(crate) mod native {
                         "{}; callback diagnostic retention failed: {retention}",
                         output.as_ref().expect_err("callback failure was matched")
                     )));
+                }
+                if *capture_complete
+                    && cleanup.is_ok()
+                    && input.key.family == "W-ENVELOPE"
+                    && input.key.scenario == "restricted"
+                {
+                    let diagnostics = (|| -> Result<()> {
+                        let bytes = read(
+                            &public_report,
+                            crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+                        )?;
+                        let original = ResultV1::parse(&bytes).map_err(CiError::Message)?;
+                        if original
+                            .provider_association
+                            .as_ref()
+                            .map(|association| &association.provider)
+                            != Some(&config.provider)
+                        {
+                            return Err(CiError::Message(
+                                "OS diagnostic original result provider differs".into(),
+                            ));
+                        }
+                        if original.authorization != AuthorizationV1::RejectedBeforeRelease
+                            || original.launch.state != LaunchStateV1::NotCreated
+                            || !original
+                                .attempts
+                                .last()
+                                .and_then(|attempt| attempt.error.as_ref())
+                                .is_some_and(|error| {
+                                    error.code == "MCSPAWN-FAILED"
+                                        && error.message.contains("bootstrap_role=loader-control")
+                                })
+                        {
+                            return Ok(());
+                        }
+                        let capture = super::loader_event_diagnostics::observe(work_deadline);
+                        let observed_utc = std::time::SystemTime::now();
+                        let failure = original
+                            .attempts
+                            .last()
+                            .and_then(|attempt| attempt.error.as_ref())
+                            .map(|error| {
+                                serde_json::json!({"code":error.code,
+                                "message":error.message.chars().take(4096).collect::<String>(),
+                                "message_truncated":error.message.chars().count()>4096})
+                            });
+                        let unix_millis = |time: std::time::SystemTime| {
+                            time.duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_millis())
+                                .map_err(|error| CiError::Message(error.to_string()))
+                        };
+                        let metadata = serde_json::to_vec(&serde_json::json!({
+                            "format":"memcordon.windows-loader-os-event-candidates","revision":1,
+                            "case":input.key,"provider":config.provider,"source_commit":config.source_commit,
+                            "association":original.provider_association,
+                            "installed_images":config.installed_components,"original_result":public_report,
+                            "original_result_sha256":crate::windows_causal_acceptance::sha256(&bytes),
+                            "original_failure":failure,
+                            "controller_started_unix_millis":unix_millis(native_started_utc)?,
+                            "controller_observed_unix_millis":unix_millis(observed_utc)?,
+                            "bootstrap_birth_identity":null,"event_correlation":"unverified-candidates",
+                            "correlation_missing":["trusted-bootstrap-birth","validated-faulting-process-id-and-starttime"],
+                            "event_execution_pid_is_not_faulting_process_identity":true,
+                            "program":capture.program,"argv":super::loader_event_diagnostics::QUERY_ARGUMENTS,
+                            "total_output_limit":super::loader_event_diagnostics::MAX_CAPTURE_BYTES,
+                            "query":capture.state
+                        }))?;
+                        for (extension, bytes) in [
+                            ("os-events.stdout.xml", capture.stdout.as_slice()),
+                            ("os-events.stderr.bin", capture.stderr.as_slice()),
+                            ("os-events.json", metadata.as_slice()),
+                        ] {
+                            let path = report.with_extension(extension);
+                            let mut file = OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)?;
+                            file.write_all(bytes)?;
+                            file.sync_all()?;
+                            if read(&path, bytes.len())? != bytes {
+                                return Err(CiError::Message(
+                                    "OS diagnostic named readback differs".into(),
+                                ));
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(diagnostic) = diagnostics {
+                        return Err(CiError::Message(format!(
+                            "{}; secondary OS diagnostic retention failed: {diagnostic}",
+                            output.as_ref().expect_err("callback failure was matched")
+                        )));
+                    }
                 }
             }
             let output = output.map_err(|error| CiError::Message(error.to_string()))?;

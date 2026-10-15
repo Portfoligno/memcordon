@@ -1024,20 +1024,22 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
                 "ready-set-event",
             ));
         }
-        if !wait_authority_and_cleanup(
+        let Some(trigger) = wait_authority_and_cleanup(
             &job,
             &frontend,
             &worker,
             &disarm,
             service_stop.as_ref(),
             Duration::from_millis(cleanup_deadline),
-        )? {
+        )?
+        else {
             return Ok(());
-        }
+        };
         super::record::write_guardian_receipt(
             &attempt_id,
             &binding.launcher_identity,
             &binding.guardian_identity,
+            trigger,
         )
         .map_err(|_| {
             GuardianFailure::new(GuardianStartupSubphase::Runtime, None, "terminal-receipt")
@@ -1066,7 +1068,7 @@ pub(super) fn wait_authority_and_cleanup(
     disarm: &OwnedHandle,
     service_stop: Option<&OwnedHandle>,
     cleanup_timeout: Duration,
-) -> Result<bool, GuardianFailure> {
+) -> Result<Option<memcordon_core::WindowsGuardianCleanupTriggerV1>, GuardianFailure> {
     let watched = [
         frontend.raw(),
         worker.raw(),
@@ -1077,7 +1079,7 @@ pub(super) fn wait_authority_and_cleanup(
     // SAFETY: every selected handle is borrowed from a live owner for the wait.
     let result = unsafe { WaitForMultipleObjects(count, watched.as_ptr(), 0, INFINITE) };
     if result == WAIT_OBJECT_0 + 2 {
-        return Ok(false);
+        return Ok(None);
     }
     if result != WAIT_OBJECT_0
         && result != WAIT_OBJECT_0 + 1
@@ -1089,6 +1091,36 @@ pub(super) fn wait_authority_and_cleanup(
             "authority-wait",
         ));
     }
+    let cleanup_cutoff = Instant::now() + cleanup_timeout;
+    let trigger = if result == WAIT_OBJECT_0 {
+        match super::process::process_identity(frontend.raw()) {
+            Ok(identity) => {
+                let mut exit_status = 0;
+                if unsafe {
+                    windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                        frontend.raw(),
+                        &raw mut exit_status,
+                    )
+                } != 0
+                {
+                    memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendLost {
+                        frontend: identity,
+                        native_exit_status: exit_status,
+                    }
+                } else {
+                    memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
+                        frontend: identity,
+                        native_code: unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                    }
+                }
+            }
+            Err(_) => memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendIdentityUnavailable,
+        }
+    } else if result == WAIT_OBJECT_0 + 1 {
+        memcordon_core::WindowsGuardianCleanupTriggerV1::WorkerLost
+    } else {
+        memcordon_core::WindowsGuardianCleanupTriggerV1::ServiceStopped
+    };
     // SAFETY: an authenticated authority died before disarm; the owned Job
     // capability grants precisely the existing guardian cleanup authority.
     if unsafe { TerminateJobObject(job.raw(), 0xC000_013A) } == 0 {
@@ -1098,8 +1130,8 @@ pub(super) fn wait_authority_and_cleanup(
             "job-terminate",
         ));
     }
-    wait_job_empty(job.raw(), Instant::now() + cleanup_timeout)?;
-    Ok(true)
+    wait_job_empty(job.raw(), cleanup_cutoff)?;
+    Ok(Some(trigger))
 }
 
 fn read_bootstrap_frame(pipe: HANDLE) -> Result<GuardianBootstrapMessageV1, GuardianFailure> {

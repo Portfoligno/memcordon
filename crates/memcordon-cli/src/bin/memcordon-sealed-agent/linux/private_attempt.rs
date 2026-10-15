@@ -518,17 +518,15 @@ impl DurablePrivateAttempt {
             return Err("V4 state directory permissions differ".into());
         }
         let path = root.join(record.attempt_id.as_str());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&record.encode()?)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| directory.sync_all())
-            .map_err(|error| error.to_string())?;
+        let bytes = record.encode()?;
+        super::atomic_publication::publish(
+            &directory,
+            std::ffi::OsStr::new(record.attempt_id.as_str()),
+            &bytes,
+            0o600,
+            MAX_PRIVATE_RECORD_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             path,
             directory,

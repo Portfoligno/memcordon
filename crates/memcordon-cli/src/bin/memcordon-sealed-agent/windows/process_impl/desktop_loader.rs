@@ -1,5 +1,36 @@
 use super::*;
 
+#[path = "loader_mitigations.rs"]
+mod loader_mitigations;
+
+#[cfg(feature = "test-support")]
+#[path = "original_loader_debug.rs"]
+mod original_loader_debug;
+
+fn original_loader_work_cutoff() -> Instant {
+    let cutoff = Instant::now() + Duration::from_secs(30);
+    #[cfg(feature = "test-support")]
+    if let Some(execution) = crate::windows::support_loader_diagnostic::current() {
+        return cutoff.min(execution.work);
+    }
+    cutoff
+}
+
+fn original_holder_wait_millis() -> u32 {
+    #[cfg(feature = "test-support")]
+    if let Some(execution) = crate::windows::support_loader_diagnostic::current() {
+        return u32::try_from(
+            execution
+                .cleanup
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(5_000),
+        )
+        .unwrap_or(5_000);
+    }
+    5_000
+}
+
 pub struct SuspendedTarget {
     pub(super) process: OwnedHandle,
     pub(super) thread: OwnedHandle,
@@ -428,7 +459,7 @@ pub(super) fn request_creator_arm(
             "holder primary changed before creation readiness",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = original_loader_work_cutoff();
     super::pipe::write_frame_bounded(
         connection,
         Some(launcher_process),
@@ -504,7 +535,7 @@ pub(super) fn consume_creator_arm(
     super::token::require_thread_token_absent(unsafe { GetCurrentThread() }).map_err(|error| {
         TargetDesktopBootstrapFailure::contract(creation_failure_phase(phase), error)
     })?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = original_loader_work_cutoff();
     super::pipe::write_frame_bounded(
         connection,
         Some(launcher_process),
@@ -1570,13 +1601,13 @@ fn close_desktop_holder_handles(
     // Connection EOF is the normal release signal; retain both native
     // authority handles until the exact holder process has signaled.
     // SAFETY: process remains owned throughout both original bounded waits.
-    let wait = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+    let wait = unsafe { WaitForSingleObject(process.raw(), original_holder_wait_millis()) };
     if wait == WAIT_TIMEOUT {
         if let Err(error) = job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS) {
             return Err(combine_desktop_retirement_error(connection_result, error));
         }
         // SAFETY: this is the same retained process handle.
-        let retired = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        let retired = unsafe { WaitForSingleObject(process.raw(), original_holder_wait_millis()) };
         if retired != WAIT_OBJECT_0 {
             return Err(combine_desktop_retirement_error(
                 connection_result,
@@ -1666,7 +1697,7 @@ impl TargetDesktopLease {
                 .to_owned()
                 .into());
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = original_loader_work_cutoff();
         let expected_window_station_sddl = target_user_object_policy.window_station_sddl();
         let expected_window_station_policy_sha256 =
             SecurityDescriptor::from_sddl(&expected_window_station_sddl)?
@@ -1826,7 +1857,7 @@ impl TargetDesktopLease {
         let frame = read_target_desktop_bootstrap_attestation(
             connection.raw(),
             bootstrap_process.raw(),
-            Instant::now() + Duration::from_secs(30),
+            original_loader_work_cutoff(),
             &binding,
             Some(&mut broker_control),
         )?;
@@ -1978,12 +2009,16 @@ impl Drop for TargetDesktopLease {
     fn drop(&mut self) {
         drop(self.connection_lease.take());
         if !self.bootstrap_process.raw().is_null()
-            && unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) } == WAIT_TIMEOUT
+            && unsafe {
+                WaitForSingleObject(self.bootstrap_process.raw(), original_holder_wait_millis())
+            } == WAIT_TIMEOUT
         {
             let _ = self
                 .bootstrap_job
                 .terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS);
-            let _ = unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 5_000) };
+            let _ = unsafe {
+                WaitForSingleObject(self.bootstrap_process.raw(), original_holder_wait_millis())
+            };
         }
     }
 }
@@ -2565,6 +2600,8 @@ pub(super) fn attach_preplan_loader_failure(
     );
     let outcome = memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(
         memcordon_core::WindowsLoaderQualificationFailureV2 {
+            mitigation_observation: None,
+            support_debug_observation: None,
             schema_version: 2,
             stable_code,
             stage,
@@ -2598,6 +2635,11 @@ struct PackageLoaderProcess {
     identity: RefCell<Option<WindowsProcessIdentityV1>>,
     snapshot: RefCell<Option<super::token::TokenQueryAttestationSnapshot>>,
     job_empty: Cell<bool>,
+    handshake_cutoff: Cell<Option<Instant>>,
+    #[cfg(feature = "test-support")]
+    diagnostic_execution: Option<std::rc::Rc<crate::windows::support_loader_diagnostic::Execution>>,
+    #[cfg(feature = "test-support")]
+    debug_owner: Option<original_loader_debug::OriginalLoaderDebug>,
 }
 
 struct PackageLoaderFactory<'a> {
@@ -2620,6 +2662,19 @@ impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
     }
 
     fn create(&self, plan: &ProductionLoaderPlan) -> Result<Self::Process, ProcessCreateFailure> {
+        #[cfg(feature = "test-support")]
+        let diagnostic_execution = crate::windows::support_loader_diagnostic::current();
+        #[cfg(feature = "test-support")]
+        if diagnostic_execution
+            .as_ref()
+            .is_some_and(|execution| Instant::now() >= execution.work)
+        {
+            return Err(ProcessCreateFailure {
+                stable_code: "support-loader-original-cutoff".into(),
+                native_status: None,
+                detail: "original support work cutoff expired before creation".into(),
+            });
+        }
         let mut command = self.command.borrow_mut();
         let mut environment = self.environment.borrow_mut();
         let mut desktop = self.desktop.borrow_mut();
@@ -2645,10 +2700,38 @@ impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
             identity: RefCell::new(None),
             snapshot: RefCell::new(None),
             job_empty: Cell::new(false),
+            handshake_cutoff: Cell::new(None),
+            #[cfg(feature = "test-support")]
+            diagnostic_execution,
+            #[cfg(feature = "test-support")]
+            debug_owner: None,
         })
     }
 
     fn cleanup(&self, _process: &mut Self::Process) -> CleanupOutcomeV1 {
+        #[cfg(feature = "test-support")]
+        if let Some(execution) = &_process.diagnostic_execution {
+            let cleanup = if let Some(owner) = _process.debug_owner.as_mut() {
+                let result = owner.cleanup_until(self.job, execution.cleanup);
+                *execution.observation.borrow_mut() = Some(owner.observation());
+                result
+            } else {
+                self.job
+                    .terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)
+                    .and_then(|()| self.job.wait_empty(execution.cleanup))
+                    .and_then(|empty| {
+                        if empty {
+                            Ok(())
+                        } else {
+                            Err("support Job drain incomplete".into())
+                        }
+                    })
+            };
+            return match cleanup {
+                Ok(()) => CleanupOutcomeV1::complete(),
+                Err(_) => CleanupOutcomeV1::failed("support-loader-original-cleanup-incomplete"),
+            };
+        }
         if _process.job_empty.get() {
             return CleanupOutcomeV1::complete();
         }
@@ -2831,6 +2914,7 @@ impl SuspendedProcessAttestor<PackageLoaderProcess> for PackageLoaderAttestor<'_
 }
 
 struct PackageLoaderChannel<'a> {
+    mitigation_observation: &'a RefCell<Option<loader_mitigations::LoaderMitigations>>,
     prepared_pipe: RefCell<Option<OwnedHandle>>,
     launch_context: &'a TargetDesktopBootstrapLaunchContext,
     control_job: &'a Job,
@@ -2844,8 +2928,91 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
     fn resume(
         &self,
         process: &mut PackageLoaderProcess,
-        _plan: &ProductionLoaderPlan,
+        plan: &ProductionLoaderPlan,
     ) -> Result<(), ProcessCreateFailure> {
+        let cutoff = Instant::now() + Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let cutoff = process
+            .diagnostic_execution
+            .as_ref()
+            .map_or(cutoff, |execution| cutoff.min(execution.work));
+        process.handshake_cutoff.set(Some(cutoff));
+        if let Some(identity) = process.identity.borrow().clone() {
+            *self.mitigation_observation.borrow_mut() = Some(loader_mitigations::capture(
+                process.native.process_handle(),
+                identity,
+                plan.executable_sha256(),
+                plan.launch_plan_sha256(),
+                cutoff,
+            ));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(execution) = &process.diagnostic_execution {
+            if !self.launch_context.target_token_restricted
+                || self.launch_context.target_token_write_restricted
+            {
+                return Err(ProcessCreateFailure {
+                    stable_code: "support-loader-restricted-selection".into(),
+                    native_status: None,
+                    detail:
+                        "diagnostic requires the original restricted non-write-restricted token"
+                            .into(),
+                });
+            }
+            let identity =
+                process
+                    .identity
+                    .borrow()
+                    .clone()
+                    .ok_or_else(|| ProcessCreateFailure {
+                        stable_code: "support-loader-identity-missing".into(),
+                        native_status: None,
+                        detail: "original suspended attestation is required before attachment"
+                            .into(),
+                    })?;
+            if Instant::now() >= cutoff
+                || plan.executable_sha256() != execution.selection.support_bootstrap_sha256
+            {
+                return Err(ProcessCreateFailure {
+                    stable_code: "support-loader-selection-refused".into(),
+                    native_status: None,
+                    detail: "original cutoff or selected bootstrap image differs".into(),
+                });
+            }
+            let prepared =
+                self.prepared_pipe
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| ProcessCreateFailure {
+                        stable_code: "support-loader-pipe-consumed".into(),
+                        native_status: None,
+                        detail: "support accept requires the original prepared pipe".into(),
+                    })?;
+            let accept = super::pipe::PendingTargetDesktopBootstrapAccept::start(prepared)
+                .map_err(|error| {
+                    package_process_failure("support-loader-accept-start", error.to_string().into())
+                })?;
+            process.debug_owner = Some(
+                original_loader_debug::OriginalLoaderDebug::attach(
+                    process.native.process_handle(),
+                    identity,
+                    execution.selection.challenge.clone(),
+                    plan.executable_sha256().to_owned(),
+                    plan.launch_plan_sha256().to_owned(),
+                    accept,
+                    execution.cleanup,
+                )
+                .map_err(|error| package_process_failure("support-loader-attach", error.into()))?,
+            );
+            if Instant::now() >= cutoff {
+                return Err(ProcessCreateFailure {
+                    stable_code: "support-loader-original-cutoff".into(),
+                    native_status: None,
+                    detail: "original support cutoff expired during attachment before resume"
+                        .into(),
+                });
+            }
+        }
         process
             .native
             .resume_once()
@@ -2879,6 +3046,7 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                 native_status: None,
                 detail: String::from("suspended attestation did not retain token snapshot"),
             })?;
+        #[cfg(not(feature = "test-support"))]
         let prepared_pipe =
             self.prepared_pipe
                 .borrow_mut()
@@ -2888,13 +3056,68 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                     native_status: None,
                     detail: String::from("loader-ready pipe was consumed more than once"),
                 })?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let connection = super::pipe::accept_target_desktop_bootstrap_pipe(
+        let deadline = process
+            .handshake_cutoff
+            .get()
+            .ok_or_else(|| ProcessCreateFailure {
+                stable_code: "loader-control-cutoff-missing".into(),
+                native_status: None,
+                detail: "loader-ready handshake has no original resume cutoff".into(),
+            })?;
+        #[cfg(feature = "test-support")]
+        let connection_result = if let Some(owner) = process.debug_owner.as_mut() {
+            let result = owner.accept_until(deadline);
+            result.map_err(|detail| {
+                if owner.observation().exit_event_continued {
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(u128::from(u32::MAX - 1)) as u32;
+                    if unsafe { WaitForSingleObject(process.native.process_handle(), remaining) }
+                        == WAIT_OBJECT_0
+                    {
+                        let mut exit_code = 0;
+                        if unsafe {
+                            GetExitCodeProcess(process.native.process_handle(), &raw mut exit_code)
+                        } != 0
+                        {
+                            return super::pipe::target_desktop_bootstrap_peer_exit_error(
+                                super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
+                                "support-connect",
+                                0,
+                                exit_code,
+                            );
+                        }
+                    }
+                }
+                super::pipe::TargetDesktopBootstrapPipeError::protocol(
+                    super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
+                    detail,
+                )
+            })
+        } else {
+            let prepared_pipe =
+                self.prepared_pipe
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| ProcessCreateFailure {
+                        stable_code: "loader-control-pipe-already-consumed".into(),
+                        native_status: None,
+                        detail: "loader-ready pipe was consumed more than once".into(),
+                    })?;
+            super::pipe::accept_target_desktop_bootstrap_pipe(
+                prepared_pipe,
+                process.native.process_handle(),
+                deadline,
+            )
+        };
+        #[cfg(not(feature = "test-support"))]
+        let connection_result = super::pipe::accept_target_desktop_bootstrap_pipe(
             prepared_pipe,
             process.native.process_handle(),
             deadline,
-        )
-        .map_err(|error| {
+        );
+        let connection = connection_result.map_err(|error| {
             let error = self.launch_context.accept_error(
                 TargetDesktopBootstrapRoleV1::LoaderControl,
                 identity.process_id,
@@ -2986,6 +3209,15 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                 TargetDesktopLeaseCreateError::from(detail),
             )
         })?;
+        #[cfg(feature = "test-support")]
+        if process.diagnostic_execution.is_some() {
+            return Err(ProcessCreateFailure {
+                stable_code: "support-loader-diagnostic-only".into(),
+                native_status: None,
+                detail: "separate debug experiment completed handshake; no workload authorization"
+                    .into(),
+            });
+        }
         Ok(
             memcordon_windows_launch_core::HandshakeOutcomeV1::Authenticated {
                 protocol_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
@@ -3197,7 +3429,9 @@ pub(super) fn launch_target_desktop_loader_control_inner(
         thread_security: &thread_security,
         executable: &executable,
     };
+    let mitigation_observation = RefCell::new(None);
     let channel = PackageLoaderChannel {
+        mitigation_observation: &mitigation_observation,
         prepared_pipe: RefCell::new(Some(prepared_pipe)),
         launch_context,
         control_job: &control_job,
@@ -3218,6 +3452,15 @@ pub(super) fn launch_target_desktop_loader_control_inner(
         .map_err(|error| TargetDesktopLeaseCreateError::from(error.to_string()))?;
     let mut wire_outcome = outcome.to_wire();
     wire_outcome.set_launch_plan_json(plan_json.clone());
+    if let memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure) = &mut wire_outcome
+    {
+        failure.mitigation_observation = mitigation_observation.into_inner().map(Box::new);
+        #[cfg(feature = "test-support")]
+        if let Some(execution) = crate::windows::support_loader_diagnostic::current() {
+            failure.support_debug_observation =
+                execution.observation.borrow().clone().map(Box::new);
+        }
+    }
     if !wire_outcome.is_consistent() {
         return Err(TargetDesktopLeaseCreateError::from(
             "production loader outcome and serialized plan are inconsistent".to_owned(),

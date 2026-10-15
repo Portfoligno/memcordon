@@ -17,6 +17,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[cfg(target_os = "windows")]
+    ConsumerReadinessLoaderDiagnostic(
+        memcordon_ci::release::original_native_components::loader_diagnostic::Args,
+    ),
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     ConsumerReadinessNativeComponents(memcordon_ci::release::original_native_components::Args),
     #[cfg(target_os = "linux")]
@@ -153,6 +157,12 @@ fn run() -> Result<()> {
         _ => workspace_root(&current)?,
     };
     let result = match cli.command {
+        #[cfg(target_os = "windows")]
+        Some(TopLevel::ConsumerReadinessLoaderDiagnostic(arguments)) => {
+            memcordon_ci::release::original_native_components::loader_diagnostic::run(
+                &root, &arguments,
+            )
+        }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         Some(TopLevel::ConsumerReadinessNativeComponents(arguments)) => {
             memcordon_ci::release::original_native_components::run(&root, &arguments)

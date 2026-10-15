@@ -149,10 +149,10 @@ fn validate_manifest_paths(
         match value {
             toml::Value::Table(table) => {
                 for (key, value) in table {
-                    if key == "path" || key == "build" {
-                        if let Some(path) = value.as_str() {
-                            output.push(path.into());
-                        }
+                    if (key == "path" || key == "build")
+                        && let Some(path) = value.as_str()
+                    {
+                        output.push(path.into());
                     }
                     paths(value, output, depth + 1)?;
                 }

@@ -68,23 +68,38 @@ fn default_serial_failure_does_not_admit_second_lane() {
 }
 
 #[test]
-fn fast_second_failure_is_primary_after_slow_first_owner_settles() {
-    let (sender, receiver) = std::sync::mpsc::channel();
+fn second_failure_remains_primary_after_admitted_first_owner_settles() {
+    let (entered, admission) = std::sync::mpsc::sync_channel(1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_settled = Arc::clone(&settled);
     let error = complete_lanes(
         Layout::Parallel,
         move || {
-            receiver.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(40));
-            Err(CiError::Message("slow first failure".into()))
+            let group = memcordon_ci::preparation::active_group().unwrap();
+            entered.send(()).unwrap();
+            while group.may_start() {
+                assert!(
+                    Instant::now() < deadline,
+                    "admitted owner did not observe stop"
+                );
+                std::thread::yield_now();
+            }
+            first_settled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         },
-        || {
-            sender.send(()).unwrap();
+        move || {
+            admission
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
             Err(CiError::Message("fast second failure".into()))
         },
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.find("fast second failure").unwrap() < error.find("slow first failure").unwrap());
+    .unwrap_err();
+    // The sole real failure has an exact primary cause; collect-all above
+    // separately retains both real errors without scheduler-order assumptions.
+    assert!(matches!(error, CiError::Message(cause) if cause == "fast second failure"));
+    assert!(settled.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]

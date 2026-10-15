@@ -26,6 +26,8 @@ environment_allowlist = [
   { file = ".github/workflows/release.yml", steps = ["Publish prepared bytes", "Publish original prepared bytes"], variable = "CARGO_REGISTRY_TOKEN", source = "${{ steps.registry-auth.outputs.token }}" },
 ]
 allowed_run_commands = [
+  "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic",
+  "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup",
   "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json",
   "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness",
   "./target/ci/release/memcordon-ci consumer-readiness-native-components --identity .release/native-readiness-identity.json --github-context --destination .release/native-readiness --cleanup",

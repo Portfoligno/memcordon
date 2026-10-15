@@ -859,6 +859,99 @@ impl PendingTargetDesktopBootstrapAccept {
         self.state = PendingAcceptState::Drained;
         Ok(())
     }
+
+    /// Support debug ownership cannot block while an outstanding debug event
+    /// suspends the peer. On error the caller must retain this owner, not drop it.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn cancel_and_poll(&mut self) -> Result<bool, TargetDesktopBootstrapPipeError> {
+        if self.state != PendingAcceptState::Pending {
+            self.state = PendingAcceptState::Drained;
+            return Ok(true);
+        }
+        let pipe = self.pipe.as_ref().expect("pending accept owns pipe").raw();
+        if unsafe { CancelIoEx(pipe, &raw const *self.overlapped) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                return Err(TargetDesktopBootstrapPipeError::native(
+                    TargetDesktopBootstrapPipeOperation::Accept,
+                    "support-connect-cancel",
+                    &error,
+                ));
+            }
+        }
+        let mut transferred = 0;
+        if unsafe { GetOverlappedResult(pipe, &raw mut *self.overlapped, &raw mut transferred, 0) }
+            != 0
+        {
+            self.state = PendingAcceptState::Drained;
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code) if code == ERROR_OPERATION_ABORTED as i32 => {
+                self.state = PendingAcceptState::Drained;
+                Ok(true)
+            }
+            Some(code) if code == ERROR_IO_INCOMPLETE as i32 => Ok(false),
+            _ => Err(TargetDesktopBootstrapPipeError::native(
+                TargetDesktopBootstrapPipeOperation::Accept,
+                "support-connect-drain",
+                &error,
+            )),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn cancel_and_drain_until(
+        &mut self,
+        cutoff: std::time::Instant,
+    ) -> Result<(), TargetDesktopBootstrapPipeError> {
+        if self.state != PendingAcceptState::Pending {
+            self.state = PendingAcceptState::Drained;
+            return Ok(());
+        }
+        let pipe = self.pipe.as_ref().expect("pending accept owns pipe").raw();
+        if unsafe { CancelIoEx(pipe, &raw const *self.overlapped) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                return Err(TargetDesktopBootstrapPipeError::native(
+                    TargetDesktopBootstrapPipeOperation::Accept,
+                    "support-connect-cancel",
+                    &error,
+                ));
+            }
+        }
+        loop {
+            let mut transferred = 0;
+            if unsafe {
+                GetOverlappedResult(pipe, &raw mut *self.overlapped, &raw mut transferred, 0)
+            } != 0
+            {
+                self.state = PendingAcceptState::Drained;
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) {
+                self.state = PendingAcceptState::Drained;
+                return Ok(());
+            }
+            if error.raw_os_error() != Some(ERROR_IO_INCOMPLETE as i32) {
+                return Err(TargetDesktopBootstrapPipeError::native(
+                    TargetDesktopBootstrapPipeOperation::Accept,
+                    "support-connect-drain",
+                    &error,
+                ));
+            }
+            let now = std::time::Instant::now();
+            if now >= cutoff {
+                return Err(TargetDesktopBootstrapPipeError::protocol(
+                    TargetDesktopBootstrapPipeOperation::Accept,
+                    "original support cleanup cutoff expired with pending accept",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1).min(cutoff - now));
+        }
+    }
 }
 
 impl Drop for PendingTargetDesktopBootstrapAccept {
@@ -1496,6 +1589,64 @@ impl std::fmt::Display for FrameAvailabilityError {
 
 pub fn frame_available(handle: HANDLE) -> Result<bool, String> {
     frame_available_detailed(handle).map_err(|error| error.to_string())
+}
+
+/// Read one small support release on a synchronous pipe owned by this sole reader.
+#[cfg(feature = "test-support")]
+pub fn read_control_release(
+    handle: HANDLE,
+    peer_process: HANDLE,
+    deadline: std::time::Instant,
+) -> Result<memcordon_core::WindowsProviderRequestV3, String> {
+    const MAX_RELEASE_BYTES: u32 = 4096;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("support control release deadline expired".into());
+        }
+        // SAFETY: the original frontend handle remains held by relay_protocol.
+        match unsafe { WaitForSingleObject(peer_process, 0) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 => return Err("support control release frontend retired".into()),
+            _ => {
+                return Err(format!(
+                    "support control release frontend wait: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        let mut prefix = [0_u8; 4];
+        let mut copied = 0_u32;
+        let mut available = 0_u32;
+        // SAFETY: initialized output storage; Peek does not consume pipe bytes.
+        if unsafe {
+            PeekNamedPipe(
+                handle,
+                prefix.as_mut_ptr().cast(),
+                4,
+                &raw mut copied,
+                &raw mut available,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(format!(
+                "support control release peek: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if copied == 4 {
+            let length = u32::from_le_bytes(prefix);
+            if length > MAX_RELEASE_BYTES {
+                return Err("support control release exceeds fixed frame bound".into());
+            }
+            if available >= 4 + length {
+                // This relay is the sole reader. The complete bounded frame is
+                // already buffered, so synchronous reads cannot wait on a tail.
+                return read_frame(handle);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 pub fn frame_available_detailed(handle: HANDLE) -> Result<bool, FrameAvailabilityError> {

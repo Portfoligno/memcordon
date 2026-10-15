@@ -370,6 +370,8 @@ impl WindowsLoaderQualificationOutcomeV2 {
                 };
                 memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(
                     memcordon_core::WindowsLoaderQualificationFailureV2 {
+                        mitigation_observation: None,
+                        support_debug_observation: None,
                         schema_version: failure.schema_version,
                         stable_code: failure.stable_code.clone(),
                         stage: match failure.stage {

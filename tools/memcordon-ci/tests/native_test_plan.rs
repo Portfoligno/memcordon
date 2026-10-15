@@ -2,8 +2,30 @@ use std::time::Duration;
 
 use memcordon_ci::{
     failure_mode::FailureMode,
-    native_test_plan::{commands, commands_with_failure},
+    native_test_plan::{build_allocation, commands, commands_with_failure},
+    performance_plan::Layout,
 };
+
+#[test]
+fn broader_native_compilation_receives_remaining_bounded_workers() {
+    for (available, layout, native_jobs) in [
+        (0, Layout::Serial, 1),
+        (1, Layout::Serial, 1),
+        (2, Layout::Parallel, 1),
+        (3, Layout::Parallel, 2),
+        (4, Layout::Parallel, 3),
+        (8, Layout::Parallel, 3),
+        (usize::MAX, Layout::Parallel, 3),
+    ] {
+        let allocation = build_allocation(available);
+        assert_eq!(allocation.layout, layout);
+        assert_eq!(allocation.product_jobs, 1);
+        assert_eq!(allocation.native_jobs, native_jobs);
+        if allocation.layout == Layout::Parallel {
+            assert!(allocation.product_jobs + allocation.native_jobs <= available.min(4));
+        }
+    }
+}
 
 #[test]
 fn native_build_and_execution_have_independent_deadlines_and_matching_targets() {

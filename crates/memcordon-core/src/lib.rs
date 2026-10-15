@@ -108,6 +108,8 @@ pub use supervision::{
     RestartSummary, SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
     SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
     SupervisionTerminal, WindowsLoaderCleanupOutcomeV1, WindowsLoaderCleanupStatusV1,
+    WindowsLoaderDebugEventV1, WindowsLoaderDebugObservationV1,
+    WindowsLoaderMitigationObservationV1, WindowsLoaderMitigationPolicyObservationV1,
     WindowsLoaderNativeStatusV1, WindowsLoaderQualificationFailureV2,
     WindowsLoaderQualificationOutcomeV2, WindowsLoaderQualificationStageV2,
     WindowsLoaderReadyEvidenceV1, WindowsSealedEvidenceV2, boundary_evidence_is_consistent,
@@ -116,7 +118,9 @@ pub use windows_capability_owner::{
     WINDOWS_CAPABILITY_OWNER_MANIFEST_SCHEMA_VERSION, WINDOWS_CAPABILITY_OWNER_ROLE_COUNT,
     WindowsCapabilityOwnerEntryV1, WindowsCapabilityOwnerManifestV1, WindowsCapabilityOwnerRoleV1,
 };
-pub use windows_guardian_receipt::{WindowsGuardianReceiptBinding, WindowsGuardianReceiptV2};
+pub use windows_guardian_receipt::{
+    WindowsGuardianCleanupTriggerV1, WindowsGuardianReceiptBinding, WindowsGuardianReceiptV2,
+};
 pub use windows_pe::{
     WINDOWS_PE_MACHINE_AMD64, WINDOWS_PE_MACHINE_ARM64, WindowsPeExport, WindowsPeExportTarget,
     WindowsPeImportDescriptor, WindowsPeImportSymbol, WindowsPeImports, WindowsPeLoaderContract,
@@ -154,12 +158,13 @@ pub use windows_sealed::{
     WindowsCallerTokenEnvelopeV1, WindowsCertificationObservationsV1,
     WindowsCertificationObservationsV2, WindowsCertificationPhaseV1,
     WindowsCleanupProcessCreationEvidenceV1, WindowsControlRequestStatusV1,
-    WindowsDurableAttemptRecordV1, WindowsDurableAttemptRecordV4, WindowsDurableCleanupStateV1,
-    WindowsEnvironmentEntryV1, WindowsFaultRejectionObservationV1,
+    WindowsControlWorkerSiteV1, WindowsDurableAttemptRecordV1, WindowsDurableAttemptRecordV4,
+    WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1, WindowsFaultRejectionObservationV1,
     WindowsFaultRejectionObservationV2, WindowsGuardianAttemptObservation,
     WindowsLaunchBrokerRequestV1, WindowsLaunchPolicyV1, WindowsLaunchRequestV1,
     WindowsLauncherRequestV1, WindowsLauncherRequestV3, WindowsLauncherResponseV1,
-    WindowsLauncherResponseV3, WindowsLifetimeV1, WindowsMissingRetirementProofV1,
+    WindowsLauncherResponseV3, WindowsLifetimeV1, WindowsLoaderDiagnosticKindV1,
+    WindowsLoaderDiagnosticSelectionV1, WindowsMissingRetirementProofV1,
     WindowsMutantHookObservationV1, WindowsMutantKillEvidenceV1, WindowsMutantNativeObservationV1,
     WindowsMutantNativeReceiptV1, WindowsMutantObservationV1, WindowsPackageCleanupOutcomeV1,
     WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsPreauthorizationFaultMatrixEvidenceV2,

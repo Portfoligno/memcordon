@@ -86,6 +86,13 @@ pub fn direct_runtime_volume_target_for_test(
 #[cfg(feature = "test-support")]
 #[path = "windows_certification_observation.rs"]
 mod certification_observation;
+#[cfg(feature = "test-support")]
+#[path = "windows_loader_diagnostic_observation.rs"]
+mod loader_diagnostic_observation;
+#[cfg(feature = "test-support")]
+pub use loader_diagnostic_observation::{
+    WindowsLoaderDiagnosticObservation, WindowsLoaderDiagnosticScope,
+};
 #[path = "windows_terminal_observation.rs"]
 mod terminal_observation;
 #[cfg(feature = "test-support")]
@@ -630,12 +637,17 @@ pub fn run(
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
         expected_provider_binding: provider_binding.clone(),
         workload_contract: policy.workload_contract().cloned(),
+        loader_diagnostic: None,
         nonce: nonce.clone(),
         command: encode_command(command).map_err(usage_error)?,
         environment: encode_environment().map_err(usage_error)?,
         current_directory: encode_current_directory().map_err(usage_error)?,
         policy: encode_policy(policy, context).map_err(usage_error)?,
     };
+    #[cfg(feature = "test-support")]
+    let mut request = request;
+    #[cfg(feature = "test-support")]
+    loader_diagnostic_observation::decorate(&mut request).map_err(transport_error)?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-request-encoded");
     let request_bytes =
@@ -646,7 +658,8 @@ pub fn run(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     #[cfg(feature = "test-support")]
-    let provider_request = certification_observation::route(request).map_err(transport_error)?;
+    let provider_request =
+        loader_diagnostic_observation::route(request).map_err(transport_error)?;
     #[cfg(not(feature = "test-support"))]
     let provider_request = WindowsProviderRequestV3::Launch(request);
     write_frame(pipe.raw(), &provider_request).map_err(transport_error)?;
@@ -850,6 +863,7 @@ pub fn run(
                     nonce: returned_nonce,
                     request_sha256: returned_digest,
                     child_pid,
+                    control_site,
                 } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
                     && returned == attempt_id
                     && returned_nonce == nonce
@@ -857,6 +871,21 @@ pub fn run(
                     && !target_authorized
                     && !target_retired =>
                 {
+                    #[cfg(feature = "test-support")]
+                    certification_observation::retain_control_site(
+                        control_site.as_deref(),
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        child_pid,
+                    )
+                    .map_err(transport_error)?;
+                    #[cfg(not(feature = "test-support"))]
+                    if control_site.is_some() {
+                        return Err(transport_error(
+                            "unexpected support control-site metadata".into(),
+                        ));
+                    }
                     relay_phase
                         .advance(WindowsRelayEventV1::TargetAuthorized)
                         .map_err(|error| transport_error(error.to_owned()))?;
@@ -871,6 +900,21 @@ pub fn run(
                         return Err(transport_error(
                             "test-support frontend disconnected its owned public channel".into(),
                         ));
+                    }
+                    #[cfg(feature = "test-support")]
+                    if let Some(site) = control_site {
+                        write_frame(
+                            pipe.raw(),
+                            &WindowsProviderRequestV3::CertificationControlReleased {
+                                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                                attempt_id: attempt_id.clone(),
+                                nonce: nonce.clone(),
+                                request_sha256: request_sha256.clone(),
+                                fault: site.fault,
+                                target_pid: child_pid,
+                            },
+                        )
+                        .map_err(transport_error)?;
                     }
                 }
                 WindowsProviderResponseV3::TargetRetired {
@@ -1951,6 +1995,8 @@ fn read_frame_with_raw_detailed<T: DeserializeOwned>(
     })?;
     #[cfg(feature = "test-support")]
     certification_observation::frame(&payload);
+    #[cfg(feature = "test-support")]
+    loader_diagnostic_observation::frame(&payload);
     Ok((decoded, payload))
 }
 

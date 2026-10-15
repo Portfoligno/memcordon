@@ -24,6 +24,8 @@ pub use linux_isolation::validate_linux_outside_file;
 mod linux_policy;
 pub mod windows_acceptance;
 mod windows_actors;
+pub mod windows_control_site;
+pub mod windows_guardian_cause;
 mod windows_toolchain;
 pub use linux_policy::LinuxPolicyGateEvidence;
 pub use linux_policy::validate_linux_policy_discovery;

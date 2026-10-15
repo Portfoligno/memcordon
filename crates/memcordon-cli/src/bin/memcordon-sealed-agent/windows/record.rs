@@ -1220,6 +1220,7 @@ impl WindowsAttemptRecordV1 {
         }
     }
 
+    #[cfg(test)]
     fn apply_terminalization_diagnostic(
         &mut self,
         error: WindowsTerminalizationErrorV1,
@@ -1481,19 +1482,56 @@ pub fn record_terminalization_failure(
     record.store()
 }
 
-pub fn record_terminalization_diagnostic(
-    attempt_id: &str,
-    error: WindowsTerminalizationErrorV1,
-) -> Result<(), String> {
+pub(super) fn replay_relay_failure_evidence(
+    binding: (&str, &str, &str),
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    caller_process_identity: &WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+    error: &WindowsTerminalizationErrorV1,
+) -> Result<memcordon_core::WindowsAttemptRetainedV2, String> {
+    let (attempt_id, _, request_sha256) = binding;
+    let _reader = RecordReaderReservation::acquire(attempt_id, request_sha256)?;
     let path = record_path(attempt_id)?;
     let bytes = read_record_bounded(&path).map_err(|read_error| read_error.to_string())?;
-    let mut record: WindowsAttemptRecordV1 =
+    let record: WindowsAttemptRecordV1 =
         serde_json::from_slice(&bytes).map_err(|parse_error| parse_error.to_string())?;
     authenticate(&record, attempt_id)?;
-    if !record.apply_terminalization_diagnostic(error)? {
-        return Ok(());
+    retained_relay_failure_from_snapshot(
+        &record,
+        binding,
+        relay_phase,
+        caller_process_identity,
+        caller_token_sha256,
+        error,
+    )
+}
+
+pub(crate) fn retained_relay_failure_from_snapshot(
+    record: &WindowsAttemptRecordV1,
+    binding: (&str, &str, &str),
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    caller_process_identity: &WindowsProcessIdentityV1,
+    caller_token_sha256: &str,
+    error: &WindowsTerminalizationErrorV1,
+) -> Result<memcordon_core::WindowsAttemptRetainedV2, String> {
+    let (attempt_id, nonce, request_sha256) = binding;
+    if record.attempt_id != attempt_id
+        || record.nonce != nonce
+        || record.request_sha256 != request_sha256
+        || record.caller_process_identity != *caller_process_identity
+        || record.caller_token_sha256 != caller_token_sha256
+        || !error.is_consistent()
+    {
+        return Err(
+            "read-only relay failure does not match authenticated attempt credentials".into(),
+        );
     }
-    record.store()
+    Ok(retained_attempt_evidence_from_snapshot(
+        attempt_id, nonce, request_sha256, relay_phase,
+        format!("observed uncommitted relay failure: {}", serde_json::to_string(error).map_err(|error| error.to_string())?),
+        vec!["read-only observation; durable revision, terminalization and original causal journal unchanged".into()],
+        Some(record),
+    ))
 }
 
 pub fn recover() -> Result<(), String> {
@@ -1619,6 +1657,13 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
     for entry in fs::read_dir(&attempts).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
+        if reserved_writer_stage(&path, &admissions_root())? {
+            ambiguous.push(format!(
+                "{} (live writer publication remains reserved)",
+                path.to_string_lossy()
+            ));
+            continue;
+        }
         let _reader = if let Ok(attempt_id) = record_attempt_id(&path) {
             Some(RecordReaderReservation::acquire(&attempt_id, &attempt_id)?)
         } else {
@@ -2230,6 +2275,9 @@ fn sweep_expired_diagnostics() -> Result<(), String> {
     }
     for entry in fs::read_dir(attempts_root()).map_err(|error| error.to_string())? {
         let path = entry.map_err(|error| error.to_string())?.path();
+        if reserved_writer_stage(&path, &admissions_root())? {
+            continue;
+        }
         let attempt_id = record_attempt_id(&path)?;
         let _reader = RecordReaderReservation::acquire(&attempt_id, &attempt_id)?;
         let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
@@ -2304,8 +2352,23 @@ fn enforce_storage_reservation(
         if !root.exists() {
             continue;
         }
-        for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
+            if root == attempts_root() && reserved_writer_stage(&entry.path(), &admissions_root())?
+            {
+                let path = entry.path();
+                let identity = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".json.new"))
+                    .ok_or("validated writer stage lost its exact filename")?;
+                if !active.contains(identity) {
+                    return Err("staged attempt has no charged active reservation".to_owned());
+                }
+                // The validated writer admission already charges all five
+                // active images; a staging image grants no terminal authority.
+                continue;
+            }
             let identity = record_attempt_id(&entry.path())?;
             if !active.contains(&identity) {
                 let metadata = entry.metadata().map_err(|error| error.to_string())?;
@@ -2935,13 +2998,7 @@ pub fn recover_attempt_for_caller(
                     record.authorization_unix_millis.is_some()
                 ));
             };
-            let response: memcordon_core::WindowsLauncherResponseV3 =
-                serde_json::from_str(outbox).map_err(|error| error.to_string())?;
-            if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(&record), &response)
-            {
-                return Err("recovery outbox is not bound to durable attempt".to_owned());
-            }
-            Ok(Some(response))
+            bound_recovery_terminal_response(&record, outbox).map(Some)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let (_, replay) = replay_record(attempt_id, request_sha256)?;
@@ -2970,6 +3027,25 @@ pub fn recover_attempt_for_caller(
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn bound_recovery_terminal_response(
+    record: &WindowsAttemptRecordV1,
+    outbox: &str,
+) -> Result<memcordon_core::WindowsLauncherResponseV3, String> {
+    let mut response: memcordon_core::WindowsLauncherResponseV3 =
+        serde_json::from_str(outbox).map_err(|error| error.to_string())?;
+    if !memcordon_core::windows_terminal_outbox_is_bound_v3(&decoded_v4(record), &response) {
+        return Err("recovery outbox is not bound to durable attempt".to_owned());
+    }
+    // The immutable outbox intentionally excludes expirable diagnostics. Export
+    // the authenticated record's current projection separately, as live replay
+    // does, without changing terminal authority or its acknowledgement digest.
+    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
+        rejection.provider_failure = provider_projection(Some(record)).0;
+        rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
+    }
+    Ok(response)
 }
 
 fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<bool, String> {
@@ -3192,6 +3268,7 @@ fn stage_recovered_closure(
         schema_version: 2,
         workload_admission: None,
         provider_failure: Some(provider_failure.clone()),
+        guardian_causal_receipt: None,
         code: "MCSEALED-WINDOWS-OWNER-LOST".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::Retirement,
         detail: if guardian_recovery {
@@ -3274,6 +3351,10 @@ pub fn recovery_inventory(
     };
     for entry in fs::read_dir(attempts_root()).map_err(|error| error.to_string())? {
         let path = entry.map_err(|error| error.to_string())?.path();
+        if reserved_writer_stage(&path, &admissions_root())? {
+            // Active admissions below retain this owner's unsettled charge.
+            continue;
+        }
         let attempt_id = record_attempt_id(&path)?;
         let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
         let record: WindowsAttemptRecordV1 =
@@ -3513,6 +3594,26 @@ pub fn validate_admission(attempt_id: &str, request_sha256: &str) -> Result<(), 
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
+pub fn diagnostic_admission_is_exclusive(
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Result<bool, String> {
+    validate_admission(attempt_id, request_sha256)?;
+    let expected = format!("{attempt_id}.json");
+    let mut entries = fs::read_dir(admissions_root()).map_err(|error| error.to_string())?;
+    let Some(entry) = entries.next() else {
+        return Ok(false);
+    };
+    let entry = entry.map_err(|error| error.to_string())?;
+    if entry.file_name() != std::ffi::OsStr::new(&expected) || entries.next().is_some() {
+        return Ok(false);
+    }
+    Ok(directory_empty(&attempts_root())?
+        && directory_empty(&quarantine_root())?
+        && directory_empty(&guardian_receipts_root())?)
+}
+
 pub fn retire_admission(attempt_id: &str) -> Result<(), String> {
     validate_attempt_id(attempt_id)?;
     let path = admissions_root().join(format!("{attempt_id}.json"));
@@ -3613,6 +3714,7 @@ pub fn rejection_evidence(
     });
     Ok(memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: provider_projection(Some(&record)).0,
+        guardian_causal_receipt: guardian_causal_projection(&record)?,
         workload_admission: None,
         schema_version: 2,
         code: code.to_owned(),
@@ -3662,6 +3764,7 @@ fn posttarget_rejection(
 ) -> memcordon_core::WindowsProviderRejectionV2 {
     memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: None,
+        guardian_causal_receipt: None,
         workload_admission: None,
         schema_version: 2,
         code: code.to_owned(),
@@ -3783,9 +3886,6 @@ fn bound_pending_terminal_response(
     };
     let mut response: memcordon_core::WindowsLauncherResponseV3 =
         serde_json::from_str(response_json).map_err(|error| error.to_string())?;
-    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
-        rejection.provider_failure = provider_projection(Some(&record)).0;
-    }
     let binding_matches = match &response {
         memcordon_core::WindowsLauncherResponseV3::Terminal(receipt) => {
             receipt.attempt_id == attempt_id
@@ -3808,6 +3908,10 @@ fn bound_pending_terminal_response(
     };
     if !binding_matches {
         return Err("pending terminal response is not bound to the replay request".to_owned());
+    }
+    if let memcordon_core::WindowsLauncherResponseV3::Reject { rejection, .. } = &mut response {
+        rejection.provider_failure = provider_projection(Some(record)).0;
+        rejection.guardian_causal_receipt = guardian_causal_projection(record)?;
     }
     Ok(Some(response))
 }
@@ -4622,6 +4726,7 @@ pub fn pretarget_rejection_at(
 ) -> memcordon_core::WindowsProviderRejectionV2 {
     memcordon_core::WindowsProviderRejectionV2 {
         provider_failure: None,
+        guardian_causal_receipt: None,
         workload_admission: None,
         schema_version: 2,
         code: code.to_owned(),
@@ -4795,6 +4900,7 @@ pub fn write_guardian_receipt(
     attempt_id: &str,
     worker_identity: &WindowsProcessIdentityV1,
     guardian_identity: &WindowsProcessIdentityV1,
+    cleanup_trigger: memcordon_core::WindowsGuardianCleanupTriggerV1,
 ) -> Result<(), String> {
     validate_attempt_id(attempt_id)?;
     fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
@@ -4803,6 +4909,18 @@ pub fn write_guardian_receipt(
     let record: WindowsAttemptRecordV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     authenticate(&record, attempt_id)?;
+    match &cleanup_trigger {
+        memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, .. }
+        | memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
+            frontend,
+            ..
+        } if frontend != &record.caller_process_identity => {
+            return Err(
+                "guardian observed frontend identity differs from authenticated caller".into(),
+            );
+        }
+        _ => {}
+    }
     if record.worker_identity.as_ref() != Some(worker_identity)
         || record.guardian_identity.as_ref() != Some(guardian_identity)
     {
@@ -4829,6 +4947,7 @@ pub fn write_guardian_receipt(
         termination_requested: true,
         native_job_query_succeeded: true,
         active_processes_zero_observed: true,
+        cleanup_trigger: Some(cleanup_trigger),
         observed_unix_millis: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -4929,9 +5048,47 @@ fn guardian_receipt_binds_record(
             boot_identity: &record.boot_identity,
             job_identity: &record.job_identity_sha256,
             owner_manifest_sha256: &owner_manifest_sha256,
+            caller_process_identity: &record.caller_process_identity,
         }) && record.guardian_identity.as_ref() == Some(&receipt.guardian_identity)
             && record.worker_identity.as_ref() == Some(&receipt.worker_identity),
     )
+}
+
+fn guardian_causal_projection(
+    record: &WindowsAttemptRecordV1,
+) -> Result<Option<Box<memcordon_core::WindowsGuardianReceiptV2>>, String> {
+    guardian_causal_projection_if_eligible(record, diagnostic_export_eligible(record), || {
+        let path = guardian_receipt_path(&record.attempt_id)?;
+        if !path.try_exists().map_err(|error| error.to_string())? {
+            return Ok(None);
+        }
+        // This reader checks the existing protected directory/file descriptor;
+        // integrity_sha256 alone is never authentication.
+        read_guardian_receipt(&record.attempt_id).map(Some)
+    })
+}
+
+fn guardian_causal_projection_if_eligible(
+    record: &WindowsAttemptRecordV1,
+    eligible: bool,
+    read_authenticated_receipt: impl FnOnce() -> Result<
+        Option<memcordon_core::WindowsGuardianReceiptV2>,
+        String,
+    >,
+) -> Result<Option<Box<memcordon_core::WindowsGuardianReceiptV2>>, String> {
+    if !eligible {
+        return Ok(None);
+    }
+    if record.guardian_identity.is_none() || record.owner_manifest.is_none() {
+        return Ok(None);
+    }
+    let Some(receipt) = read_authenticated_receipt()? else {
+        return Ok(None);
+    };
+    if !guardian_receipt_binds_record(&receipt, record)? {
+        return Err("guardian causal diagnostic differs from authenticated attempt".into());
+    }
+    Ok(Some(Box::new(receipt)))
 }
 
 fn guardian_receipt_path(attempt_id: &str) -> Result<PathBuf, String> {
@@ -4980,6 +5137,84 @@ fn record_attempt_id(path: &Path) -> Result<String, String> {
     })?;
     validate_attempt_id(attempt_id).map_err(|error| record_name_refusal(path, &error))?;
     Ok(attempt_id.to_owned())
+}
+
+/// Recognize only a bounded transaction still owned by its exact live writer.
+/// An abandoned or unknown stage remains a refusal, never committed authority.
+fn reserved_writer_stage(path: &Path, admissions: &Path) -> Result<bool, String> {
+    let Some(attempt_id) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".json.new"))
+    else {
+        return Ok(false);
+    };
+    validate_attempt_id(attempt_id)?;
+    let admission_path = admissions.join(attempt_id).with_extension("writer.json");
+    let admission: AdmissionRecordV1 = serde_json::from_slice(
+        &read_record_bounded_with_limit(&admission_path, 4096)
+            .map_err(|error| format!("staged attempt writer admission unavailable: {error}"))?,
+    )
+    .map_err(|error| format!("staged attempt writer admission invalid: {error}"))?;
+    validate_attempt_id(&admission.request_sha256)?;
+    if admission.attempt_id != attempt_id
+        || !admission.workload_reservation
+        || admission.owner_process_identities.is_empty()
+    {
+        return Err("staged attempt lacks its exact writer reservation".to_owned());
+    }
+    let mut live = false;
+    for owner in admission.owner_process_identities {
+        if owner.process_id == 0 || owner.creation_time_100ns == 0 {
+            return Err("staged attempt writer identity is invalid".to_owned());
+        }
+        live |= process_identity_is_live(owner)?;
+    }
+    if !live {
+        return Err(
+            "staged attempt writer is not live; exclusive authenticated recovery required"
+                .to_owned(),
+        );
+    }
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64
+    {
+        return Err("staged attempt is not a bounded ordinary file".to_owned());
+    }
+    let mut standard = FILE_STANDARD_INFO::default();
+    // SAFETY: query the exact held staging object without reading its partial bytes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileStandardInfo,
+            (&raw mut standard).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if standard.NumberOfLinks != 1 {
+        return Err("staged attempt has multiple links".to_owned());
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn reserved_writer_stage_for_test(
+    path: &Path,
+    admissions: &Path,
+) -> Result<bool, String> {
+    reserved_writer_stage(path, admissions)
 }
 
 pub fn validate_attempt_id(value: &str) -> Result<(), String> {

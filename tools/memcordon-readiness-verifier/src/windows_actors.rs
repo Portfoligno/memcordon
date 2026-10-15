@@ -598,9 +598,14 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             selector,
             &observation,
             actor.recovery.as_deref().map(json).transpose()?.as_ref(),
-            attempt,
-            nonce,
-            request,
+            (attempt, nonce, request),
+            actor.held_before.as_deref().map(json).transpose()?.as_ref(),
+            actor
+                .frontend_exit
+                .as_deref()
+                .map(json)
+                .transpose()?
+                .as_ref(),
         )?;
         if let Some(path) = &actor.recovery {
             let invocation_path = actor
@@ -902,6 +907,9 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
                         &[
                             "format",
                             "revision",
+                            "attempt_id",
+                            "nonce",
+                            "request_sha256",
                             "fault",
                             "process",
                             "thread",
@@ -945,6 +953,39 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
                     {
                         return Err(
                             "native control site/SCM/held worker association differs".into()
+                        );
+                    }
+                    crate::windows_control_site::validate(
+                        &site,
+                        attempt,
+                        nonce,
+                        request,
+                        selector,
+                        before["live_target_identity"]["process_id"]
+                            .as_u64()
+                            .ok_or("control target PID absent")?,
+                    )?;
+                    let mut authenticated_sites = 0_usize;
+                    for raw in observation["authenticated_provider_frames"]
+                        .as_array()
+                        .ok_or("control frames absent")?
+                    {
+                        let bytes: Vec<u8> = serde_json::from_value(raw.clone())
+                            .map_err(|error| error.to_string())?;
+                        let frame = crate::wire::json(&bytes)?;
+                        if frame["kind"] == "target-authorized" {
+                            if frame["control_site"] != site {
+                                return Err(
+                                    "control sidecar differs from authenticated original frame"
+                                        .into(),
+                                );
+                            }
+                            authenticated_sites += 1;
+                        }
+                    }
+                    if authenticated_sites != 1 {
+                        return Err(
+                            "control site authenticated frame is absent or duplicated".into()
                         );
                     }
                     (
@@ -1240,10 +1281,11 @@ fn validate_effect(
     selector: &str,
     observation: &Value,
     recovery: Option<&Value>,
-    attempt: &str,
-    nonce: &str,
-    request: &str,
+    binding: (&str, &str, &str),
+    held_before: Option<&Value>,
+    frontend_exit: Option<&Value>,
 ) -> VerificationResult<()> {
+    let (attempt, nonce, request) = binding;
     let frames = observation["authenticated_provider_frames"]
         .as_array()
         .ok_or("actual authenticated actor frames absent")?;
@@ -1311,6 +1353,20 @@ fn validate_effect(
     }
     for frame in &decoded {
         validate_frame(frame, attempt, nonce, request)?;
+        if frame["kind"] == "target-authorized" {
+            let control = kind == "fault"
+                && matches!(
+                    selector,
+                    "control-worker-killed-after-authorization"
+                        | "control-service-killed-after-authorization"
+                );
+            if control != frame.get("control_site").is_some() {
+                return Err("control site differs from actual actor selection".into());
+            }
+            if control && frame["control_site"]["fault"] != selector {
+                return Err("control site selected fault differs".into());
+            }
+        }
     }
     for frame in decoded {
         let receipt = frame.get("receipt").unwrap_or(&frame);
@@ -1457,6 +1513,19 @@ fn validate_effect(
             crate::wire::validate_windows_proof_matrix(&proof_vocabulary)?;
         }
         let event = &original["observed"]["event"];
+        if selector == "frontend-killed-after-authorization"
+            && let (Some(held), Some(frontend)) = (held_before, frontend_exit)
+            && crate::windows_guardian_cause::frontend_path(
+                rejection,
+                terminal,
+                observation,
+                held,
+                frontend,
+            )?
+        {
+            crate::wire::validate_original_failure(original)?;
+            return Ok(());
+        }
         if event["safe_detail"] == serde_json::json!({"injected-windows-fault":{"fault":selector}})
         {
             let mut vocabulary = original.clone();
@@ -1675,6 +1744,7 @@ fn validate_frame(
                     "workload_admission",
                     "provider_failure",
                     "loader_qualification",
+                    "guardian_causal_receipt",
                 ],
             )?;
             if rejection["schema_version"] != 2
@@ -1682,6 +1752,12 @@ fn validate_frame(
                 || !rejection["loader_qualification"].is_null()
             {
                 return Err("actor fault substituted an admission/loader refusal".into());
+            }
+            if !rejection["guardian_causal_receipt"].is_null() {
+                crate::windows_guardian_cause::validate(
+                    &rejection["guardian_causal_receipt"],
+                    &rejection["disposition"]["receipt"],
+                )?;
             }
             match rejection["disposition"]["disposition"]
                 .as_str()
@@ -1845,13 +1921,25 @@ fn validate_frame(
                     "request_sha256",
                     "child_pid",
                 ],
-                &[],
+                &["control_site"],
             )?;
             if frame["child_pid"]
                 .as_u64()
                 .is_none_or(|pid| pid == 0 || pid > u64::from(u32::MAX))
             {
                 return Err("actor authorization PID absent".into());
+            }
+            if let Some(site) = frame.get("control_site") {
+                crate::windows_control_site::validate(
+                    site,
+                    attempt,
+                    nonce,
+                    request,
+                    site["fault"].as_str().ok_or("control site fault absent")?,
+                    frame["child_pid"]
+                        .as_u64()
+                        .ok_or("control target PID absent")?,
+                )?;
             }
         }
         "target-retired" | "relays-abort" => shape(frame, &core, &[])?,

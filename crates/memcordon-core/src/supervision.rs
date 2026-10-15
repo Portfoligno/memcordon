@@ -240,6 +240,62 @@ pub struct WindowsLoaderQualificationFailureV2 {
     pub cleanup: WindowsLoaderCleanupOutcomeV1,
     pub diagnostic_id: Option<String>,
     pub detail: String,
+    /// Read-only process observations; never qualification or retirement authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitigation_observation: Option<Box<WindowsLoaderMitigationObservationV1>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_debug_observation: Option<Box<WindowsLoaderDebugObservationV1>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "observation", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WindowsLoaderMitigationPolicyObservationV1 {
+    Observed { flags: u32 },
+    Unavailable { native_code: u32 },
+    CutoffExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderMitigationObservationV1 {
+    pub process: crate::WindowsProcessIdentityV1,
+    pub executable_sha256: String,
+    pub launch_plan_sha256: String,
+    pub system_call_disable: WindowsLoaderMitigationPolicyObservationV1,
+    pub binary_signature: WindowsLoaderMitigationPolicyObservationV1,
+    pub image_load: WindowsLoaderMitigationPolicyObservationV1,
+}
+
+/// Candidate observations from an explicitly separate support experiment.
+/// Debug events are never launch, failure-receipt, or retirement authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderDebugObservationV1 {
+    pub process: crate::WindowsProcessIdentityV1,
+    pub creator_thread_id: u32,
+    pub challenge: String,
+    pub executable_sha256: String,
+    pub launch_plan_sha256: String,
+    pub events: Vec<WindowsLoaderDebugEventV1>,
+    pub omitted_events: u64,
+    pub detached: bool,
+    pub exit_event_continued: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderDebugEventV1 {
+    pub code: u32,
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub exception_code: Option<u32>,
+    pub first_chance: Option<bool>,
+    pub address: Option<u64>,
+    pub native_exit_code: Option<u32>,
+    pub image_path: Option<String>,
+    pub image_path_error: Option<u32>,
+    pub continuation: u32,
+    pub continuation_error: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -301,6 +357,35 @@ impl WindowsLoaderQualificationOutcomeV2 {
                     && failure.qualification_id.len() <= MAX_CODE_BYTES
                     && !failure.detail.is_empty()
                     && failure.detail.len() <= MAX_DETAIL_BYTES
+                    && failure
+                        .mitigation_observation
+                        .as_ref()
+                        .is_none_or(|observation| {
+                            observation.process.process_id != 0
+                                && observation.process.creation_time_100ns != 0
+                                && digest_is_valid(&observation.executable_sha256)
+                                && failure.launch_plan_sha256.as_ref()
+                                    == Some(&observation.launch_plan_sha256)
+                        })
+                    && failure
+                        .support_debug_observation
+                        .as_ref()
+                        .is_none_or(|observation| {
+                            observation.process.process_id != 0
+                                && observation.process.creation_time_100ns != 0
+                                && observation.creator_thread_id != 0
+                                && digest_is_valid(&observation.challenge)
+                                && digest_is_valid(&observation.executable_sha256)
+                                && failure.launch_plan_sha256.as_ref()
+                                    == Some(&observation.launch_plan_sha256)
+                                && observation.events.len() <= 64
+                                && observation.events.iter().all(|event| {
+                                    event
+                                        .image_path
+                                        .as_ref()
+                                        .is_none_or(|path| path.len() <= 2048)
+                                })
+                        })
                     && failure
                         .launch_plan_sha256
                         .as_ref()

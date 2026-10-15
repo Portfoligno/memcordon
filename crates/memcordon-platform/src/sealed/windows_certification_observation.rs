@@ -44,6 +44,9 @@ pub struct WindowsCertificationFrontendAction {
 
 thread_local! { static ACTIVE: RefCell<Option<WindowsCertificationObservation>> = const { RefCell::new(None) }; }
 thread_local! { static DESTINATION: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) }; }
+pub(super) fn active() -> bool {
+    ACTIVE.with(|active| active.borrow().is_some())
+}
 pub struct WindowsCertificationScope {
     _thread: PhantomData<Rc<()>>,
 }
@@ -201,6 +204,62 @@ pub(super) fn frame(bytes: &[u8]) {
     });
 }
 
+pub(super) fn retain_control_site(
+    site: Option<&memcordon_core::WindowsControlWorkerSiteV1>,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    target_pid: u32,
+) -> Result<(), String> {
+    let selected = ACTIVE.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .and_then(|observation| match observation.selection {
+                WindowsCertificationSelection::Fault {
+                    fault:
+                        fault @ (WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization),
+                } => Some(fault),
+                _ => None,
+            })
+    });
+    let (site, fault) = match (site, selected) {
+        (None, None) => return Ok(()),
+        (Some(site), Some(fault)) => (site, fault),
+        _ => return Err("control worker metadata does not match active support selection".into()),
+    };
+    if !site.binds(attempt_id, nonce, request_sha256, fault, target_pid) {
+        return Err("authenticated control worker metadata binding differs".into());
+    }
+    let path = DESTINATION
+        .with(|destination| {
+            destination
+                .borrow()
+                .as_ref()
+                .map(|path| path.with_file_name("control-worker-native.json"))
+        })
+        .ok_or("live control worker metadata destination absent")?;
+    let parent = path
+        .parent()
+        .ok_or("control worker metadata parent absent")?;
+    let bytes = serde_json::to_vec(site).map_err(|error| error.to_string())?;
+    if bytes.len() > 64 * 1024 {
+        return Err("control worker metadata exceeds bound".into());
+    }
+    use std::io::Write;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist_noclobber(&path)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
     use std::{
         io::Read,
@@ -216,17 +275,32 @@ pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
                     fault: WindowsSealedFault::FrontendDisconnectedAfterAuthorization,
                 } => Some((
                     false,
+                    false,
                     observation.launch.as_ref()?.command.arguments.clone(),
                 )),
                 WindowsCertificationSelection::Fault {
                     fault: WindowsSealedFault::FrontendKilledAfterAuthorization,
-                } => Some((true, observation.launch.as_ref()?.command.arguments.clone())),
+                } => Some((
+                    true,
+                    false,
+                    observation.launch.as_ref()?.command.arguments.clone(),
+                )),
+                WindowsCertificationSelection::Fault {
+                    fault:
+                        WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+                } => Some((
+                    false,
+                    true,
+                    observation.launch.as_ref()?.command.arguments.clone(),
+                )),
                 _ => None,
             })
     });
-    let Some((kill, arguments)) = selected else {
+    let Some((kill, control_release, arguments)) = selected else {
         return Ok(false);
     };
+    let deadline = Instant::now() + Duration::from_secs(75);
     if arguments
         .first()
         .and_then(|arg| String::from_utf16(arg).ok())
@@ -265,7 +339,6 @@ pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
     if !transcript.is_absolute() {
         return Err("frontend transcript must be owned absolute path".into());
     }
-    let deadline = Instant::now() + Duration::from_secs(75);
     loop {
         let mut released = false;
         if let Ok(mut file) = std::fs::File::open(&transcript) {
@@ -310,6 +383,9 @@ pub(super) fn after_target_authorized(target_pid: u32) -> Result<bool, String> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    if control_release {
+        return Ok(false);
+    }
     let action = WindowsCertificationFrontendAction {
         format: "memcordon.windows-component-frontend-action".into(),
         revision: 1,
@@ -346,7 +422,7 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn caller_identity() -> Result<WindowsProcessIdentityV1, String> {
+pub(super) fn caller_identity() -> Result<WindowsProcessIdentityV1, String> {
     use windows_sys::Win32::{
         Foundation::FILETIME,
         System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessTimes},

@@ -65,7 +65,7 @@ fn failed_report_sink_has_separate_evidence_and_full_evidence_pipe_never_blocks(
             .args(["+0ms", "--report"])
             .arg(&output)
             .args(["--", "/usr/bin/true"]);
-        assert_eq!(bounded(command).code(), Some(125));
+        assert_eq!(bounded(command, "invalid-output").code(), Some(125));
         assert!(!output.exists());
         let text = evidence.finish();
         if !full {
@@ -79,7 +79,7 @@ fn failed_report_sink_has_separate_evidence_and_full_evidence_pipe_never_blocks(
     }
 }
 
-fn bounded(mut command: Command) -> std::process::ExitStatus {
+fn bounded(mut command: Command, phase: &str) -> std::process::ExitStatus {
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
     std::thread::spawn(move || {
@@ -95,26 +95,43 @@ fn bounded(mut command: Command) -> std::process::ExitStatus {
     });
     let mut child = receiver
         .recv_timeout(Duration::from_secs(5))
-        .expect("native creation deadline")
-        .expect("native fixture spawn");
+        .unwrap_or_else(|error| {
+            panic!(
+                "{phase}: native creation deadline: {error}; elapsed {:?}",
+                started.elapsed()
+            )
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "{phase}: native fixture spawn: {error}; elapsed {:?}",
+                started.elapsed()
+            )
+        });
     loop {
         if let Some(status) = child.try_wait().expect("nonblocking native wait") {
             return status;
         }
         if started.elapsed() > Duration::from_secs(5) {
-            child.kill().expect("fixture cancellation");
+            let pid = child.id();
+            child.kill().unwrap_or_else(|error| {
+                panic!(
+                    "{phase}: fixture cancellation for PID {pid}: {error}; elapsed {:?}",
+                    started.elapsed()
+                )
+            });
             let teardown = Instant::now();
+            let mut terminal = None;
             while teardown.elapsed() < Duration::from_secs(2) {
-                if child
-                    .try_wait()
-                    .expect("fixture reap observation")
-                    .is_some()
-                {
+                if let Some(status) = child.try_wait().expect("fixture reap observation") {
+                    terminal = Some(status);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            panic!("native result writer exceeded independent outer deadline");
+            panic!(
+                "{phase}: native result writer exceeded independent outer deadline; PID {pid}; elapsed {:?}; kill succeeded; terminal observation {terminal:?}",
+                started.elapsed()
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -129,7 +146,10 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         .args(["+0ms", "--report"])
         .arg(&input)
         .args(["--", "/usr/bin/true"]);
-    assert_eq!(bounded(baseline).code(), Some(123));
+    assert_eq!(
+        bounded(baseline, "stalled-writer-baseline").code(),
+        Some(123)
+    );
     for phase in ["before-write", "before-rename", "before-ack"] {
         let phase_directory = directory.path().join(phase);
         std::fs::create_dir(&phase_directory).expect("phase directory");
@@ -143,7 +163,7 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
             .arg(&output)
             .arg(&marker);
         let started = Instant::now();
-        assert_eq!(bounded(command).code(), Some(125), "{phase}");
+        assert_eq!(bounded(command, phase).code(), Some(125), "{phase}");
         let evidence: serde_json::Value = serde_json::from_str(&evidence.finish()).unwrap();
         assert_eq!(evidence["schema"], 1);
         assert_eq!(evidence["stage"], "writer_deadline");
@@ -156,10 +176,9 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         assert_eq!(evidence["writer"]["malformed"], false);
         assert_eq!(evidence["writer"]["truncated"], false);
         assert!(evidence["writer"]["os_error"].is_null());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{phase} exceeded delivery reserve and tolerance"
-        );
+        // Save the original observation before checking cleanup; a late return
+        // must still expose its actual native reaping and output-state proof.
+        let observed_elapsed = started.elapsed();
         let marker: (u32, memcordon_core::ReportWritePhase) = serde_json::from_slice(
             &std::fs::read(marker).expect("actual native persistence barrier reached"),
         )
@@ -169,11 +188,12 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         assert_eq!(
             unsafe { libc::kill(i32::try_from(marker.0).expect("native PID"), 0) },
             -1,
-            "writer survives {phase}"
+            "writer survives {phase}; elapsed {observed_elapsed:?}; evidence {evidence}"
         );
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            Some(libc::ESRCH),
+            "{phase}; elapsed {observed_elapsed:?}; evidence {evidence}"
         );
         if phase == "before-ack" {
             let report: memcordon_core::MemcordonReport = serde_json::from_slice(
@@ -185,6 +205,11 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         } else {
             assert!(!output.exists(), "pre-rename barrier committed report");
         }
+        assert!(
+            observed_elapsed < Duration::from_secs(2),
+            "{phase} exceeded delivery reserve and tolerance: elapsed {observed_elapsed:?}; reaped writer PID {}; evidence {evidence}",
+            marker.0
+        );
     }
 }
 
@@ -198,7 +223,7 @@ fn result_writer_preserves_the_execution_return_deadline_for_durable_writes() {
         .args(["+0ms", "--report"])
         .arg(&input)
         .args(["--", "/usr/bin/true"]);
-    assert_eq!(bounded(baseline).code(), Some(123));
+    assert_eq!(bounded(baseline, "replay-baseline").code(), Some(123));
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     command
@@ -206,7 +231,7 @@ fn result_writer_preserves_the_execution_return_deadline_for_durable_writes() {
         .arg(&input)
         .arg(&output);
     let started = Instant::now();
-    assert_eq!(bounded(command).code(), Some(0));
+    assert_eq!(bounded(command, "replay").code(), Some(0));
     assert!(
         started.elapsed() >= Duration::from_millis(1100),
         "writer fixture did not consume the former 900ms write window"

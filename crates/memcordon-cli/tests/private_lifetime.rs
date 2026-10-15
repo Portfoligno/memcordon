@@ -55,7 +55,7 @@ fn early_target_status_helper() {
     use std::fs::File;
     use std::os::fd::FromRawFd;
     use std::time::Instant;
-    let target = Command::new(std::env::current_exe().unwrap())
+    let mut target = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "reserved_exit_helper", "--ignored"])
         .spawn()
         .unwrap();
@@ -81,6 +81,12 @@ fn early_target_status_helper() {
                     entered_tx.send(()).unwrap();
                     reap_private_descendants(Lifetime::Workload).map(|_| ())
                 },
+            );
+            // The exact native helper already reaped the target before
+            // publishing its raw status; Child must observe that transfer.
+            assert_eq!(
+                target.wait().unwrap_err().raw_os_error(),
+                Some(libc::ECHILD)
             );
             finished_tx.send(result).unwrap();
         });

@@ -11,23 +11,28 @@ fn holder(
     OwnedHandle,
     std::process::ChildStdout,
 ) {
+    let job = Job::create_session_holder_fixture().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", name, "--nocapture"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let job = Job::create_session_holder().unwrap();
     // SAFETY: both Job and child process handles remain owned and valid.
-    assert_ne!(
-        unsafe {
-            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
-                job.handle(),
-                child.as_raw_handle(),
-            )
-        },
-        0
-    );
+    let assigned = unsafe {
+        windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+            job.handle(),
+            child.as_raw_handle(),
+        )
+    };
+    if assigned == 0 {
+        let original = std::io::Error::last_os_error();
+        let termination = child.kill();
+        let settlement = child.wait();
+        panic!(
+            "fixture Job assignment failed: {original}; termination: {termination:?}; settlement: {settlement:?}"
+        );
+    }
     let connection = OwnedHandle::new(child.stdin.take().unwrap().into_raw_handle()).unwrap();
     let output = child.stdout.take().unwrap();
     let process = OwnedHandle::new(child.into_raw_handle()).unwrap();

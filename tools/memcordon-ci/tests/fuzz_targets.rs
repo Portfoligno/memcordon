@@ -73,40 +73,63 @@ fn malformed_or_empty_inventory_cannot_silently_lose_coverage() {
 #[test]
 fn workflow_requires_complete_static_shards_and_cache_inputs() {
     let workflow = include_str!("../../../.github/workflows/deep-ci.yml");
-    let validate = |source: &str| {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
-        memcordon_ci::policy::check_deep_fuzz_shards(yaml["jobs"]["fuzz"].as_mapping().unwrap())
-    };
-    validate(workflow).unwrap();
-    for (from, to) in [
-        (
-            "shard: [quarter-one, quarter-two, quarter-three, quarter-four]",
-            "shard: [quarter-one]",
-        ),
-        (
-            "shard: [quarter-one, quarter-two, quarter-three, quarter-four]",
-            "shard: [quarter-one, quarter-one, quarter-three, quarter-four]",
-        ),
-        (
-            "matrix.shard == 'quarter-two'",
-            "matrix.shard == 'quarter-one'",
-        ),
-        ("suite fuzz-quarter-two", "suite fuzz-quarter-one"),
-        ("fail-fast: false", "fail-fast: true"),
-        ("'fuzz/Cargo.lock', 'fuzz/Cargo.toml'", "'fuzz/Cargo.toml'"),
-        (
-            "always() && matrix.shard == 'quarter-one' && steps.fuzz-deps",
-            "success() && matrix.shard == 'quarter-one' && steps.fuzz-deps",
-        ),
-    ] {
-        assert!(workflow.contains(from));
-        assert!(
-            validate(&workflow.replace(from, to)).is_err(),
-            "accepted {to}"
-        );
-    }
     let yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
     let baseline = yaml["jobs"]["fuzz"].as_mapping().unwrap();
+    let validate = memcordon_ci::policy::check_deep_fuzz_shards;
+    validate(baseline).unwrap();
+    let reject = |job: serde_yaml::Mapping| {
+        assert_ne!(
+            &job, baseline,
+            "mutation did not change the validated fuzz job"
+        );
+        assert!(
+            validate(&job).is_err(),
+            "accepted changed fuzz job: {job:?}"
+        );
+    };
+    let strategy_key = serde_yaml::Value::String("strategy".into());
+    assert_eq!(
+        baseline[&strategy_key]["fail-fast"].as_str(),
+        Some("${{ github.event_name != 'workflow_dispatch' }}")
+    );
+    for value in [
+        true.into(),
+        false.into(),
+        "${{ github.event_name == 'workflow_dispatch' }}".into(),
+    ] {
+        let mut job = baseline.clone();
+        job.get_mut(&strategy_key).unwrap()["fail-fast"] = value;
+        reject(job);
+    }
+    let mut job = baseline.clone();
+    job.get_mut(&strategy_key)
+        .unwrap()
+        .as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("fail-fast".into()));
+    reject(job);
+    for shards in [
+        vec!["quarter-one"],
+        vec![
+            "quarter-one",
+            "quarter-one",
+            "quarter-three",
+            "quarter-four",
+        ],
+        vec!["quarter-one", "quarter-two", "quarter-three", "other"],
+        vec![
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+            "extra",
+        ],
+    ] {
+        let mut job = baseline.clone();
+        job.get_mut(&strategy_key).unwrap()["matrix"]["shard"] =
+            serde_yaml::to_value(shards).unwrap();
+        reject(job);
+    }
     for (name, value) in [
         ("timeout-minutes", serde_yaml::Value::Number(90.into())),
         ("if", serde_yaml::Value::Bool(false)),
@@ -114,22 +137,107 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
     ] {
         let mut job = baseline.clone();
         job.insert(name.into(), value);
-        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
+        reject(job);
     }
     let steps_key = serde_yaml::Value::String("steps".into());
-    let count = baseline[&steps_key].as_sequence().unwrap().len();
-    for index in 0..count {
+    let steps = baseline[&steps_key].as_sequence().unwrap();
+    let step_id = |id: &str| {
+        steps
+            .iter()
+            .position(|step| step["id"].as_str() == Some(id))
+            .unwrap()
+    };
+    let source_restore = step_id("fuzz-deps");
+    let source_save = steps
+        .iter()
+        .position(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("actions/cache/save@"))
+                && step["with"]["key"].as_str()
+                    == Some("${{ steps.fuzz-deps.outputs.cache-primary-key }}")
+        })
+        .unwrap();
+    for (index, field, from, to) in [
+        (
+            step_id("fuzz-two"),
+            "if",
+            "matrix.shard == 'quarter-two'",
+            "matrix.shard == 'quarter-one'",
+        ),
+        (
+            step_id("fuzz-two"),
+            "run",
+            "suite fuzz-quarter-two",
+            "suite fuzz-quarter-one",
+        ),
+        (
+            source_restore,
+            "if",
+            "hashFiles('fuzz/Cargo.lock')",
+            "hashFiles('missing.lock')",
+        ),
+        (source_save, "if", "always()", "success()"),
+    ] {
+        let original = steps[index][field].as_str().unwrap();
+        assert!(original.contains(from));
         let mut job = baseline.clone();
-        job[&steps_key].as_sequence_mut().unwrap().remove(index);
-        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
+        job.get_mut(&steps_key).unwrap().as_sequence_mut().unwrap()[index][field] =
+            original.replace(from, to).into();
+        reject(job);
+    }
+    for (field, from, to) in [
+        (
+            "key",
+            "hashFiles('fuzz/Cargo.lock')",
+            "hashFiles('missing.lock')",
+        ),
+        ("path", "~/.cargo/registry/cache", "target/ci"),
+    ] {
+        let original = steps[source_restore]["with"][field].as_str().unwrap();
+        assert!(original.contains(from));
         let mut job = baseline.clone();
-        job[&steps_key].as_sequence_mut().unwrap()[index]
+        job.get_mut(&steps_key).unwrap().as_sequence_mut().unwrap()[source_restore]["with"]
+            [field] = original.replace(from, to).into();
+        reject(job);
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let mut job = baseline.clone();
+        job.get_mut(&steps_key)
+            .unwrap()
+            .as_sequence_mut()
+            .unwrap()
+            .remove(index);
+        if step["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("save-context"))
+        {
+            // An absent optional refresh leaves its save condition false.
+            assert_ne!(&job, baseline);
+            validate(&job).unwrap();
+        } else {
+            reject(job);
+        }
+        if step["run"].as_str().is_none() {
+            // Cache transfers and retained diagnostics intentionally remain optional.
+            continue;
+        }
+        let mut job = baseline.clone();
+        job.get_mut(&steps_key).unwrap().as_sequence_mut().unwrap()[index]
             .as_mapping_mut()
             .unwrap()
             .insert("continue-on-error".into(), true.into());
-        assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
+        reject(job);
     }
     let mut job = baseline.clone();
-    job[&steps_key].as_sequence_mut().unwrap().swap(5, 7);
-    assert!(memcordon_ci::policy::check_deep_fuzz_shards(&job).is_err());
+    let driver = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Build ordinary CI driver"))
+        .unwrap();
+    job.get_mut(&steps_key)
+        .unwrap()
+        .as_sequence_mut()
+        .unwrap()
+        .swap(driver, step_id("fuzz-one"));
+    reject(job);
 }

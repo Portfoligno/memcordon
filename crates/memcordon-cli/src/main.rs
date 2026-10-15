@@ -1,5 +1,7 @@
 mod commands;
 mod presentation;
+#[cfg(all(target_os = "windows", feature = "test-support"))]
+mod support_loader_diagnostic;
 
 use memcordon::invocation::{
     CLEAN_USAGE, DOCTOR_USAGE, HelpKind, Invocation, PLAN_USAGE, ROOT_USAGE, route,
@@ -8,6 +10,13 @@ use presentation::Presentation;
 
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(all(target_os = "windows", feature = "test-support"))]
+    if argv
+        .first()
+        .is_some_and(|argument| argument == "__windows-loader-diagnostic")
+    {
+        std::process::exit(support_loader_diagnostic::execute(&argv));
+    }
     #[cfg(all(target_os = "windows", feature = "test-support"))]
     if argv
         .first()

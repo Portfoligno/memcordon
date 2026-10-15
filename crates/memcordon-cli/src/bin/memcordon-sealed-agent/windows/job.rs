@@ -109,6 +109,8 @@ enum JobObjectSecurity {
     LauncherService,
     NestedCanaryCreator,
     SessionHolder,
+    #[cfg(test)]
+    SessionHolderFixture,
 }
 
 impl Job {
@@ -159,7 +161,16 @@ impl Job {
     }
 
     pub fn create_session_holder() -> Result<Self, String> {
-        let job = Self::create_with_security(None, None, None, JobObjectSecurity::SessionHolder)?;
+        Self::create_session_holder_with_security(JobObjectSecurity::SessionHolder)
+    }
+
+    #[cfg(test)]
+    pub fn create_session_holder_fixture() -> Result<Self, String> {
+        Self::create_session_holder_with_security(JobObjectSecurity::SessionHolderFixture)
+    }
+
+    fn create_session_holder_with_security(security: JobObjectSecurity) -> Result<Self, String> {
+        let job = Self::create_with_security(None, None, None, security)?;
         job.configure_session_holder()?;
         job.verify_session_holder_configuration()?;
         if job.active_processes()? != 0 || job.total_processes()? != 0 {
@@ -179,6 +190,10 @@ impl Job {
             JobObjectSecurity::LauncherService => super::security::launcher_job_sddl()?,
             JobObjectSecurity::NestedCanaryCreator => super::security::nested_canary_job_sddl()?,
             JobObjectSecurity::SessionHolder => super::security::session_holder_job_sddl()?,
+            #[cfg(test)]
+            JobObjectSecurity::SessionHolderFixture => {
+                super::security::session_holder_fixture_job_sddl()?
+            }
         };
         let security = super::security::SecurityDescriptor::from_sddl(&sddl)?;
         let attributes = security.attributes(false);

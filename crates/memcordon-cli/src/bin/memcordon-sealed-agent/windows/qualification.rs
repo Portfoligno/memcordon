@@ -2899,6 +2899,7 @@ fn recursive_provider_canary() -> Result<(), String> {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
         expected_provider_binding: super::package::installed_public_provider_binding()?,
         workload_contract: None,
+        loader_diagnostic: None,
         restart_attempt: 0,
         nonce: format!("recursive-{}", std::process::id()),
         command: NativeWindowsCommandV1 {

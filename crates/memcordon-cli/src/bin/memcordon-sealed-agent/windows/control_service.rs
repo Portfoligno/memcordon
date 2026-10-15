@@ -1,5 +1,6 @@
 use std::io;
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use memcordon_core::{
     WINDOWS_CONTROL_PIPE, WINDOWS_CONTROL_SERVICE_NAME, WINDOWS_LAUNCHER_PIPE,
@@ -277,6 +278,17 @@ struct LaunchProgress {
     binding: Option<LaunchBinding>,
     relay_phase: WindowsRelayPhaseV1,
     response_state: LaunchResponseState,
+    #[cfg(any(test, feature = "test-support"))]
+    control_site: Option<ControlSitePhase>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlSitePhase {
+    AuthorizationDelivery,
+    NativeIdentity,
+    Release,
+    RetirementReached,
 }
 
 impl Default for LaunchProgress {
@@ -285,6 +297,8 @@ impl Default for LaunchProgress {
             binding: None,
             relay_phase: WindowsRelayPhaseV1::AwaitStreams,
             response_state: LaunchResponseState::None,
+            #[cfg(any(test, feature = "test-support"))]
+            control_site: None,
         }
     }
 }
@@ -301,6 +315,107 @@ impl LaunchClientFailure {
             "{}; relay_phase={:?} response_state={:?}",
             self.detail, self.progress.relay_phase, self.progress.response_state
         )
+    }
+}
+
+fn retain_launch_failure(
+    public: HANDLE,
+    nonce: String,
+    request_sha256: String,
+    result: Result<(), LaunchClientFailure>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            let code = stable_error_code(&failure.detail).to_owned();
+            match (&failure.progress.binding, failure.progress.response_state) {
+                (Some(binding), LaunchResponseState::None) => pipe::write_frame(
+                    public,
+                    &WindowsProviderResponseV3::Reject {
+                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                        attempt_id: binding.attempt_id.clone(),
+                        nonce: binding.nonce.clone(),
+                        request_sha256: binding.request_sha256.clone(),
+                        rejection: super::record::pretarget_rejection_at(
+                            &code,
+                            pretarget_phase(&code),
+                            failure.detail,
+                        ),
+                    },
+                ),
+                (None, LaunchResponseState::None) => {
+                    let mut identity = Sha256::new();
+                    identity.update(nonce.as_bytes());
+                    identity.update(request_sha256.as_bytes());
+                    identity.update(b"pretarget-rejection-v1");
+                    pipe::write_frame(
+                        public,
+                        &WindowsProviderResponseV3::Reject {
+                            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                            attempt_id: hex(identity.finalize()),
+                            nonce,
+                            request_sha256,
+                            rejection: super::record::pretarget_rejection_at(
+                                &code,
+                                pretarget_phase(&code),
+                                failure.detail,
+                            ),
+                        },
+                    )
+                }
+                (Some(binding), response_state) => {
+                    let primary = failure.detail.clone();
+                    let replay_error = if response_state == LaunchResponseState::BoundAttemptActive
+                    {
+                        match authenticate_replay_binding(
+                            public,
+                            &binding.attempt_id,
+                            &binding.nonce,
+                            &binding.request_sha256,
+                        ) {
+                            Ok(caller) => match replay_terminal(
+                                public,
+                                &binding.attempt_id,
+                                &binding.nonce,
+                                &binding.request_sha256,
+                                failure.progress.relay_phase,
+                                &caller,
+                                Some(super::record::bounded_terminalization_error(
+                                    memcordon_core::WindowsTerminalizationErrorStageV1::LaunchRelay,
+                                    &code,
+                                    &primary,
+                                    None,
+                                )),
+                            ) {
+                                Ok(ReplayTerminalProgress::Complete) => return Ok(()),
+                                Ok(ReplayTerminalProgress::Pending) => return Ok(()),
+                                Err(error) => error,
+                            },
+                            Err(error) => error,
+                        }
+                    } else {
+                        "terminal was delivered but durable retirement was not confirmed".to_owned()
+                    };
+                    let caller = authenticate_replay_binding(
+                        public,
+                        &binding.attempt_id,
+                        &binding.nonce,
+                        &binding.request_sha256,
+                    )?;
+                    let retained = super::record::retained_attempt_evidence(
+                        &caller,
+                        failure.progress.relay_phase,
+                        primary,
+                        vec![replay_error],
+                    );
+                    pipe::write_frame(
+                        public,
+                        &WindowsProviderResponseV3::AttemptRetainedV2(retained),
+                    )
+                }
+                _ => Err(failure.diagnostic()),
+            }
+        }
     }
 }
 
@@ -528,6 +643,34 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                 ),
             }
         }
+        #[cfg(feature = "test-support")]
+        WindowsProviderRequestV3::LoaderDiagnosticLaunch {
+            schema_version,
+            attempt_id,
+            request_sha256,
+            caller_process_identity,
+            launch,
+        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && launch.schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
+        {
+            if !super::token::pipe_client_is_elevated(public)? {
+                return Err("loader diagnostic requires an elevated authenticated caller".into());
+            }
+            if launch.expected_provider_binding
+                != super::package::installed_public_provider_binding()?
+            {
+                return Err("loader diagnostic selected provider binding differs".into());
+            }
+            validate_certification_binding(
+                &launch,
+                &attempt_id,
+                &request_sha256,
+                &caller_process_identity,
+            )?;
+            let mut progress = LaunchProgress::default();
+            launch_client_inner(public, launch, None, None, true, &mut progress)
+                .map_err(|detail| LaunchClientFailure { progress, detail }.diagnostic())
+        }
         WindowsProviderRequestV3::Launch(launch)
             if launch.schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
         {
@@ -542,101 +685,8 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
             let request_sha256 = hex(Sha256::digest(
                 serde_json::to_vec(&launch).map_err(|error| error.to_string())?,
             ));
-            match launch_client(public, launch, None, None) {
-                Ok(()) => Ok(()),
-                Err(failure) => {
-                    let code = stable_error_code(&failure.detail).to_owned();
-                    match (&failure.progress.binding, failure.progress.response_state) {
-                        (Some(binding), LaunchResponseState::None) => pipe::write_frame(
-                            public,
-                            &WindowsProviderResponseV3::Reject {
-                                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                                attempt_id: binding.attempt_id.clone(),
-                                nonce: binding.nonce.clone(),
-                                request_sha256: binding.request_sha256.clone(),
-                                rejection: super::record::pretarget_rejection_at(
-                                    &code,
-                                    pretarget_phase(&code),
-                                    failure.detail,
-                                ),
-                            },
-                        ),
-                        (None, LaunchResponseState::None) => {
-                            let mut identity = Sha256::new();
-                            identity.update(nonce.as_bytes());
-                            identity.update(request_sha256.as_bytes());
-                            identity.update(b"pretarget-rejection-v1");
-                            pipe::write_frame(
-                                public,
-                                &WindowsProviderResponseV3::Reject {
-                                    schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                                    attempt_id: hex(identity.finalize()),
-                                    nonce,
-                                    request_sha256,
-                                    rejection: super::record::pretarget_rejection_at(
-                                        &code,
-                                        pretarget_phase(&code),
-                                        failure.detail,
-                                    ),
-                                },
-                            )
-                        }
-                        (Some(binding), response_state) => {
-                            let primary = failure.detail.clone();
-                            let replay_error = if response_state
-                                == LaunchResponseState::BoundAttemptActive
-                            {
-                                match authenticate_replay_binding(
-                                    public,
-                                    &binding.attempt_id,
-                                    &binding.nonce,
-                                    &binding.request_sha256,
-                                ) {
-                                    Ok(caller) => match replay_terminal(
-                                        public,
-                                        &binding.attempt_id,
-                                        &binding.nonce,
-                                    &binding.request_sha256,
-                                    failure.progress.relay_phase,
-                                    &caller,
-                                    Some(super::record::bounded_terminalization_error(
-                                        memcordon_core::WindowsTerminalizationErrorStageV1::LaunchRelay,
-                                        &code,
-                                        &primary,
-                                        None,
-                                    )),
-                                ) {
-                                        Ok(ReplayTerminalProgress::Complete) => return Ok(()),
-                                        Ok(ReplayTerminalProgress::Pending) => return Ok(()),
-                                        Err(error) => error,
-                                    },
-                                    Err(error) => error,
-                                }
-                            } else {
-                                "terminal was delivered but durable retirement was not confirmed"
-                                    .to_owned()
-                            };
-                            let caller = authenticate_replay_binding(
-                                public,
-                                &binding.attempt_id,
-                                &binding.nonce,
-                                &binding.request_sha256,
-                            )?;
-                            let retained = super::record::retained_attempt_evidence(
-                                &caller,
-                                failure.progress.relay_phase,
-                                primary,
-                                vec![replay_error],
-                            );
-                            pipe::write_frame(
-                                public,
-                                &WindowsProviderResponseV3::AttemptRetainedV2(retained),
-                            )
-                        }
-                        _ => Err(failure.diagnostic()),
-                    }
-                }
-            }
+            let result = launch_client(public, launch, None, None);
+            retain_launch_failure(public, nonce, request_sha256, result)
         }
         #[cfg(any(test, feature = "test-support"))]
         WindowsProviderRequestV3::CertificationFault {
@@ -719,8 +769,22 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                     },
                 )
             } else {
-                launch_client(public, launch, Some(fault), None)
-                    .map_err(LaunchClientFailure::diagnostic)
+                let nonce = launch.nonce.clone();
+                match launch_client(public, launch, Some(fault), None) {
+                    Err(mut failure)
+                        if failure.progress.control_site.is_some()
+                            && failure.progress.control_site
+                                != Some(ControlSitePhase::RetirementReached) =>
+                    {
+                        failure.detail = format!(
+                            "support control site {:?}: {}",
+                            failure.progress.control_site.unwrap(),
+                            failure.detail
+                        );
+                        retain_launch_failure(public, nonce, request_sha256, Err(failure))
+                    }
+                    result => result.map_err(LaunchClientFailure::diagnostic),
+                }
             }
         }
         #[cfg(any(test, feature = "test-support"))]
@@ -1098,6 +1162,7 @@ fn launch_client(
         launch,
         certification_fault,
         certification_mutant,
+        false,
         &mut progress,
     )
     .map_err(|detail| LaunchClientFailure { progress, detail })
@@ -1108,9 +1173,29 @@ fn launch_client_inner(
     launch: memcordon_core::WindowsLaunchRequestV1,
     certification_fault: Option<WindowsSealedFault>,
     certification_mutant: Option<WindowsSealedMutant>,
+    diagnostic_dispatch: bool,
     progress: &mut LaunchProgress,
 ) -> Result<(), String> {
     let mut client_pid = 0_u32;
+    if diagnostic_dispatch != launch.loader_diagnostic.is_some()
+        || (diagnostic_dispatch && !cfg!(feature = "test-support"))
+        || (diagnostic_dispatch
+            && (certification_fault.is_some() || certification_mutant.is_some()))
+    {
+        return Err("loader diagnostics require the separate support dispatch".into());
+    }
+    if let Some(selection) = &launch.loader_diagnostic {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        selection
+            .validate_at(u64::try_from(now.as_millis()).map_err(|error| error.to_string())?)?;
+        if selection.support_bootstrap_sha256
+            != super::package::validate_installed_target_desktop_bootstrap_loader_control()?
+        {
+            return Err("loader diagnostic selected support bootstrap bytes differ".into());
+        }
+    }
     // SAFETY: public is a connected server pipe and output storage is writable.
     if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
         return Err(io::Error::last_os_error().to_string());
@@ -1137,18 +1222,26 @@ fn launch_client_inner(
         nonce: launch.nonce.clone(),
         request_sha256: request_sha256.clone(),
     });
+    let mut _diagnostic_package_lease = None;
     let _admission = {
         // Package mutation and launch admission share one cross-process
         // serialization point. The durable admission is established before
         // releasing it, closing the check-to-mutation race.
         let package_lease = super::package::PackageLease::acquire()?;
+        if diagnostic_dispatch && !super::record::attempts_empty()? {
+            return Err("loader diagnostic requires fresh isolated support provider state".into());
+        }
         if !super::record::recovery_clear()? {
             return Err(
                 "MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS: provider quarantine is not empty".to_owned(),
             );
         }
         let admission = super::record::reserve_admission(&attempt_id, &request_sha256)?;
-        drop(package_lease);
+        if diagnostic_dispatch {
+            _diagnostic_package_lease = Some(package_lease);
+        } else {
+            drop(package_lease);
+        }
         admission
     };
     let nonce = launch.nonce.clone();
@@ -1281,20 +1374,6 @@ fn launch_client_inner(
         }
         Err(error) => return Err(remote_transfers.abort(error)),
     };
-    #[cfg(feature = "test-support")]
-    let certification_arguments = if matches!(
-        certification_fault,
-        Some(
-            WindowsSealedFault::ControlWorkerKilledAfterAuthorization
-                | WindowsSealedFault::ControlServiceKilledAfterAuthorization
-        )
-    ) {
-        launch.command.arguments.clone()
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(feature = "test-support"))]
-    let certification_arguments = Vec::new();
     let broker = WindowsLaunchBrokerRequestV1 {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: attempt_id.clone(),
@@ -1324,7 +1403,6 @@ fn launch_client_inner(
         &nonce,
         &request_sha256,
         certification_fault,
-        &certification_arguments,
         progress,
     )
 }
@@ -2008,7 +2086,6 @@ fn relay_protocol(
     expected_nonce: &str,
     expected_request_sha256: &str,
     certification_fault: Option<WindowsSealedFault>,
-    certification_arguments: &[Vec<u16>],
     progress: &mut LaunchProgress,
 ) -> Result<(), String> {
     loop {
@@ -2104,6 +2181,7 @@ fn relay_protocol(
                         nonce,
                         request_sha256,
                         child_pid,
+                        control_site: None,
                     }
                 }
                 WindowsLauncherResponseV3::TargetRetired {
@@ -2208,6 +2286,64 @@ fn relay_protocol(
                     return Err("launcher emitted an invalid launch response".to_owned());
                 }
             };
+            #[cfg(feature = "test-support")]
+            let mut public_response = public_response;
+            #[cfg(feature = "test-support")]
+            if let Some(
+                fault @ (WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                | WindowsSealedFault::ControlServiceKilledAfterAuthorization),
+            ) = certification_fault
+            {
+                if let WindowsProviderResponseV3::TargetAuthorized {
+                    child_pid,
+                    control_site,
+                    ..
+                } = &mut public_response
+                {
+                    progress.control_site = Some(ControlSitePhase::NativeIdentity);
+                    // SAFETY: observe only this original control-service process.
+                    let process = super::process::process_identity(unsafe { GetCurrentProcess() })?;
+                    let thread = super::record::current_worker_thread_identity()?;
+                    let site = memcordon_core::WindowsControlWorkerSiteV1 {
+                        format: "memcordon.windows-component-control-worker-site".into(),
+                        revision: 1,
+                        attempt_id: expected_attempt_id.into(),
+                        nonce: expected_nonce.into(),
+                        request_sha256: expected_request_sha256.into(),
+                        fault,
+                        process,
+                        thread,
+                        target_pid: *child_pid,
+                        target_authorization_observed: true,
+                    };
+                    if !site.binds(
+                        expected_attempt_id,
+                        expected_nonce,
+                        expected_request_sha256,
+                        fault,
+                        *child_pid,
+                    ) {
+                        return Err("original control worker site identity is inconsistent".into());
+                    }
+                    *control_site = Some(Box::new(site));
+                }
+            }
+            #[cfg(feature = "test-support")]
+            if matches!(
+                certification_fault,
+                Some(
+                    WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+                )
+            ) && matches!(
+                public_response,
+                WindowsProviderResponseV3::TargetAuthorized { .. }
+            ) {
+                progress.control_site = Some(ControlSitePhase::AuthorizationDelivery);
+            }
+            #[cfg(feature = "test-support")]
+            let control_release_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(75);
             if let Err(error) = pipe::write_frame(public, &public_response) {
                 revoke_frontend_streams(frontend_process, &prepared_handles);
                 cancel_launcher_attempt(
@@ -2234,34 +2370,25 @@ fn relay_protocol(
                 if let WindowsProviderResponseV3::TargetAuthorized { child_pid, .. } =
                     &public_response
                 {
-                    use std::os::windows::ffi::OsStringExt;
-                    let descriptor = certification_arguments
-                        .get(1)
-                        .ok_or("owned control actor descriptor absent")?;
-                    let descriptor =
-                        std::path::PathBuf::from(std::ffi::OsString::from_wide(descriptor));
-                    if !descriptor.is_absolute() {
-                        return Err("owned control actor descriptor must be absolute".into());
-                    }
-                    let path = descriptor.with_file_name("control-worker-native.json");
-                    if path.try_exists().map_err(|error| error.to_string())? {
-                        return Err("owned control actor worker observation already exists".into());
-                    }
-                    // SAFETY: the pseudo process handle is used only to observe
-                    // this measured support service's actual native identity.
-                    let process = super::process::process_identity(unsafe {
-                        windows_sys::Win32::System::Threading::GetCurrentProcess()
-                    })?;
-                    let thread = super::record::current_worker_thread_identity()?;
-                    let bytes=serde_json::to_vec(&serde_json::json!({"format":"memcordon.windows-component-control-worker-site","revision":1,
-                    "fault":certification_fault,"process":process,"thread":thread,"target_pid":child_pid,
-                    "target_authorization_observed":true})).map_err(|error|error.to_string())?;
-                    memcordon_core::write_report_bytes_atomic(&path, &bytes)
-                        .map_err(|error| error.to_string())?;
-                    super::launcher_service::wait_for_certification_release_marker(
-                        certification_arguments,
-                        *child_pid,
+                    progress.control_site = Some(ControlSitePhase::Release);
+                    let release = pipe::read_control_release(
+                        public,
+                        frontend_process,
+                        control_release_deadline,
                     )?;
+                    let selected = certification_fault.ok_or("support control selection absent")?;
+                    if !release.control_release_binds(
+                        expected_attempt_id,
+                        expected_nonce,
+                        expected_request_sha256,
+                        selected,
+                        *child_pid,
+                    ) {
+                        return Err(
+                            "support control release differs from bound authorization".into()
+                        );
+                    }
+                    progress.control_site = Some(ControlSitePhase::RetirementReached);
                 }
             }
             if certification_fault

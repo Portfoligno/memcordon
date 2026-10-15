@@ -81,6 +81,7 @@ mod signal;
 #[doc(hidden)]
 pub use sealed::windows::{
     WindowsCertificationObservation, WindowsCertificationScope, WindowsCertificationSelection,
+    WindowsLoaderDiagnosticObservation, WindowsLoaderDiagnosticScope,
     direct_runtime_volume_target_for_test, open_protected_runtime_for_test,
     protected_runtime_descriptor_for_test, runtime_security_descriptor_bounds_for_test,
 };

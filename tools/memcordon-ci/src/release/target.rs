@@ -445,18 +445,13 @@ pub fn build_selected_with_failure(
         .selection(selected, Some(&distribution.target));
     let mut phases = crate::native_test_plan::commands_with_failure(true, failure_mode).into_iter();
     let compile = phases.next().expect("native compile phase");
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4);
-    let layout = if workers > 1 {
-        crate::performance_plan::Layout::Parallel
-    } else {
-        crate::performance_plan::Layout::Serial
-    };
-    let product_jobs = (workers / 2).max(1).to_string();
-    let test_jobs = (workers - workers / 2).max(1).to_string();
+    let allocation = crate::native_test_plan::build_allocation(
+        std::thread::available_parallelism().map_or(1, usize::from),
+    );
+    let product_jobs = allocation.product_jobs.to_string();
+    let test_jobs = allocation.native_jobs.to_string();
     crate::preparation::complete_lanes_with_failure(
-        layout,
+        allocation.layout,
         failure_mode,
         || command.arg("--jobs").arg(product_jobs).run().map(|_| ()),
         || {

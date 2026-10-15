@@ -970,7 +970,17 @@ fn check_scope_planner(planner: &Mapping, conditional_plan: bool) -> Result<()> 
 }
 
 fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
-    let steps = ordinary_steps(job, "native cache")?;
+    let steps = ordinary_steps(
+        job,
+        if purpose == "native-readiness" {
+            "native readiness cache"
+        } else {
+            "native cache"
+        },
+    )?;
+    if purpose == "native-readiness" {
+        check_support_loader_diagnostic(steps)?;
+    }
     let expected = format!(
         "./target/ci/release/memcordon-ci ci cache-context --purpose {purpose} --shard complete"
     );
@@ -986,6 +996,86 @@ fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
                 && !(purpose == "native-debug" && *run == "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete"))
     {
         return Err(failure("native debug/release cache role differs"));
+    }
+    Ok(())
+}
+
+fn check_support_loader_diagnostic(steps: &[Value]) -> Result<()> {
+    let unique = |id: &str| -> Result<usize> {
+        let found = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step["id"].as_str() == Some(id))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if found.len() != 1 {
+            return Err(failure("support diagnostic role must be unique"));
+        }
+        Ok(found[0])
+    };
+    let original = unique("native_readiness_cleanup")?;
+    let run = unique("support_loader_diagnostic")?;
+    let cleanup = unique("support_loader_diagnostic_cleanup")?;
+    let started = "always() && runner.os == 'Windows' && steps.support_loader_diagnostic.outputs.diagnostic-started == 'true'";
+    let command = "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic";
+    if original >= run
+        || run >= cleanup
+        || steps[run]["if"].as_str()
+            != Some(
+                "always() && runner.os == 'Windows' && steps.native_readiness_cleanup.outcome == 'success' && steps.native_readiness_cleanup.outputs.cache-quiescent == 'true'",
+            )
+        || steps[run]["run"].as_str() != Some(command)
+        || steps[cleanup]["if"].as_str() != Some(started)
+        || steps[cleanup]["run"].as_str() != Some(format!("{command} --cleanup").as_str())
+        || steps[run]["continue-on-error"].as_bool() != Some(true)
+        || steps[cleanup]["continue-on-error"].as_bool() != Some(true)
+    {
+        return Err(failure(
+            "separate support diagnostic must preserve original settlement and cleanup",
+        ));
+    }
+    let uploads = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["with"]["path"].as_str()
+                == Some(".release/support-loader-diagnostic/diagnostic-artifacts")
+        })
+        .collect::<Vec<_>>();
+    if uploads.len() != 1 {
+        return Err(failure(
+            "separate support diagnostic artifact absent or duplicated",
+        ));
+    }
+    let (index, upload) = uploads[0];
+    if index <= cleanup
+        || upload["uses"].as_str() != Some(PINNED_UPLOAD_ARTIFACT_ACTION)
+        || upload["if"].as_str() != Some(started)
+        || upload["continue-on-error"].as_bool() != Some(true)
+        || upload["with"]["name"].as_str()
+            != Some(
+                "support-loader-diagnostic-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            )
+        || upload["with"]["if-no-files-found"].as_str() != Some("error")
+        || upload["with"]["include-hidden-files"].as_bool() != Some(true)
+        || upload["with"]["overwrite"].as_bool() != Some(false)
+    {
+        return Err(failure(
+            "support diagnostic must retain its separate immutable bounded artifact namespace",
+        ));
+    }
+    let guard = "(steps.support_loader_diagnostic.outputs.diagnostic-started != 'true' || steps.support_loader_diagnostic_cleanup.outputs.cache-quiescent == 'true')";
+    for step in steps {
+        if step["uses"].as_str()
+            == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+            && !step["if"]
+                .as_str()
+                .is_some_and(|condition| condition.contains(guard))
+        {
+            return Err(failure(
+                "native cache save must retain diagnostic owner settlement",
+            ));
+        }
     }
     Ok(())
 }
@@ -1008,7 +1098,32 @@ fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
         let optional_cache = scalar(step, "uses")
             .is_some_and(|uses| uses.starts_with("actions/cache/"))
             && step.get(key("continue-on-error")).and_then(Value::as_bool) == Some(true);
-        if step.contains_key(key("continue-on-error")) && !diagnostic && !optional_cache
+        let support_diagnostic = matches!(context, "native readiness cache" | "release native")
+            && step.get(key("continue-on-error")).and_then(Value::as_bool) == Some(true)
+            && match scalar(step, "id") {
+                Some("support_loader_diagnostic") => {
+                    scalar(step, "run")
+                        == Some(
+                            "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic",
+                        )
+                }
+                Some("support_loader_diagnostic_cleanup") => {
+                    scalar(step, "run")
+                        == Some(
+                            "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup",
+                        )
+                }
+                None => {
+                    scalar(step, "uses") == Some(PINNED_UPLOAD_ARTIFACT_ACTION)
+                        && value["with"]["path"].as_str()
+                            == Some(".release/support-loader-diagnostic/diagnostic-artifacts")
+                }
+                _ => false,
+            };
+        if step.contains_key(key("continue-on-error"))
+            && !diagnostic
+            && !optional_cache
+            && !support_diagnostic
             || context != "publisher" && step.contains_key(key("env"))
             || step.contains_key(key("shell"))
         {
@@ -1258,6 +1373,31 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         return Err(failure("deep shard runner or execution bounds differ"));
     }
     let steps = ordinary_steps(job, "deep shards")?;
+    let checkout = steps
+        .iter()
+        .position(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+                && step["if"].is_null()
+        })
+        .ok_or_else(|| failure("deep shard checkout absent"))?;
+    let toolchain = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str() == Some("rustup toolchain install 1.97.1 --profile minimal")
+                && step["if"].is_null()
+        })
+        .ok_or_else(|| failure("deep shard pinned toolchain absent"))?;
+    let driver = steps
+        .iter()
+        .position(|step| step["run"].as_str() == Some(ORDINARY_DRIVER_BUILD))
+        .ok_or_else(|| failure("deep shard driver build absent"))?;
+    if checkout >= toolchain || toolchain >= driver {
+        return Err(failure(
+            "deep shard checkout and toolchain must precede driver build",
+        ));
+    }
     let mut invocations = Vec::new();
     let mut restores = 0;
     let mut saves = 0;
@@ -1291,13 +1431,17 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                     let restore = uses.contains("/restore@");
                     if selected_path == ORDINARY_SOURCE_PATHS {
                         if restore {
-                            if !selected_key.contains("hashFiles('Cargo.lock')") {
+                            let condition = scalar(step, "if").unwrap_or_default();
+                            if !selected_key.contains("hashFiles('Cargo.lock')")
+                                || !condition.contains("hashFiles('Cargo.lock') != ''")
+                            {
                                 return Err(failure(
                                     "workspace source cache must include its lockfile",
                                 ));
                             }
                             if family == "fuzz"
-                                && !selected_key.contains("hashFiles('fuzz/Cargo.lock')")
+                                && (!selected_key.contains("hashFiles('fuzz/Cargo.lock')")
+                                    || !condition.contains("hashFiles('fuzz/Cargo.lock') != ''"))
                             {
                                 return Err(failure("fuzz manifest must include its lockfile"));
                             }
@@ -3719,7 +3863,20 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
                         return Err(failure("matrix diagnostics require their actual shard"));
                     }
                 } else if step.contains_key(key("continue-on-error")) {
-                    return Err(failure("required artifact failure cannot be ignored"));
+                    if !matches!(
+                        name,
+                        "native-linux-x64"
+                            | "native-linux-arm64"
+                            | "native-macos-x64"
+                            | "native-macos-arm64"
+                            | "native-windows-x64"
+                            | "native-windows-arm64"
+                    ) || scalar(with, "path")
+                        != Some(".release/support-loader-diagnostic/diagnostic-artifacts")
+                    {
+                        return Err(failure("required artifact failure cannot be ignored"));
+                    }
+                    check_support_loader_diagnostic(steps)?;
                 }
             }
             if uses.starts_with("actions/download-artifact@") && preparation {
@@ -3895,6 +4052,31 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             "finalization must copy validated original bytes without rebuilding",
         ));
     }
+    let finalize_index = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str() == Some(finalize)
+                && step["if"].is_null()
+                && step["continue-on-error"].is_null()
+        })
+        .ok_or_else(|| failure("finalization command absent"))?;
+    let inputs: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step["with"]["path"].as_str() == Some(".release/assembled"))
+        .collect();
+    if inputs.len() != 1 || inputs[0].0 >= finalize_index {
+        return Err(failure(
+            "one immutable assembled input must precede finalization",
+        ));
+    }
+    check_rehearsal_download(
+        inputs[0].1,
+        "${{ needs.assemble-payload.outputs.assembled-artifact-id }}",
+        ".release/assembled",
+        None,
+        false,
+    )?;
     let early = jobs
         .get(key("assemble-payload"))
         .ok_or_else(|| failure("early assembly absent"))?;

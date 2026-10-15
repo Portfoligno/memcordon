@@ -10,6 +10,8 @@ use serde::Deserialize;
 use super::{artifacts, native_component_harness, source};
 use crate::consumer_readiness_ledger::{CellEvidence, SourceIdentity};
 use crate::{CiError, Result};
+#[path = "original_loader_diagnostic.rs"]
+pub mod loader_diagnostic;
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct Args {
@@ -338,6 +340,14 @@ impl OwnedRecord {
 }
 
 fn select(root: &Path, args: &Args) -> Result<Selection> {
+    select_with_diagnostic_deadline(root, args, None)
+}
+
+fn select_with_diagnostic_deadline(
+    root: &Path,
+    args: &Args,
+    diagnostic: Option<&crate::support_loader_producer::DiagnosticDeadline>,
+) -> Result<Selection> {
     let identity_record = OwnedRecord::read(&args.identity)?;
     let identity: SourceIdentity = identity_record.parse()?;
     let target = super::distribution::native_target()?;
@@ -345,7 +355,7 @@ fn select(root: &Path, args: &Args) -> Result<Selection> {
         OwnedRecord::read(&root.join(".release/native-components/measured-harnesses.json"))?;
     let roles: AcquiredRoles = roles_record.parse()?;
     let deadline_record = OwnedRecord::read(&root.join(".release/native-operation-deadline.json"))?;
-    let deadline: native_component_harness::OriginalNativeDeadline = deadline_record.parse()?;
+    let mut deadline: native_component_harness::OriginalNativeDeadline = deadline_record.parse()?;
     let host_record = OwnedRecord::read(&root.join(".release/native-components/native-host.json"))?;
     let host: AcquiredHost = host_record.parse()?;
     let target_job = match target {
@@ -514,6 +524,7 @@ fn select(root: &Path, args: &Args) -> Result<Selection> {
             ));
         }
     }
+    let instant = Instant::now();
     let now = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -521,15 +532,34 @@ fn select(root: &Path, args: &Args) -> Result<Selection> {
             .as_millis(),
     )
     .map_err(|error| CiError::Message(error.to_string()))?;
-    if now < deadline.started_unix_millis
-        || now >= deadline.cleanup_deadline_unix_millis
-        || (!args.cleanup && now >= deadline.work_deadline_unix_millis)
+    if diagnostic.is_none()
+        && (now < deadline.started_unix_millis
+            || now >= deadline.cleanup_deadline_unix_millis
+            || (!args.cleanup && now >= deadline.work_deadline_unix_millis))
     {
         return Err(CiError::Message(
             "original native component cutoff exhausted or clock regressed".into(),
         ));
     }
-    let instant = Instant::now();
+    if let Some(operation) = diagnostic {
+        if args.cleanup {
+            operation.remaining_cleanup_at(instant, now)?;
+        } else {
+            operation.remaining_at(instant, now)?;
+        }
+        if operation.native_target != target
+            || serde_json::to_vec(&operation.source)? != serde_json::to_vec(&identity)?
+        {
+            return Err(CiError::Message(
+                "separate diagnostic source association differs".into(),
+            ));
+        }
+        // Only this explicitly separate producer uses its own immutable origin.
+        // The retained production deadline record remains untouched provenance.
+        deadline.started_unix_millis = operation.started_unix_millis;
+        deadline.work_deadline_unix_millis = operation.work_deadline_unix_millis;
+        deadline.cleanup_deadline_unix_millis = operation.cleanup_deadline_unix_millis;
+    }
     let work = instant
         .checked_add(Duration::from_millis(
             deadline.work_deadline_unix_millis.saturating_sub(now),
@@ -1263,6 +1293,19 @@ fn prepare_windows_support(
     WindowsOriginalOwner,
     Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
 )> {
+    prepare_windows_support_until(root, destination, selection, selection.work)
+}
+
+#[cfg(windows)]
+fn prepare_windows_support_until(
+    root: &Path,
+    destination: &Path,
+    selection: &Selection,
+    work: Instant,
+) -> Result<(
+    WindowsOriginalOwner,
+    Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
+)> {
     use crate::windows_installed_cases::{InstalledWindowsPayload, SelectedArtifact};
     let actor_root = root.join(".release/native-components/actor");
     let actor_record = selection
@@ -1377,7 +1420,7 @@ fn prepare_windows_support(
         agent,
         &selection.identity,
         &lifetime,
-        selection.work,
+        work,
     )?;
     let config = InstalledWindowsPayload::from_materialized(
         crate::windows_causal_acceptance::InstalledChannel::NativeBundle,

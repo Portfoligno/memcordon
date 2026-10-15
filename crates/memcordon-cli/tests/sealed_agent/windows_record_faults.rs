@@ -3,6 +3,18 @@ use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 
+#[test]
+fn expired_guardian_causal_projection_never_reads_or_exports_native_receipt() {
+    let record = observed_record();
+    assert!(
+        guardian_causal_projection_if_eligible(&record, false, || {
+            panic!("expired diagnostics must not read protected receipt");
+        })
+        .unwrap()
+        .is_none()
+    );
+}
+
 #[path = "windows_v3_fixture.rs"]
 mod terminal_fixture;
 
@@ -1082,6 +1094,55 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
 }
 
 #[test]
+fn staged_attempt_requires_its_live_exact_writer_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let admissions = tempfile::tempdir().unwrap();
+    let attempt_id = digest(b"live-staged-attempt-accounting");
+    let request = digest(b"live-staged-request");
+    let staged = root.path().join(&attempt_id).with_extension("json.new");
+    std::fs::write(&staged, b"partial writer-owned bytes").unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    reserve_owned_component_writer_for_test(admissions.path(), &attempt_id, &request).unwrap();
+    let admission_path = admissions
+        .path()
+        .join(&attempt_id)
+        .with_extension("writer.json");
+    let admission_bytes = std::fs::read(&admission_path).unwrap();
+    let stage_bytes = std::fs::read(&staged).unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).unwrap());
+    assert_eq!(std::fs::read(&staged).unwrap(), stage_bytes);
+    assert_eq!(std::fs::read(&admission_path).unwrap(), admission_bytes);
+    let mut invalid: serde_json::Value = serde_json::from_slice(&admission_bytes).unwrap();
+    invalid["attempt_id"] = serde_json::json!(digest(b"foreign-stage"));
+    std::fs::write(&admission_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    let mut invalid: serde_json::Value = serde_json::from_slice(&admission_bytes).unwrap();
+    invalid["owner_process_identities"][0]["creation_time_100ns"] = serde_json::json!(1);
+    std::fs::write(&admission_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    std::fs::write(&admission_path, &admission_bytes).unwrap();
+    let alias = root.path().join("linked-stage");
+    std::fs::hard_link(&staged, &alias).unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    std::fs::remove_file(alias).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staged)
+        .unwrap()
+        .set_len(memcordon_core::WINDOWS_MAX_FRAME_BYTES as u64 + 1)
+        .unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    std::fs::remove_file(&staged).unwrap();
+    std::fs::create_dir(&staged).unwrap();
+    assert!(reserved_writer_stage_for_test(&staged, admissions.path()).is_err());
+    assert!(
+        !reserved_writer_stage_for_test(&root.path().join("unknown-entry"), admissions.path())
+            .unwrap()
+    );
+    retire_owned_component_writer_for_test(admissions.path(), &attempt_id, true).unwrap();
+}
+
+#[test]
 #[ignore = "requires explicit owned native component receipt input"]
 fn native_settlement_reservation_requires_local_writer_retirement() {
     let receipt = super::super::readiness_receipt::begin(
@@ -1230,6 +1291,77 @@ fn native_provider_projection_preserves_original_and_reports_bounded_loss() {
     assert_eq!(projection.loss.secondary_events_omitted, 17);
     let projection_bytes = serde_json::to_vec(&projection).unwrap();
     assert!(projection_bytes.len() <= memcordon_core::MAX_DIAGNOSTIC_PROJECTION_BYTES);
+    let mut recovered_record = record.clone();
+    let rejection = terminal_fixture::postauthorization_failure(
+        &mut recovered_record,
+        WindowsProcessIdentityV1 {
+            process_id: 2,
+            creation_time_100ns: 2,
+        },
+        true,
+        "MCSEALED-WINDOWS-AUTHORITY-LOSS",
+        memcordon_core::BoundarySetupPhase::Retirement,
+    );
+    recovered_record.terminal_disposition =
+        Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
+    let mut transport_event = event.clone();
+    transport_event.sequence = 0;
+    transport_event.category = memcordon_core::FailureCategoryV1::Transport;
+    transport_event.operation = memcordon_core::FailureOperationV1::DeliverResponse;
+    transport_event.code = memcordon_core::FailureCodeV1::ControlTransport;
+    transport_event.native_code = Some(memcordon_core::NativeFailureCodeV1::Win32(232));
+    transport_event.observed_phase = memcordon_core::AttemptObservationPhaseV1::Cleaning;
+    transport_event.safe_detail = memcordon_core::SafeDiagnosticDetailV1::InjectedWindowsFault {
+        fault: memcordon_core::WindowsSealedFault::FrontendDisconnectedAfterAuthorization,
+    };
+    recovered_record.causal_diagnostics = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    recovered_record
+        .causal_diagnostics
+        .observe(transport_event)
+        .unwrap();
+    recovered_record.causal_diagnostics.durable_through_sequence =
+        Some(recovered_record.causal_diagnostics.sequence);
+    let transport_projection = memcordon_core::ProviderFailureDiagnosticV1::from_journal(
+        projection.provider_binding.clone(),
+        &recovered_record.attempt_id,
+        &recovered_record.request_sha256,
+        &recovered_record.causal_diagnostics,
+    )
+    .unwrap();
+    let response = memcordon_core::WindowsLauncherResponseV3::Reject {
+        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        attempt_id: recovered_record.attempt_id.clone(),
+        nonce: recovered_record.nonce.clone(),
+        request_sha256: recovered_record.request_sha256.clone(),
+        rejection,
+    };
+    let authority = response.terminal_authority_json().unwrap();
+    let stripped: memcordon_core::WindowsLauncherResponseV3 =
+        serde_json::from_str(&authority).unwrap();
+    assert!(
+        matches!(&stripped, memcordon_core::WindowsLauncherResponseV3::Reject {
+        rejection, ..
+    } if rejection.provider_failure.is_none())
+    );
+    let recovered = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    assert!(
+        matches!(&recovered, memcordon_core::WindowsLauncherResponseV3::Reject {
+        rejection, ..
+    } if rejection.provider_failure.as_ref() == Some(&transport_projection))
+    );
+    assert_eq!(recovered.terminal_authority_json().unwrap(), authority);
+    let mut foreign = recovered_record.clone();
+    foreign.request_sha256 = "ab".repeat(32);
+    assert!(bound_recovery_terminal_response(&foreign, &authority).is_err());
+    recovered_record.diagnostic_retention.tombstone =
+        Some(memcordon_core::OriginalUnavailableReasonV1::RetentionExpired);
+    let expired = bound_recovery_terminal_response(&recovered_record, &authority).unwrap();
+    assert!(
+        matches!(&expired, memcordon_core::WindowsLauncherResponseV3::Reject {
+        rejection, ..
+    } if rejection.provider_failure.is_none())
+    );
+    assert_eq!(expired.terminal_authority_json().unwrap(), authority);
     let record_path = receipt.retain("projection.record.json", &bytes);
     let projection_path = receipt.retain("projection.public.json", &projection_bytes);
     let original_path = receipt.retain(

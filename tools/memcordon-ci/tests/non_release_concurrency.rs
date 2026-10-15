@@ -276,46 +276,249 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         "stress-packages",
         "stress-lifecycle",
     ] {
-        let steps = deep["jobs"][family]["steps"].as_sequence().unwrap();
-        let mut source_steps = 0;
-        let mut compiled_steps = 0;
-        for step in steps.iter().filter(|step| {
-            step["uses"]
-                .as_str()
-                .is_some_and(|uses| uses.starts_with("actions/cache/"))
-        }) {
-            let actual: Vec<_> = step["with"]["path"].as_str().unwrap().lines().collect();
-            if actual.first() == Some(&"~/.cargo/registry/index") {
-                source_steps += 1;
-                assert_eq!(
-                    actual,
-                    [
-                        "~/.cargo/registry/index",
-                        "~/.cargo/registry/cache",
-                        "~/.cargo/git/db"
-                    ]
-                );
-            } else {
-                compiled_steps += 1;
-                let expected = match family {
-                    "miri" => vec!["target/ci/miri-*"],
-                    "fuzz" => vec![
-                        "fuzz/target",
-                        "target/ci-tools/bin",
-                        "target/ci-tools-build",
-                    ],
-                    "stress" => vec!["target/ci/stress"],
-                    "stress-packages" => vec!["target/ci/stress-packages"],
-                    "stress-lifecycle" => vec!["target/ci/stress-lifecycle"],
-                    _ => unreachable!(),
-                };
-                assert_eq!(actual, expected, "unselected output or credential cache");
-            }
+        finite_cache_paths(&deep["jobs"][family], family).unwrap();
+    }
+
+    let baseline = &deep["jobs"]["miri"];
+    for replacement in [
+        "~/.cargo",
+        "~/.cargo/credentials.toml",
+        "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db",
+    ] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["id"] == "miri-deps")
+            .unwrap()["with"]["path"] = replacement.into();
+        assert_ne!(&job, baseline);
+        assert!(finite_cache_paths(&job, "miri").is_err());
+    }
+    for replacement in [
+        "target/ci/reports",
+        "target/ci-build",
+        "target/ci/miri-*",
+        "${{ steps.compiled-context-second.outputs.product-paths }}",
+    ] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["id"] == "compiled-first")
+            .unwrap()["with"]["path"] = replacement.into();
+        assert_ne!(&job, baseline);
+        assert!(finite_cache_paths(&job, "miri").is_err());
+    }
+    for id in ["compiled-first", "compiled-context-second"] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .retain(|step| step["id"] != id);
+        assert_ne!(&job, baseline);
+        assert!(finite_cache_paths(&job, "miri").is_err());
+    }
+    let mut job = baseline.clone();
+    job["steps"]
+        .as_sequence_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|step| step["with"]["key"] == "${{ steps.compiled-first.outputs.cache-primary-key }}")
+        .unwrap()["with"]["path"] = "target/ci/reports".into();
+    assert_ne!(&job, baseline);
+    assert!(finite_cache_paths(&job, "miri").is_err());
+    let baseline = &deep["jobs"]["fuzz"];
+    for (id, path) in [
+        ("cache-cargo-fuzz-binary", "target/ci-tools/bin"),
+        ("cache-cargo-fuzz-build", "target/ci-tools-build"),
+    ] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["id"] == id)
+            .unwrap()["with"]["path"] = path.into();
+        assert_ne!(&job, baseline);
+        assert!(finite_cache_paths(&job, "fuzz").is_err());
+    }
+}
+
+fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
+    let require = |valid: bool| {
+        valid
+            .then_some(())
+            .ok_or_else(|| "cache role or custody differs".to_owned())
+    };
+    let steps = job["steps"].as_sequence().ok_or("steps absent")?;
+    let shards: &[&str] = match family {
+        "miri" => &["first", "second"],
+        "fuzz" => &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        "stress" | "stress-packages" | "stress-lifecycle" => &["complete"],
+        _ => return Err("unknown family".into()),
+    };
+    let reference =
+        |context: &str, output: &str| format!("${{{{ steps.{context}.outputs.{output} }}}}");
+    let mut roles = std::collections::BTreeMap::new();
+    for shard in shards {
+        let (id, context) = if *shard == "complete" {
+            ("compiled".to_owned(), "compiled-context".to_owned())
+        } else {
+            (
+                format!("compiled-{shard}"),
+                format!("compiled-context-{shard}"),
+            )
+        };
+        let declarations: Vec<_> = steps
+            .iter()
+            .filter(|step| step["id"].as_str() == Some(&context))
+            .collect();
+        require(declarations.len() == 1)?;
+        require(
+            declarations[0]["run"].as_str()
+                == Some(&format!(
+                    "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}"
+                )),
+        )?;
+        if *shard != "complete" {
+            require(declarations[0]["if"].as_str() == Some(&format!("matrix.shard == '{shard}'")))?;
         }
-        assert_eq!(source_steps, 2, "source restore and save must both exist");
-        assert_eq!(
-            compiled_steps, 2,
-            "compiled restore and save must both exist"
+        let roots =
+            memcordon_ci::cache_restore::roots(family, shard).map_err(|error| error.to_string())?;
+        roles.insert(
+            id,
+            (
+                reference(&context, "product-key"),
+                reference(&context, "product-paths"),
+                Some(reference(&context, "product-restore-prefix")),
+                roots,
+            ),
         );
     }
+    if family == "fuzz" {
+        require(steps.iter().filter(|step| step["id"] == "cache-cargo-fuzz" && step["run"] == "./target/ci/release/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete").count() == 1)?;
+        for (id, key, path, roots) in [
+            (
+                "cache-cargo-fuzz-binary",
+                "tool-key",
+                "tool-path",
+                vec![
+                    memcordon_ci::preparation::auxiliary_tool(Path::new(""), "cargo-fuzz")
+                        .map_err(|error| error.to_string())?,
+                ],
+            ),
+            (
+                "cache-cargo-fuzz-build",
+                "tool-build-key",
+                "tool-build-path",
+                vec!["target/ci-tools-build/cargo-fuzz".into()],
+            ),
+        ] {
+            roles.insert(
+                id.into(),
+                (
+                    reference("cache-cargo-fuzz", key),
+                    reference("cache-cargo-fuzz", path),
+                    None,
+                    roots,
+                ),
+            );
+        }
+    }
+    let mut downloads = 0;
+    let mut saves = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    for (ordinal, step) in steps.iter().enumerate() {
+        let Some(uses) = step["uses"].as_str() else {
+            continue;
+        };
+        if uses.starts_with("actions/cache/save@") {
+            saves += 1;
+            continue;
+        }
+        if !uses.starts_with("actions/cache/restore@") {
+            continue;
+        }
+        let id = step["id"].as_str().ok_or("restore id absent")?;
+        require(seen.insert(id))?;
+        let key = step["with"]["key"].as_str().ok_or("restore key absent")?;
+        let path = step["with"]["path"].as_str().ok_or("restore path absent")?;
+        if key.starts_with("mc-download-v4-${{ runner.os }}-") {
+            downloads += 1;
+            require(
+                path.lines().collect::<Vec<_>>() == ["~/.cargo/registry/cache", "~/.cargo/git/db"],
+            )?;
+            require(
+                key.contains("hashFiles('Cargo.lock')")
+                    && step["if"].as_str().is_some_and(|condition| {
+                        condition.contains("hashFiles('Cargo.lock') != ''")
+                    }),
+            )?;
+            if family == "fuzz" {
+                require(
+                    key.contains("hashFiles('fuzz/Cargo.lock')")
+                        && step["if"].as_str().is_some_and(|condition| {
+                            condition.contains("hashFiles('fuzz/Cargo.lock') != ''")
+                        }),
+                )?;
+            }
+        } else {
+            let (expected_key, expected_path, prefix, roots) =
+                roles.remove(id).ok_or("unknown restore role")?;
+            require(key == expected_key && path == expected_path)?;
+            if let Some(prefix) = prefix {
+                require(step["with"]["restore-keys"].as_str() == Some(&prefix))?;
+                if let Some(shard) = id.strip_prefix("compiled-") {
+                    require(step["if"].as_str().is_some_and(|condition| {
+                        condition.contains(&format!("matrix.shard == '{shard}'"))
+                    }))?;
+                }
+            }
+            for root in roots {
+                require(!root.to_string_lossy().contains('*'))?;
+                for excluded in [
+                    ".release/prepared",
+                    "target/ci/reports",
+                    "target/ci/deadline-evidence",
+                    "target/ci-consumers/capture",
+                    "target/ci-build/package-staging",
+                    "~/.cargo/credentials.toml",
+                    "~/.cargo/config.toml",
+                ] {
+                    require(!Path::new(excluded).starts_with(&root))?;
+                }
+                if family == "miri" {
+                    let other = if id == "compiled-first" {
+                        "target/ci/miri-second"
+                    } else {
+                        "target/ci/miri-first"
+                    };
+                    require(!Path::new(other).starts_with(root))?;
+                }
+            }
+        }
+        let paired: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, save)| {
+                save["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+                    && save["with"]["key"].as_str() == Some(&reference(id, "cache-primary-key"))
+            })
+            .collect();
+        require(
+            paired.len() == 1
+                && paired[0].0 > ordinal
+                && paired[0].1["with"]["path"].as_str() == Some(path),
+        )?;
+    }
+    require(downloads == 1 && roles.is_empty() && saves == seen.len())
 }

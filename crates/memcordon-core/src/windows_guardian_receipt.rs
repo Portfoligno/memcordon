@@ -9,6 +9,22 @@ use sha2::{Digest, Sha256};
 use crate::WindowsProcessIdentityV1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "trigger", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WindowsGuardianCleanupTriggerV1 {
+    FrontendLost {
+        frontend: WindowsProcessIdentityV1,
+        native_exit_status: u32,
+    },
+    WorkerLost,
+    ServiceStopped,
+    FrontendIdentityUnavailable,
+    FrontendExitStatusUnavailable {
+        frontend: WindowsProcessIdentityV1,
+        native_code: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsGuardianReceiptV2 {
     pub schema_version: u32,
@@ -25,6 +41,8 @@ pub struct WindowsGuardianReceiptV2 {
     pub termination_requested: bool,
     pub native_job_query_succeeded: bool,
     pub active_processes_zero_observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_trigger: Option<WindowsGuardianCleanupTriggerV1>,
     pub observed_unix_millis: u64,
     pub integrity_sha256: String,
 }
@@ -40,6 +58,7 @@ pub struct WindowsGuardianReceiptBinding<'a> {
     pub boot_identity: &'a str,
     pub job_identity: &'a str,
     pub owner_manifest_sha256: &'a str,
+    pub caller_process_identity: &'a WindowsProcessIdentityV1,
 }
 
 impl WindowsGuardianReceiptV2 {
@@ -76,6 +95,17 @@ impl WindowsGuardianReceiptV2 {
             && self.termination_requested
             && self.native_job_query_succeeded
             && self.active_processes_zero_observed
+            && self
+                .cleanup_trigger
+                .as_ref()
+                .is_none_or(|trigger| match trigger {
+                    WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, .. }
+                    | WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
+                        frontend,
+                        ..
+                    } => frontend.process_id != 0 && frontend.creation_time_100ns != 0,
+                    _ => true,
+                })
             && self.observed_unix_millis != 0
             && self
                 .canonical_sha256()
@@ -92,5 +122,16 @@ impl WindowsGuardianReceiptV2 {
             && self.original_boot_id == binding.boot_identity
             && self.job_identity == binding.job_identity
             && self.owner_manifest_sha256 == binding.owner_manifest_sha256
+            && self
+                .cleanup_trigger
+                .as_ref()
+                .is_none_or(|trigger| match trigger {
+                    WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, .. }
+                    | WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
+                        frontend,
+                        ..
+                    } => frontend == binding.caller_process_identity,
+                    _ => true,
+                })
     }
 }

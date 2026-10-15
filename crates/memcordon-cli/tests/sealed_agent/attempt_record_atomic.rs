@@ -6,6 +6,22 @@ use tempfile::TempDir;
 const IDENTITY: &str = "abababababababababababababababab";
 
 #[test]
+fn initial_record_collision_preserves_original_allocated_custody() {
+    use std::os::unix::fs::MetadataExt;
+    let root = TempDir::new().unwrap();
+    let record = AttemptRecord::create_for_test(root.path(), IDENTITY.to_owned(), 1).unwrap();
+    let path = root.path().join(IDENTITY);
+    let bytes = std::fs::read(&path).unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    assert!(AttemptRecord::create_for_test(root.path(), IDENTITY.to_owned(), 2).is_err());
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    record.retire().unwrap();
+}
+
+#[test]
 fn production_allocated_and_transitioned_records_pass_strict_recovery_parser() {
     let temporary = TempDir::new().unwrap();
     let record = AttemptRecord::create_for_test(temporary.path(), IDENTITY.to_owned(), 1).unwrap();

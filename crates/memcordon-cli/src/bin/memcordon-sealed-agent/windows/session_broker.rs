@@ -27,6 +27,20 @@ use super::pipe::OwnedHandle;
 pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;
 const BROKER_ROLE: u8 = 3;
 const BROKER_TRANSACTION_DEADLINE: Duration = Duration::from_secs(30);
+
+fn broker_work_cutoff() -> Instant {
+    let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+    #[cfg(feature = "test-support")]
+    let deadline = super::support_loader_diagnostic::work_cutoff(deadline);
+    deadline
+}
+
+fn broker_cleanup_cutoff() -> Instant {
+    let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+    #[cfg(feature = "test-support")]
+    let deadline = super::support_loader_diagnostic::cleanup_cutoff(deadline);
+    deadline
+}
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const LAUNCHER_PROCESS_BROKER_ACCESS: u32 =
     SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE;
@@ -544,7 +558,7 @@ impl BrokerControlLease {
             .pipe
             .as_ref()
             .ok_or_else(|| "session broker control pipe is absent".to_owned())?;
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_work_cutoff();
         super::pipe::write_frame_bounded(
             pipe.raw(),
             Some(self.broker.handle.raw()),
@@ -606,7 +620,7 @@ impl BrokerControlLease {
             .pipe
             .as_ref()
             .ok_or_else(|| "session broker control pipe is absent".to_owned())?;
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_work_cutoff();
         super::pipe::write_frame_bounded(
             pipe.raw(),
             Some(self.broker.handle.raw()),
@@ -659,7 +673,7 @@ impl BrokerControlLease {
             .pipe
             .as_ref()
             .ok_or_else(|| "session broker control pipe is absent".to_owned())?;
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_cleanup_cutoff();
         super::pipe::write_frame_bounded(
             pipe.raw(),
             Some(self.broker.handle.raw()),
@@ -775,7 +789,7 @@ unsafe fn broker_service_transaction(
         return Ok(());
     }
     let (launcher_process, launcher_identity) = authenticate_launcher_client(pipe.raw())?;
-    let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+    let deadline = broker_work_cutoff();
     let broker_identity = super::process::process_identity(unsafe { GetCurrentProcess() })?;
     let challenge = super::token::service_attestation_challenge("session-broker")
         .map_err(|error| error.to_string())?;
@@ -953,7 +967,7 @@ fn run_creation_authority_transaction(
     let mut failed = false;
     let mut station_tid = None;
     loop {
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_work_cutoff();
         let frame: SessionBrokerProductionFrameV1 = super::pipe::read_frame_bounded(
             pipe,
             Some(launcher_process),
@@ -1047,7 +1061,7 @@ fn run_creation_authority_transaction(
                 let consumed: SessionBrokerProductionFrameV1 = super::pipe::read_frame_bounded(
                     pipe,
                     Some(launcher_process),
-                    Instant::now() + BROKER_TRANSACTION_DEADLINE,
+                    broker_work_cutoff(),
                     super::pipe::TargetDesktopBootstrapPipeOperation::BrokerConsumedRead,
                 )
                 .map_err(|error| error.to_string())?;
@@ -1079,7 +1093,7 @@ fn run_creation_authority_transaction(
                 super::pipe::write_frame_bounded(
                     pipe,
                     Some(launcher_process),
-                    Instant::now() + BROKER_TRANSACTION_DEADLINE,
+                    broker_work_cutoff(),
                     super::pipe::TargetDesktopBootstrapPipeOperation::BrokerClearedWrite,
                     &SessionBrokerProductionFrameV1::Cleared {
                         binding_sha256: launched.binding_sha256.clone(),
@@ -1177,7 +1191,7 @@ fn start_authenticated_broker(
     .map_err(|error| operation.startup_failure(BrokerClientStartupStage::DemandStart, error))?;
     let pipe = match super::pipe::connect_session_broker_pipe(
         WINDOWS_SESSION_BROKER_PIPE,
-        Instant::now() + BROKER_TRANSACTION_DEADLINE,
+        broker_work_cutoff(),
     ) {
         Ok(pipe) => pipe,
         Err(endpoint_error) => {
@@ -1223,7 +1237,7 @@ fn start_authenticated_broker(
                 ),
             ));
         }
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_work_cutoff();
         let hello = match super::pipe::read_frame_bounded(
             pipe.raw(),
             Some(pinned_broker.handle.raw()),
@@ -1301,7 +1315,7 @@ pub(crate) fn request_holder(
         let pipe = authenticated.pipe();
         let broker = authenticated.broker();
         let hello = &authenticated.hello;
-        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        let deadline = broker_work_cutoff();
         job.verify_session_holder_configuration()?;
         if job.active_processes()? != 0 {
             return Err("session-holder Job is not empty before broker request".to_owned());
@@ -1494,11 +1508,12 @@ fn retire_authenticated_broker(
         BROKER_TRANSACTION_DEADLINE,
     )?;
     let started = Instant::now();
+    let deadline = broker_cleanup_cutoff();
     loop {
         if !super::pipe::endpoint_exists(WINDOWS_SESSION_BROKER_PIPE)? {
             return Ok(());
         }
-        if started.elapsed() >= BROKER_TRANSACTION_DEADLINE {
+        if Instant::now() >= deadline {
             return Err(format!(
                 "role=session-broker operation=retire phase=endpoint-disappearance pinned_pid={} pinned_creation_time_100ns={} elapsed_ms={} timed_out=true",
                 broker.identity.process_id,

@@ -280,11 +280,13 @@ fn persist_actor_late_effect(
                 &json!({"format":if control{"memcordon.windows-component-control-worker-exit"}else{"memcordon.windows-component-worker-exit"},"revision":1,"process_id":worker["process_id"],"process_creation_time_100ns":worker["creation_time_100ns"],"thread":thread,"held_before_fault":true,"exit_observed":true,"native_exit_status":if control&&!process_loss{0}else{0xC000_013A_u32},"process_retirement_observed":process_loss,"process_native_exit_status":if process_loss{json!(0xC000_013A_u32)}else{Value::Null}}),
             ));
             if control {
-                actor.control_worker_site = Some(put(
-                    case,
-                    "control-site.json",
-                    &json!({"format":"memcordon.windows-component-control-worker-site","revision":1,"fault":selector,"process":worker,"thread":thread,"target_pid":target["process_id"],"target_authorization_observed":true}),
-                ));
+                let site = json!({"format":"memcordon.windows-component-control-worker-site","revision":1,"attempt_id":attempt,"nonce":nonce,"request_sha256":digest,"fault":selector,"process":worker,"thread":thread,"target_pid":target["process_id"],"target_authorization_observed":true});
+                let authorization = json!({"kind":"target-authorized","schema_version":3,"attempt_id":attempt,"nonce":nonce,"request_sha256":digest,"child_pid":target["process_id"],"control_site":site});
+                observation["authenticated_provider_frames"] = json!([
+                    serde_json::to_vec(&authorization).unwrap(),
+                    serde_json::to_vec(&terminal).unwrap(),
+                ]);
+                actor.control_worker_site = Some(put(case, "control-site.json", &site));
                 actor.control_worker_held = Some(put(
                     case,
                     "control-held.json",
@@ -609,6 +611,56 @@ fn persisted_remaining_15_authorized_actor_effects_require_original_terminal_and
     for facet in ["postresume", "cleanup", "after-exit"] {
         let mut case = persisted_actor_facet(facet);
         case.validate().unwrap();
+        if facet == "postresume" {
+            for ordinal in [3, 4] {
+                let path = format!("actors/{ordinal}/control-site.json");
+                let original = std::fs::read(case.root.path().join(&path)).unwrap();
+                for field in ["attempt_id", "nonce", "request_sha256"] {
+                    case.mutate(&path, |site| {
+                        site.as_object_mut().unwrap().remove(field);
+                    });
+                    assert!(
+                        case.validate().is_err(),
+                        "accepted missing control-site {field}"
+                    );
+                    case.write(&path, &original);
+                }
+                case.mutate(&path, |site| site["nonce"] = json!("foreign-nonce"));
+                assert!(
+                    case.validate().is_err(),
+                    "accepted foreign control-site nonce"
+                );
+                case.write(&path, &original);
+                let path = format!("actors/{ordinal}/observation.json");
+                let original = std::fs::read(case.root.path().join(&path)).unwrap();
+                case.mutate(&path, |raw| {
+                    raw["authenticated_provider_frames"]
+                        .as_array_mut()
+                        .unwrap()
+                        .remove(0);
+                });
+                assert!(
+                    case.validate().is_err(),
+                    "accepted absent control-site authorization"
+                );
+                case.write(&path, &original);
+                case.mutate(&path, |raw| {
+                    let bytes: Vec<u8> =
+                        serde_json::from_value(raw["authenticated_provider_frames"][0].clone())
+                            .unwrap();
+                    let mut frame: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(frame["kind"], "target-authorized");
+                    frame["control_site"]["thread"]["creation_time_100ns"] = json!(999);
+                    raw["authenticated_provider_frames"][0] =
+                        json!(serde_json::to_vec(&frame).unwrap());
+                });
+                assert!(
+                    case.validate().is_err(),
+                    "accepted reassociated authenticated control site"
+                );
+                case.write(&path, &original);
+            }
+        }
         let count = match facet {
             "postresume" => 8,
             "cleanup" => 6,
@@ -635,12 +687,30 @@ fn persisted_remaining_15_authorized_actor_effects_require_original_terminal_and
         }
         let path = "actors/0/observation.json";
         let original = std::fs::read(case.root.path().join(path)).unwrap();
+        let terminal_index = |raw: &Value| {
+            let matches: Vec<_> = raw["authenticated_provider_frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, frame)| {
+                    let bytes: Vec<u8> = serde_json::from_value(frame.clone()).unwrap();
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    (value["kind"] == "terminal").then_some(index)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1);
+            matches[0]
+        };
         case.mutate(path, |raw| {
+            let index = terminal_index(raw);
             let bytes: Vec<u8> =
-                serde_json::from_value(raw["authenticated_provider_frames"][0].clone()).unwrap();
+                serde_json::from_value(raw["authenticated_provider_frames"][index].clone())
+                    .unwrap();
             let mut terminal: Value = serde_json::from_slice(&bytes).unwrap();
             terminal["retirement_proof"]["owner_capabilities_closed"] = json!(false);
-            raw["authenticated_provider_frames"][0] = json!(serde_json::to_vec(&terminal).unwrap());
+            raw["authenticated_provider_frames"][index] =
+                json!(serde_json::to_vec(&terminal).unwrap());
         });
         assert!(
             case.validate().is_err(),
@@ -648,11 +718,14 @@ fn persisted_remaining_15_authorized_actor_effects_require_original_terminal_and
         );
         case.write(path, &original);
         case.mutate(path, |raw| {
+            let index = terminal_index(raw);
             let bytes: Vec<u8> =
-                serde_json::from_value(raw["authenticated_provider_frames"][0].clone()).unwrap();
+                serde_json::from_value(raw["authenticated_provider_frames"][index].clone())
+                    .unwrap();
             let mut terminal: Value = serde_json::from_slice(&bytes).unwrap();
             terminal["process_observation"]["fake_native_authority"] = json!(true);
-            raw["authenticated_provider_frames"][0] = json!(serde_json::to_vec(&terminal).unwrap());
+            raw["authenticated_provider_frames"][index] =
+                json!(serde_json::to_vec(&terminal).unwrap());
         });
         assert!(
             case.validate().is_err(),
@@ -660,12 +733,15 @@ fn persisted_remaining_15_authorized_actor_effects_require_original_terminal_and
         );
         case.write(path, &original);
         case.mutate(path, |raw| {
+            let index = terminal_index(raw);
             let bytes: Vec<u8> =
-                serde_json::from_value(raw["authenticated_provider_frames"][0].clone()).unwrap();
+                serde_json::from_value(raw["authenticated_provider_frames"][index].clone())
+                    .unwrap();
             let mut terminal: Value = serde_json::from_slice(&bytes).unwrap();
             terminal["policy_enforcement"] =
                 json!({"state":"authorized","provider_resources_closed":true});
-            raw["authenticated_provider_frames"][0] = json!(serde_json::to_vec(&terminal).unwrap());
+            raw["authenticated_provider_frames"][index] =
+                json!(serde_json::to_vec(&terminal).unwrap());
         });
         assert!(
             case.validate().is_err(),

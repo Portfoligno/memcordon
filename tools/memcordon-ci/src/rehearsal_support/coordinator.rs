@@ -780,7 +780,7 @@ pub fn run_with_jobs(
         thread::scope(|scope| {
             let (sender, receiver) = mpsc::sync_channel(2);
             let mut admitted = 0;
-            for ordinal in next..next + count {
+            for (ordinal, case) in selected.iter().enumerate().skip(next).take(count) {
                 if cancelled.load(Ordering::SeqCst)
                     || Instant::now() + Duration::from_secs(10) >= work
                 {
@@ -795,7 +795,6 @@ pub fn run_with_jobs(
                     break;
                 }
                 let sender = sender.clone();
-                let case = &selected[ordinal];
                 let context = &context;
                 match thread::Builder::new().spawn_scoped(scope, move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -857,10 +856,10 @@ pub fn run_with_jobs(
                         eprintln!("secondary rehearsal diagnostic failure: {error}");
                     }
                 }
-                if primary.is_none() {
-                    if let Err(error) = fs::remove_dir_all(&state) {
-                        primary = Some(error.into());
-                    }
+                if primary.is_none()
+                    && let Err(error) = fs::remove_dir_all(&state)
+                {
+                    primary = Some(error.into());
                 }
             }
         });
@@ -1572,10 +1571,10 @@ pub fn assert_parallel_input_isolation(input: &Path) -> Result<()> {
             let result = worker
                 .join()
                 .unwrap_or_else(|_| Err(failure("parallel input control panicked")));
-            if let Err(error) = result {
-                if primary.is_none() {
-                    primary = Some(error);
-                }
+            if let Err(error) = result
+                && primary.is_none()
+            {
+                primary = Some(error);
             }
         }
         primary.map_or(Ok(()), Err)

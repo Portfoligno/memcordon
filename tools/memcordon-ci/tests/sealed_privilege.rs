@@ -25,6 +25,8 @@ fn failed_loader_outcome() -> WindowsLoaderQualificationOutcomeV2 {
             stable_code: None,
         },
         diagnostic_id: None,
+        mitigation_observation: None,
+        support_debug_observation: None,
         detail: String::from("CreateProcessAsUserW denied access"),
     })
 }

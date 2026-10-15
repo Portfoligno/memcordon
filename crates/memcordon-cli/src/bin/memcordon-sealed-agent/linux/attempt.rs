@@ -166,13 +166,6 @@ impl AttemptRecord {
     ) -> Result<Self, String> {
         validate_identity(&identity, caller_envelope_digest.as_deref())?;
         let path = state_root.join(&identity);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
         let version = if caller_envelope_digest.is_some() {
             2
         } else {
@@ -182,26 +175,22 @@ impl AttemptRecord {
             .as_deref()
             .map(|digest| format!("caller-envelope-digest={digest}\n"))
             .unwrap_or_default();
-        let persist = write_record(
-            &mut file,
-            &format!(
-                "version={version}\ncgroup={identity}\nfrontend-pid={frontend_pid}\n{envelope}state=allocated\n"
-            ),
+        let bytes = record_text(&format!(
+            "version={version}\ncgroup={identity}\nfrontend-pid={frontend_pid}\n{envelope}state=allocated\n"
+        ));
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(state_root)
+            .map_err(|error| error.to_string())?;
+        super::atomic_publication::publish(
+            &directory,
+            std::ffi::OsStr::new(&identity),
+            bytes.as_bytes(),
+            0o600,
+            16 * 1024,
         )
-        .and_then(|()| file.sync_all().map_err(|error| error.to_string()))
-        .and_then(|()| sync_directory(state_root));
-        if let Err(error) = persist {
-            drop(file);
-            let cleanup = fs::remove_file(&path)
-                .and_then(|()| File::open(state_root)?.sync_all())
-                .map_err(|cleanup_error| cleanup_error.to_string());
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup_error) => {
-                    format!("{error}; MCSEALED-RECORD-CLEANUP: {cleanup_error}")
-                }
-            });
-        }
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             policy_binding: None,
             private_invocation: None,

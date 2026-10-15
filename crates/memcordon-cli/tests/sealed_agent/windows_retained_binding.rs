@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn observed_relay_error_never_revises_the_original_record_or_relaxes_credentials() {
+    let caller = super::super::readiness_receipt::HeldNativeProcess::open(std::process::id());
+    let attempt = "01".repeat(32);
+    let request = "02".repeat(32);
+    let token = "03".repeat(32);
+    let nonce = "original-relay-nonce";
+    let mut record = super::super::record::WindowsAttemptRecordV1::new(
+        attempt.clone(),
+        request.clone(),
+        caller.identity.clone(),
+        token.clone(),
+        "04".repeat(32),
+    )
+    .unwrap();
+    record.nonce = nonce.into();
+    record.record_revision = 8;
+    record.terminalization.sequence = 1;
+    let error = super::super::record::bounded_terminalization_error(
+        memcordon_core::WindowsTerminalizationErrorStageV1::LaunchRelay,
+        "MCREPORT-WRITE",
+        "support control site Publication: Access is denied",
+        Some(5),
+    );
+    let project = |record: &super::super::record::WindowsAttemptRecordV1,
+                   nonce: &str,
+                   request: &str,
+                   caller: &memcordon_core::WindowsProcessIdentityV1,
+                   token: &str| {
+        super::super::record::retained_relay_failure_from_snapshot(
+            record,
+            (&attempt, nonce, request),
+            memcordon_core::WindowsRelayPhaseV1::Authorized,
+            caller,
+            token,
+            &error,
+        )
+    };
+    let before = serde_json::to_vec(&record).unwrap();
+    let observed = project(&record, nonce, &request, &caller.identity, &token).unwrap();
+    assert!(
+        observed
+            .primary_detail
+            .contains("observed uncommitted relay failure")
+    );
+    assert!(observed.primary_detail.contains(&error.detail));
+    assert_eq!(serde_json::to_vec(&record).unwrap(), before);
+    assert_eq!(record.record_revision, 8);
+    assert_eq!(record.terminalization.sequence, 1);
+    assert_eq!(observed.causal_diagnostics, record.causal_diagnostics);
+    assert!(!observed.terminal_replay_available);
+    assert!(!observed.cleanup_complete);
+    assert!(project(&record, "foreign", &request, &caller.identity, &token).is_err());
+    assert!(project(&record, nonce, &"05".repeat(32), &caller.identity, &token).is_err());
+    assert!(project(&record, nonce, &request, &caller.identity, &"05".repeat(32)).is_err());
+    let mut foreign = caller.identity.clone();
+    foreign.creation_time_100ns += 1;
+    assert!(project(&record, nonce, &request, &foreign, &token).is_err());
+}
+
+#[test]
 fn authenticated_retained_binding_rejects_other_attempt_request_process_creation_and_token() {
     let receipt = super::super::readiness_receipt::begin(
         "windows::control_service::retained_binding_tests::authenticated_retained_binding_rejects_other_attempt_request_process_creation_and_token",

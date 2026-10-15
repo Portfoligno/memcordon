@@ -35,11 +35,13 @@ pub mod sealed_selector;
 pub mod standard_contract;
 pub mod standard_runner;
 pub mod stress;
+pub mod support_loader_producer;
 pub mod target_shard;
 #[cfg(windows)]
 mod windows_caller_snapshot_diagnostic;
 pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
+pub mod windows_component_query_evidence;
 pub mod windows_consumer_readiness;
 pub mod windows_execution_acceptance;
 pub mod windows_installed_cases;

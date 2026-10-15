@@ -963,6 +963,26 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
+      - id: support_loader_diagnostic
+        name: Observe separate support bootstrap startup
+        if: always() && runner.os == 'Windows' && steps.native_readiness_cleanup.outcome == 'success' && steps.native_readiness_cleanup.outputs.cache-quiescent == 'true'
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic
+      - id: support_loader_diagnostic_cleanup
+        name: Settle separate support bootstrap owners
+        if: always() && runner.os == 'Windows' && steps.support_loader_diagnostic.outputs.diagnostic-started == 'true'
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup
+      - name: Retain non-authoritative support bootstrap observations
+        if: always() && runner.os == 'Windows' && steps.support_loader_diagnostic.outputs.diagnostic-started == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: support-loader-diagnostic-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/support-loader-diagnostic/diagnostic-artifacts
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
       - id: payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -972,15 +992,15 @@ jobs:
           include-hidden-files: true
           overwrite: false
       - id: products-save-context
-        if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
+        if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && (steps.support_loader_diagnostic.outputs.diagnostic-started != 'true' || steps.support_loader_diagnostic_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true'
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-readiness --shard complete
-      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.cache.outputs.product-key
+      - if: always() && steps.cache.outputs.compiled-cache-usable == 'true' && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && (steps.support_loader_diagnostic.outputs.diagnostic-started != 'true' || steps.support_loader_diagnostic_cleanup.outputs.cache-quiescent == 'true') && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.cache.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache.outputs.product-paths }}
           key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+      - if: always() && (steps.build.outputs.cache-quiescent == 'true' || steps.build-diagnostic.outputs.cache-quiescent == 'true') && (runner.os == 'macOS' || steps.native_readiness_cleanup.outputs.cache-quiescent == 'true') && (steps.support_loader_diagnostic.outputs.diagnostic-started != 'true' || steps.support_loader_diagnostic_cleanup.outputs.cache-quiescent == 'true') && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

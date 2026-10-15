@@ -731,10 +731,9 @@ impl CommandSpec {
         if !self.defer_group_failure
             && (result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|output| !output.status.success()))
+            && let Some(group) = &group
         {
-            if let Some(group) = &group {
-                group.request_after_failure();
-            }
+            group.request_after_failure();
         }
         let state = if result.as_ref().is_ok_and(|output| output.status.success()) {
             "completed"

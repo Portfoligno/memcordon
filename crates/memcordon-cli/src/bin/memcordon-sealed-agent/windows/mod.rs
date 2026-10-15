@@ -23,6 +23,8 @@ pub mod service_manager;
 pub mod session_broker;
 mod settlement;
 mod startup_diagnostics;
+#[cfg(feature = "test-support")]
+mod support_loader_diagnostic;
 pub mod token;
 pub mod user_api;
 

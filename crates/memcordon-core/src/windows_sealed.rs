@@ -1427,6 +1427,55 @@ pub struct WindowsWorkerThreadIdentityV1 {
     pub creation_time_100ns: u64,
 }
 
+/// Native support-site observations are diagnostic metadata, not authorization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsControlWorkerSiteV1 {
+    pub format: String,
+    pub revision: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub fault: WindowsSealedFault,
+    pub process: WindowsProcessIdentityV1,
+    pub thread: WindowsWorkerThreadIdentityV1,
+    pub target_pid: u32,
+    pub target_authorization_observed: bool,
+}
+
+impl WindowsControlWorkerSiteV1 {
+    pub fn binds(
+        &self,
+        attempt_id: &str,
+        nonce: &str,
+        request_sha256: &str,
+        fault: WindowsSealedFault,
+        target_pid: u32,
+    ) -> bool {
+        self.format == "memcordon.windows-component-control-worker-site"
+            && self.revision == 1
+            && self.attempt_id == attempt_id
+            && windows_sha256_text_is_valid(&self.attempt_id)
+            && self.nonce == nonce
+            && !self.nonce.is_empty()
+            && self.request_sha256 == request_sha256
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && self.fault == fault
+            && matches!(
+                fault,
+                WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                    | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+            )
+            && self.process.process_id != 0
+            && self.process.creation_time_100ns != 0
+            && self.thread.thread_id != 0
+            && self.thread.creation_time_100ns != 0
+            && self.target_pid == target_pid
+            && target_pid != 0
+            && self.target_authorization_observed
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsDurableAttemptRecordV4 {
@@ -2417,6 +2466,42 @@ pub struct WindowsCallerTokenEnvelopeV1 {
     pub impersonation_level: u32,
 }
 
+/// A separate support experiment; this selection is never workload authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsLoaderDiagnosticKindV1 {
+    OriginalRestrictedBootstrap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderDiagnosticSelectionV1 {
+    pub kind: WindowsLoaderDiagnosticKindV1,
+    pub challenge: String,
+    pub support_bootstrap_sha256: String,
+    pub producer_deadline_sha256: String,
+    pub work_deadline_unix_ms: u64,
+    pub cleanup_deadline_unix_ms: u64,
+}
+
+impl WindowsLoaderDiagnosticSelectionV1 {
+    pub fn validate_at(&self, now_unix_ms: u64) -> Result<(), &'static str> {
+        if !windows_sha256_text_is_valid(&self.challenge)
+            || self.challenge.bytes().all(|byte| byte == b'0')
+            || !windows_sha256_text_is_valid(&self.support_bootstrap_sha256)
+            || !windows_sha256_text_is_valid(&self.producer_deadline_sha256)
+        {
+            return Err("loader diagnostic challenge or selected image digest is invalid");
+        }
+        if self.work_deadline_unix_ms <= now_unix_ms
+            || self.cleanup_deadline_unix_ms < self.work_deadline_unix_ms
+        {
+            return Err("loader diagnostic original cutoffs are expired or unordered");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsLaunchRequestV1 {
@@ -2425,6 +2510,9 @@ pub struct WindowsLaunchRequestV1 {
     pub expected_provider_binding: crate::PublicProviderBindingV1,
     #[serde(default, deserialize_with = "deserialize_workload_contract")]
     pub workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
+    /// Included in the canonical launch digest. Absent for ordinary launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader_diagnostic: Option<Box<WindowsLoaderDiagnosticSelectionV1>>,
     pub nonce: String,
     pub command: NativeWindowsCommandV1,
     pub environment: Vec<WindowsEnvironmentEntryV1>,
@@ -2815,6 +2903,21 @@ impl WindowsGuardianAttemptObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsProviderRequestV3 {
+    CertificationControlReleased {
+        schema_version: u32,
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+        fault: WindowsSealedFault,
+        target_pid: u32,
+    },
+    LoaderDiagnosticLaunch {
+        schema_version: u32,
+        attempt_id: String,
+        request_sha256: String,
+        caller_process_identity: WindowsProcessIdentityV1,
+        launch: WindowsLaunchRequestV1,
+    },
     WorkloadDiscovery {
         schema_version: u32,
         challenge: crate::workload_contract::Nonce128,
@@ -2906,6 +3009,32 @@ pub enum WindowsProviderRequestV3 {
         request_sha256: String,
         relay_phase: WindowsRelayPhaseV1,
     },
+}
+
+impl WindowsProviderRequestV3 {
+    pub fn control_release_binds(
+        &self,
+        expected_attempt: &str,
+        expected_nonce: &str,
+        expected_request: &str,
+        expected_fault: WindowsSealedFault,
+        expected_target: u32,
+    ) -> bool {
+        matches!(
+            expected_fault,
+            WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                | WindowsSealedFault::ControlServiceKilledAfterAuthorization
+        ) && !expected_attempt.is_empty()
+            && !expected_nonce.is_empty()
+            && !expected_request.is_empty()
+            && expected_target != 0
+            && matches!(self, Self::CertificationControlReleased {
+                schema_version, attempt_id, nonce, request_sha256, fault, target_pid,
+            } if *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+                && attempt_id == expected_attempt && nonce == expected_nonce
+                && request_sha256 == expected_request && *fault == expected_fault
+                && *target_pid == expected_target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3651,6 +3780,8 @@ pub enum WindowsProviderResponse<Terminal, Rejection> {
         nonce: String,
         request_sha256: String,
         child_pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_site: Option<Box<WindowsControlWorkerSiteV1>>,
     },
     TargetRetired {
         schema_version: u32,
@@ -3928,6 +4059,33 @@ pub type WindowsLauncherResponseV1 =
 pub type WindowsLauncherResponseV3 =
     WindowsLauncherResponse<WindowsTerminalReceiptV2, WindowsProviderRejectionV2>;
 
+trait ExpirableRejectionDiagnostics {
+    fn clear_expirable_diagnostics(&mut self);
+}
+
+impl ExpirableRejectionDiagnostics for ProviderRejectionEvidence {
+    fn clear_expirable_diagnostics(&mut self) {
+        self.provider_failure = None;
+        if let Some(crate::WindowsLoaderQualificationOutcomeV2::Failed(failure)) =
+            self.loader_qualification.as_mut()
+        {
+            failure.support_debug_observation = None;
+        }
+    }
+}
+
+impl ExpirableRejectionDiagnostics for WindowsProviderRejectionV2 {
+    fn clear_expirable_diagnostics(&mut self) {
+        self.provider_failure = None;
+        self.guardian_causal_receipt = None;
+        if let Some(crate::WindowsLoaderQualificationOutcomeV2::Failed(failure)) =
+            self.loader_qualification.as_mut()
+        {
+            failure.support_debug_observation = None;
+        }
+    }
+}
+
 macro_rules! terminal_authority_encoding {
     ($response:ty) => {
         impl $response {
@@ -3935,7 +4093,7 @@ macro_rules! terminal_authority_encoding {
             pub fn terminal_authority_json(&self) -> Result<String, serde_json::Error> {
                 let mut authority = self.clone();
                 if let Self::Reject { rejection, .. } = &mut authority {
-                    rejection.provider_failure = None;
+                    rejection.clear_expirable_diagnostics();
                 }
                 let mut bytes = crate::bounded_json_bytes(
                     &authority,
@@ -4241,6 +4399,10 @@ pub struct WindowsProviderRejectionV2 {
     pub workload_admission: Option<crate::workload_evidence::WorkloadAdmissionRejectionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    /// Rehydrated only after authenticating the protected native receipt.
+    /// This causal projection is excluded from immutable outbox/ACK authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_causal_receipt: Option<Box<crate::WindowsGuardianReceiptV2>>,
     pub code: String,
     pub phase: crate::BoundarySetupPhase,
     pub detail: String,
@@ -4293,6 +4455,24 @@ impl WindowsProviderRejectionV2 {
             || self.provider_failure.as_ref().is_some_and(|failure| {
                 !failure.is_consistent() || failure.projection_sha256 != failure.canonical_digest()
             })
+            || self
+                .guardian_causal_receipt
+                .as_ref()
+                .is_some_and(|guardian| {
+                    let Some(terminal) = self.terminal_receipt() else {
+                        return true;
+                    };
+                    let proof = &terminal.retirement_proof;
+                    !guardian.is_consistent()
+                        || guardian.attempt_id != terminal.attempt_id
+                        || guardian.nonce != terminal.nonce
+                        || guardian.request_sha256 != terminal.request_sha256
+                        || guardian.provider_generation != proof.provider_generation
+                        || guardian.launch_incarnation != proof.launch_incarnation
+                        || guardian.original_boot_id != proof.original_boot_id
+                        || guardian.job_identity != proof.job_identity
+                        || guardian.owner_manifest_sha256 != proof.owner_manifest_sha256
+                })
         {
             return false;
         }

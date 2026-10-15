@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 #[path = "private_owner_loss_observation.rs"]
 mod private_owner_loss_observation;
 
+#[path = "linux_atomic_publication.rs"]
+mod linux_atomic_publication;
+
 const ROOT: &str = "/var/lib/memcordon/sealed";
 const IMAGE: &str = "/usr/libexec/memcordon-installed-private-fixture";
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
@@ -423,16 +426,19 @@ pub fn run(
         result["runtime_quarantine_retained"] = Value::Bool(true);
     }
     let bytes = serde_json::to_vec(&result).map_err(|e| e.to_string())?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(observed)
-        .map_err(|e| e.to_string())?;
-    std::io::Write::write_all(&mut output, &bytes)
-        .and_then(|()| output.sync_all())
-        .map_err(|e| e.to_string())?;
+    let observation_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(observed.parent().ok_or("observation parent absent")?)
+        .map_err(|error| error.to_string())?;
+    linux_atomic_publication::publish(
+        &observation_directory,
+        observed.file_name().ok_or("observation basename absent")?,
+        &bytes,
+        0o644,
+        1024 * 1024,
+    )
+    .map_err(|error| error.to_string())?;
     while !assessed.try_exists().map_err(|e| e.to_string())? {
         if Instant::now() >= until {
             return Err("owner-loss assessment acknowledgement deadline expired".into());

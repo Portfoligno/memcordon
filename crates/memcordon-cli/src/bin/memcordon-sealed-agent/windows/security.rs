@@ -529,6 +529,16 @@ pub fn session_holder_job_sddl() -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
+pub fn session_holder_fixture_job_sddl() -> Result<String, String> {
+    // The retirement fixture creates its real Job as the test process user,
+    // without assuming the production launcher's SYSTEM service identity.
+    let creator = super::token::process_user_sid(unsafe {
+        windows_sys::Win32::System::Threading::GetCurrentProcess()
+    })?;
+    Ok(format!("O:{creator}D:P(D;;WDWO;;;OW)(A;;GA;;;{creator})"))
+}
+
 pub fn launcher_thread_sddl() -> Result<String, String> {
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
     Ok(format!("O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})"))

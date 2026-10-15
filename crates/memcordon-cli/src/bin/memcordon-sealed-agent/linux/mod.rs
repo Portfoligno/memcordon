@@ -1,3 +1,5 @@
+#[path = "../../linux_atomic_publication.rs"]
+pub(crate) mod atomic_publication;
 pub mod attempt;
 pub mod cgroup;
 mod cgroup_membership;

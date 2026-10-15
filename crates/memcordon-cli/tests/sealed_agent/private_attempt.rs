@@ -217,6 +217,13 @@ fn native_journal_allocated_record_roundtrips_and_recovery_preserves_it() {
     let durable = DurablePrivateAttempt::create_for_test(state.path(), allocated()).unwrap();
     assert_eq!(durable.read_back().unwrap(), allocated());
     let bytes = std::fs::read(state.path().join(IDENTITY)).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::metadata(state.path().join(IDENTITY)).unwrap();
+    assert!(DurablePrivateAttempt::create_for_test(state.path(), allocated()).is_err());
+    let after = std::fs::metadata(state.path().join(IDENTITY)).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(std::fs::read(state.path().join(IDENTITY)).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 1);
     assert!(crate::linux::recovery::integrity_valid(
         std::str::from_utf8(&bytes).unwrap()
     ));
