@@ -224,15 +224,31 @@ pub fn cargo_configs(root: &Path) -> Result<BTreeMap<String, String>> {
     for (index, ancestor) in root.ancestors().enumerate() {
         locations.push((format!("ancestor-config-{index}"), ancestor.join(".cargo")));
     }
-    let home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
-        })
-        .ok_or_else(|| CiError::Message("Cargo home unidentified".into()))?;
+    let home = crate::download_cache::cargo_home(root)?;
     if !locations.iter().any(|(_, path)| path == &home) {
         locations.push(("cargo-home-config".into(), home));
     }
+    cargo_config_locations(locations, false)
+}
+
+pub fn download_configs(root: &Path, install: bool) -> Result<BTreeMap<String, String>> {
+    let home = crate::download_cache::cargo_home(root)?;
+    let mut locations = Vec::new();
+    if !install {
+        for (index, ancestor) in root.ancestors().enumerate() {
+            locations.push((format!("ancestor-config-{index}"), ancestor.join(".cargo")));
+        }
+    }
+    if !locations.iter().any(|(_, path)| path == &home) {
+        locations.push(("cargo-home-config".into(), home));
+    }
+    cargo_config_locations(locations, true)
+}
+
+fn cargo_config_locations(
+    locations: Vec<(String, std::path::PathBuf)>,
+    downloads: bool,
+) -> Result<BTreeMap<String, String>> {
     let mut inputs = BTreeMap::new();
     for (role, directory) in locations {
         let legacy = directory.join("config");
@@ -251,6 +267,26 @@ pub fn cargo_configs(root: &Path) -> Result<BTreeMap<String, String>> {
         let bytes = artifacts::read_file(&path)?;
         // Never retain configuration bytes or credential-bearing values in diagnostics.
         let text = String::from_utf8_lossy(&bytes);
+        if downloads {
+            let config: toml::Value = toml::from_str(&text).map_err(|_| {
+                CiError::Message("download Cargo configuration is malformed".into())
+            })?;
+            if config.get("source").is_some()
+                || config.get("registries").is_some()
+                || config.get("registry").is_some()
+            {
+                return Err(CiError::Message(
+                    "custom download registry/source unmodeled".into(),
+                ));
+            }
+            if config
+                .get("build")
+                .and_then(|build| build.get("target"))
+                .is_some()
+            {
+                return Err(CiError::Message("download target policy unmodeled".into()));
+            }
+        }
         if [
             "token",
             "credential",

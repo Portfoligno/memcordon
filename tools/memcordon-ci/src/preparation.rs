@@ -344,17 +344,23 @@ pub fn prepare_until(
     complete_lanes(
         layout,
         || {
-            observed(
-                rustup_cargo(
-                    root,
-                    &toolchains.stable,
-                    ["fetch", "--locked"],
-                    remaining(deadline, Duration::from_secs(900))?,
-                )
-                .bounded_until(deadline),
-                &source_reports,
-                "fetch",
+            crate::download_cache::fetch_until(
+                root,
+                crate::download_cache::DownloadFamily::Workspace,
+                deadline,
+                Some(&source_reports),
             )?;
+            if matches!(
+                profile,
+                BootstrapProfile::Fuzz | BootstrapProfile::ReleasePreflight
+            ) {
+                crate::download_cache::fetch_until(
+                    root,
+                    crate::download_cache::DownloadFamily::Fuzz,
+                    deadline,
+                    Some(&source_reports),
+                )?;
+            }
             observed(
                 rustup_cargo(
                     root,
@@ -415,6 +421,8 @@ pub fn prepare_until(
                     fs::set_permissions(destination, fs::metadata(&restored)?.permissions())?;
                     continue;
                 }
+                let family = crate::download_cache::DownloadFamily::for_purpose(package);
+                let download_before = crate::download_cache::context_until(root, family, deadline);
                 observed(
                     rustup_cargo(
                         root,
@@ -459,6 +467,18 @@ pub fn prepare_until(
                     return Err(CiError::Message(
                         "staged auxiliary version differs from selected pin".into(),
                     ));
+                }
+                if crate::download_cache::packaged_lock_present(root, package, version)
+                    .unwrap_or_else(|error| {
+                        eprintln!("tool download lock inspection unavailable: {error}");
+                        false
+                    })
+                {
+                    crate::download_cache::record(
+                        family,
+                        &download_before,
+                        &crate::download_cache::context_until(root, family, deadline),
+                    );
                 }
             }
             Ok(())

@@ -55,6 +55,12 @@ pub fn write_to(path: Option<&std::path::Path>, values: &[(&str, String)]) -> Re
 }
 
 pub fn quiescent(result: Result<()>) -> Result<()> {
+    if let Err(error) = crate::download_cache::flush() {
+        if result.is_ok() {
+            return Err(error);
+        }
+        eprintln!("download population output collection failed: {error}");
+    }
     fn settled(error: &CiError) -> bool {
         match error {
             CiError::SettledCommandFailure(_)

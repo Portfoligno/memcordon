@@ -993,7 +993,7 @@ fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
         || contexts
             .iter()
             .any(|run| !run.contains(&format!("--purpose {purpose} --shard complete"))
-                && !(purpose == "native-debug" && *run == "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete"))
+                && !(purpose == "native-debug" && matches!(*run, "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete" | "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save")))
     {
         return Err(failure("native debug/release cache role differs"));
     }
@@ -1095,8 +1095,13 @@ fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
                 .and_then(|with| with.get(key("if-no-files-found")))
                 .and_then(Value::as_str)
                 == Some("warn");
-        let optional_cache = scalar(step, "uses")
+        let optional_cache = (scalar(step, "uses")
             .is_some_and(|uses| uses.starts_with("actions/cache/"))
+            || scalar(step, "run").is_some_and(|run| {
+                run.contains(" ci download-cache-context ")
+                    || (run.contains(" ci cache-context ")
+                        && step.get(key("timeout-minutes")).and_then(Value::as_u64) == Some(2))
+            }))
             && step.get(key("continue-on-error")).and_then(Value::as_bool) == Some(true);
         let support_diagnostic = matches!(context, "native readiness cache" | "release native")
             && step.get(key("continue-on-error")).and_then(Value::as_bool) == Some(true)
@@ -1234,7 +1239,7 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                 return Err(failure("duplicate cache restore id"));
             }
             if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"] {
-                if !selected.starts_with("mc-download-v4-${{ runner.os }}-")
+                if !selected.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-")
                     || selected.contains("runner.arch")
                     || selected.contains("github.sha")
                     || !step["if"]
@@ -1242,11 +1247,11 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                         .unwrap_or_default()
                         .contains("hashFiles('Cargo.lock') != ''")
                     || !step["with"]["restore-keys"].as_str().is_some_and(|prefix| {
-                        prefix.starts_with("mc-download-v4-${{ runner.os }}-")
+                        prefix.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-")
                     })
                 {
                     return Err(failure(
-                        "download cache must use guarded common v4 identity",
+                        "download seed must use guarded partial bootstrap identity",
                     ));
                 }
             } else if let Some(context) = cache_output_reference(selected, "product-key") {
@@ -1268,6 +1273,21 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                         ));
                     }
                 }
+            } else if let Some(context) = cache_output_reference(selected, "source-key") {
+                if !steps.iter().take(ordinal).any(|candidate| {
+                    candidate["id"].as_str() == Some(context)
+                        && candidate["run"].as_str().is_some_and(|run| {
+                            run.contains(" ci download-cache-context ")
+                                || run.contains(" ci cache-context --purpose cargo-")
+                        })
+                }) {
+                    return Err(failure("download context must precede every restore"));
+                }
+                let prefix = format!("${{{{ steps.{context}.outputs.source-restore-prefix }}}}");
+                let paths = format!("${{{{ steps.{context}.outputs.source-paths }}}}");
+                if step["with"]["restore-keys"].as_str() != Some(prefix.as_str()) || path != paths {
+                    return Err(failure("download recipe context/path/prefix differ"));
+                }
             } else if !["tool-key", "tool-build-key", "index-key"]
                 .iter()
                 .any(|output| cache_output_reference(selected, output).is_some())
@@ -1282,6 +1302,15 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                 .or_default()
                 .push((ordinal, step));
             let condition = step["if"].as_str().unwrap_or_default();
+            if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
+                && !condition.contains(
+                    "steps.workspace-download-context.outputs.bootstrap-home-matches == 'true'",
+                )
+            {
+                return Err(failure(
+                    "bootstrap seed save requires actual home association",
+                ));
+            }
             if !condition.contains("always()")
                 || !condition.contains("github.event_name == 'push'")
                 || !condition.contains("workflow_dispatch")
@@ -1298,12 +1327,107 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
         }
     }
     for (id, (ordinal, restore)) in restores {
-        let selected = saves
-            .remove(&id)
-            .ok_or_else(|| failure("cache restore/save pairing absent"))?;
+        let selected = match saves.remove(&id) {
+            Some(selected) => selected,
+            None if cache_output_reference(
+                restore["with"]["key"].as_str().unwrap_or_default(),
+                "source-key",
+            )
+            .is_some() =>
+            {
+                continue;
+            }
+            None => return Err(failure("cache restore/save pairing absent")),
+        };
         for (save_ordinal, save) in selected {
             if save_ordinal <= ordinal || save["with"]["path"] != restore["with"]["path"] {
                 return Err(failure("cache restore/save roots or ordering differ"));
+            }
+            if let Some(context) = cache_output_reference(
+                restore["with"]["key"].as_str().unwrap_or_default(),
+                "source-key",
+            ) {
+                let command = steps
+                    .iter()
+                    .take(ordinal)
+                    .find(|step| step["id"].as_str() == Some(context))
+                    .and_then(|step| step["run"].as_str())
+                    .ok_or_else(|| failure("download context must precede restore"))?;
+                let (population, population_key, producer_command) =
+                    if command.ends_with("--family workspace") {
+                        (
+                            "workspace-downloads-populated",
+                            "workspace-downloads-key",
+                            " ci fetch-downloads --family workspace",
+                        )
+                    } else if command.ends_with("--family fuzz") {
+                        (
+                            "fuzz-downloads-populated",
+                            "fuzz-downloads-key",
+                            " ci prepare --profile fuzz",
+                        )
+                    } else if command.contains("--purpose cargo-audit ") {
+                        (
+                            "download-cargo-audit-populated",
+                            "download-cargo-audit-key",
+                            " suite supply-chain",
+                        )
+                    } else if command.contains("--purpose cargo-deny ") {
+                        (
+                            "download-cargo-deny-populated",
+                            "download-cargo-deny-key",
+                            " suite supply-chain",
+                        )
+                    } else if command.contains("--purpose cargo-fuzz ") {
+                        (
+                            "download-cargo-fuzz-populated",
+                            "download-cargo-fuzz-key",
+                            " ci prepare --profile fuzz",
+                        )
+                    } else {
+                        return Err(failure("download recipe context unmodeled"));
+                    };
+                let save_context = context.strip_suffix("-context").map_or_else(
+                    || format!("{context}-save-context"),
+                    |base| format!("{base}-save-context"),
+                );
+                let save_probe = steps
+                    .iter()
+                    .take(save_ordinal)
+                    .enumerate()
+                    .find(|(_, step)| step["id"].as_str() == Some(&save_context))
+                    .ok_or_else(|| failure("source save context absent"))?;
+                if save_probe.0 <= ordinal
+                    || save_probe.1["run"].as_str() != Some(command)
+                    || save_probe.1["continue-on-error"].as_bool() != Some(true)
+                {
+                    return Err(failure(
+                        "source save must recompute its exact recipe context",
+                    ));
+                }
+                let condition = save["if"].as_str().unwrap_or_default();
+                let producers = steps
+                    .iter()
+                    .take(save_probe.0)
+                    .skip(ordinal + 1)
+                    .filter(|step| {
+                        step["run"]
+                            .as_str()
+                            .is_some_and(|run| run.contains(producer_command))
+                    })
+                    .filter_map(|step| step["id"].as_str())
+                    .collect::<Vec<_>>();
+                if !producers.iter().any(|owner| condition.contains(&format!("steps.{owner}.outputs.{population} == 'true'")) && condition.contains(&format!("steps.{save_context}.outputs.source-key == steps.{owner}.outputs.{population_key}")) && condition.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'")))
+                    || !condition.contains(&format!("steps.{save_context}.outputs.source-key == steps.{context}.outputs.source-key"))
+                    || !condition.contains(&format!("steps.{save_context}.outcome == 'success'"))
+                    || !condition.contains(&format!("steps.{id}.outputs.cache-hit != 'true'"))
+                    || (condition.contains("steps.deps.outputs.cache-hit")
+                        || condition.contains("steps.supply-deps.outputs.cache-hit"))
+                {
+                    return Err(failure(
+                        "complete downloads require actual recipe population and current source-key rechecks",
+                    ));
+                }
             }
             if cache_output_reference(
                 restore["with"]["key"].as_str().unwrap_or_default(),
@@ -1421,7 +1545,8 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                 )?;
                 let selected_key = scalar(with, "key").unwrap_or_default();
                 let selected_path = scalar(with, "path").unwrap_or_default();
-                if selected_key.starts_with("mc-download-v4-")
+                if selected_key.starts_with("mc-download-bootstrap-v5-")
+                    || selected_key.contains(".outputs.source-key")
                     || selected_key.contains(".outputs.product-key")
                     || selected_key.contains(".outputs.tool-key")
                     || selected_key.contains(".outputs.tool-build-key")
@@ -1432,7 +1557,7 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                     if selected_path == ORDINARY_SOURCE_PATHS {
                         if restore {
                             let condition = scalar(step, "if").unwrap_or_default();
-                            if !selected_key.contains("hashFiles('Cargo.lock')")
+                            if !selected_key.contains("hashFiles('Cargo.lock',")
                                 || !condition.contains("hashFiles('Cargo.lock') != ''")
                             {
                                 return Err(failure(
@@ -1440,8 +1565,7 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                                 ));
                             }
                             if family == "fuzz"
-                                && (!selected_key.contains("hashFiles('fuzz/Cargo.lock')")
-                                    || !condition.contains("hashFiles('fuzz/Cargo.lock') != ''"))
+                                && !condition.contains("hashFiles('fuzz/Cargo.lock') != ''")
                             {
                                 return Err(failure("fuzz manifest must include its lockfile"));
                             }
@@ -4197,6 +4321,7 @@ struct RustPolicy {
     standard_compiler_mutations: usize,
     cleared_environments: usize,
     cargo_home_mutations: usize,
+    standard_output_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -4290,6 +4415,11 @@ impl<'ast> Visit<'ast> for RustPolicy {
             {
                 self.cargo_home_mutations += 1;
             }
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "GITHUB_OUTPUT")
+            {
+                self.standard_output_mutations += 1;
+            }
         }
         syn::visit::visit_expr_method_call(self, expression);
     }
@@ -4351,6 +4481,17 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
         && visitor.subprocess_env_mutations == visitor.cargo_home_mutations
 }
 
+fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    [
+        Path::new("tools/memcordon-ci/tests/cache_download_families.rs"),
+        Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs"),
+    ]
+    .contains(&relative)
+        && visitor.subprocess_env_mutations
+            == visitor.cargo_home_mutations + visitor.standard_output_mutations
+        && visitor.cleared_environments == 0
+}
+
 fn reviewed_macos_writer_image(relative: &Path) -> bool {
     [
         Path::new("crates/memcordon-platform/src/macos_watchdog.rs"),
@@ -4385,6 +4526,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
         && !reviewed_proxy_environment(relative, &visitor)
         && !reviewed_compiler_environment(relative, &visitor)
         && !reviewed_isolated_cargo_environment(relative, &visitor)
+        && !reviewed_download_fixture_environment(relative, &visitor)
         && !reviewed_git_environment(relative)
     {
         visitor
@@ -4481,6 +4623,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             && !reviewed_proxy_environment(relative, &visitor)
             && !reviewed_compiler_environment(relative, &visitor)
             && !reviewed_isolated_cargo_environment(relative, &visitor)
+            && !reviewed_download_fixture_environment(relative, &visitor)
             && !reviewed_git_environment(relative)
         {
             visitor

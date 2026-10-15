@@ -39,6 +39,7 @@ pub enum OptionalCache {
 pub struct CacheDiagnostics {
     pub source_commit: String,
     pub source_tree: String,
+    pub unavailable_reasons: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, Serialize)]
@@ -127,15 +128,24 @@ pub fn context(
         Err(_) => usable = false,
     }
     let git = Git::new(root)?;
-    let diagnostics = CacheDiagnostics {
+    let mut diagnostics = CacheDiagnostics {
         source_commit: git.text(["rev-parse", "--verify", "HEAD"])?,
         source_tree: git.text(["rev-parse", "--verify", "HEAD^{tree}"])?,
+        unavailable_reasons: Vec::new(),
     };
+    if configurations.is_err() {
+        diagnostics
+            .unavailable_reasons
+            .push("cargo-configuration-unmodeled".into());
+    }
     if !git
         .text(["status", "--porcelain=v1", "--untracked-files=no"])?
         .is_empty()
     {
         local_usable = false;
+        diagnostics
+            .unavailable_reasons
+            .push("product-dirty-tracked-source".into());
     }
     let tracked = git.text(["ls-files", "--stage"])?;
     for line in tracked.lines() {
@@ -151,6 +161,9 @@ pub fn context(
                 .and_then(|submodule| submodule.text(["rev-parse", "HEAD"]));
             if actual.as_deref().ok() != Some(selected) {
                 local_usable = false;
+                diagnostics
+                    .unavailable_reasons
+                    .push("product-submodule-selection-differs".into());
             }
             inputs.insert(format!("submodule:{path}"), selected.into());
         }
@@ -161,6 +174,9 @@ pub fn context(
             .contains("filter=lfs")
     {
         local_usable = false;
+        diagnostics
+            .unavailable_reasons
+            .push("product-lfs-bytes-unidentified".into());
     }
     let pins = crate::config::toolchains(root)?;
     let selected_toolchain = if purpose.starts_with("miri") || purpose.starts_with("fuzz") {
@@ -281,7 +297,7 @@ pub fn context(
         }
     }
     for (name, _value) in std::env::vars_os() {
-        let name = name.to_string_lossy();
+        let name = name.to_string_lossy().to_ascii_uppercase();
         if name == "CARGO_BUILD_JOBS" {
             continue;
         }
@@ -313,6 +329,11 @@ pub fn context(
             // Overrides may select otherwise unidentified tools/headers. They
             // remain usable for clean builds, with affected reuse disabled.
             usable = false;
+            if diagnostics.unavailable_reasons.len() < 16 {
+                diagnostics
+                    .unavailable_reasons
+                    .push(format!("compiler-override:{name}"));
+            }
         }
     }
     if purpose.starts_with("fuzz") {
@@ -348,7 +369,12 @@ pub fn context(
                     Ok(value) => {
                         inputs.insert(name.into(), value);
                     }
-                    Err(_) => usable = false,
+                    Err(_) => {
+                        usable = false;
+                        diagnostics
+                            .unavailable_reasons
+                            .push(format!("native-tool-unavailable:{name}"));
+                    }
                 }
             }
         }
@@ -361,17 +387,27 @@ pub fn context(
                     Ok(value) => {
                         inputs.insert(name.into(), value);
                     }
-                    Err(_) => usable = false,
+                    Err(_) => {
+                        usable = false;
+                        diagnostics
+                            .unavailable_reasons
+                            .push(format!("native-tool-unavailable:{name}"));
+                    }
                 }
             }
         }
         "windows" => {
-            for name in ["VCToolsVersion", "WindowsSDKVersion", "WindowsSdkDir"] {
-                match std::env::var(name) {
-                    Ok(value) if !value.is_empty() => {
-                        inputs.insert(name.into(), value);
-                    }
-                    _ => usable = false,
+            #[cfg(windows)]
+            match crate::windows_cache_identity::discover_native(
+                distribution::native_target()?,
+                std::time::Instant::now() + Duration::from_secs(30),
+            ) {
+                Ok(identity) => inputs.extend(identity),
+                Err(error) => {
+                    usable = false;
+                    diagnostics
+                        .unavailable_reasons
+                        .push(format!("Windows native selection unavailable: {error}"));
                 }
             }
         }
@@ -382,7 +418,12 @@ pub fn context(
             Ok(value) if !value.is_empty() => {
                 inputs.insert(name.into(), value);
             }
-            _ => usable = false,
+            _ => {
+                usable = false;
+                diagnostics
+                    .unavailable_reasons
+                    .push(format!("image-identity-unavailable:{name}"));
+            }
         }
     }
     let revision = 4;
@@ -443,36 +484,12 @@ pub fn context(
             entries.insert(name.into(), entry);
         }
     }
-    let mut download_content = BTreeMap::new();
-    download_content.insert(
-        "lock".into(),
-        artifacts::checksum(&artifacts::read_file(&root.join("Cargo.lock"))?),
-    );
-    if purpose.starts_with("fuzz") {
-        download_content.insert(
-            "fuzz-lock".into(),
-            artifacts::checksum(&artifacts::read_file(&root.join("fuzz/Cargo.lock"))?),
-        );
-    }
-    if let Ok(configuration) = &configurations {
-        download_content.extend(configuration.clone());
-    }
-    let (download_key, download_prefix) =
-        crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
-            family: "downloads".into(),
-            layout_revision: revision,
-            compatibility: BTreeMap::from([("archive-os".into(), std::env::consts::OS.into())]),
-            content: download_content,
-        })?;
     entries.insert(
         "source".into(),
-        OptionalCache::Available {
-            entry: CacheEntry {
-                exact_key: download_key,
-                restore_prefix: Some(download_prefix),
-                paths: vec!["~/.cargo/registry/cache".into(), "~/.cargo/git/db".into()],
-            },
-        },
+        crate::download_cache::context(
+            root,
+            crate::download_cache::DownloadFamily::for_purpose(purpose),
+        ),
     );
     if let Ok(configuration) = &configurations {
         let stable_reader = query(root, "rustup", &["run", &pins.stable, "cargo", "-V"])?;
@@ -502,10 +519,17 @@ pub fn context(
     usable &= local_usable;
     if local.is_err() {
         usable = false;
+        diagnostics
+            .unavailable_reasons
+            .push("product-local-inputs-unmodeled".into());
     }
-    let paths = crate::cache_restore::roots(purpose, shard);
+    let layout = crate::cache_restore::layout(purpose, shard);
+    let paths = layout.as_ref().map(|layout| layout.archive_members());
     if paths.is_err() || !external.is_empty() {
         usable = false;
+        diagnostics
+            .unavailable_reasons
+            .push("product-output-ownership-unestablished".into());
     }
     // Consumer archive envelopes are integrity inputs, not a compiler projection.
     // No compiled consumer entry is emitted until its current builder owns a seed root.
@@ -544,7 +568,7 @@ pub fn context(
         let (exact_key, restore_prefix) =
             crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
                 family: "workspace".into(),
-                layout_revision: revision,
+                layout_revision: layout.as_ref().expect("usable layout").revision,
                 compatibility,
                 content: local?,
             })?;
@@ -554,7 +578,7 @@ pub fn context(
                 entry: CacheEntry {
                     exact_key,
                     restore_prefix: Some(restore_prefix),
-                    paths: paths?,
+                    paths: paths.expect("usable layout"),
                 },
             },
         );
@@ -573,6 +597,9 @@ pub fn context(
             OptionalCache::Unavailable { .. } => None,
         })
         .collect();
+    diagnostics.unavailable_reasons.sort();
+    diagnostics.unavailable_reasons.dedup();
+    diagnostics.unavailable_reasons.truncate(16);
     Ok(CacheContext {
         revision,
         usable,
@@ -584,8 +611,26 @@ pub fn context(
 }
 
 pub fn emit(root: &Path, purpose: &str, shard: &str, external: &[PathBuf]) -> Result<()> {
+    emit_with_intent(root, purpose, shard, external, false)
+}
+
+pub fn emit_with_intent(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    external: &[PathBuf],
+    for_save: bool,
+) -> Result<()> {
     let context = context(root, purpose, shard, external)?;
     let mut outputs = vec![("compiled-cache-usable", "false".to_owned())];
+    outputs.push((
+        "bootstrap-home-matches",
+        crate::download_cache::bootstrap_home_matches(root).to_string(),
+    ));
+    outputs.push((
+        "payload-ready",
+        (for_save && crate::cache_restore::payload_ready(root, purpose, shard)?).to_string(),
+    ));
     if context.usable {
         outputs[0].1 = "true".into();
     }

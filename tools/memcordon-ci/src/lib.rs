@@ -11,6 +11,7 @@ pub mod capability;
 pub mod command;
 pub mod config;
 pub mod consumer_readiness_ledger;
+pub mod download_cache;
 pub mod failure_mode;
 pub mod fuzz_targets;
 pub mod line_evidence;
@@ -37,6 +38,8 @@ pub mod standard_runner;
 pub mod stress;
 pub mod support_loader_producer;
 pub mod target_shard;
+#[cfg(windows)]
+pub mod windows_cache_identity;
 #[cfg(windows)]
 mod windows_caller_snapshot_diagnostic;
 pub mod windows_causal_acceptance;

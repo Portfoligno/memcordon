@@ -97,9 +97,9 @@ fn validate(value: &Value) -> Result<usize, String> {
                     if selected_paths != ["~/.cargo/registry/cache", "~/.cargo/git/db"] {
                         return Err("raw source path list differs".into());
                     }
-                    if !key.starts_with("mc-download-v4-${{ runner.os }}-")
+                    if !key.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-")
                         || key.contains("runner.arch")
-                        || key.contains("ci/")
+                        || key.contains("github.sha")
                     {
                         return Err("raw source namespace/scope differs".into());
                     }
@@ -108,7 +108,7 @@ fn validate(value: &Value) -> Result<usize, String> {
                         return Err("raw source restore lacks lockfile guard".into());
                     }
                     if !step["with"]["restore-keys"].as_str().is_some_and(|prefix| {
-                        prefix.starts_with("mc-download-v4-${{ runner.os }}-")
+                        prefix.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-")
                     }) {
                         return Err("raw source fallback missing".into());
                     }
@@ -130,6 +130,15 @@ fn validate(value: &Value) -> Result<usize, String> {
                         }) {
                             return Err(format!("compiled restore {id} lacks {mode} sanitation"));
                         }
+                    }
+                } else if let Some(context) = output_reference(key, "source-key") {
+                    let prefix =
+                        format!("${{{{ steps.{context}.outputs.source-restore-prefix }}}}");
+                    let path = format!("${{{{ steps.{context}.outputs.source-paths }}}}");
+                    if step["with"]["restore-keys"].as_str() != Some(&prefix)
+                        || step["with"]["path"].as_str() != Some(&path)
+                    {
+                        return Err("recipe download projection differs".into());
                     }
                 } else if !["tool-key", "tool-build-key", "index-key"]
                     .iter()
@@ -162,12 +171,25 @@ fn validate(value: &Value) -> Result<usize, String> {
             }
         }
         for (id, (ordinal, restore)) in restores {
-            let paired = saves.remove(id).ok_or_else(|| {
-                format!(
-                    "unpaired restore {}:{id}",
-                    job_name.as_str().unwrap_or_default()
+            let paired = match saves.remove(id) {
+                Some(paired) => paired,
+                None if output_reference(
+                    restore["with"]["key"].as_str().unwrap_or_default(),
+                    "source-key",
                 )
-            })?;
+                .is_some() =>
+                {
+                    continue;
+                }
+                None => {
+                    return Err({
+                        format!(
+                            "unpaired restore {}:{id}",
+                            job_name.as_str().unwrap_or_default()
+                        )
+                    });
+                }
+            };
             for (save_ordinal, save) in paired {
                 if save_ordinal <= ordinal || paths(restore)? != paths(save)? {
                     return Err("restore/save path/order differs".into());

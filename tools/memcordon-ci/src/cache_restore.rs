@@ -13,6 +13,68 @@ pub enum RestoreMode {
     Discard,
 }
 
+/// Transport members are distinct from recursively disposable directories.
+#[derive(Clone, Debug)]
+pub struct CacheLayout {
+    pub directories: Vec<PathBuf>,
+    pub required_files: Vec<PathBuf>,
+    pub cargo_targets: Vec<PathBuf>,
+    pub revision: u32,
+}
+
+impl CacheLayout {
+    pub fn archive_members(&self) -> Vec<PathBuf> {
+        self.directories
+            .iter()
+            .chain(&self.required_files)
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn layout(purpose: &str, shard: &str) -> Result<CacheLayout> {
+    let directories = roots(purpose, shard)?;
+    let auxiliary = purpose == "native-auxiliary";
+    Ok(CacheLayout {
+        cargo_targets: if auxiliary {
+            vec!["target".into()]
+        } else {
+            directories.clone()
+        },
+        directories,
+        required_files: if auxiliary {
+            vec![PathBuf::from("target").join("CACHEDIR.TAG")]
+        } else {
+            Vec::new()
+        },
+        revision: if auxiliary { 5 } else { 4 },
+    })
+}
+
+pub fn payload_ready(root: &Path, purpose: &str, shard: &str) -> Result<bool> {
+    let layout = layout(purpose, shard)?;
+    let targets = layout
+        .directories
+        .iter()
+        .map(|path| safe_root(root, path))
+        .collect::<Result<Vec<_>>>()?;
+    for target in &layout.cargo_targets {
+        if !cargo_marker_present(&root.join(target))? {
+            return Ok(false);
+        }
+    }
+    let locks = settled_locks(&targets)?;
+    let populated = targets.iter().any(|path| {
+        walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_type().is_file() && entry.file_name() != ".cargo-lock")
+    });
+    drop(locks);
+    Ok(populated)
+}
+
 pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
     let paths: &[&str] = match (purpose, shard) {
         ("quality", "complete") => &["target/ci/quality", "target/ci/quality-doc"],
@@ -211,14 +273,29 @@ fn cargo_marker_present(target: &Path) -> Result<bool> {
 }
 
 pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Result<()> {
-    let roots = roots(purpose, shard)?;
+    let deadline = Instant::now() + Duration::from_secs(5 * 60);
+    let layout = layout(purpose, shard)?;
     // Validate every root before making the first mutation.
-    let targets: Vec<_> = roots
+    let targets: Vec<_> = layout
+        .directories
         .iter()
         .map(|path| safe_root(root, path))
         .collect::<Result<_>>()?;
+    // Validate the shared marker even on discard, before deleting anything.
+    let markers = layout
+        .cargo_targets
+        .iter()
+        .map(|path| {
+            let target = root.join(path);
+            if purpose != "native-auxiliary" && !target.try_exists()? {
+                Ok(true)
+            } else {
+                cargo_marker_present(&target)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let locks = settled_locks(&targets)?;
     if matches!(mode, RestoreMode::Discard) {
-        let locks = settled_locks(&targets)?;
         // Windows denies removal of an open lock file. Observe all locks before
         // dropping the handles; workflow ordering forbids any owner starting
         // until this sanitation command has returned successfully.
@@ -233,20 +310,26 @@ pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Re
         drop(locks);
         return Ok(());
     }
-    let cleanup_targets = if purpose == "native-auxiliary" {
-        // These payloads contain profiles only; Cargo's genuine marker belongs
-        // to their common parent, which is never a disposal root.
-        vec![root.join("target")]
-    } else {
-        targets
-    };
-    for target in &cleanup_targets {
-        if target.try_exists()? && !cargo_marker_present(target)? {
-            // An optional seed without Cargo's marker cannot authorize cleanup.
-            // Discard only this role's prevalidated payloads before cold work.
-            return prepare(root, purpose, shard, RestoreMode::Discard);
+    if markers.iter().any(|present| !present) {
+        #[cfg(windows)]
+        drop(locks);
+        for target in &targets {
+            if target.try_exists()? {
+                std::fs::remove_dir_all(target)?;
+            }
         }
+        #[cfg(not(windows))]
+        drop(locks);
+        eprintln!("cache sanitation: discarded missing/invalid Cargo marker");
+        return Ok(());
     }
+    // Cargo clean must acquire its own locks, never wait on parent-held handles.
+    drop(locks);
+    let cleanup_targets = layout
+        .cargo_targets
+        .iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
     let pins = crate::config::toolchains(root)?;
     let toolchain = if purpose == "msrv" {
         &pins.msrv
@@ -275,7 +358,6 @@ pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Re
             .ok_or_else(|| CiError::Message("local package identity absent".into()))?;
         packages.push(name.to_owned());
     }
-    let deadline = Instant::now() + Duration::from_secs(5 * 60);
     for target in cleanup_targets {
         if !target.try_exists()? {
             continue;

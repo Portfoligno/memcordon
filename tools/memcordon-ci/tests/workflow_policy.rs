@@ -258,14 +258,14 @@ fn dependabot_requires_each_independent_dependency_surface() {
 }
 
 #[test]
-fn fuzz_dependency_cache_keys_require_the_fuzz_lockfile() {
+fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let relative = ".github/workflows/deep-ci.yml";
     let exact = std::fs::read_to_string(root.join(relative))
         .expect("workflow fixture should be readable")
         .replace("\r\n", "\n");
-    let invalid = exact.replacen("-${{ hashFiles('fuzz/Cargo.lock') }}", "", 1);
+    let invalid = exact.replacen(" && hashFiles('fuzz/Cargo.lock') != ''", "", 1);
     assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
     let error = policy::validate_workflow_bytes(
         &root,

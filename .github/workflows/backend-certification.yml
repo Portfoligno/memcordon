@@ -56,11 +56,25 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined
       - id: compiled
         continue-on-error: true
@@ -90,6 +104,8 @@ jobs:
           include-hidden-files: true
       - id: compiled-save-context
         if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined
       - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
@@ -97,7 +113,7 @@ jobs:
         with:
           path: ${{ steps.context.outputs.product-paths }}
           key: ${{ steps.compiled.outputs.cache-primary-key }}
-      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -105,6 +121,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   macos-native:
     needs: macos-performance-plan
@@ -131,11 +158,25 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native
       - id: compiled
         continue-on-error: true
@@ -165,6 +206,8 @@ jobs:
           include-hidden-files: true
       - id: compiled-save-context
         if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native
       - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
@@ -172,7 +215,7 @@ jobs:
         with:
           path: ${{ steps.context.outputs.product-paths }}
           key: ${{ steps.compiled.outputs.cache-primary-key }}
-      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -180,6 +223,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   macos-acceptance:
     needs: macos-performance-plan
@@ -206,11 +260,25 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard acceptance
       - id: compiled
         continue-on-error: true
@@ -240,6 +308,8 @@ jobs:
           include-hidden-files: true
       - id: compiled-save-context
         if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard acceptance
       - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
@@ -247,7 +317,7 @@ jobs:
         with:
           path: ${{ steps.context.outputs.product-paths }}
           key: ${{ steps.compiled.outputs.cache-primary-key }}
-      - if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.deps.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -255,6 +325,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.deps.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && steps.native.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   macos-assessment:
     if: always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'
@@ -303,11 +384,25 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete
       - id: products
         continue-on-error: true
@@ -335,6 +430,8 @@ jobs:
           if-no-files-found: error
       - id: products-save-context
         if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete
       - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
@@ -342,7 +439,7 @@ jobs:
         with:
           path: ${{ steps.context.outputs.product-paths }}
           key: ${{ steps.products.outputs.cache-primary-key }}
-      - if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.sources.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.sources.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.sources.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.sources.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -350,6 +447,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.sources.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && steps.build.outputs.cache-quiescent == 'true' && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   windows-payload-arm64:
     if: github.event.deleted != true
@@ -389,10 +497,22 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: context
         if: matrix.channel == 'cargo'
         run: ./target/ci/release/memcordon-ci release consumer-cache --target target/ci/windows-prepared/native-payload --packages target/ci/windows-prepared/cargo-payload --channel cargo --profile readiness
@@ -409,7 +529,7 @@ jobs:
           path: target/ci/windows-installed
           if-no-files-found: error
           include-hidden-files: true
-      - if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.sources.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.sources.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.sources.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.sources.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -417,6 +537,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.sources.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && (steps.native.conclusion == 'skipped' || steps.native.outputs.cache-quiescent == 'true') && (steps.cargo.conclusion == 'skipped' || steps.cargo.outputs.cache-quiescent == 'true') && steps.workspace-downloads.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   windows-installed-arm64:
     if: github.event.deleted != true
@@ -454,12 +585,26 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: private-context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete
       - id: private-compiled
         if: steps.private-context.outputs.compiled-cache-usable == 'true'
@@ -479,6 +624,8 @@ jobs:
         run: ./target/ci/release/memcordon-ci suite backend-linux-private
       - id: private-save-context
         if: always() && steps.private-run.outputs.cache-quiescent == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete
       - name: Save settled private compilation
         if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-save-context.outcome == 'success' && steps.private-save-context.outputs.product-key == steps.private-context.outputs.product-key && steps.private-compiled.outputs.cache-primary-key != '' && steps.private-compiled.outputs.cache-hit != 'true'
@@ -494,7 +641,7 @@ jobs:
           path: target/ci/private-installed
           if-no-files-found: error
           include-hidden-files: true
-      - if: always() && steps.private-deps.outputs.cache-hit != 'true' && steps.private-run.outputs.cache-quiescent == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.private-deps.outputs.cache-hit != 'true' && steps.private-run.outputs.cache-quiescent == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -502,6 +649,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.private-deps.outputs.cache-primary-key }}
+      - id: workspace-download-save-context
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && steps.private-run.outputs.cache-quiescent == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - name: Save complete workspace downloads
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && steps.private-run.outputs.cache-quiescent == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
   standard-linux:
     needs: macos-performance-plan
@@ -522,12 +680,26 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: backend-context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - id: backend-compiled
         continue-on-error: true
@@ -550,6 +722,8 @@ jobs:
         run: ./target/ci/release/memcordon-ci suite backend-linux-cgroup
       - id: backend-compiled-save-context
         if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
@@ -557,7 +731,7 @@ jobs:
         with:
           path: ${{ steps.backend-context.outputs.product-paths }}
           key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
-      - if: always() && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -585,12 +759,26 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: backend-context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - id: backend-compiled
         continue-on-error: true
@@ -613,6 +801,8 @@ jobs:
         run: ./target/ci/release/memcordon-ci suite backend-windows-job
       - id: backend-compiled-save-context
         if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
@@ -620,7 +810,7 @@ jobs:
         with:
           path: ${{ steps.backend-context.outputs.product-paths }}
           key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
-      - if: always() && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -648,12 +838,26 @@ jobs:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: mc-download-v4-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mc-download-v4-${{ runner.os }}-workspace-
+          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
       - run: rustup toolchain install 1.97.1 --profile minimal
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
+      - id: workspace-download-context
+        run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
+      - id: workspace-downloads
+        if: steps.workspace-download-context.outputs.source-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.workspace-download-context.outputs.source-paths }}
+          key: ${{ steps.workspace-download-context.outputs.source-key }}
+          restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: workspace-fetch
+        run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: backend-context
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - id: backend-compiled
         continue-on-error: true
@@ -676,6 +880,8 @@ jobs:
         run: ./target/ci/release/memcordon-ci suite backend-windows-job
       - id: backend-compiled-save-context
         if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
       - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
@@ -683,7 +889,7 @@ jobs:
         with:
           path: ${{ steps.backend-context.outputs.product-paths }}
           key: ${{ steps.backend-compiled.outputs.cache-primary-key }}
-      - if: always() && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.standard-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.standard-deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

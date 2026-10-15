@@ -26,6 +26,16 @@ environment_allowlist = [
   { file = ".github/workflows/release.yml", steps = ["Publish prepared bytes", "Publish original prepared bytes"], variable = "CARGO_REGISTRY_TOKEN", source = "${{ steps.registry-auth.outputs.token }}" },
 ]
 allowed_run_commands = [
+  "./.release/tool/memcordon-ci ci fetch-downloads --family workspace",
+  "rustup toolchain install nightly-2026-07-31 --profile minimal",
+  "rustup run 1.97.1 cargo clean --locked --offline --package memcordon-ci --target-dir target",
+  "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save",
+  "./target/ci/release/memcordon-ci ci download-cache-context --family workspace",
+  "./target/ci/release/memcordon-ci ci download-cache-context --family fuzz",
+  "./target/ci/release/memcordon-ci ci fetch-downloads --family workspace",
+  "./target/ci/release/memcordon-ci ci fetch-downloads --family fuzz",
+  "./.release/tool/memcordon-ci ci download-cache-context --family workspace",
+  "./.release/tool/memcordon-ci ci download-cache-context --family fuzz",
   "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic",
   "./target/ci/release/memcordon-ci consumer-readiness-loader-diagnostic --identity .release/native-readiness-identity.json --github-context --destination .release/support-loader-diagnostic --cleanup",
   "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json",

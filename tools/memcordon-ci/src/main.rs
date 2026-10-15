@@ -61,11 +61,21 @@ enum TopLevel {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    DownloadCacheContext {
+        #[arg(long, value_enum)]
+        family: memcordon_ci::download_cache::DownloadFamily,
+    },
+    FetchDownloads {
+        #[arg(long, value_enum)]
+        family: memcordon_ci::download_cache::DownloadFamily,
+    },
     Prepare {
         #[arg(long, value_enum)]
         profile: memcordon_ci::bootstrap_profile::BootstrapProfile,
     },
     CacheContext {
+        #[arg(long)]
+        for_save: bool,
         #[arg(long, default_value = "native")]
         purpose: String,
         #[arg(long, default_value = "complete")]
@@ -178,12 +188,24 @@ fn run() -> Result<()> {
             memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments)
         }
         Some(TopLevel::Ci { command }) => match command {
+            CiCommand::DownloadCacheContext { family } => {
+                memcordon_ci::download_cache::emit(&root, family)
+            }
+            CiCommand::FetchDownloads { family } => memcordon_ci::download_cache::fetch_until(
+                &root,
+                family,
+                std::time::Instant::now() + std::time::Duration::from_secs(900),
+                None,
+            ),
             CiCommand::Prepare { profile } => memcordon_ci::preparation::prepare(&root, profile),
             CiCommand::CacheContext {
+                for_save,
                 purpose,
                 shard,
                 external,
-            } => memcordon_ci::cache::emit(&root, &purpose, &shard, &external),
+            } => {
+                memcordon_ci::cache::emit_with_intent(&root, &purpose, &shard, &external, for_save)
+            }
             CiCommand::PrepareRestoredCache {
                 purpose,
                 shard,
