@@ -74,6 +74,7 @@ pub struct ProgressOutput {
 struct ProcessControl {
     cancelled: Option<Arc<AtomicBool>>,
     progress: Option<ProgressOutput>,
+    failure: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -335,10 +336,34 @@ pub fn run_with_deadline_controlled_output_limit(
     cancelled: Option<Arc<AtomicBool>>,
     progress: Option<ProgressOutput>,
 ) -> Result<ObservedOutput, ProcessTestError> {
+    run_with_deadline_notified_output_limit(command, deadline, limit, cancelled, progress, None)
+}
+
+/// Notify the coordinator at an observed failure, before native retirement or readers settle.
+/// The callback must be nonblocking and must not perform report I/O.
+pub fn run_with_deadline_notified_output_limit(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+    cancelled: Option<Arc<AtomicBool>>,
+    progress: Option<ProgressOutput>,
+    failure: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<ObservedOutput, ProcessTestError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    OuterTestBoundary::configure(command).map_err(ProcessTestError::Spawn)?;
+    let notify = || {
+        if let Some(notify) = &failure {
+            notify();
+        }
+    };
+    OuterTestBoundary::configure(command).map_err(|error| {
+        notify();
+        ProcessTestError::Spawn(error)
+    })?;
     let started = Instant::now();
-    let child = command.spawn().map_err(ProcessTestError::Spawn)?;
+    let child = command.spawn().map_err(|error| {
+        notify();
+        ProcessTestError::Spawn(error)
+    })?;
     let returned = started.elapsed();
     observe_deadline_child(
         child,
@@ -350,6 +375,7 @@ pub fn run_with_deadline_controlled_output_limit(
         ProcessControl {
             cancelled,
             progress,
+            failure,
         },
     )
 }
@@ -420,13 +446,28 @@ fn observe_deadline_child(
     let ProcessControl {
         cancelled,
         progress,
+        failure,
     } = control;
+    let notified = std::cell::Cell::new(false);
+    let notify = || {
+        if !notified.replace(true)
+            && let Some(notify) = &failure
+        {
+            // An observational hook cannot unwind through the exact child owner.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify()));
+        }
+    };
     let boundary = match OuterTestBoundary::after_spawn(&child) {
         Ok(boundary) => boundary,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ProcessTestError::Spawn(error));
+            notify();
+            let kill = child.kill();
+            let wait = child.wait();
+            // No outer boundary was admitted, so descendant settlement is unknown
+            // even if the direct child was successfully reaped.
+            return Err(ProcessTestError::Wait(io::Error::other(format!(
+                "native boundary admission failed: {error}; direct kill={kill:?}; direct wait={wait:?}"
+            ))));
         }
     };
     let boundary_admitted = started.elapsed();
@@ -459,6 +500,7 @@ fn observe_deadline_child(
         if stdout_reader.output_limited.load(Ordering::Acquire)
             || stderr_reader.output_limited.load(Ordering::Acquire)
         {
+            notify();
             // Preserve the first cap violation and settle the owned boundary before
             // any report formatting. A full pipe must not consume the whole guard.
             let cleanup = boundary
@@ -470,15 +512,45 @@ fn observe_deadline_child(
             let wait = child.wait().map_err(|error| error.to_string());
             let stdout = stdout_reader.snapshot();
             let stderr = stderr_reader.snapshot();
+            let mut reader_cleanup = Ok(());
             if cleanup.is_ok() {
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let out_limited = stdout_reader.output_limited.load(Ordering::Acquire);
+                let err_limited = stderr_reader.output_limited.load(Ordering::Acquire);
+                let out = stdout_reader.join();
+                let err = stderr_reader.join();
+                let settled = |result: thread::Result<io::Result<Vec<u8>>>, limited| {
+                    matches!(result, Ok(Ok(_))) || (limited && matches!(result, Ok(Err(_))))
+                };
+                if !settled(out, out_limited) || !settled(err, err_limited) {
+                    reader_cleanup =
+                        Err("output-limit readers did not settle successfully".to_owned());
+                }
             }
+            let callback_cleanup = callback_result.take().map_or_else(
+                || {
+                    callback_receiver
+                        .recv_timeout(deadline.saturating_sub(started.elapsed()))
+                        .map_err(|error| format!("after-spawn callback did not settle: {error}"))
+                },
+                Ok,
+            );
+            let callback_cleanup = match callback_cleanup {
+                Ok(result) => {
+                    let joined = callback
+                        .join()
+                        .map_err(|_| "after-spawn callback panicked".to_owned());
+                    result.map_err(|error| error.to_string()).and(joined)
+                }
+                Err(error) => Err(error),
+            };
             return Err(ProcessTestError::OutputLimit {
                 stdout,
                 stderr,
                 termination: wait.as_ref().ok().copied(),
-                cleanup: cleanup.and(wait.map(|_| ())),
+                cleanup: cleanup
+                    .and(wait.map(|_| ()))
+                    .and(reader_cleanup)
+                    .and(callback_cleanup),
             });
         }
         if callback_result.is_none() {
@@ -491,6 +563,7 @@ fn observe_deadline_child(
             }
         }
         if callback_result.as_ref().is_some_and(Result::is_err) {
+            notify();
             let error = callback_result
                 .take()
                 .expect("callback result was present")
@@ -527,8 +600,14 @@ fn observe_deadline_child(
         }
         if observed_status.is_none() {
             match child.try_wait() {
-                Ok(status) => observed_status = status,
+                Ok(status) => {
+                    observed_status = status;
+                    if status.is_some_and(|status| !status.success()) {
+                        notify();
+                    }
+                }
                 Err(error) => {
+                    notify();
                     let cleanup = boundary.terminate_and_reap(&mut child);
                     if cleanup.is_err() {
                         let _ = child.kill();
@@ -547,6 +626,7 @@ fn observe_deadline_child(
             break status;
         }
         if started.elapsed() < deadline
+            && observed_status.is_none_or(|status| status.success())
             && cancelled
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -602,6 +682,7 @@ fn observe_deadline_child(
             });
         }
         if started.elapsed() >= deadline {
+            notify();
             // Snapshot existing observations before cleanup changes process state. No extra
             // process queries or output reads may delay retirement for diagnostic collection.
             let observation = TimeoutObservation {
@@ -682,3 +763,7 @@ pub fn assert_stdout_empty(output: &ObservedOutput) {
 pub use memcordon_platform::test_support::windows_trace_volume;
 #[cfg(windows)]
 pub use memcordon_platform::test_support::{windows_file_identity, windows_reparse_data};
+
+#[cfg(test)]
+#[path = "../tests/support/early_failure.rs"]
+mod early_failure;

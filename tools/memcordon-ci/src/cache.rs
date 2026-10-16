@@ -104,11 +104,124 @@ fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
     )
 }
 
+/// Remove only selection differences absent from the actual compilation recipe.
+pub fn partition_compatibility(
+    purpose: &str,
+    partition: crate::cache_restore::CompiledPartition,
+    mut inputs: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    use crate::cache_restore::CompiledPartition;
+    inputs.insert("partition".into(), serde_json::to_string(&partition)?);
+    if partition == CompiledPartition::NativeTests {
+        let recipe = native_recipe(purpose)
+            .ok_or_else(|| CiError::Message("purpose has no native-test recipe".into()))?;
+        inputs.remove("purpose");
+        inputs.remove("shard");
+        inputs.retain(|name, _| !name.starts_with("product-") && !name.starts_with("consumer-"));
+        inputs.insert(
+            "profile".into(),
+            if purpose == "native-debug" {
+                "dev"
+            } else {
+                "release"
+            }
+            .into(),
+        );
+        inputs.insert(
+            "compilation-arguments".into(),
+            serde_json::to_string(recipe.first().expect("native compile recipe"))?,
+        );
+    }
+    if partition == CompiledPartition::FuzzTargets {
+        inputs.remove("shard");
+        inputs.insert(
+            "instrumentation".into(),
+            "cargo-fuzz-default-libfuzzer-release".into(),
+        );
+    }
+    Ok(inputs)
+}
+
 pub fn context(
     root: &Path,
     purpose: &str,
     shard: &str,
     external: &[PathBuf],
+) -> Result<CacheContext> {
+    context_partition(root, purpose, shard, external, None)
+}
+
+pub fn context_partition(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    external: &[PathBuf],
+    partition: Option<crate::cache_restore::CompiledPartition>,
+) -> Result<CacheContext> {
+    if let Some(partition) = partition {
+        crate::cache_restore::partition_layout(purpose, shard, Some(partition))?;
+    }
+    if purpose.is_empty()
+        || shard.is_empty()
+        || !purpose
+            .bytes()
+            .chain(shard.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(CiError::Message("invalid cache purpose/shard".into()));
+    }
+    match collect_context(root, purpose, shard, external, partition) {
+        Ok(context) => Ok(context),
+        Err(
+            error @ (CiError::Process(_) | CiError::Cancelled(_) | CiError::LaneFailures { .. }),
+        ) => Err(error),
+        Err(error) => {
+            eprintln!("compiled cache projection unavailable: {error}");
+            let unavailable = OptionalCache::Unavailable {
+                reason: "required compiled inputs unavailable".into(),
+            };
+            let entries: BTreeMap<String, OptionalCache> = BTreeMap::from([
+                (
+                    "source".into(),
+                    crate::download_cache::context(
+                        root,
+                        crate::download_cache::DownloadFamily::for_purpose(purpose),
+                    ),
+                ),
+                ("product".into(), unavailable.clone()),
+                ("consumer".into(), unavailable),
+            ]);
+            let partitions = entries
+                .iter()
+                .filter_map(|(name, value)| match value {
+                    OptionalCache::Available { entry } => {
+                        Some((name.clone(), entry.exact_key.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(CacheContext {
+                revision: 6,
+                usable: false,
+                inputs: BTreeMap::new(),
+                partitions,
+                entries,
+                diagnostics: CacheDiagnostics {
+                    source_commit: String::new(),
+                    source_tree: String::new(),
+                    unavailable_reasons: vec!["compiled-input-projection-unavailable".into()],
+                },
+            })
+        }
+    }
+}
+
+fn collect_context(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    external: &[PathBuf],
+    partition: Option<crate::cache_restore::CompiledPartition>,
 ) -> Result<CacheContext> {
     if purpose.is_empty()
         || shard.is_empty()
@@ -122,7 +235,20 @@ pub fn context(
     let mut inputs = BTreeMap::new();
     let mut usable = true;
     let mut local_usable = true;
-    let configurations = crate::cache_inputs::cargo_configs(root);
+    let tool_purpose = matches!(purpose, "cargo-audit" | "cargo-deny" | "cargo-fuzz");
+    let configurations = if tool_purpose {
+        crate::cache_inputs::install_configs(root)
+    } else {
+        // Ordinary source-test/fuzz recipes use implicit-host compilation. A
+        // global target override would change that recipe rather than select
+        // the target represented by its explicit-target product sibling.
+        crate::cache_inputs::cargo_configs_for_target(
+            root,
+            (partition == Some(crate::cache_restore::CompiledPartition::Product))
+                .then(distribution::native_target)
+                .transpose()?,
+        )
+    };
     match &configurations {
         Ok(configuration) => inputs.extend(configuration.clone()),
         Err(_) => usable = false,
@@ -186,22 +312,33 @@ pub fn context(
     } else {
         &pins.stable
     };
-    inputs.insert(
-        "rustc".into(),
-        query(root, "rustup", &["run", selected_toolchain, "rustc", "-vV"])?,
-    );
-    inputs.insert(
-        "cargo".into(),
-        query(root, "rustup", &["run", selected_toolchain, "cargo", "-V"])?,
-    );
+    for (name, arguments) in [
+        ("rustc", vec!["run", selected_toolchain, "rustc", "-vV"]),
+        ("cargo", vec!["run", selected_toolchain, "cargo", "-V"]),
+    ] {
+        match query(root, "rustup", &arguments) {
+            Ok(value) => {
+                inputs.insert(name.into(), value);
+            }
+            Err(error) => {
+                usable = false;
+                diagnostics
+                    .unavailable_reasons
+                    .push(format!("compiler-query-unavailable:{name}"));
+                eprintln!("optional compiled cache probe unavailable: {error}");
+            }
+        }
+    }
     inputs.insert("target".into(), distribution::native_target()?.into());
     inputs.insert("purpose".into(), purpose.into());
     inputs.insert("toolchain".into(), selected_toolchain.clone());
     inputs.insert("shard".into(), shard.into());
-    if matches!(
-        purpose,
-        "consumer-readiness" | "native-readiness" | "windows-working" | "private"
-    ) {
+    if partition != Some(crate::cache_restore::CompiledPartition::NativeTests)
+        && matches!(
+            purpose,
+            "consumer-readiness" | "native-readiness" | "windows-working" | "private"
+        )
+    {
         let selected = distribution::Distribution::read(root)?
             .consumer_readiness()?
             .native()?
@@ -232,10 +369,12 @@ pub fn context(
             }
             .into(),
         );
-        if matches!(
-            purpose,
-            "native-release" | "native-readiness" | "windows-working" | "private"
-        ) {
+        if partition != Some(crate::cache_restore::CompiledPartition::NativeTests)
+            && matches!(
+                purpose,
+                "native-release" | "native-readiness" | "windows-working" | "private"
+            )
+        {
             inputs.insert("product-package".into(), "memcordon".into());
             inputs.insert("product-profile".into(), "release".into());
             match distribution::Distribution::read(root).and_then(|selected| {
@@ -265,14 +404,16 @@ pub fn context(
             "source-tests:dev+release;product:release;consumer:dev+release;driver:dev".into(),
         );
     }
-    inputs.insert(
-        "distribution".into(),
-        artifacts::checksum(&artifacts::read_file(&root.join("ci/distribution.toml"))?),
-    );
-    inputs.insert(
-        "lock".into(),
-        artifacts::checksum(&artifacts::read_file(&root.join("Cargo.lock"))?),
-    );
+    if !tool_purpose {
+        inputs.insert(
+            "distribution".into(),
+            artifacts::checksum(&artifacts::read_file(&root.join("ci/distribution.toml"))?),
+        );
+        inputs.insert(
+            "lock".into(),
+            artifacts::checksum(&artifacts::read_file(&root.join("Cargo.lock"))?),
+        );
+    }
     for name in [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
@@ -301,6 +442,29 @@ pub fn context(
         if name == "CARGO_BUILD_JOBS" {
             continue;
         }
+        if name == "CARGO_ENCODED_RUSTFLAGS" {
+            if let Ok(value) = std::env::var(&name) {
+                if let Ok(flags) = crate::cache_inputs::encoded_rustflags(&value) {
+                    if !inputs.keys().any(|key| key.starts_with("profile.")) {
+                        inputs.insert(name, serde_json::to_string(&flags)?);
+                        continue;
+                    }
+                }
+            }
+        }
+        if name == "CARGO_INCREMENTAL" {
+            if let Ok(value) = std::env::var(&name) {
+                if let Ok(value) = crate::cache_inputs::incremental_setting(&value) {
+                    if !inputs
+                        .keys()
+                        .any(|key| key == "build.incremental" || key.ends_with(".incremental"))
+                    {
+                        inputs.insert(name, value.to_string());
+                        continue;
+                    }
+                }
+            }
+        }
         if matches!(
             name.as_ref(),
             "CC" | "CXX"
@@ -313,6 +477,8 @@ pub fn context(
                 | "CPLUS_INCLUDE_PATH"
                 | "LIBRARY_PATH"
                 | "RUSTC"
+                | "RUSTFLAGS"
+                | "RUSTDOCFLAGS"
                 | "RUSTC_WRAPPER"
                 | "RUSTC_WORKSPACE_WRAPPER"
         ) || name.starts_with("CARGO_TARGET_")
@@ -463,16 +629,47 @@ pub fn context(
             ),
         ] {
             let entry = if usable {
-                let (exact_key, _) = crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
-                    family: family.into(),
-                    layout_revision: revision,
-                    compatibility: compatibility.clone(),
-                    content: content.clone(),
-                })?;
+                compatibility.insert("tool-package".into(), purpose.into());
+                compatibility.insert(
+                    "tool-build-root".into(),
+                    root.join("target/ci-tools-build")
+                        .join(purpose)
+                        .display()
+                        .to_string(),
+                );
+                compatibility.insert(
+                    "registry-source-root".into(),
+                    crate::download_cache::cargo_home(root)?
+                        .join("registry/src")
+                        .display()
+                        .to_string(),
+                );
+                compatibility.insert(
+                    "tool-build-recipe".into(),
+                    "install-locked-stable-release-default-features-per-tool-staging-bounded-jobs-v2".into(),
+                );
+                compatibility.insert(
+                    "cargo-home".into(),
+                    crate::download_cache::cargo_home(root)?
+                        .canonicalize()?
+                        .display()
+                        .to_string(),
+                );
+                compatibility.insert(
+                    "compiler-source-root".into(),
+                    root.canonicalize()?.display().to_string(),
+                );
+                let (exact_key, prefix) =
+                    crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
+                        family: family.into(),
+                        layout_revision: if family == "tool-build" { 6 } else { revision },
+                        compatibility: compatibility.clone(),
+                        content: content.clone(),
+                    })?;
                 OptionalCache::Available {
                     entry: CacheEntry {
                         exact_key,
-                        restore_prefix: None,
+                        restore_prefix: (family == "tool-build").then_some(prefix),
                         paths: vec![path],
                     },
                 }
@@ -491,11 +688,14 @@ pub fn context(
             crate::download_cache::DownloadFamily::for_purpose(purpose),
         ),
     );
-    if let Ok(configuration) = &configurations {
-        let stable_reader = query(root, "rustup", &["run", &pins.stable, "cargo", "-V"])?;
+    if let (Ok(configuration), Some(selected_reader), Ok(stable_reader)) = (
+        &configurations,
+        inputs.get("cargo"),
+        query(root, "rustup", &["run", &pins.stable, "cargo", "-V"]),
+    ) {
         let readers = BTreeMap::from([
             ("driver-reader".into(), stable_reader),
-            ("selected-reader".into(), inputs["cargo"].clone()),
+            ("selected-reader".into(), selected_reader.clone()),
             ("index-os".into(), std::env::consts::OS.into()),
         ]);
         let (exact_key, _) = crate::cache_inputs::keys(&crate::cache_inputs::KeyInputs {
@@ -523,7 +723,7 @@ pub fn context(
             .unavailable_reasons
             .push("product-local-inputs-unmodeled".into());
     }
-    let layout = crate::cache_restore::layout(purpose, shard);
+    let layout = crate::cache_restore::partition_layout(purpose, shard, partition);
     let paths = layout.as_ref().map(|layout| layout.archive_members());
     if paths.is_err() || !external.is_empty() {
         usable = false;
@@ -543,6 +743,16 @@ pub fn context(
     compatibility.remove("lock");
     compatibility.remove("distribution");
     compatibility.remove("native-test-arguments");
+    compatibility.insert(
+        "cargo-home".into(),
+        crate::download_cache::cargo_home(root)?
+            .canonicalize()?
+            .display()
+            .to_string(),
+    );
+    if let Some(partition) = partition {
+        compatibility = partition_compatibility(purpose, partition, compatibility)?;
+    }
     if purpose == "native-auxiliary" {
         compatibility.insert(
             "profile".into(),
@@ -570,7 +780,13 @@ pub fn context(
                 family: "workspace".into(),
                 layout_revision: layout.as_ref().expect("usable layout").revision,
                 compatibility,
-                content: local?,
+                content: {
+                    let mut content = local?;
+                    if partition == Some(crate::cache_restore::CompiledPartition::FuzzTargets) {
+                        content.insert("selected-shard".into(), shard.into());
+                    }
+                    content
+                },
             })?;
         entries.insert(
             "product".into(),
@@ -621,7 +837,18 @@ pub fn emit_with_intent(
     external: &[PathBuf],
     for_save: bool,
 ) -> Result<()> {
-    let context = context(root, purpose, shard, external)?;
+    emit_partition(root, purpose, shard, external, for_save, None)
+}
+
+pub fn emit_partition(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    external: &[PathBuf],
+    for_save: bool,
+    partition: Option<crate::cache_restore::CompiledPartition>,
+) -> Result<()> {
+    let context = context_partition(root, purpose, shard, external, partition)?;
     let mut outputs = vec![("compiled-cache-usable", "false".to_owned())];
     outputs.push((
         "bootstrap-home-matches",
@@ -629,7 +856,9 @@ pub fn emit_with_intent(
     ));
     outputs.push((
         "payload-ready",
-        (for_save && crate::cache_restore::payload_ready(root, purpose, shard)?).to_string(),
+        (for_save
+            && crate::cache_restore::partition_payload_ready(root, purpose, shard, partition)?)
+        .to_string(),
     ));
     if context.usable {
         outputs[0].1 = "true".into();
@@ -701,6 +930,15 @@ pub fn emit_with_intent(
             outputs.push((path_output, String::new()));
         }
     }
+    outputs.push((
+        "tool-build-restore-prefix",
+        match context.entries.get("tool-build") {
+            Some(OptionalCache::Available { entry }) => {
+                entry.restore_prefix.clone().unwrap_or_default()
+            }
+            _ => String::new(),
+        },
+    ));
     crate::workflow_output::write(&outputs)?;
     println!("{}", serde_json::to_string_pretty(&context)?);
     Ok(())

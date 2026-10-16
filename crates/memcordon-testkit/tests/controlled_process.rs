@@ -105,6 +105,63 @@ fn slow_logger_does_not_block_output_capture_or_retirement() {
 }
 
 #[test]
+fn actual_failure_notifies_even_with_a_full_progress_queue() {
+    let observed = Arc::new(AtomicU64::new(0));
+    let notifications = observed.clone();
+    let (sender, _receiver) = mpsc::sync_channel(0);
+    let output = memcordon_testkit::run_with_deadline_notified_output_limit(
+        &mut fixture("fails_without_failure_text"),
+        Duration::from_secs(10),
+        64 * 1024,
+        None,
+        Some(ProgressOutput {
+            sender,
+            omitted: Arc::new(AtomicU64::new(0)),
+        }),
+        Some(Arc::new(move || {
+            notifications.fetch_add(1, Ordering::AcqRel);
+        })),
+    )
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(observed.load(Ordering::Acquire) > 0);
+    assert!(
+        output
+            .stdout
+            .windows(b"ordinary output".len())
+            .any(|part| part == b"ordinary output")
+    );
+}
+
+#[test]
+fn spawn_failure_notifies_before_return() {
+    let observed = Arc::new(AtomicBool::new(false));
+    let notified = observed.clone();
+    let error = memcordon_testkit::run_with_deadline_notified_output_limit(
+        &mut Command::new("memcordon-nonexistent-observation-fixture"),
+        Duration::from_secs(10),
+        1024,
+        None,
+        None,
+        Some(Arc::new(move || {
+            notified.store(true, Ordering::Release);
+        })),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ProcessTestError::Spawn(_)));
+    assert!(observed.load(Ordering::Acquire));
+}
+
+#[test]
+#[ignore = "nonzero native status observation fixture"]
+fn fails_without_failure_text() {
+    use std::io::Write;
+    std::io::stdout().write_all(b"ordinary output\n").unwrap();
+    std::io::stdout().flush().unwrap();
+    std::process::exit(19);
+}
+
+#[test]
 #[ignore = "owned subprocess progress and cancellation fixture"]
 fn waits_after_progress() {
     use std::io::Write;

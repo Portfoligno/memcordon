@@ -90,7 +90,9 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
     let strategy_key = serde_yaml::Value::String("strategy".into());
     assert_eq!(
         baseline[&strategy_key]["fail-fast"].as_str(),
-        Some("${{ github.event_name != 'workflow_dispatch' }}")
+        Some(
+            "${{ github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all' }}"
+        )
     );
     for value in [
         true.into(),
@@ -168,8 +170,8 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
         (
             step_id("fuzz-two"),
             "run",
-            "suite fuzz-quarter-two",
-            "suite fuzz-quarter-one",
+            "suite fuzz-execute-quarter-two",
+            "suite fuzz-execute-quarter-one",
         ),
         (
             source_restore,
@@ -213,11 +215,20 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             Some("fuzz-download-save-context" | "cache-cargo-fuzz-save-context")
         );
         let optional_refresh_or_seed = step["id"].as_str().is_some_and(|id| {
-            id == "workspace-downloads" || (id.ends_with("save-context") && !source_refresh)
+            id == "workspace-downloads"
+                || id == "archive-seed-restore"
+                || id == "index-snapshot-restore"
+                || id.ends_with("-seed")
+                || (id.ends_with("save-context") && !source_refresh)
         });
         let optional_source_save = matches!(
             step["name"].as_str(),
-            Some("Save complete fuzz downloads" | "Save cargo-fuzz downloads")
+            Some(
+                "Save complete fuzz downloads"
+                    | "Save cargo-fuzz downloads"
+                    | "Save observed registry-archives"
+                    | "Save observed registry-index"
+            )
         );
         if optional_refresh_or_seed || optional_source_save {
             // Missing seeds/saves leave required population intact. Compiled

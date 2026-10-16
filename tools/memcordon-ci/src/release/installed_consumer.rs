@@ -1712,6 +1712,33 @@ pub fn run_channel_with_external(
     channel: InstalledChannel,
     external_input: Option<&Path>,
 ) -> Result<()> {
+    run_channel_with_cache(
+        root,
+        target_directory,
+        package_directory,
+        destination,
+        channel,
+        external_input,
+        super::ordinary_consumer_cache::ConsumerBuildLayout::Ephemeral,
+    )
+}
+
+pub fn run_channel_with_cache(
+    root: &Path,
+    target_directory: &Path,
+    package_directory: &Path,
+    destination: &Path,
+    channel: InstalledChannel,
+    external_input: Option<&Path>,
+    consumer_cache: super::ordinary_consumer_cache::ConsumerBuildLayout,
+) -> Result<()> {
+    use super::ordinary_consumer_cache::{self, ConsumerBuildLayout};
+    ordinary_consumer_cache::validate_selection(
+        consumer_cache,
+        matches!(channel, InstalledChannel::CargoPackage),
+        true,
+        external_input.is_some(),
+    )?;
     let started = std::time::Instant::now();
     let channel_name = match channel {
         InstalledChannel::NativeBundle => "native",
@@ -1754,28 +1781,45 @@ pub fn run_channel_with_external(
             ));
         }
         create_fresh_destination(destination)?;
+        let mut ordinary_consumer = None;
         let payload = match channel {
             InstalledChannel::NativeBundle => materialize_native(target_directory, destination)?,
             InstalledChannel::CargoPackage => {
-                let consumer = PackageConsumer::prepare_selected(
-                    root,
-                    package_directory,
-                    &bundle.distribution,
-                )?;
+                let consumer = if consumer_cache == ConsumerBuildLayout::StableOrdinary {
+                    ordinary_consumer_cache::prepare_execution(
+                        root,
+                        target_directory,
+                        package_directory,
+                    )?
+                } else {
+                    PackageConsumer::prepare_selected(
+                        root,
+                        package_directory,
+                        &bundle.distribution,
+                    )?
+                };
                 if consumer.bundle.source != bundle.source {
                     return Err(CiError::Message(
                         "installed channel source selections differ".into(),
                     ));
                 }
-                materialize_cargo(
+                let build = consumer
+                    .ordinary_slot()
+                    .map(|slot| slot.build().to_owned())
+                    .unwrap_or_else(|| root.join("target/ci-consumers"));
+                let payload = materialize_cargo(
                     root,
                     target_directory,
                     package_directory,
                     &bundle,
                     &consumer,
-                    &root.join("target/ci-consumers"),
+                    &build,
                     destination,
-                )?
+                )?;
+                if consumer_cache == ConsumerBuildLayout::StableOrdinary {
+                    ordinary_consumer = Some(consumer);
+                }
+                payload
             }
         };
         let predecessor = if payload.distribution.runtime_selection()?
@@ -1826,7 +1870,11 @@ pub fn run_channel_with_external(
                 .to_owned(),
             ),
         ]);
-        source::write_json(&destination.join("consumer.json"), &measured)
+        source::write_json(&destination.join("consumer.json"), &measured)?;
+        if let Some(consumer) = ordinary_consumer {
+            ordinary_consumer_cache::complete(&consumer, &payload.distribution)?;
+        }
+        Ok(())
     })();
     record(
         if result.is_ok() {

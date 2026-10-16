@@ -10,6 +10,256 @@ use std::{
 };
 
 #[test]
+fn nested_default_inherits_collect_all_and_original_deadline() {
+    use memcordon_ci::{
+        failure_mode::FailureMode,
+        preparation::{active_group, with_operation},
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let result = with_operation(FailureMode::CollectAll, deadline, || {
+        assert!(with_operation(FailureMode::StopAfterFailure, deadline, || Ok(())).is_err());
+        assert!(
+            complete_lanes_with_failure(
+                Layout::Serial,
+                FailureMode::StopAfterFailure,
+                || Ok(()),
+                || Ok(())
+            )
+            .is_err()
+        );
+        complete_lanes(
+            Layout::Serial,
+            || {
+                let root = active_group().unwrap();
+                assert_eq!(root.mode(), FailureMode::CollectAll);
+                assert_eq!(root.deadline(), deadline);
+                memcordon_ci::preparation::with_nested_operation(
+                    deadline + Duration::from_secs(60),
+                    || {
+                        assert_eq!(active_group().unwrap().deadline(), deadline);
+                        Err(CiError::Message("nested required failure".into()))
+                    },
+                )
+            },
+            || {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    });
+    assert!(result.is_err());
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(active_group().is_none());
+}
+
+#[test]
+fn operation_restores_thread_local_owner_after_panic() {
+    use memcordon_ci::{
+        failure_mode::FailureMode,
+        preparation::{active_group, with_operation},
+    };
+    let result: memcordon_ci::Result<()> = with_operation(
+        FailureMode::CollectAll,
+        Instant::now() + Duration::from_secs(20),
+        || panic!("owner panic"),
+    );
+    assert!(result.is_err());
+    assert!(active_group().is_none());
+}
+
+#[test]
+fn nested_parallel_lanes_reuse_the_current_thread() {
+    complete_lanes(
+        Layout::Parallel,
+        || {
+            let owner = std::thread::current().id();
+            complete_lanes(
+                Layout::Parallel,
+                || {
+                    assert_eq!(std::thread::current().id(), owner);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(std::thread::current().id(), owner);
+                    Ok(())
+                },
+            )
+        },
+        || Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn nested_cargo_arguments_cannot_exceed_the_parent_lane_allocation() {
+    complete_lanes(
+        Layout::Parallel,
+        || {
+            let inherited = memcordon_ci::preparation::active_group()
+                .unwrap()
+                .compiler_jobs();
+            complete_lanes(
+                Layout::Parallel,
+                || {
+                    for jobs in [
+                        vec!["--jobs", "99"],
+                        vec!["--jobs=99"],
+                        vec!["-j99"],
+                        vec![],
+                    ] {
+                        let command = memcordon_ci::command::rustup_cargo(
+                            std::path::Path::new("."),
+                            "stable",
+                            ["check"],
+                            Duration::from_secs(20),
+                        )
+                        .args(jobs)
+                        .materialize()?;
+                        let arguments: Vec<_> = command.get_args().collect();
+                        let position = arguments
+                            .iter()
+                            .position(|argument| *argument == "--jobs")
+                            .unwrap();
+                        assert_eq!(
+                            arguments[position + 1],
+                            std::ffi::OsStr::new(&inherited.to_string())
+                        );
+                    }
+                    let fuzz = CommandSpec::toolchain_program(
+                        "rustup",
+                        std::path::Path::new("."),
+                        "stable",
+                        std::path::Path::new("cargo-fuzz"),
+                        Duration::from_secs(20),
+                    )
+                    .args(["build", "target"])
+                    .materialize()?;
+                    let jobs = fuzz
+                        .get_envs()
+                        .find(|(key, _)| *key == "CARGO_BUILD_JOBS")
+                        .unwrap()
+                        .1
+                        .unwrap();
+                    assert_eq!(jobs, std::ffi::OsStr::new(&inherited.to_string()));
+                    Ok(())
+                },
+                || Ok(()),
+            )
+        },
+        || Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn later_collect_all_pair_selects_its_own_first_observed_failure() {
+    use memcordon_ci::{
+        failure_mode::FailureMode,
+        preparation::{active_group, with_operation},
+    };
+    with_operation(
+        FailureMode::CollectAll,
+        Instant::now() + Duration::from_secs(20),
+        || {
+            assert!(
+                complete_lanes(
+                    Layout::Parallel,
+                    || { Err(CiError::Message("earlier pair first lane".into())) },
+                    || Ok(())
+                )
+                .is_err()
+            );
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let error = complete_lanes(
+                Layout::Parallel,
+                move || {
+                    receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Err(CiError::Message("later pair slower first lane".into()))
+                },
+                || {
+                    active_group().unwrap().request_after_failure();
+                    sender.send(()).unwrap();
+                    Err(CiError::Message(
+                        "later pair first observed second lane".into(),
+                    ))
+                },
+            )
+            .unwrap_err();
+            let CiError::LaneFailures { primary, .. } = error else {
+                panic!("both required errors retained");
+            };
+            assert!(primary.to_string().contains("first observed second lane"));
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn stateful_phase_finishes_cleanup_then_withholds_the_next_command() {
+    use memcordon_ci::command::PeerStopPolicy;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    complete_lanes(
+        Layout::Parallel,
+        || {
+            CommandSpec::new(
+                std::env::current_exe().unwrap(),
+                path,
+                Duration::from_secs(20),
+            )
+            .args([
+                "--ignored",
+                "--exact",
+                "stateful_phase_child",
+                "--nocapture",
+            ])
+            .peer_stop_policy(PeerStopPolicy::FinishOwnedPhase)
+            .run()?;
+            assert!(path.join("phase-cleaned").exists());
+            let error = CommandSpec::new(
+                std::env::current_exe().unwrap(),
+                path,
+                Duration::from_secs(20),
+            )
+            .arg("--list")
+            .run()
+            .unwrap_err();
+            assert!(matches!(error, CiError::NotStartedAfterFailure));
+            Ok(())
+        },
+        || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.join("phase-ready").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            memcordon_ci::preparation::active_group()
+                .unwrap()
+                .request_after_failure();
+            std::fs::write(path.join("phase-release"), b"release\n")?;
+            Err(CiError::Message("peer required failure".into()))
+        },
+    )
+    .unwrap_err();
+    assert!(path.join("phase-cleaned").exists());
+}
+
+#[test]
+#[ignore = "stateful native cleanup fixture"]
+fn stateful_phase_child() {
+    let path = std::env::current_dir().unwrap();
+    std::fs::write(path.join("phase-ready"), b"ready\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.join("phase-release").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    std::fs::write(path.join("phase-cleaned"), b"cleaned\n").unwrap();
+}
+
+#[test]
 fn collect_all_settles_both_owners_after_failure_or_panic() {
     for layout in [Layout::Serial, Layout::Parallel] {
         let observed = Arc::new(Mutex::new(Vec::new()));

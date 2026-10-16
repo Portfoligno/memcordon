@@ -329,19 +329,19 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         "target/ci/reports",
         "target/ci-build",
         "target/ci/miri-*",
-        "${{ steps.compiled-context-second.outputs.product-paths }}",
+        "${{ steps.compiled-context-quarter-two.outputs.product-paths }}",
     ] {
         let mut job = baseline.clone();
         job["steps"]
             .as_sequence_mut()
             .unwrap()
             .iter_mut()
-            .find(|step| step["id"] == "compiled-first")
+            .find(|step| step["id"] == "compiled-quarter-one")
             .unwrap()["with"]["path"] = replacement.into();
         assert_ne!(&job, baseline);
         assert!(finite_cache_paths(&job, "miri").is_err());
     }
-    for id in ["compiled-first", "compiled-context-second"] {
+    for id in ["compiled-quarter-one", "compiled-context-quarter-two"] {
         let mut job = baseline.clone();
         job["steps"]
             .as_sequence_mut()
@@ -355,7 +355,9 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         .as_sequence_mut()
         .unwrap()
         .iter_mut()
-        .find(|step| step["with"]["key"] == "${{ steps.compiled-first.outputs.cache-primary-key }}")
+        .find(|step| {
+            step["with"]["key"] == "${{ steps.compiled-quarter-one.outputs.cache-primary-key }}"
+        })
         .unwrap()["with"]["path"] = "target/ci/reports".into();
     assert_ne!(&job, baseline);
     assert!(finite_cache_paths(&job, "miri").is_err());
@@ -377,14 +379,23 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
 }
 
 fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
-    let require = |valid: bool| {
-        valid
-            .then_some(())
-            .ok_or_else(|| "cache role or custody differs".to_owned())
-    };
+    #[track_caller]
+    fn require(valid: bool) -> Result<(), String> {
+        valid.then_some(()).ok_or_else(|| {
+            format!(
+                "cache role or custody differs at {}",
+                std::panic::Location::caller()
+            )
+        })
+    }
     let steps = job["steps"].as_sequence().ok_or("steps absent")?;
     let shards: &[&str] = match family {
-        "miri" => &["first", "second"],
+        "miri" => &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
         "fuzz" => &[
             "quarter-one",
             "quarter-two",
@@ -438,7 +449,12 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         require(
             declarations[0]["run"].as_str()
                 == Some(&format!(
-                    "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}"
+                    "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}{}",
+                    if family == "fuzz" {
+                        " --partition fuzz-targets"
+                    } else {
+                        ""
+                    }
                 )),
         )?;
         if *shard != "complete" {
@@ -490,11 +506,35 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
     let mut saves = 0;
     let mut paired_saves = 0;
     let mut seen = std::collections::BTreeSet::new();
+    let projected = |key: &str, output: &str| {
+        key.strip_prefix("${{ steps.")
+            .and_then(|tail| tail.strip_suffix(" }}"))
+            .and_then(|inner| inner.split_once(".outputs."))
+            .filter(|(_, selected)| *selected == output)
+            .map(|(context, _)| context.to_owned())
+    };
     for (ordinal, step) in steps.iter().enumerate() {
         let Some(uses) = step["uses"].as_str() else {
             continue;
         };
         if uses.starts_with("actions/cache/save@") {
+            let selected = step["with"]["key"].as_str().ok_or("save key absent")?;
+            if let Some(context) =
+                projected(selected, "snapshot-key").or_else(|| projected(selected, "sysroot-key"))
+            {
+                let output = if selected.contains("sysroot-key") {
+                    "sysroot-path"
+                } else {
+                    "snapshot-path"
+                };
+                require(step["with"]["path"].as_str() == Some(&reference(&context, output)))?;
+                require(
+                    steps[..ordinal]
+                        .iter()
+                        .any(|candidate| candidate["id"].as_str() == Some(&context)),
+                )?;
+                continue;
+            }
             saves += 1;
             continue;
         }
@@ -505,6 +545,72 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         require(seen.insert(id))?;
         let key = step["with"]["key"].as_str().ok_or("restore key absent")?;
         let path = step["with"]["path"].as_str().ok_or("restore path absent")?;
+        let extended = match id {
+            "archive-seed-restore" => Some((
+                "archive-seed-context",
+                "seed-lookup-key",
+                "seed-import-path",
+                "ci seed-context --kind registry-archives".to_owned(),
+            )),
+            "index-snapshot-restore" => Some((
+                "index-snapshot-context",
+                "seed-lookup-key",
+                "seed-import-path",
+                "ci seed-context --kind registry-index".to_owned(),
+            )),
+            "miri-sysroot-cache" if family == "miri" => Some((
+                "miri-sysroot-context",
+                "sysroot-key",
+                "sysroot-path",
+                "ci miri-cache-context".to_owned(),
+            )),
+            "archive-seed-probe" => Some((
+                "archive-seed-snapshot",
+                "snapshot-key",
+                "snapshot-path",
+                "ci cache-snapshot --kind registry-archives".to_owned(),
+            )),
+            "index-snapshot-probe" => Some((
+                "index-snapshot-snapshot",
+                "snapshot-key",
+                "snapshot-path",
+                "ci cache-snapshot --kind registry-index".to_owned(),
+            )),
+            _ => None,
+        };
+        let fuzz_seed = if family == "fuzz" {
+            [("one", "quarter-one"), ("two", "quarter-two"), ("three", "quarter-three"), ("four", "quarter-four")].into_iter().find_map(|(label, shard)| {
+                if id == format!("fuzz-{label}-seed") { Some((format!("fuzz-{label}-seed-context"), "seed-lookup-key", "seed-import-path", format!("ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard {shard}"))) }
+                else if id == format!("fuzz-{label}-probe") { Some((format!("fuzz-{label}-snapshot"), "snapshot-key", "snapshot-path", format!("ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard {shard} --stage build"))) }
+                else { None }
+            })
+        } else {
+            None
+        };
+        if let Some((context, selected_key, selected_path, command)) = extended
+            .map(|(context, key, path, command)| (context.to_owned(), key, path, command))
+            .or(fuzz_seed)
+        {
+            require(
+                key == reference(&context, selected_key)
+                    && path == reference(&context, selected_path),
+            )?;
+            require(steps[..ordinal].iter().any(|candidate| {
+                candidate["id"].as_str() == Some(&context)
+                    && candidate["run"].as_str()
+                        == Some(&format!("./target/ci/release/memcordon-ci {command}"))
+            }))?;
+            if selected_key == "snapshot-key" {
+                require(step["with"]["lookup-only"].as_bool() == Some(true))?;
+            }
+            if selected_key == "seed-lookup-key" {
+                require(
+                    step["with"]["restore-keys"].as_str()
+                        == Some(&reference(&context, "seed-restore-prefix")),
+                )?;
+            }
+            continue;
+        }
         let source_role = source_roles.remove(id);
         if key.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-") {
             downloads += 1;
@@ -588,12 +694,12 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
                     require(!Path::new(excluded).starts_with(&root))?;
                 }
                 if family == "miri" {
-                    let other = if id == "compiled-first" {
-                        "target/ci/miri-second"
-                    } else {
-                        "target/ci/miri-first"
-                    };
-                    require(!Path::new(other).starts_with(root))?;
+                    for other in shards
+                        .iter()
+                        .filter(|shard| id != format!("compiled-{shard}"))
+                    {
+                        require(!Path::new(&format!("target/ci/miri-{other}")).starts_with(&root))?;
+                    }
                 }
             }
         }

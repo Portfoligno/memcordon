@@ -292,7 +292,7 @@ pub fn archive_order(bundle: &PackageBundle, payloads: &[Vec<u8>]) -> Result<Vec
 }
 
 pub struct PackageConsumer {
-    _directory: tempfile::TempDir,
+    _directory: ConsumerDirectoryOwner,
     pub manifest: PathBuf,
     pub config: PathBuf,
     pub cli_source: PathBuf,
@@ -306,7 +306,43 @@ pub struct PackageConsumer {
     selected_features: Vec<String>,
 }
 
+/// Source ownership is independent of the compilation output transported by Actions.
+pub enum ConsumerDirectoryOwner {
+    Ephemeral(tempfile::TempDir),
+    Stable(super::ordinary_consumer_cache::OrdinarySlot),
+}
+
+impl ConsumerDirectoryOwner {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Ephemeral(directory) => directory.path(),
+            Self::Stable(slot) => slot.source(),
+        }
+    }
+
+    fn cargo_home(&self) -> PathBuf {
+        match self {
+            Self::Ephemeral(directory) => directory.path().join("cargo-home"),
+            Self::Stable(slot) => slot.cargo_home(),
+        }
+    }
+
+    fn install(&self) -> PathBuf {
+        match self {
+            Self::Ephemeral(directory) => directory.path().join("install"),
+            Self::Stable(slot) => slot.install(),
+        }
+    }
+}
+
 impl PackageConsumer {
+    pub(crate) fn ordinary_slot(&self) -> Option<&super::ordinary_consumer_cache::OrdinarySlot> {
+        match &self._directory {
+            ConsumerDirectoryOwner::Stable(slot) => Some(slot),
+            ConsumerDirectoryOwner::Ephemeral(_) => None,
+        }
+    }
+
     pub fn prepare(root: &Path, packages: &Path) -> Result<Self> {
         Self::prepare_selection(root, packages, None)
     }
@@ -325,8 +361,44 @@ impl PackageConsumer {
         packages: &Path,
         distribution: Option<&super::distribution::TargetDistribution>,
     ) -> Result<Self> {
+        Self::prepare_at(
+            root,
+            packages,
+            distribution,
+            ConsumerDirectoryOwner::Ephemeral(tempfile::tempdir()?),
+        )
+    }
+
+    pub fn prepare_cached_ordinary(
+        root: &Path,
+        packages: &Path,
+        distribution: &super::distribution::TargetDistribution,
+        slot: super::ordinary_consumer_cache::OrdinarySlot,
+    ) -> Result<Self> {
+        distribution.validate()?;
+        let ordinary = super::distribution::Distribution::read(root)?
+            .native()?
+            .clone();
+        if serde_json::to_value(distribution)? != serde_json::to_value(&ordinary)? {
+            return Err(CiError::Message(
+                "stable ordinary builder rejects readiness/capture distribution".into(),
+            ));
+        }
+        Self::prepare_at(
+            root,
+            packages,
+            Some(distribution),
+            ConsumerDirectoryOwner::Stable(slot),
+        )
+    }
+
+    fn prepare_at(
+        root: &Path,
+        packages: &Path,
+        distribution: Option<&super::distribution::TargetDistribution>,
+        directory: ConsumerDirectoryOwner,
+    ) -> Result<Self> {
         let (bundle, bytes) = PackageBundle::load(packages)?;
-        let directory = tempfile::tempdir()?;
         let mut patches = toml::Table::new();
         let mut dependencies = toml::Table::new();
         let mut cli_source = None;
@@ -424,8 +496,8 @@ impl PackageConsumer {
             consumer.join("src").join("main.rs"),
             "fn main() { let bytes: memcordon_core::ByteSize = \"4MiB\".parse().expect(\"public byte-size parser\"); assert_eq!(bytes.bytes(), 4 * 1024 * 1024); }\n",
         )?;
-        let install_root = directory.path().join("install");
-        let cargo_home = directory.path().join("cargo-home");
+        let install_root = directory.install();
+        let cargo_home = directory.cargo_home();
         fs::create_dir(&cargo_home)?;
         crate::cache_inputs::seed_current_downloads(&cargo_home, false)?;
         let mut value = Self {
@@ -524,6 +596,132 @@ impl PackageConsumer {
         }
         value.verify_packaged_sources()?;
         Ok(value)
+    }
+
+    pub(crate) fn ordinary_input_identity(&self) -> Result<BTreeMap<String, String>> {
+        self.verify_packaged_sources()?;
+        let mut inputs = BTreeMap::new();
+        for file in [
+            &self.manifest,
+            &self.config,
+            &self.manifest.with_file_name("Cargo.lock"),
+            &self.cli_source.join("Cargo.lock"),
+        ] {
+            inputs.insert(
+                file.display().to_string(),
+                artifacts::checksum(&artifacts::read_file(file)?),
+            );
+        }
+        inputs.insert(
+            "consumer-graph".into(),
+            serde_json::to_string(&self.consumer_graph)?,
+        );
+        inputs.insert(
+            "install-graph".into(),
+            serde_json::to_string(&self.install_graph)?,
+        );
+        for record in &self.bundle.files {
+            inputs.insert(record.name.clone(), record.sha256.clone());
+        }
+        Ok(inputs)
+    }
+
+    /// Cargo's package IDs, rather than fingerprint filenames, select every local unit.
+    pub fn ordinary_build_layout_for_transport(&self) -> Result<()> {
+        self.verify_packaged_sources()?;
+        self.ordinary_slot()
+            .ok_or_else(|| CiError::Message("ordinary layout requires live stable owner".into()))?
+            .mark_build_layout()
+    }
+
+    pub fn sanitize_ordinary_build(&self, root: &Path) -> Result<()> {
+        let slot = self.ordinary_slot().ok_or_else(|| {
+            CiError::Message("ordinary sanitation requires live stable owner".into())
+        })?;
+        let _safe = crate::cache_restore::safe_root(
+            root,
+            slot.build()
+                .strip_prefix(root.canonicalize()?)
+                .map_err(|_| CiError::Message("ordinary build escaped checkout".into()))?,
+        )?;
+        let locks = crate::cache_restore::settled_locks(&[slot.build().to_owned()])?;
+        drop(locks);
+        if !super::ordinary_consumer_cache::build_ready(slot.build())? {
+            return Err(CiError::Message(
+                "ordinary sanitation rejects another cache family/layout".into(),
+            ));
+        }
+        self.clean_ordinary_locals(root, slot.build())
+    }
+
+    pub(crate) fn clean_ordinary_locals(&self, root: &Path, target: &Path) -> Result<()> {
+        self.verify_packaged_sources()?;
+        let toolchain = crate::config::toolchains(root)?.stable;
+        for manifest in [&self.manifest, &self.cli_source.join("Cargo.toml")] {
+            let mut metadata = rustup_cargo(
+                manifest.parent().expect("manifest parent"),
+                &toolchain,
+                ["metadata", "--locked", "--format-version", "1"],
+                Duration::from_secs(300),
+            )
+            .isolated_cargo(&self.cargo_home)
+            .arg("--manifest-path")
+            .arg(manifest)
+            .arg("--config")
+            .arg(&self.config);
+            if let Some(target) = &self.selected_target {
+                metadata = metadata.arg("--filter-platform").arg(target);
+            }
+            if manifest.parent() == Some(self.cli_source.as_path()) {
+                for feature in &self.selected_features {
+                    metadata = metadata.arg("--features").arg(feature);
+                }
+            }
+            let output = metadata.output_quiet()?;
+            if !output.status.success() {
+                return Err(CiError::Message(
+                    "ordinary consumer cleanup metadata failed".into(),
+                ));
+            }
+            let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+            let local: Vec<_> = metadata
+                .packages
+                .iter()
+                .filter(|package| package.source.is_none())
+                .collect();
+            if local.is_empty() {
+                return Err(CiError::Message(
+                    "ordinary consumer local package inventory absent".into(),
+                ));
+            }
+            for package in local {
+                for explicit in [false, true] {
+                    let mut clean = rustup_cargo(
+                        manifest.parent().expect("manifest parent"),
+                        &toolchain,
+                        ["clean"],
+                        Duration::from_secs(300),
+                    )
+                    .isolated_cargo(&self.cargo_home)
+                    .arg("--manifest-path")
+                    .arg(manifest)
+                    .arg("--config")
+                    .arg(&self.config)
+                    .arg("--target-dir")
+                    .arg(target)
+                    .arg("--package")
+                    .arg(&package.id.repr);
+                    if explicit {
+                        if let Some(target) = &self.selected_target {
+                            clean = clean.arg("--target").arg(target);
+                        }
+                    }
+                    clean.run()?;
+                }
+            }
+        }
+        self.verify_selected_graph(root, false)?;
+        self.verify_selected_graph(root, true)
     }
 
     fn verify_packaged_sources(&self) -> Result<()> {
@@ -913,7 +1111,7 @@ fn prepare_packaged_consumer_lock(
     Ok(metadata)
 }
 
-fn resolved_graph(metadata: &cargo_metadata::Metadata) -> Result<serde_json::Value> {
+pub(crate) fn resolved_graph(metadata: &cargo_metadata::Metadata) -> Result<serde_json::Value> {
     let resolve = metadata
         .resolve
         .as_ref()

@@ -541,6 +541,31 @@ fn check_push_and_dispatch_events(workflow: &Mapping, context: &str) -> Result<(
         let configuration = events
             .get(key(event))
             .ok_or_else(|| failure(format!("{context} {event} is absent")))?;
+        if event == "workflow_dispatch" && context == "deep CI" {
+            let dispatch = mapping(configuration, "Deep dispatch")?;
+            exact_mapping_keys(dispatch, &["inputs"], "Deep dispatch")?;
+            let inputs = mapping(&dispatch["inputs"], "Deep dispatch inputs")?;
+            exact_mapping_keys(inputs, &["failure-mode"], "Deep dispatch inputs")?;
+            let mode = mapping(&inputs["failure-mode"], "Deep failure mode")?;
+            exact_mapping_keys(
+                mode,
+                &["description", "type", "default", "options"],
+                "Deep failure mode",
+            )?;
+            if mode["type"].as_str() != Some("choice")
+                || mode["default"].as_str() != Some("collect-all")
+            {
+                return Err(failure(
+                    "Deep manual diagnostics must preserve collect-all default",
+                ));
+            }
+            exact_string_sequence(
+                &mode["options"],
+                &["stop-after-failure", "collect-all"],
+                "Deep failure modes",
+            )?;
+            continue;
+        }
         if !configuration.is_null()
             && configuration
                 .as_mapping()
@@ -670,7 +695,17 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             .ok_or_else(|| failure("deep CI Miri job is absent"))?,
         "deep CI Miri",
     )?;
-    check_deep_shards(miri, "miri", &["first", "second"], 60)?;
+    check_deep_shards(
+        miri,
+        "miri",
+        &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        75,
+    )?;
     let planner = mapping(
         jobs.get(key("performance-plan"))
             .ok_or_else(|| failure("stress planner absent"))?,
@@ -981,8 +1016,9 @@ fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
     if purpose == "native-readiness" {
         check_support_loader_diagnostic(steps)?;
     }
+    let partition = " --partition native-tests";
     let expected = format!(
-        "./target/ci/release/memcordon-ci ci cache-context --purpose {purpose} --shard complete"
+        "./target/ci/release/memcordon-ci ci cache-context --purpose {purpose} --shard complete{partition}"
     );
     let contexts = steps
         .iter()
@@ -1189,7 +1225,336 @@ fn cache_output_reference<'a>(value: &'a str, output: &str) -> Option<&'a str> {
     (selected == output && !step.is_empty()).then_some(step)
 }
 
+fn ordinary_command(command: &str) -> Option<String> {
+    for driver in [
+        "./target/ci/release/memcordon-ci",
+        "./.release/tool/memcordon-ci",
+    ] {
+        if let Some(arguments) = command
+            .strip_prefix(driver)
+            .filter(|arguments| arguments.starts_with(' '))
+        {
+            return Some(format!("./target/ci/release/memcordon-ci{arguments}"));
+        }
+    }
+    None
+}
+
+fn check_compilation_checkpoint(
+    steps: &[Value],
+    compile: &str,
+    execute: &str,
+    selection: Option<&str>,
+) -> Result<()> {
+    let prefix = "./target/ci/release/memcordon-ci suite ";
+    let compiles: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["run"].as_str().and_then(ordinary_command).as_deref()
+                == Some(format!("{prefix}{compile}").as_str())
+        })
+        .collect();
+    let executions: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["run"].as_str().and_then(ordinary_command).as_deref()
+                == Some(format!("{prefix}{execute}").as_str())
+        })
+        .collect();
+    if compiles.len() != 1
+        || executions.len() != 1
+        || compiles[0].0 >= executions[0].0
+        || compiles[0].1["if"].as_str() != selection
+        || selection.is_some() && executions[0].1["if"].as_str() != selection
+    {
+        return Err(failure(
+            "required compilation must precede selected execution",
+        ));
+    }
+    let owner = compiles[0].1["id"]
+        .as_str()
+        .ok_or_else(|| failure("compilation owner id absent"))?;
+    let between = &steps[compiles[0].0 + 1..executions[0].0];
+    let snapshots: Vec<_> = between
+        .iter()
+        .filter(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains(" ci cache-snapshot --kind compiled "))
+                && step["if"].as_str().is_some_and(|guard| {
+                    guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+                })
+        })
+        .collect();
+    if snapshots.len() != 1
+        || !snapshots[0]["if"].as_str().is_some_and(|guard| {
+            guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+                && guard.contains("always()")
+        })
+    {
+        return Err(failure(
+            "early checkpoint requires actual compilation settlement",
+        ));
+    }
+    let snapshot = snapshots[0]["id"]
+        .as_str()
+        .ok_or_else(|| failure("compilation snapshot id absent"))?;
+    if !between.iter().any(|step| {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains(" ci cleanup-cache-snapshot --kind compiled "))
+            && step["if"].as_str().is_some_and(|guard| {
+                guard.contains("always()")
+                    && guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+            })
+    }) {
+        return Err(failure(
+            "closed compiled snapshot requires cleanup before execution",
+        ));
+    }
+    let selected = format!("${{{{ steps.{snapshot}.outputs.snapshot-key }}}}");
+    if between
+        .iter()
+        .filter(|step| {
+            step["uses"].as_str()
+                == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+                && step["with"]["key"].as_str() == Some(selected.as_str())
+        })
+        .count()
+        != 1
+    {
+        return Err(failure(
+            "settled compilation must save before required execution",
+        ));
+    }
+    Ok(())
+}
+
+/// Distinct snapshot identities are content keyed; they never save through a complete-entry key.
+fn check_extended_cache(
+    steps: &[Value],
+    ordinal: usize,
+    restore: bool,
+    selected: &str,
+    path: &str,
+) -> Result<bool> {
+    let step = &steps[ordinal];
+    let find = |id: &str| -> Result<(usize, &Value)> {
+        let found: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step["id"].as_str() == Some(id))
+            .collect();
+        if found.len() != 1 {
+            return Err(failure("extended cache context must be unique"));
+        }
+        Ok(found[0])
+    };
+    let guard = step["if"].as_str().unwrap_or_default();
+    let permitted_save = || {
+        guard.contains("always()")
+            && guard.contains("github.event_name == 'push'")
+            && guard.contains("github.event_name == 'workflow_dispatch'")
+    };
+    if let Some(context) = cache_output_reference(selected, "seed-lookup-key") {
+        let (before, producer) = find(context)?;
+        let command = producer["run"]
+            .as_str()
+            .and_then(ordinary_command)
+            .ok_or_else(|| failure("seed context command absent"))?;
+        let args = command
+            .strip_prefix("./target/ci/release/memcordon-ci ci seed-context ")
+            .ok_or_else(|| failure("seed context command differs"))?;
+        if ![
+            "--kind compiled ",
+            "--kind registry-archives",
+            "--kind registry-index",
+        ]
+        .iter()
+        .any(|kind| args.starts_with(kind))
+            || !restore
+            || before >= ordinal
+            || step["with"]["restore-keys"].as_str()
+                != Some(format!("${{{{ steps.{context}.outputs.seed-restore-prefix }}}}").as_str())
+            || path != format!("${{{{ steps.{context}.outputs.seed-import-path }}}}")
+            || !guard.contains(&format!("steps.{context}.outputs.seed-lookup-key != ''"))
+        {
+            return Err(failure("seed restore must use its actual bounded context"));
+        }
+        let id = step["id"]
+            .as_str()
+            .ok_or_else(|| failure("seed restore id absent"))?;
+        let import = format!("./target/ci/release/memcordon-ci ci import-cache-snapshot {args}");
+        if !steps.iter().skip(ordinal + 1).any(|candidate| {
+            candidate["run"]
+                .as_str()
+                .and_then(ordinary_command)
+                .as_deref()
+                == Some(import.as_str())
+                && candidate["if"].as_str().is_some_and(|guard| {
+                    guard.contains(&format!("steps.{id}.outcome == 'success'"))
+                        && guard.contains(&format!("steps.{id}.outputs.cache-matched-key != ''"))
+                })
+        }) {
+            return Err(failure("seed restore requires actual validated import"));
+        }
+        return Ok(true);
+    }
+    if let Some(context) = cache_output_reference(selected, "snapshot-key") {
+        let (before, producer) = find(context)?;
+        let command = producer["run"]
+            .as_str()
+            .and_then(ordinary_command)
+            .ok_or_else(|| failure("snapshot producer absent"))?;
+        let owner_guard = producer["if"].as_str().unwrap_or_default();
+        if !restore {
+            let cleanup = command.replace(" ci cache-snapshot ", " ci cleanup-cache-snapshot ");
+            let cleanup = cleanup
+                .split_once(" --stage ")
+                .map_or(cleanup.as_str(), |(command, _)| command);
+            if !steps.iter().skip(ordinal + 1).any(|candidate| {
+                candidate["run"]
+                    .as_str()
+                    .and_then(ordinary_command)
+                    .as_deref()
+                    == Some(cleanup)
+                    && candidate["if"].as_str().is_some_and(|guard| {
+                        guard.contains("always()") && guard.contains("quiescent == 'true'")
+                    })
+            }) {
+                return Err(failure(
+                    "snapshot transfer must finish before required staging cleanup",
+                ));
+            }
+        }
+        if !owner_guard.contains("always()")
+            || !(owner_guard.contains("outputs.cache-quiescent == 'true'")
+                || owner_guard.contains("outputs.miri-sysroot-quiescent == 'true'"))
+        {
+            return Err(failure("snapshot requires settled current writers"));
+        }
+        if before >= ordinal
+            || !command.starts_with("./target/ci/release/memcordon-ci ci cache-snapshot --kind ")
+            || !guard.contains(&format!("steps.{context}.outputs.snapshot-ready == 'true'"))
+            || path != format!("${{{{ steps.{context}.outputs.snapshot-path }}}}")
+        {
+            return Err(failure(
+                "snapshot save/probe requires current actual snapshot",
+            ));
+        }
+        if command.contains("--kind compiled ")
+            && !guard.contains(&format!("steps.{context}.outputs.input-key == steps."))
+        {
+            return Err(failure(
+                "compiled checkpoint must recheck initial input identity",
+            ));
+        }
+        if restore {
+            if step["with"]["lookup-only"].as_bool() != Some(true)
+                || !step["with"]["restore-keys"].is_null()
+            {
+                return Err(failure("snapshot probe must only look up exact content"));
+            }
+        } else {
+            let probes: Vec<_> = steps
+                .iter()
+                .take(ordinal)
+                .skip(before + 1)
+                .filter(|candidate| {
+                    candidate["with"]["key"].as_str() == Some(selected)
+                        && candidate["with"]["path"].as_str() == Some(path)
+                        && candidate["with"]["lookup-only"].as_bool() == Some(true)
+                })
+                .collect();
+            if probes.len() != 1
+                || !permitted_save()
+                || !probes[0]["id"].as_str().is_some_and(|id| {
+                    guard.contains(&format!("steps.{id}.outputs.cache-hit != 'true'"))
+                })
+            {
+                return Err(failure(
+                    "snapshot save needs exact probe and existing event policy",
+                ));
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(context) = cache_output_reference(selected, "sysroot-key") {
+        let (before, producer) = find(context)?;
+        if before >= ordinal
+            || producer["run"]
+                .as_str()
+                .and_then(ordinary_command)
+                .as_deref()
+                != Some("./target/ci/release/memcordon-ci ci miri-cache-context")
+            || path != format!("${{{{ steps.{context}.outputs.sysroot-path }}}}")
+        {
+            return Err(failure("Miri sysroot cache context/path differs"));
+        }
+        let (setup, operation) = find("miri-sysroot-setup")?;
+        let components: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                step["run"].as_str().and_then(ordinary_command).as_deref()
+                    == Some("./target/ci/release/memcordon-ci ci prepare-miri-components")
+            })
+            .collect();
+        if components.len() != 1 || components[0].0 >= before || !components[0].1["if"].is_null() {
+            return Err(failure(
+                "Miri components must precede generated sysroot context",
+            ));
+        }
+        if operation["run"]
+            .as_str()
+            .and_then(ordinary_command)
+            .as_deref()
+            != Some("./target/ci/release/memcordon-ci ci prepare-miri-sysroot")
+            || !operation["if"].is_null()
+        {
+            return Err(failure("Miri sysroot hit cannot skip actual pinned setup"));
+        }
+        if restore {
+            if step["id"].as_str() != Some("miri-sysroot-cache")
+                || setup <= ordinal
+                || !guard.contains(&format!("steps.{context}.outputs.sysroot-key != ''"))
+                || !step["with"]["restore-keys"].is_null()
+            {
+                return Err(failure(
+                    "Miri sysroot restore must precede unconditional setup",
+                ));
+            }
+        } else {
+            let (recheck, probe) = find("miri-sysroot-save-context")?;
+            if setup >= recheck || recheck >= ordinal || probe["run"].as_str().and_then(ordinary_command).as_deref() != Some("./target/ci/release/memcordon-ci ci miri-cache-context") || !permitted_save()
+                || !guard.contains("steps.miri-sysroot-setup.outputs.miri-sysroot-ready == 'true'") || !guard.contains("steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true'")
+                || !guard.contains(&format!("steps.miri-sysroot-save-context.outputs.sysroot-key == steps.{context}.outputs.sysroot-key")) || !guard.contains("steps.miri-sysroot-cache.outputs.cache-hit != 'true'") { return Err(failure("Miri sysroot save requires current identity and setup settlement")); }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
+    for step in steps {
+        if let Some(shard) = step["run"]
+            .as_str()
+            .and_then(ordinary_command)
+            .and_then(|run| {
+                run.strip_prefix("./target/ci/release/memcordon-ci suite fuzz-compile-")
+                    .map(str::to_owned)
+            })
+        {
+            check_compilation_checkpoint(
+                steps,
+                &format!("fuzz-compile-{shard}"),
+                &format!("fuzz-execute-{shard}"),
+                step["if"].as_str(),
+            )?;
+        }
+    }
     let mut restores = BTreeMap::new();
     let mut saves = BTreeMap::<String, Vec<(usize, &Value)>>::new();
     for (ordinal, step) in steps.iter().enumerate() {
@@ -1231,6 +1596,9 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
         let selected = step["with"]["key"]
             .as_str()
             .ok_or_else(|| failure("cache key absent"))?;
+        if check_extended_cache(steps, ordinal, restore, selected, path)? {
+            continue;
+        }
         if restore {
             let id = step["id"]
                 .as_str()
@@ -1255,6 +1623,19 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                     ));
                 }
             } else if let Some(context) = cache_output_reference(selected, "product-key") {
+                let input_command = steps
+                    .iter()
+                    .take(ordinal)
+                    .find(|candidate| candidate["id"].as_str() == Some(context))
+                    .and_then(|candidate| candidate["run"].as_str())
+                    .ok_or_else(|| failure("compiled context must precede restore"))?;
+                let argument = |command: &str, flag: &str| -> Option<String> {
+                    let arguments: Vec<_> = command.split_whitespace().collect();
+                    arguments
+                        .windows(2)
+                        .find(|pair| pair[0] == flag)
+                        .map(|pair| pair[1].to_owned())
+                };
                 let prefix = format!("${{{{ steps.{context}.outputs.product-restore-prefix }}}}");
                 if step["with"]["restore-keys"].as_str() != Some(prefix.as_str()) {
                     return Err(failure("compiled cache compatibility boundary differs"));
@@ -1263,7 +1644,10 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                     if !steps.iter().skip(ordinal + 1).any(|candidate| {
                         candidate["run"].as_str().is_some_and(|run| {
                             run.contains(" ci prepare-restored-cache ")
-                                && run.ends_with(&format!("--mode {mode}"))
+                                && argument(run, "--mode").as_deref() == Some(mode)
+                                && ["--purpose", "--shard", "--partition"].iter().all(|flag| {
+                                    argument(run, flag) == argument(input_command, flag)
+                                })
                         }) && candidate["if"]
                             .as_str()
                             .is_some_and(|condition| condition.contains(&format!("steps.{id}.")))
@@ -1302,6 +1686,14 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                 .or_default()
                 .push((ordinal, step));
             let condition = step["if"].as_str().unwrap_or_default();
+            if (path.contains(".outputs.product-paths")
+                || path.contains(".outputs.tool-build-path"))
+                && !condition.contains("success()")
+            {
+                return Err(failure(
+                    "complete compiled caches require actual successful compilation; failed settled output belongs only to snapshot seeds",
+                ));
+            }
             if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
                 && !condition.contains(
                     "steps.workspace-download-context.outputs.bootstrap-home-matches == 'true'",
@@ -1475,7 +1867,17 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
             .ok_or_else(|| failure("shard strategy absent"))?,
         "shard strategy",
     )?;
-    exact_mapping_keys(strategy, &["fail-fast", "matrix"], "shard strategy")?;
+    let fields = if family == "miri" {
+        vec!["fail-fast", "max-parallel", "matrix"]
+    } else {
+        vec!["fail-fast", "matrix"]
+    };
+    exact_mapping_keys(strategy, &fields, "shard strategy")?;
+    if family == "miri" && strategy["max-parallel"].as_u64() != Some(4) {
+        return Err(failure(
+            "Miri quarters require a four-cell concurrency bound",
+        ));
+    }
     let matrix = mapping(
         strategy
             .get(key("matrix"))
@@ -1490,7 +1892,10 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         shards,
         "complete shard inventory",
     )?;
-    if scalar(strategy, "fail-fast") != Some("${{ github.event_name != 'workflow_dispatch' }}")
+    if scalar(strategy, "fail-fast")
+        != Some(
+            "${{ github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all' }}",
+        )
         || scalar(job, "runs-on") != Some("ubuntu-24.04")
         || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout)
     {
@@ -1561,7 +1966,9 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
             && run.split_whitespace().any(|part| part == "suite")
         {
             ordinary_driver_before_suite(steps, ordinal)?;
-            invocations.push((run, scalar(step, "if")));
+            if !run.contains(" suite fuzz-compile-") {
+                invocations.push((run, scalar(step, "if")));
+            }
         }
         if let Some(uses) = scalar(step, "uses") {
             if uses.starts_with("actions/cache/") {
@@ -1572,6 +1979,12 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
                 )?;
                 let selected_key = scalar(with, "key").unwrap_or_default();
                 let selected_path = scalar(with, "path").unwrap_or_default();
+                if ["snapshot-key", "seed-lookup-key", "sysroot-key"]
+                    .iter()
+                    .any(|output| cache_output_reference(selected_key, output).is_some())
+                {
+                    continue;
+                }
                 if selected_key.starts_with("mc-download-bootstrap-v5-")
                     || selected_key.contains(".outputs.source-key")
                     || selected_key.contains(".outputs.product-key")
@@ -1635,36 +2048,46 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
             }
         }
     }
-    let expected: Vec<_> = shards
+    let mut expected: Vec<_> = shards
         .iter()
         .map(|shard| match (family, *shard) {
-            ("miri", "first") => Ok((
-                "./target/ci/release/memcordon-ci suite miri-first",
-                Some("matrix.shard == 'first'"),
+            ("miri", "quarter-one") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-quarter-one",
+                Some("matrix.shard == 'quarter-one'"),
             )),
-            ("miri", "second") => Ok((
-                "./target/ci/release/memcordon-ci suite miri-second",
-                Some("matrix.shard == 'second'"),
+            ("miri", "quarter-two") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-quarter-two",
+                Some("matrix.shard == 'quarter-two'"),
+            )),
+            ("miri", "quarter-three") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-quarter-three",
+                Some("matrix.shard == 'quarter-three'"),
+            )),
+            ("miri", "quarter-four") => Ok((
+                "./target/ci/release/memcordon-ci suite miri-quarter-four",
+                Some("matrix.shard == 'quarter-four'"),
             )),
             ("fuzz", "quarter-one") => Ok((
-                "./target/ci/release/memcordon-ci suite fuzz-quarter-one",
+                "./target/ci/release/memcordon-ci suite fuzz-execute-quarter-one",
                 Some("matrix.shard == 'quarter-one'"),
             )),
             ("fuzz", "quarter-two") => Ok((
-                "./target/ci/release/memcordon-ci suite fuzz-quarter-two",
+                "./target/ci/release/memcordon-ci suite fuzz-execute-quarter-two",
                 Some("matrix.shard == 'quarter-two'"),
             )),
             ("fuzz", "quarter-three") => Ok((
-                "./target/ci/release/memcordon-ci suite fuzz-quarter-three",
+                "./target/ci/release/memcordon-ci suite fuzz-execute-quarter-three",
                 Some("matrix.shard == 'quarter-three'"),
             )),
             ("fuzz", "quarter-four") => Ok((
-                "./target/ci/release/memcordon-ci suite fuzz-quarter-four",
+                "./target/ci/release/memcordon-ci suite fuzz-execute-quarter-four",
                 Some("matrix.shard == 'quarter-four'"),
             )),
             _ => Err(failure("unsupported shard")),
         })
         .collect::<Result<_>>()?;
+    invocations.sort_unstable();
+    expected.sort_unstable();
     if invocations != expected
         || restores != 1
         || saves != 1
@@ -1672,14 +2095,19 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         || compiled_restores != shards.len()
         || compiled_saves != shards.len()
     {
-        return Err(failure(
-            "ordinary shard invocation/cache/evidence coverage differs",
-        ));
+        return Err(failure(format!(
+            "ordinary {family} shard invocation/cache/evidence coverage differs: invocations={invocations:?} expected={expected:?} source restores={restores} saves={saves} plans={plans} compiled restores={compiled_restores} saves={compiled_saves}"
+        )));
     }
     check_cache_lifecycle(steps)?;
     for shard in shards {
+        let partition = if family == "fuzz" {
+            " --partition fuzz-targets"
+        } else {
+            ""
+        };
         let recipe = format!(
-            "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}"
+            "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}{partition}"
         );
         let context = format!("compiled-context-{shard}");
         let condition = format!("matrix.shard == '{shard}'");
@@ -1692,6 +2120,14 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
         }
     }
     if family == "fuzz" {
+        for shard in shards {
+            check_compilation_checkpoint(
+                steps,
+                &format!("fuzz-compile-{shard}"),
+                &format!("fuzz-execute-{shard}"),
+                Some(&format!("matrix.shard == '{shard}'")),
+            )?;
+        }
         let tool_context = steps
             .iter()
             .position(|step| {
@@ -2087,6 +2523,14 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
     Ok(())
 }
 pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
+    let mut workflow = Mapping::new();
+    let mut jobs = Mapping::new();
+    jobs.insert(key("fuzz"), Value::Mapping(job.clone()));
+    workflow.insert(key("jobs"), Value::Mapping(jobs));
+    let normalized = normalize_failure_branches(&workflow)?;
+    let job = normalized["jobs"]["fuzz"]
+        .as_mapping()
+        .expect("normalized fuzz job");
     check_deep_shards(
         job,
         "fuzz",
@@ -2214,17 +2658,22 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
             })
             .collect::<Vec<_>>();
         if name == "native" {
-            if suites.len() != 2
-                || suites[0]["run"].as_str() != Some(invocation.as_str())
-                || suites[0]["if"].as_str()
+            check_compilation_checkpoint(steps, "native-compile", "native-execute", None)?;
+            if suites.len() != 3
+                || suites[0]["run"].as_str()
+                    != Some("./target/ci/release/memcordon-ci suite native-compile")
+                || !suites[0]["if"].is_null()
+                || suites[1]["run"].as_str()
+                    != Some("./target/ci/release/memcordon-ci suite native-execute")
+                || suites[1]["if"].as_str()
                     != Some(
                         "github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'",
                     )
-                || suites[1]["run"].as_str()
+                || suites[2]["run"].as_str()
                     != Some(
-                        "./target/ci/release/memcordon-ci suite native --failure-mode collect-all",
+                        "./target/ci/release/memcordon-ci suite native-execute --failure-mode collect-all",
                     )
-                || suites[1]["if"].as_str()
+                || suites[2]["if"].as_str()
                     != Some(
                         "github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'",
                     )
@@ -2766,6 +3215,19 @@ fn check_readiness_candidate_steps(
 }
 
 fn check_release_structure(jobs: &Mapping) -> Result<()> {
+    let select = jobs["select"]["steps"]
+        .as_sequence()
+        .ok_or_else(|| failure("Release selection steps absent"))?;
+    if select.iter().any(|step| {
+        matches!(
+            step["id"].as_str(),
+            Some("workspace-downloads" | "workspace-fetch")
+        )
+    }) {
+        return Err(failure(
+            "Release selection must not restore/fetch the complete Workspace family",
+        ));
+    }
     check_rehearsal_tool(jobs)?;
     check_rehearsal_job(jobs, false)?;
     check_rehearsal_job(jobs, true)?;
@@ -3262,7 +3724,9 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 .get(key("strategy"))
                 .and_then(|strategy| strategy.get(key("fail-fast")))
                 .and_then(Value::as_str)
-                != Some("${{ github.event_name != 'workflow_dispatch' }}")
+                != Some(
+                    "${{ github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all' }}",
+                )
             {
                 return Err(failure(
                     "only automated disposable shard matrices use fail-fast",
@@ -3273,9 +3737,33 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 .and_then(|strategy| strategy.get(key("matrix")))
                 .and_then(|matrix| matrix.get(key("shard")))
                 .ok_or_else(|| failure("release shard inventory absent"))?;
-            exact_string_sequence(shards, &["first", "second"], "release complete halves")?;
-            for shard in ["first", "second"] {
-                let run = format!("./.release/tool/memcordon-ci suite {name}-{shard}");
+            exact_string_sequence(
+                shards,
+                &[
+                    "quarter-one",
+                    "quarter-two",
+                    "quarter-three",
+                    "quarter-four",
+                ],
+                "release complete quarters",
+            )?;
+            if job["strategy"]["max-parallel"].as_u64() != Some(4) {
+                return Err(failure(
+                    "Release quarters require a four-cell concurrency bound",
+                ));
+            }
+            for shard in [
+                "quarter-one",
+                "quarter-two",
+                "quarter-three",
+                "quarter-four",
+            ] {
+                let selected = if name == "fuzz" {
+                    format!("fuzz-execute-{shard}")
+                } else {
+                    format!("{name}-{shard}")
+                };
+                let run = format!("./.release/tool/memcordon-ci suite {selected}");
                 let expected = format!("matrix.shard == '{shard}'");
                 let matches: Vec<_> = steps
                     .iter()
@@ -3556,6 +4044,7 @@ fn validate_workflow_bytes_into(
     }
     let document = parse_yaml(bytes)?;
     let workflow = mapping(&document, "workflow")?;
+    let normalized = normalize_failure_branches(workflow)?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {
         return Err(failure(format!(
             "workflow-level shell/env is forbidden: {relative:?}"
@@ -3649,7 +4138,10 @@ fn validate_workflow_bytes_into(
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
             continue;
         };
-        check_cache_lifecycle(steps)?;
+        let logical_steps = normalized["jobs"][job_name]["steps"]
+            .as_sequence()
+            .ok_or_else(|| failure("normalized steps absent"))?;
+        check_cache_lifecycle(logical_steps)?;
         for step_value in steps {
             let step = mapping(step_value, "step")?;
             if step.contains_key(key("shell")) {
@@ -3780,8 +4272,11 @@ fn validate_workflow_bytes_into(
                             .ok_or_else(|| failure("cache save action needs with"))?,
                         "cache with",
                     )?;
-                    let primary_key = scalar(with, "key")
-                        .is_some_and(|value| value.contains("outputs.cache-primary-key"));
+                    let primary_key = scalar(with, "key").is_some_and(|value| {
+                        value.contains("outputs.cache-primary-key")
+                            || cache_output_reference(value, "snapshot-key").is_some()
+                            || cache_output_reference(value, "sysroot-key").is_some()
+                    });
                     if !condition.contains("always()") || !cache_hit || !primary_key {
                         return Err(failure(
                             "cache save must be guarded by always/cache-hit and reuse the primary key",
@@ -3791,6 +4286,10 @@ fn validate_workflow_bytes_into(
             }
         }
     }
+    // Validate the literal two-branch mode routing and selected-step outputs before
+    // presenting one logical operation to the existing source/cache validators.
+    let workflow = &normalized;
+    let jobs = mapping(&workflow["jobs"], "normalized jobs")?;
     if relative == Path::new(".github/workflows/ci.yml") {
         check_ci_structure(workflow, jobs, policy)?;
         if text.contains("paths:") || text.contains("paths-ignore:") {
@@ -3811,6 +4310,166 @@ fn validate_workflow_bytes_into(
         check_preparation_transport(workflow, jobs)?;
     }
     Ok(())
+}
+
+fn normalize_failure_branches(workflow: &Mapping) -> Result<Mapping> {
+    const STOP: &str =
+        "github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'";
+    const ALL: &str =
+        "github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'";
+    fn routed(command: &str) -> bool {
+        [
+            " suite miri-",
+            " suite fuzz-compile-",
+            " suite fuzz-execute-",
+            " suite supply-chain",
+            " suite quality",
+            " suite msrv",
+            " ci prepare --profile ",
+        ]
+        .iter()
+        .any(|token| command.contains(token))
+    }
+    fn rewrite(value: &mut Value, owners: &[String]) -> Result<()> {
+        match value {
+            Value::String(text) => {
+                for owner in owners {
+                    let mut replacements = Vec::new();
+                    for field in ["outcome", "conclusion"] {
+                        let original = format!("steps.{owner}.{field} == 'skipped'");
+                        let selected = format!(
+                            "({original} && steps.{owner}-diagnostic.{field} == 'skipped')"
+                        );
+                        let marker = format!("@logical-mode-{}@", replacements.len());
+                        *text = text.replace(&selected, &marker);
+                        if text.contains(&original) {
+                            return Err(failure(
+                                "skipped mode branch must include its diagnostic peer",
+                            ));
+                        }
+                        replacements.push((marker, original));
+                    }
+                    let prefix = format!("(steps.{owner}.outputs.");
+                    while let Some(start) = text.find(&prefix) {
+                        let tail = &text[start + prefix.len()..];
+                        let output: String = tail
+                            .chars()
+                            .take_while(|character| {
+                                character.is_ascii_alphanumeric() || *character == '-'
+                            })
+                            .collect();
+                        let original = format!("steps.{owner}.outputs.{output}");
+                        let selected =
+                            format!("({original} || steps.{owner}-diagnostic.outputs.{output})");
+                        if !text[start..].starts_with(&selected) {
+                            return Err(failure(
+                                "mode outputs must select the same actual owner branch",
+                            ));
+                        }
+                        let marker = format!("@logical-mode-{}@", replacements.len());
+                        text.replace_range(start..start + selected.len(), &marker);
+                        replacements.push((marker, original));
+                    }
+                    if text.contains(&format!("steps.{owner}-diagnostic."))
+                        || text.contains(&format!("steps.{owner}.outputs."))
+                    {
+                        return Err(failure("mode output/settlement references are not paired"));
+                    }
+                    for (marker, original) in replacements {
+                        *text = text.replace(&marker, &original);
+                    }
+                }
+            }
+            Value::Sequence(values) => {
+                for value in values {
+                    rewrite(value, owners)?;
+                }
+            }
+            Value::Mapping(values) => {
+                for value in values.values_mut() {
+                    rewrite(value, owners)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut normalized = workflow.clone();
+    let jobs = normalized
+        .get_mut(key("jobs"))
+        .and_then(Value::as_mapping_mut)
+        .ok_or_else(|| failure("jobs absent"))?;
+    for job in jobs.values_mut() {
+        let Some(steps) = job.get_mut("steps").and_then(Value::as_sequence_mut) else {
+            continue;
+        };
+        let mut result = Vec::with_capacity(steps.len());
+        let mut owners = Vec::new();
+        let mut ordinal = 0;
+        while ordinal < steps.len() {
+            let step = &steps[ordinal];
+            let command = step["run"].as_str().unwrap_or_default();
+            if !routed(command) {
+                result.push(step.clone());
+                ordinal += 1;
+                continue;
+            }
+            let base = command
+                .strip_suffix(" --failure-mode stop-after-failure")
+                .ok_or_else(|| {
+                    failure("required suite must begin a literal stop/diagnostic pair")
+                })?;
+            let owner = step["id"]
+                .as_str()
+                .ok_or_else(|| failure("mode operation lacks id"))?;
+            let condition = step["if"]
+                .as_str()
+                .ok_or_else(|| failure("mode selector absent"))?;
+            let selection = if condition == STOP {
+                None
+            } else {
+                Some(
+                    condition
+                        .strip_suffix(&format!(" && ({STOP})"))
+                        .ok_or_else(|| failure("stop branch condition differs"))?,
+                )
+            };
+            let diagnostic = steps
+                .get(ordinal + 1)
+                .ok_or_else(|| failure("diagnostic branch absent"))?;
+            let expected_condition = selection.map_or_else(
+                || ALL.to_owned(),
+                |selection| format!("{selection} && ({ALL})"),
+            );
+            let mut expected = step.clone();
+            expected["id"] = Value::String(format!("{owner}-diagnostic"));
+            expected["run"] = Value::String(format!("{base} --failure-mode collect-all"));
+            expected["if"] = Value::String(expected_condition);
+            if diagnostic != &expected {
+                return Err(failure(
+                    "diagnostic branch must differ only in literal mode, id and selector",
+                ));
+            }
+            let mut logical = step.clone();
+            logical["run"] = Value::String(base.to_owned());
+            if let Some(selection) = selection {
+                logical["if"] = Value::String(selection.to_owned());
+            } else {
+                logical
+                    .as_mapping_mut()
+                    .expect("step map")
+                    .remove(key("if"));
+            }
+            result.push(logical);
+            owners.push(owner.to_owned());
+            ordinal += 2;
+        }
+        *steps = result;
+        for step in steps {
+            rewrite(step, &owners)?;
+        }
+    }
+    Ok(normalized)
 }
 
 fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
@@ -4359,6 +5018,8 @@ struct RustPolicy {
     standard_compiler_mutations: usize,
     cleared_environments: usize,
     cargo_home_mutations: usize,
+    cargo_job_budget_mutations: usize,
+    managed_miri_sysroot_mutations: usize,
     standard_output_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
@@ -4454,6 +5115,20 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 self.cargo_home_mutations += 1;
             }
             if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "CARGO_BUILD_JOBS")
+                && matches!(expression.args.iter().nth(1), Some(syn::Expr::MethodCall(serialized)) if serialized.method == "to_string" && serialized.args.is_empty()
+                    && matches!(&*serialized.receiver, syn::Expr::MethodCall(jobs) if jobs.method == "compiler_jobs" && jobs.args.is_empty()
+                        && matches!(&*jobs.receiver, syn::Expr::Path(group) if group.path.is_ident("group"))))
+            {
+                self.cargo_job_budget_mutations += 1;
+            }
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "MIRI_SYSROOT")
+                && matches!(expression.args.iter().nth(1), Some(syn::Expr::Path(root)) if root.path.is_ident("root"))
+            {
+                self.managed_miri_sysroot_mutations += 1;
+            }
+            if expression.method == "env"
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "GITHUB_OUTPUT")
             {
                 self.standard_output_mutations += 1;
@@ -4514,9 +5189,15 @@ fn reviewed_compiler_environment(relative: &Path, visitor: &RustPolicy) -> bool 
 
 fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) -> bool {
     // CommandSpec removes ambient Cargo/compiler overrides before selecting
-    // the owned standard Cargo home; callers cannot provide arbitrary keys.
+    // the owned standard Cargo home, compiler allocation and managed Miri
+    // sysroot. Each extra setter has one reviewed source/value shape.
     relative == Path::new("tools/memcordon-ci/src/command.rs")
-        && visitor.subprocess_env_mutations == visitor.cargo_home_mutations
+        && visitor.cargo_job_budget_mutations <= 1
+        && visitor.managed_miri_sysroot_mutations <= 1
+        && visitor.subprocess_env_mutations
+            == visitor.cargo_home_mutations
+                + visitor.cargo_job_budget_mutations
+                + visitor.managed_miri_sysroot_mutations
 }
 
 fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {

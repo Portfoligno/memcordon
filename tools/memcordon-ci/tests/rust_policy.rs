@@ -191,11 +191,35 @@ fn isolated_cargo_boundary_only_may_select_standard_cargo_home() {
     let standard = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", "/owned/cargo-home"); }"#;
     validate_rust_policy_bytes(boundary, standard).unwrap();
     assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), standard).is_err());
+    let miri =
+        br#"fn run(command: &mut std::process::Command) { command.env("MIRI_SYSROOT", root); }"#;
+    validate_rust_policy_bytes(boundary, miri).unwrap();
+    assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), miri).is_err());
     for source in [
         br#"fn run(command: &mut std::process::Command) { command.env("CUSTOM_CI_FLAG", "value"); }"#.as_slice(),
         br#"fn run(command: &mut std::process::Command) { command.env("RUSTC", "/unowned/rustc"); }"#.as_slice(),
         br#"fn run(command: &mut std::process::Command, key: &str) { command.env(key, "value"); }"#.as_slice(),
         br#"fn run(command: &mut std::process::Command) { command.envs([("CARGO_HOME", "/owned/cargo-home")]); }"#.as_slice(),
+    ] {
+        assert!(validate_rust_policy_bytes(boundary, source).is_err());
+    }
+}
+
+#[test]
+fn cargo_fuzz_budget_is_reviewed_only_at_the_owned_command_boundary() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    let actual = include_str!("../src/command.rs");
+    validate_rust_policy_bytes(boundary, actual.as_bytes()).unwrap();
+    let standard = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_BUILD_JOBS", group.compiler_jobs().to_string()); }"#;
+    validate_rust_policy_bytes(boundary, standard).unwrap();
+    assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), standard).is_err());
+    for source in [
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_BUILD_JOBS", "99"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("MIRI_SYSROOT", "/arbitrary"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("MIRI_SYSROOT", arbitrary); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_BUILD_JOBS", arbitrary.to_string()); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CUSTOM_CI_JOBS", group.compiler_jobs().to_string()); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_BUILD_JOBS", group.compiler_jobs().to_string()).env("CARGO_BUILD_JOBS", group.compiler_jobs().to_string()); }"#.as_slice(),
     ] {
         assert!(validate_rust_policy_bytes(boundary, source).is_err());
     }

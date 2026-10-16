@@ -1,6 +1,5 @@
 //! Real offline Cargo installation from checksum-valid authored registry data.
 use memcordon_ci::{
-    command::rustup_cargo,
     download_cache::{self, DownloadFamily},
     release::artifacts,
 };
@@ -56,7 +55,7 @@ fn package(
     bytes
 }
 
-fn child(root: &Path, home: &Path, output: &Path) {
+fn child(root: &Path, home: &Path, output: &Path) -> String {
     let result = Command::new(std::env::current_exe().unwrap())
         .current_dir(root)
         .args([
@@ -66,6 +65,7 @@ fn child(root: &Path, home: &Path, output: &Path) {
             "--nocapture",
         ])
         .env("CARGO_HOME", home)
+        .env("CARGO_NET_OFFLINE", "true")
         .env("GITHUB_OUTPUT", output)
         .output()
         .unwrap();
@@ -75,12 +75,14 @@ fn child(root: &Path, home: &Path, output: &Path) {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    String::from_utf8_lossy(&result.stderr).into_owned()
 }
 
 #[test]
 fn partial_first_snapshot_cannot_freeze_real_tool_archive_roundtrip() {
     let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
+    let canonical = fixture.path().canonicalize().unwrap();
+    let root = canonical.as_path();
     let home = root.join("cargo-home");
     fs::create_dir_all(root.join("ci")).unwrap();
     fs::create_dir_all(&home).unwrap();
@@ -101,7 +103,7 @@ fn partial_first_snapshot_cannot_freeze_real_tool_archive_roundtrip() {
     )
     .unwrap();
     fs::write(root.join("Cargo.lock"), "version=4\n").unwrap();
-    fs::write(home.join("config.toml"), "[net]\noffline=true\n").unwrap();
+    fs::write(home.join("config.toml"), "").unwrap();
     let dependency = package(&home, "cache-fixture-dependency", &[("Cargo.toml", "[package]\nname=\"cache-fixture-dependency\"\nversion=\"0.0.1\"\nedition=\"2021\"\n".into()), ("src/lib.rs", "pub fn version() -> &'static str { \"0.0.1\" }\n".into())], serde_json::json!([]));
     let cache = home.join("registry/cache").join(NAMESPACE);
     fs::create_dir_all(&cache).unwrap();
@@ -119,15 +121,18 @@ fn partial_first_snapshot_cannot_freeze_real_tool_archive_roundtrip() {
         "version=4\n[[package]]\nname=\"cargo-audit\"\nversion=\"0.0.1\"\ndependencies=[\"cache-fixture-dependency\"]\n[[package]]\nname=\"cache-fixture-dependency\"\nversion=\"0.0.1\"\nsource=\"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum=\"{}\"\n",
         artifacts::checksum(&dependency)
     );
-    let tool = package(&home, "cargo-audit", &[("Cargo.toml", "[package]\nname=\"cargo-audit\"\nversion=\"0.0.1\"\nedition=\"2021\"\n[dependencies]\ncache-fixture-dependency=\"=0.0.1\"\n".into()), ("Cargo.lock", lock), ("src/main.rs", "fn main() { println!(\"cargo-audit {}\", cache_fixture_dependency::version()); }\n".into())], serde_json::json!([{"name":"cache-fixture-dependency","req":"=0.0.1","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}]));
+    let tool = package(&home, "cargo-audit", &[("Cargo.toml", "[package]\nname=\"cargo-audit\"\nversion=\"0.0.1\"\nedition=\"2021\"\n[dependencies]\ncache-fixture-dependency=\"=0.0.1\"\n".into()), ("Cargo.lock", lock), ("src/main.rs", "fn main() { if std::env::args().any(|arg| arg == \"audit\") { std::fs::write(\"audit-scanned\", b\"scanned\\n\").unwrap(); } println!(\"cargo-audit {}\", cache_fixture_dependency::version()); }\n".into())], serde_json::json!([{"name":"cache-fixture-dependency","req":"=0.0.1","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}]));
     // The explicitly partial first producer lacks this registry package. The
     // acquisition fixture supplies it; real Cargo must verify and install it.
     fs::write(cache.join("cargo-audit-0.0.1.crate"), &tool).unwrap();
     let output = root.join("outputs");
     fs::write(&output, "").unwrap();
-    child(root, &home, &output);
+    let diagnostics = child(root, &home, &output);
     let first = fs::read_to_string(&output).unwrap();
-    assert!(first.contains("download-cargo-audit-populated=true\n"));
+    assert!(
+        first.contains("download-cargo-audit-populated=true\n"),
+        "{diagnostics}"
+    );
     assert!(!first.contains("download-cargo-deny-populated=true"));
     let mut complete = tar::Builder::new(Vec::new());
     complete
@@ -153,6 +158,137 @@ fn partial_first_snapshot_cannot_freeze_real_tool_archive_roundtrip() {
             .unwrap()
             .contains("download-cargo-audit-populated=true\n")
     );
+    let deny = package(&home, "cargo-deny", &[
+        ("Cargo.toml", "[package]\nname=\"cargo-deny\"\nversion=\"0.0.1\"\nedition=\"2021\"\n".into()),
+        ("Cargo.lock", "version=4\n[[package]]\nname=\"cargo-deny\"\nversion=\"0.0.1\"\n".into()),
+        ("src/main.rs", "fn main() { println!(\"cargo-deny 0.0.1\"); }\n".into()),
+        ("build.rs", "fn main() { let here = std::env::current_dir().unwrap(); let root = here.ancestors().find(|p| p.join(\"ci/toolchains.toml\").exists()).unwrap(); std::fs::write(root.join(\"deny-build-waiting\"), b\"waiting\\n\").unwrap(); let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10); while !root.join(\"audit-scanned\").exists() { assert!(std::time::Instant::now() < deadline, \"warm audit did not scan during cold deny acquisition\"); std::thread::yield_now(); } std::fs::write(root.join(\"deny-built-after-scan\"), b\"built\\n\").unwrap(); }\n".into()),
+    ], serde_json::json!([]));
+    fs::write(cache.join("cargo-deny-0.0.1.crate"), deny).unwrap();
+    let pipeline = Command::new(std::env::current_exe().unwrap())
+        .current_dir(root)
+        .args([
+            "--ignored",
+            "--exact",
+            "actual_pipeline_child",
+            "--nocapture",
+        ])
+        .env("CARGO_HOME", &home)
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        pipeline.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&pipeline.stdout),
+        String::from_utf8_lossy(&pipeline.stderr)
+    );
+    assert!(root.join("deny-built-after-scan").is_file());
+}
+
+#[test]
+#[ignore = "owned actual warm/cold tool pipeline acceptance child"]
+fn actual_pipeline_child() {
+    use memcordon_ci::{failure_mode::FailureMode, performance_plan::Layout, preparation};
+    let root = std::env::current_dir().unwrap();
+    let stable = memcordon_ci::config::toolchains(&root).unwrap().stable;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let [audit, deny] = memcordon_ci::command::supply_chain_commands(&root, &stable);
+    preparation::with_operation(FailureMode::CollectAll, deadline, || {
+        preparation::complete_lanes_with_allocation(
+            Layout::Parallel,
+            FailureMode::CollectAll,
+            [1, 1],
+            || {
+                preparation::ensure_one_auxiliary_until(
+                    &root,
+                    "cargo-audit",
+                    "0.0.1",
+                    &stable,
+                    deadline,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )?;
+                while !root.join("deny-build-waiting").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "cold deny did not start"
+                    );
+                    std::thread::yield_now();
+                }
+                let duplicate = preparation::ensure_one_auxiliary_until(
+                    &root,
+                    "cargo-deny",
+                    "0.0.1",
+                    &stable,
+                    deadline,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )
+                .unwrap_err();
+                assert!(
+                    duplicate
+                        .to_string()
+                        .contains("duplicate concurrent auxiliary acquisition")
+                );
+                audit.run().map(|_| ())
+            },
+            || {
+                preparation::ensure_one_auxiliary_until(
+                    &root,
+                    "cargo-deny",
+                    "0.0.1",
+                    &stable,
+                    deadline,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )?;
+                deny.run().map(|_| ())
+            },
+        )
+    })
+    .unwrap();
+    let audit_bytes = fs::read(preparation::auxiliary_tool(&root, "cargo-audit").unwrap()).unwrap();
+    let deny_bytes = fs::read(preparation::auxiliary_tool(&root, "cargo-deny").unwrap()).unwrap();
+    assert!(!audit_bytes.is_empty() && !deny_bytes.is_empty());
+    // Both cold slots acquire independently without replacing the shared bin.
+    fs::remove_file(preparation::auxiliary_tool(&root, "cargo-audit").unwrap()).unwrap();
+    fs::remove_file(preparation::auxiliary_tool(&root, "cargo-deny").unwrap()).unwrap();
+    preparation::with_operation(FailureMode::CollectAll, deadline, || {
+        preparation::complete_lanes_with_allocation(
+            Layout::Parallel,
+            FailureMode::CollectAll,
+            [1, 1],
+            || {
+                preparation::ensure_one_auxiliary_until(
+                    &root,
+                    "cargo-audit",
+                    "0.0.1",
+                    &stable,
+                    deadline,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )
+                .map(|_| ())
+            },
+            || {
+                preparation::ensure_one_auxiliary_until(
+                    &root,
+                    "cargo-deny",
+                    "0.0.1",
+                    &stable,
+                    deadline,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )
+                .map(|_| ())
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        fs::read(preparation::auxiliary_tool(&root, "cargo-audit").unwrap()).unwrap(),
+        audit_bytes
+    );
+    assert_eq!(
+        fs::read(preparation::auxiliary_tool(&root, "cargo-deny").unwrap()).unwrap(),
+        deny_bytes
+    );
 }
 
 #[test]
@@ -162,23 +298,14 @@ fn actual_install_child() {
     let stable = memcordon_ci::config::toolchains(&root).unwrap().stable;
     let family = DownloadFamily::ToolCargoAudit;
     let before = download_cache::context(&root, family);
-    rustup_cargo(
+    memcordon_ci::preparation::ensure_one_auxiliary_until(
         &root,
+        "cargo-audit",
+        "0.0.1",
         &stable,
-        [
-            "install",
-            "--locked",
-            "--version",
-            "0.0.1",
-            "cargo-audit",
-            "--root",
-        ],
-        Duration::from_secs(120),
+        std::time::Instant::now() + Duration::from_secs(120),
+        std::num::NonZeroUsize::new(2).unwrap(),
     )
-    .arg(root.join("target/ci-tools"))
-    .arg("--target-dir")
-    .arg(root.join("target/ci-tools-build/cargo-audit"))
-    .run()
     .unwrap();
     let executable = memcordon_ci::preparation::auxiliary_tool(&root, "cargo-audit").unwrap();
     let version =

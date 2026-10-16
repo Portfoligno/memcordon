@@ -87,7 +87,12 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         ("supply-chain", "supply-chain"),
     ] {
         let mut changed = exact.clone();
-        let command = ["./.release/tool/memcordon-ci suite", suite].join(" ");
+        let command = [
+            "./.release/tool/memcordon-ci suite",
+            suite,
+            "--failure-mode stop-after-failure",
+        ]
+        .join(" ");
         let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
         let index = steps
             .iter()
@@ -117,14 +122,14 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         changed["jobs"][family]["strategy"]["matrix"]["shard"][1] = Value::String("first".into());
         assert!(
             validate(RELEASE, &changed).is_err(),
-            "duplicate {family} half"
+            "invalid {family} quarter"
         );
         let mut changed = exact.clone();
         let steps = changed["jobs"][family]["steps"].as_sequence_mut().unwrap();
-        steps.retain(|step| step["id"].as_str() != Some("second"));
+        steps.retain(|step| step["id"].as_str() != Some("quarter-two"));
         assert!(
             validate(RELEASE, &changed).is_err(),
-            "removed {family} second execution"
+            "removed {family} quarter-two execution"
         );
     }
     for missing in [
@@ -183,7 +188,9 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
             let step = match mutation {
                 "release-suite" => steps
                     .iter_mut()
-                    .find(|step| step["run"] == "./target/ci/release/memcordon-ci suite native")
+                    .find(|step| {
+                        step["run"] == "./target/ci/release/memcordon-ci suite native-execute"
+                    })
                     .unwrap(),
                 "head-checkout" => steps
                     .iter_mut()
@@ -324,7 +331,7 @@ fn actual_release_native_owner_still_executes_optimized_tests_and_complete_backe
     let source = include_str!("../src/release/target.rs");
     assert!(source.contains("crate::native_test_plan::commands_with_failure(true, failure_mode)"));
     assert!(source.contains(".bounded_until(operation_deadline)"));
-    assert!(source.contains("crate::preparation::complete_lanes_with_failure("));
+    assert!(source.contains("crate::preparation::complete_lanes_with_allocation("));
     assert!(source.contains("for phase in phases"));
     for backend in [
         "backend-linux-cgroup",

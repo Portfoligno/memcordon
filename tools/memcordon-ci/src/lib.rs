@@ -6,6 +6,7 @@ pub mod bootstrap_profile;
 pub mod cache;
 pub mod cache_inputs;
 pub mod cache_restore;
+pub mod cache_snapshot;
 pub mod caller_observation;
 pub mod capability;
 pub mod command;
@@ -17,6 +18,7 @@ pub mod fuzz_targets;
 pub mod line_evidence;
 #[cfg(target_os = "linux")]
 pub mod linux_consumer_readiness;
+pub mod miri_cache;
 pub mod miri_targets;
 pub mod native_channel;
 pub mod native_results;

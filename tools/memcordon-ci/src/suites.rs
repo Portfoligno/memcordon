@@ -13,6 +13,10 @@ use crate::{CiError, Result, Suite, policy};
 const CARGO_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
+#[cfg(test)]
+#[path = "../tests/private/suite_failure_loops.rs"]
+mod suite_failure_loops;
+
 fn cargo(
     root: &Path,
     toolchain: &str,
@@ -35,7 +39,17 @@ fn cargo_with_deadline(
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string()),
     );
-    rustup_cargo(root, toolchain, cargo_arguments, deadline).run()
+    let command = rustup_cargo(root, toolchain, cargo_arguments, deadline);
+    let command = if subcommand == "miri" {
+        if let Some(path) = memcordon_ci::miri_cache::managed_root(root)? {
+            command.miri_sysroot(&path)
+        } else {
+            command
+        }
+    } else {
+        command
+    };
+    command.run()
 }
 
 fn quality(root: &Path, stable: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
@@ -136,12 +150,14 @@ fn quality_compile_until(
     fs::create_dir(&first)?;
     fs::create_dir(&second)?;
     let packages = config::policy(root)?.workspace.publish_packages;
-    crate::preparation::complete_lanes_with_failure(
+    crate::preparation::complete_lanes_with_allocation(
         layout,
         mode,
+        [(workers - workers / 2).max(1), (workers / 2).max(1)],
         || {
+            let mut failures = None;
             for package in packages {
-                crate::preparation::observed(
+                let outcome = crate::preparation::observed(
                     rustup_cargo(
                         root,
                         stable,
@@ -165,9 +181,10 @@ fn quality_compile_until(
                     .bounded_until(deadline),
                     &first,
                     &package,
-                )?;
+                );
+                retain_failure(&mut failures, outcome, mode)?;
             }
-            Ok(())
+            failures.map_or(Ok(()), Err)
         },
         || {
             crate::preparation::observed(
@@ -220,12 +237,17 @@ fn quality_compile_until(
     )
 }
 
-fn msrv(root: &Path, version: &str) -> Result<()> {
+fn msrv(root: &Path, version: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(90 * 60);
     let policy = config::policy(root)?;
+    let mut failures = None;
     for package in policy.workspace.production_packages {
+        let mut prerequisite = true;
         for phase in ["check", "test"] {
-            let arguments = vec![
+            if !prerequisite {
+                break;
+            }
+            let mut arguments = vec![
                 OsString::from(phase),
                 OsString::from("--target-dir"),
                 OsString::from("target/ci/msrv"),
@@ -235,10 +257,60 @@ fn msrv(root: &Path, version: &str) -> Result<()> {
                 OsString::from("--all-features"),
                 OsString::from("--locked"),
             ];
-            rustup_cargo(root, version, arguments, CARGO_DEADLINE)
+            if phase == "test" && mode == crate::failure_mode::FailureMode::CollectAll {
+                arguments.push(OsString::from("--no-fail-fast"));
+            }
+            let outcome = rustup_cargo(root, version, arguments, CARGO_DEADLINE)
                 .bounded_until(deadline)
-                .run()?;
+                .run()
+                .map(|_| ());
+            prerequisite = outcome.is_ok();
+            retain_failure(&mut failures, outcome, mode)?;
         }
+    }
+    failures.map_or(Ok(()), Err)
+}
+
+fn retain_failure(
+    failures: &mut Option<CiError>,
+    outcome: Result<()>,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
+    if let Err(error) = outcome {
+        if mode == crate::failure_mode::FailureMode::StopAfterFailure
+            || crate::preparation::active_group().is_some_and(|group| {
+                group.requested.load(std::sync::atomic::Ordering::Acquire)
+                    || Instant::now() >= group.deadline()
+            })
+        {
+            return Err(match failures.take() {
+                Some(primary) => CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(error),
+                },
+                None => error,
+            });
+        }
+        let mut retained = 0;
+        let mut current = failures.as_ref();
+        while let Some(CiError::LaneFailures { primary, .. }) = current {
+            retained += 1;
+            current = Some(primary.as_ref());
+        }
+        if retained >= 8 {
+            eprintln!(
+                "additional suite failure omitted: {}",
+                crate::command::bounded_excerpt(error.to_string().as_bytes())
+            );
+            return Ok(());
+        }
+        *failures = Some(match failures.take() {
+            None => error,
+            Some(primary) => CiError::LaneFailures {
+                primary: Box::new(primary),
+                secondary: Box::new(error),
+            },
+        });
     }
     Ok(())
 }
@@ -253,6 +325,19 @@ fn native(
         cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
     }
     Ok(())
+}
+
+fn native_phase(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+    compile: bool,
+) -> Result<()> {
+    let command = memcordon_ci::native_test_plan::commands_with_failure(false, mode)
+        .into_iter()
+        .nth(if compile { 0 } else { 1 })
+        .expect("native compile/execute plan");
+    cargo_with_deadline(root, stable, "test", command.arguments, command.deadline).map(|_| ())
 }
 
 fn install_tool(root: &Path, stable: &str, name: &str, version: &str) -> Result<()> {
@@ -272,13 +357,14 @@ fn install_tool_until(
     version: &str,
     deadline: Instant,
 ) -> Result<()> {
-    let _ = stable;
-    let profile = match name {
-        "cargo-fuzz" => crate::bootstrap_profile::BootstrapProfile::Fuzz,
-        "cargo-audit" | "cargo-deny" => crate::bootstrap_profile::BootstrapProfile::SupplyChain,
-        _ => return Err(CiError::Message("unsupported auxiliary tool".into())),
-    };
-    crate::preparation::ensure_auxiliary_tool_until(root, profile, name, version, deadline)?;
+    crate::preparation::ensure_one_auxiliary_until(
+        root,
+        name,
+        version,
+        stable,
+        deadline,
+        std::num::NonZeroUsize::new(1).unwrap(),
+    )?;
     Ok(())
 }
 
@@ -287,8 +373,11 @@ fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMod
     let lockfile = root.join("Cargo.lock");
     let lock_before = fs::read(&lockfile)?;
     let tools = config::tools(root)?;
-    install_tool_until(root, stable, "cargo-audit", &tools.cargo_audit, deadline)?;
-    install_tool_until(root, stable, "cargo-deny", &tools.cargo_deny, deadline)?;
+    // Toolchain mutation finishes before either Cargo/tool lane starts.
+    CommandSpec::new("rustup", root, Duration::from_secs(900))
+        .args(["toolchain", "install", stable, "--profile", "minimal"])
+        .bounded_until(deadline)
+        .run()?;
     let mut commands = supply_chain_commands(root, stable).into_iter();
     let audit = commands
         .next()
@@ -299,25 +388,70 @@ fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMod
         .expect("deny command")
         .bounded_until(deadline);
     assert!(commands.next().is_none(), "exact supply command inventory");
-    let checks = crate::preparation::complete_lanes_with_failure(
-        crate::performance_plan::Layout::Parallel,
-        mode,
-        || audit.run().map(|_| ()),
-        || deny.run().map(|_| ()),
-    );
-    if fs::read(lockfile)? != lock_before {
-        return Err(CiError::Message(
-            "supply-chain operations changed Cargo.lock".to_owned(),
-        ));
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 4);
+    let layout = if workers == 1 {
+        crate::performance_plan::Layout::Serial
+    } else {
+        crate::performance_plan::Layout::Parallel
+    };
+    let audit_jobs = std::num::NonZeroUsize::new(workers.div_ceil(2)).unwrap();
+    let deny_jobs = std::num::NonZeroUsize::new((workers / 2).max(1)).unwrap();
+    let checks = crate::preparation::with_operation(mode, deadline, || {
+        crate::preparation::complete_lanes_with_allocation(
+            layout,
+            mode,
+            [audit_jobs.get(), deny_jobs.get()],
+            || {
+                crate::preparation::ensure_one_auxiliary_until(
+                    root,
+                    "cargo-audit",
+                    &tools.cargo_audit,
+                    stable,
+                    deadline,
+                    audit_jobs,
+                )?;
+                audit.run().map(|_| ())
+            },
+            || {
+                crate::preparation::ensure_one_auxiliary_until(
+                    root,
+                    "cargo-deny",
+                    &tools.cargo_deny,
+                    stable,
+                    deadline,
+                    deny_jobs,
+                )?;
+                deny.run().map(|_| ())
+            },
+        )
+    });
+    let lock_check = fs::read(lockfile).map_err(CiError::from).and_then(|after| {
+        if after == lock_before {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "supply-chain operations changed Cargo.lock".into(),
+            ))
+        }
+    });
+    match (checks, lock_check) {
+        (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
+            primary: Box::new(primary),
+            secondary: Box::new(secondary),
+        }),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
     }
-    checks
 }
 
 fn miri(
     root: &Path,
     nightly: &str,
-    shard: Option<memcordon_ci::miri_targets::MiriShard>,
+    shard: Option<memcordon_ci::target_shard::ShardSpec>,
     target_directory: &Path,
+    mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
     CommandSpec::new("rustup", root, Duration::from_secs(10 * 60))
         .args([
@@ -330,7 +464,7 @@ fn miri(
             "miri",
         ])
         .run()?;
-    cargo(root, nightly, "miri", ["setup"])?;
+    memcordon_ci::miri_cache::ensure(root, nightly, Instant::now() + Duration::from_secs(900))?;
     let metadata = cargo(
         root,
         nightly,
@@ -338,58 +472,74 @@ fn miri(
         ["--format-version", "1", "--no-deps", "--locked"],
     )?;
     let targets = match shard {
-        Some(shard) => memcordon_ci::miri_targets::plan_shard(&metadata, "memcordon-core", shard)?,
+        Some(shard) => {
+            memcordon_ci::miri_targets::plan_partition(&metadata, "memcordon-core", shard)?
+        }
         None => memcordon_ci::miri_targets::plan(&metadata, "memcordon-core")?,
     };
-    let name = match shard {
-        Some(memcordon_ci::miri_targets::MiriShard::First) => "first.json",
-        Some(_) => "second.json",
+    let name = match shard.map(|s| (s.index(), s.count())) {
+        Some((0, 2)) => "first.json",
+        Some((1, 2)) => "second.json",
+        Some((0, 4)) => "quarter-one.json",
+        Some((1, 4)) => "quarter-two.json",
+        Some((2, 4)) => "quarter-three.json",
+        Some((3, 4)) => "quarter-four.json",
         None => "all.json",
+        _ => return Err(CiError::Message("unsupported Miri partition".into())),
     };
     write_plan(
         root,
         "miri",
         name,
-        &serde_json::json!({"planner_version": 1, "package": "memcordon-core", "shard_index": shard.map(|s| s.spec().index()), "shard_count": shard.map(|s| s.spec().count()), "targets": targets}),
+        &serde_json::json!({"planner_version": 1, "package": "memcordon-core", "shard_index": shard.map(|s| s.index()), "shard_count": shard.map(|s| s.count()), "targets": targets}),
     )?;
+    let mut failures = None;
     for target in targets {
-        let mut arguments = vec![
-            OsString::from("test"),
-            OsString::from("--target-dir"),
-            target_directory.as_os_str().to_owned(),
-            OsString::from("--package"),
-            OsString::from("memcordon-core"),
-            OsString::from("--locked"),
-        ];
-        arguments.extend(target.arguments().into_iter().map(OsString::from));
-        if target == memcordon_ci::miri_targets::MiriTarget::Integration("report".into()) {
-            let mut list = arguments.clone();
-            list.extend(["--", "--list", "--format", "terse"].map(OsString::from));
-            let all = cargo(root, nightly, "miri", &list)?;
-            list.push(OsString::from("--ignored"));
-            let ignored = cargo(root, nightly, "miri", &list)?;
-            let batches = memcordon_ci::miri_targets::report_batches(&all, &ignored)?;
-            write_plan(
-                root,
-                "miri",
-                "report-batches.json",
-                &serde_json::json!({
-                    "planner_version": 1, "target": "report", "command_deadline_seconds": CARGO_DEADLINE.as_secs(), "batches": batches
-                }),
-            )?;
-            for batch in batches {
-                let mut command = arguments.clone();
-                command.push(OsString::from("--"));
-                command.extend(batch.arguments().into_iter().map(OsString::from));
-                cargo(root, nightly, "miri", command)?;
+        let outcome = (|| -> Result<()> {
+            let mut arguments = vec![
+                OsString::from("test"),
+                OsString::from("--target-dir"),
+                target_directory.as_os_str().to_owned(),
+                OsString::from("--package"),
+                OsString::from("memcordon-core"),
+                OsString::from("--locked"),
+            ];
+            arguments.extend(target.arguments().into_iter().map(OsString::from));
+            if target == memcordon_ci::miri_targets::MiriTarget::Integration("report".into()) {
+                let mut list = arguments.clone();
+                list.extend(["--", "--list", "--format", "terse"].map(OsString::from));
+                let all = cargo(root, nightly, "miri", &list)?;
+                list.push(OsString::from("--ignored"));
+                let ignored = cargo(root, nightly, "miri", &list)?;
+                let batches = memcordon_ci::miri_targets::report_batches(&all, &ignored)?;
+                write_plan(
+                    root,
+                    "miri",
+                    "report-batches.json",
+                    &serde_json::json!({
+                        "planner_version": 1, "target": "report", "command_deadline_seconds": CARGO_DEADLINE.as_secs(), "batches": batches
+                    }),
+                )?;
+                for batch in batches {
+                    let mut command = arguments.clone();
+                    command.push(OsString::from("--"));
+                    command.extend(batch.arguments().into_iter().map(OsString::from));
+                    retain_failure(
+                        &mut failures,
+                        cargo(root, nightly, "miri", command).map(|_| ()),
+                        mode,
+                    )?;
+                }
+            } else {
+                // Concurrency-sensitive harnesses remain intact, including their
+                // inter-test races. The original 900s command deadline applies.
+                cargo(root, nightly, "miri", arguments)?;
             }
-        } else {
-            // Concurrency-sensitive harnesses remain intact, including their
-            // inter-test races. The original 900s command deadline applies.
-            cargo(root, nightly, "miri", arguments)?;
-        }
+            Ok(())
+        })();
+        retain_failure(&mut failures, outcome, mode)?;
     }
-    Ok(())
+    failures.map_or(Ok(()), Err)
 }
 
 fn fuzz(
@@ -397,6 +547,19 @@ fn fuzz(
     stable: &str,
     nightly: &str,
     shard: Option<memcordon_ci::target_shard::ShardSpec>,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
+    fuzz_phase(root, stable, nightly, shard, true, true, mode)
+}
+
+fn fuzz_phase(
+    root: &Path,
+    stable: &str,
+    nightly: &str,
+    shard: Option<memcordon_ci::target_shard::ShardSpec>,
+    compile: bool,
+    execute: bool,
+    mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
     let targets = memcordon_ci::fuzz_targets::targets_sharded(
         &std::fs::read_to_string(root.join("fuzz").join("Cargo.toml"))?,
@@ -440,38 +603,60 @@ fn fuzz(
         .args(["toolchain", "install", nightly, "--profile", "minimal"])
         .run()?;
     let cargo_fuzz = crate::preparation::auxiliary_tool(root, "cargo-fuzz")?;
-    for target in &targets {
-        CommandSpec::toolchain_program("rustup", root, nightly, &cargo_fuzz, CARGO_DEADLINE)
+    if targets.is_empty() {
+        return Err(CiError::Message("fuzz selection is empty".into()));
+    }
+    let mut failures = None;
+    if compile {
+        for target in &targets {
+            let outcome = CommandSpec::toolchain_program(
+                "rustup",
+                root,
+                nightly,
+                &cargo_fuzz,
+                CARGO_DEADLINE,
+            )
             .args([
                 OsString::from("fuzz"),
                 OsString::from("build"),
                 OsString::from(target),
             ])
-            .run()?;
+            .run()
+            .map(|_| ());
+            retain_failure(&mut failures, outcome, mode)?;
+        }
     }
-    for target in &targets {
-        CommandSpec::toolchain_program(
-            "rustup",
-            root,
-            nightly,
-            &cargo_fuzz,
-            Duration::from_secs(5 * 60),
-        )
-        .args([
-            OsString::from("fuzz"),
-            OsString::from("run"),
-            OsString::from(target),
-            OsString::from("--"),
-            OsString::from("-max_total_time=30"),
-            OsString::from(if target.starts_with("workload-") {
-                "-max_len=1048576"
-            } else {
-                "-max_len=4096"
-            }),
-        ])
-        .run()?;
+    // A partially failed compile phase supplies no execution evidence.
+    if let Some(error) = failures.take() {
+        return Err(error);
     }
-    Ok(())
+    if execute {
+        for target in &targets {
+            let outcome = CommandSpec::toolchain_program(
+                "rustup",
+                root,
+                nightly,
+                &cargo_fuzz,
+                Duration::from_secs(5 * 60),
+            )
+            .args([
+                OsString::from("fuzz"),
+                OsString::from("run"),
+                OsString::from(target),
+                OsString::from("--"),
+                OsString::from("-max_total_time=30"),
+                OsString::from(if target.starts_with("workload-") {
+                    "-max_len=1048576"
+                } else {
+                    "-max_len=4096"
+                }),
+            ])
+            .run()
+            .map(|_| ());
+            retain_failure(&mut failures, outcome, mode)?;
+        }
+    }
+    failures.map_or(Ok(()), Err)
 }
 
 fn write_plan(root: &Path, family: &str, name: &str, value: &serde_json::Value) -> Result<()> {
@@ -1148,73 +1333,224 @@ pub(crate) struct SuiteOptions {
 }
 
 pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
+    if matches!(
+        suite,
+        Suite::Policy
+            | Suite::Stress
+            | Suite::StressPackages
+            | Suite::StressLifecycle
+            | Suite::BackendLinuxCgroup
+            | Suite::BackendLinuxPrivate
+            | Suite::BackendWindowsJob
+            | Suite::BackendWindowsSealed
+            | Suite::BackendMacosWatchdog
+            | Suite::ReleaseMacosNative
+            | Suite::ReleaseMacosAcceptance
+            | Suite::MacosDeadline
+    ) {
+        return run_inner(root, suite, options);
+    }
+    let deadline = Instant::now()
+        + Duration::from_secs(
+            if matches!(suite, Suite::Msrv | Suite::Quality | Suite::QualityCompile) {
+                90 * 60
+            } else {
+                60 * 60
+            },
+        );
+    crate::preparation::with_operation(options.failure_mode, deadline, || {
+        run_inner(root, suite, options)
+    })
+}
+
+fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
     if options.failure_mode == crate::failure_mode::FailureMode::CollectAll
         && !matches!(
             suite,
-            Suite::Native | Suite::Quality | Suite::QualityCompile | Suite::SupplyChain
+            Suite::Native
+                | Suite::NativeCompile
+                | Suite::NativeExecute
+                | Suite::Quality
+                | Suite::QualityCompile
+                | Suite::SupplyChain
+                | Suite::Msrv
+                | Suite::Miri
+                | Suite::MiriFirst
+                | Suite::MiriSecond
+                | Suite::MiriQuarterOne
+                | Suite::MiriQuarterTwo
+                | Suite::MiriQuarterThree
+                | Suite::MiriQuarterFour
+                | Suite::Fuzz
+                | Suite::FuzzFirst
+                | Suite::FuzzSecond
+                | Suite::FuzzQuarterOne
+                | Suite::FuzzQuarterTwo
+                | Suite::FuzzQuarterThree
+                | Suite::FuzzQuarterFour
+                | Suite::FuzzCompileFirst
+                | Suite::FuzzCompileSecond
+                | Suite::FuzzCompileQuarterOne
+                | Suite::FuzzCompileQuarterTwo
+                | Suite::FuzzCompileQuarterThree
+                | Suite::FuzzCompileQuarterFour
+                | Suite::FuzzExecuteFirst
+                | Suite::FuzzExecuteSecond
+                | Suite::FuzzExecuteQuarterOne
+                | Suite::FuzzExecuteQuarterTwo
+                | Suite::FuzzExecuteQuarterThree
+                | Suite::FuzzExecuteQuarterFour
         )
     {
         return Err(CiError::Message(
-            "collect-all is supported for native, quality and supply-chain suites".into(),
+            "collect-all is unsupported for this stateful suite".into(),
         ));
     }
     let toolchains = config::toolchains(root)?;
+    let phased_fuzz = match suite {
+        Suite::FuzzCompileFirst => Some((0, 2, true)),
+        Suite::FuzzCompileSecond => Some((1, 2, true)),
+        Suite::FuzzCompileQuarterOne => Some((0, 4, true)),
+        Suite::FuzzCompileQuarterTwo => Some((1, 4, true)),
+        Suite::FuzzCompileQuarterThree => Some((2, 4, true)),
+        Suite::FuzzCompileQuarterFour => Some((3, 4, true)),
+        Suite::FuzzExecuteFirst => Some((0, 2, false)),
+        Suite::FuzzExecuteSecond => Some((1, 2, false)),
+        Suite::FuzzExecuteQuarterOne => Some((0, 4, false)),
+        Suite::FuzzExecuteQuarterTwo => Some((1, 4, false)),
+        Suite::FuzzExecuteQuarterThree => Some((2, 4, false)),
+        Suite::FuzzExecuteQuarterFour => Some((3, 4, false)),
+        _ => None,
+    };
+    if let Some((index, count, compile)) = phased_fuzz {
+        return fuzz_phase(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(shard(index, count)),
+            compile,
+            !compile,
+            options.failure_mode,
+        );
+    }
     match suite {
         Suite::Policy => policy::run(root),
         Suite::Quality => quality(root, &toolchains.stable, options.failure_mode),
         Suite::QualityCompile => quality_compile(root, &toolchains.stable, options.failure_mode),
-        Suite::Msrv => msrv(root, &toolchains.msrv),
+        Suite::Msrv => msrv(root, &toolchains.msrv, options.failure_mode),
         Suite::Native => native(root, &toolchains.stable, false, options.failure_mode),
+        Suite::NativeCompile => native_phase(root, &toolchains.stable, options.failure_mode, true),
+        Suite::NativeExecute => native_phase(root, &toolchains.stable, options.failure_mode, false),
+        Suite::FuzzCompileFirst
+        | Suite::FuzzCompileSecond
+        | Suite::FuzzCompileQuarterOne
+        | Suite::FuzzCompileQuarterTwo
+        | Suite::FuzzCompileQuarterThree
+        | Suite::FuzzCompileQuarterFour
+        | Suite::FuzzExecuteFirst
+        | Suite::FuzzExecuteSecond
+        | Suite::FuzzExecuteQuarterOne
+        | Suite::FuzzExecuteQuarterTwo
+        | Suite::FuzzExecuteQuarterThree
+        | Suite::FuzzExecuteQuarterFour => unreachable!("phased fuzz handled above"),
         Suite::SupplyChain => supply_chain(root, &toolchains.stable, options.failure_mode),
-        Suite::Miri => miri(root, &toolchains.miri, None, Path::new("target/ci/miri")),
+        Suite::Miri => miri(
+            root,
+            &toolchains.miri,
+            None,
+            Path::new("target/ci/miri"),
+            options.failure_mode,
+        ),
         Suite::MiriFirst => miri(
             root,
             &toolchains.miri,
-            Some(memcordon_ci::miri_targets::MiriShard::First),
+            Some(shard(0, 2)),
             Path::new("target/ci/miri-first"),
+            options.failure_mode,
         ),
         Suite::MiriSecond => miri(
             root,
             &toolchains.miri,
-            Some(memcordon_ci::miri_targets::MiriShard::Second),
+            Some(shard(1, 2)),
             Path::new("target/ci/miri-second"),
+            options.failure_mode,
         ),
-        Suite::Fuzz => fuzz(root, &toolchains.stable, &toolchains.miri, None),
+        Suite::MiriQuarterOne => miri(
+            root,
+            &toolchains.miri,
+            Some(shard(0, 4)),
+            Path::new("target/ci/miri-quarter-one"),
+            options.failure_mode,
+        ),
+        Suite::MiriQuarterTwo => miri(
+            root,
+            &toolchains.miri,
+            Some(shard(1, 4)),
+            Path::new("target/ci/miri-quarter-two"),
+            options.failure_mode,
+        ),
+        Suite::MiriQuarterThree => miri(
+            root,
+            &toolchains.miri,
+            Some(shard(2, 4)),
+            Path::new("target/ci/miri-quarter-three"),
+            options.failure_mode,
+        ),
+        Suite::MiriQuarterFour => miri(
+            root,
+            &toolchains.miri,
+            Some(shard(3, 4)),
+            Path::new("target/ci/miri-quarter-four"),
+            options.failure_mode,
+        ),
+        Suite::Fuzz => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            None,
+            options.failure_mode,
+        ),
         Suite::FuzzFirst => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(0, 2)),
+            options.failure_mode,
         ),
         Suite::FuzzSecond => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(1, 2)),
+            options.failure_mode,
         ),
         Suite::FuzzQuarterOne => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(0, 4)),
+            options.failure_mode,
         ),
         Suite::FuzzQuarterTwo => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(1, 4)),
+            options.failure_mode,
         ),
         Suite::FuzzQuarterThree => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(2, 4)),
+            options.failure_mode,
         ),
         Suite::FuzzQuarterFour => fuzz(
             root,
             &toolchains.stable,
             &toolchains.miri,
             Some(shard(3, 4)),
+            options.failure_mode,
         ),
         Suite::Stress => memcordon_ci::stress::combined(root, &toolchains.stable),
         Suite::StressPackages => memcordon_ci::stress::packages(

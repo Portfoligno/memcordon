@@ -84,6 +84,76 @@ fn validate(value: &Value) -> Result<usize, String> {
                 }
             }
             let key = step["with"]["key"].as_str().ok_or("missing key")?;
+            if let Some(context) = output_reference(key, "seed-lookup-key") {
+                if !action.contains("/restore@")
+                    || selected_paths
+                        != [format!(
+                            "${{{{ steps.{context}.outputs.seed-import-path }}}}"
+                        )]
+                    || !step["if"].as_str().is_some_and(|condition| {
+                        condition
+                            .contains(&format!("steps.{context}.outputs.seed-lookup-key != ''"))
+                    })
+                    || !steps.iter().take(ordinal).any(|step| {
+                        step["id"].as_str() == Some(&context)
+                            && step["run"]
+                                .as_str()
+                                .is_some_and(|run| run.contains(" ci seed-context --kind "))
+                    })
+                {
+                    return Err("seed restore lacks bounded import context/path/key".into());
+                }
+                total += 1;
+                continue;
+            }
+            if let Some(snapshot) = output_reference(key, "snapshot-key") {
+                if selected_paths != [format!("${{{{ steps.{snapshot}.outputs.snapshot-path }}}}")]
+                    || !steps.iter().take(ordinal).any(|step| {
+                        step["id"].as_str() == Some(&snapshot)
+                            && step["run"]
+                                .as_str()
+                                .is_some_and(|run| run.contains(" ci cache-snapshot --kind "))
+                    })
+                    || !step["if"].as_str().is_some_and(|condition| {
+                        condition.contains(&format!(
+                            "steps.{snapshot}.outputs.snapshot-ready == 'true'"
+                        ))
+                    })
+                {
+                    return Err("snapshot transfer lacks current closed-copy identity".into());
+                }
+                if action.contains("/restore@") {
+                    if step["with"]["lookup-only"].as_bool() != Some(true) {
+                        return Err("snapshot probe must not overwrite closed copy".into());
+                    }
+                    total += 1;
+                }
+                continue;
+            }
+            if let Some(context) = output_reference(key, "sysroot-key") {
+                if selected_paths != [format!("${{{{ steps.{context}.outputs.sysroot-path }}}}")]
+                    || !steps.iter().take(ordinal).any(|step| {
+                        step["id"].as_str() == Some(&context)
+                            && step["run"]
+                                .as_str()
+                                .is_some_and(|run| run.ends_with(" ci miri-cache-context"))
+                    })
+                {
+                    return Err("Miri setup cache lacks exact setup context".into());
+                }
+                if action.contains("/save@")
+                    && !step["if"].as_str().is_some_and(|condition| {
+                        condition.contains("miri-sysroot-ready == 'true'")
+                            && condition.contains("miri-sysroot-quiescent == 'true'")
+                    })
+                {
+                    return Err("Miri setup cache needs actual ready and settled setup".into());
+                }
+                if action.contains("/restore@") {
+                    total += 1;
+                }
+                continue;
+            }
             if action.contains("/restore@") {
                 total += 1;
                 let id = step["id"].as_str().ok_or("restore missing id")?;
@@ -119,11 +189,14 @@ fn validate(value: &Value) -> Result<usize, String> {
                         return Err("compiled fallback is not full compatibility boundary".into());
                     }
                     for mode in ["discard", "exact", "compatible"] {
-                        let required = format!("--mode {mode}");
                         if !steps.iter().skip(ordinal + 1).any(|candidate| {
                             candidate["run"].as_str().is_some_and(|run| {
                                 run.contains(" ci prepare-restored-cache ")
-                                    && run.ends_with(&required)
+                                    && run
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .windows(2)
+                                        .any(|pair| pair == ["--mode", mode])
                             }) && candidate["if"].as_str().is_some_and(|condition| {
                                 condition.contains(&format!("steps.{id}."))
                             })
@@ -162,6 +235,7 @@ fn validate(value: &Value) -> Result<usize, String> {
                     return Err("save lacks trusted event/always/nonempty key guard".into());
                 }
                 if !condition.contains("cache-quiescent == 'true'")
+                    && !condition.contains("outputs.cache-quiescent) == 'true'")
                     && !condition.contains("outcome == 'success'")
                     && !(selected_paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
                         && condition.contains("success()"))

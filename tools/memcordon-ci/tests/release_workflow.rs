@@ -172,7 +172,10 @@ fn release_quality_installs_required_components_before_running_the_suite() {
         .unwrap();
     check(&workflow).unwrap();
     let quality = unique_step(steps, "quality compilation", |step| {
-        step["run"].as_str() == Some("./.release/tool/memcordon-ci suite quality-compile")
+        step["run"].as_str()
+            == Some(
+                "./.release/tool/memcordon-ci suite quality-compile --failure-mode stop-after-failure",
+            )
     });
     assert!(steps[..quality].iter().any(|step| {
         step["run"].as_str()

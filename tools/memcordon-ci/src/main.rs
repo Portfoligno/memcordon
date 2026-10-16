@@ -72,8 +72,57 @@ enum CiCommand {
     Prepare {
         #[arg(long, value_enum)]
         profile: memcordon_ci::bootstrap_profile::BootstrapProfile,
+        #[arg(long, value_enum, default_value_t = memcordon_ci::failure_mode::FailureMode::StopAfterFailure)]
+        failure_mode: memcordon_ci::failure_mode::FailureMode,
+    },
+    PrepareMiriComponents,
+    MiriCacheContext,
+    PrepareMiriSysroot,
+    SeedContext {
+        #[arg(long, value_enum)]
+        kind: memcordon_ci::cache_snapshot::SnapshotKind,
+        #[arg(long, default_value = "native-debug")]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
+    },
+    CacheSnapshot {
+        #[arg(long, value_enum)]
+        kind: memcordon_ci::cache_snapshot::SnapshotKind,
+        #[arg(long, default_value = "native-debug")]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
+        #[arg(long, value_parser = ["build"], default_value = "build")]
+        stage: String,
+    },
+    ImportCacheSnapshot {
+        #[arg(long, value_enum)]
+        kind: memcordon_ci::cache_snapshot::SnapshotKind,
+        #[arg(long, default_value = "native-debug")]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
+    },
+    CleanupCacheSnapshot {
+        #[arg(long, value_enum)]
+        kind: memcordon_ci::cache_snapshot::SnapshotKind,
+        #[arg(long, default_value = "native-debug")]
+        purpose: String,
+        #[arg(long, default_value = "complete")]
+        shard: String,
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
     },
     CacheContext {
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
         #[arg(long)]
         for_save: bool,
         #[arg(long, default_value = "native")]
@@ -84,6 +133,8 @@ enum CiCommand {
         external: Vec<PathBuf>,
     },
     PrepareRestoredCache {
+        #[arg(long, value_enum)]
+        partition: Option<memcordon_ci::cache_restore::CompiledPartition>,
         #[arg(long)]
         purpose: String,
         #[arg(long, default_value = "complete")]
@@ -115,10 +166,16 @@ enum Suite {
     QualityCompile,
     Msrv,
     Native,
+    NativeCompile,
+    NativeExecute,
     SupplyChain,
     Miri,
     MiriFirst,
     MiriSecond,
+    MiriQuarterOne,
+    MiriQuarterTwo,
+    MiriQuarterThree,
+    MiriQuarterFour,
     Fuzz,
     FuzzFirst,
     FuzzSecond,
@@ -126,6 +183,18 @@ enum Suite {
     FuzzQuarterTwo,
     FuzzQuarterThree,
     FuzzQuarterFour,
+    FuzzCompileFirst,
+    FuzzCompileSecond,
+    FuzzCompileQuarterOne,
+    FuzzCompileQuarterTwo,
+    FuzzCompileQuarterThree,
+    FuzzCompileQuarterFour,
+    FuzzExecuteFirst,
+    FuzzExecuteSecond,
+    FuzzExecuteQuarterOne,
+    FuzzExecuteQuarterTwo,
+    FuzzExecuteQuarterThree,
+    FuzzExecuteQuarterFour,
     Stress,
     StressPackages,
     StressLifecycle,
@@ -197,20 +266,60 @@ fn run() -> Result<()> {
                 std::time::Instant::now() + std::time::Duration::from_secs(900),
                 None,
             ),
-            CiCommand::Prepare { profile } => memcordon_ci::preparation::prepare(&root, profile),
+            CiCommand::Prepare {
+                profile,
+                failure_mode,
+            } => memcordon_ci::preparation::prepare_with_failure(&root, profile, failure_mode),
+            CiCommand::PrepareMiriComponents => memcordon_ci::miri_cache::components(
+                &root,
+                std::time::Instant::now() + std::time::Duration::from_secs(2700),
+            ),
+            CiCommand::MiriCacheContext => memcordon_ci::miri_cache::context(&root),
+            CiCommand::PrepareMiriSysroot => memcordon_ci::miri_cache::prepare(&root),
+            CiCommand::SeedContext {
+                kind,
+                purpose,
+                shard,
+                partition,
+            } => {
+                memcordon_ci::cache_snapshot::seed_context(&root, kind, &purpose, &shard, partition)
+            }
+            CiCommand::CacheSnapshot {
+                kind,
+                purpose,
+                shard,
+                partition,
+                stage: _,
+            } => memcordon_ci::cache_snapshot::snapshot(&root, kind, &purpose, &shard, partition),
+            CiCommand::ImportCacheSnapshot {
+                kind,
+                purpose,
+                shard,
+                partition,
+            } => memcordon_ci::cache_snapshot::import(&root, kind, &purpose, &shard, partition),
+            CiCommand::CleanupCacheSnapshot {
+                kind,
+                purpose,
+                shard,
+                partition,
+            } => memcordon_ci::cache_snapshot::cleanup(&root, kind, &purpose, &shard, partition),
             CiCommand::CacheContext {
+                partition,
                 for_save,
                 purpose,
                 shard,
                 external,
-            } => {
-                memcordon_ci::cache::emit_with_intent(&root, &purpose, &shard, &external, for_save)
-            }
+            } => memcordon_ci::cache::emit_partition(
+                &root, &purpose, &shard, &external, for_save, partition,
+            ),
             CiCommand::PrepareRestoredCache {
+                partition,
                 purpose,
                 shard,
                 mode,
-            } => memcordon_ci::cache_restore::prepare(&root, &purpose, &shard, mode),
+            } => memcordon_ci::cache_restore::prepare_partition(
+                &root, &purpose, &shard, partition, mode,
+            ),
             CiCommand::CheckWorkflows => policy::run(&root),
             CiCommand::WorkflowScope => memcordon_ci::workflow_scope::emit_from_github(),
             CiCommand::PerformancePlan => {

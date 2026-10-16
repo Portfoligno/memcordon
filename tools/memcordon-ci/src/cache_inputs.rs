@@ -17,7 +17,16 @@ pub struct KeyInputs {
 pub fn keys(input: &KeyInputs) -> Result<(String, String)> {
     if !matches!(
         input.family.as_str(),
-        "downloads" | "index" | "workspace" | "consumer" | "tool" | "tool-build"
+        "downloads"
+            | "index"
+            | "workspace"
+            | "consumer"
+            | "tool"
+            | "tool-build"
+            | "compiled-seed"
+            | "registry-archive-seed"
+            | "registry-index-snapshot"
+            | "miri-sysroot"
     ) {
         return Err(CiError::Message("unknown cache family".into()));
     }
@@ -221,15 +230,30 @@ fn validate_manifest_paths(
 
 /// Cargo prefers the extensionless config if both forms exist.
 pub fn cargo_configs(root: &Path) -> Result<BTreeMap<String, String>> {
+    cargo_configs_for_target(root, None)
+}
+
+pub fn cargo_configs_for_target(
+    root: &Path,
+    target: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    cargo_configs_with_home(root, &crate::download_cache::cargo_home(root)?, target)
+}
+
+/// Project an isolated child's actual selected home rather than its parent's environment.
+pub fn cargo_configs_with_home(
+    root: &Path,
+    home: &Path,
+    target: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
     let mut locations = Vec::new();
     for (index, ancestor) in root.ancestors().enumerate() {
         locations.push((format!("ancestor-config-{index}"), ancestor.join(".cargo")));
     }
-    let home = crate::download_cache::cargo_home(root)?;
-    if !locations.iter().any(|(_, path)| path == &home) {
-        locations.push(("cargo-home-config".into(), home));
+    if !locations.iter().any(|(_, path)| path == home) {
+        locations.push(("cargo-home-config".into(), home.to_owned()));
     }
-    cargo_config_locations(locations, false)
+    cargo_config_locations(locations, ConfigPurpose::Compiled, target)
 }
 
 pub fn download_configs(root: &Path, install: bool) -> Result<BTreeMap<String, String>> {
@@ -243,15 +267,50 @@ pub fn download_configs(root: &Path, install: bool) -> Result<BTreeMap<String, S
     if !locations.iter().any(|(_, path)| path == &home) {
         locations.push(("cargo-home-config".into(), home));
     }
-    cargo_config_locations(locations, true)
+    cargo_config_locations(locations, ConfigPurpose::Downloads, None)
+}
+
+/// An archive/index seed promises observed public bytes, never an acquisition
+/// closure. Compiler-only settings therefore cannot invalidate its source scope.
+pub fn registry_seed_configs(root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut locations = root
+        .ancestors()
+        .enumerate()
+        .map(|(index, path)| (format!("ancestor-config-{index}"), path.join(".cargo")))
+        .collect::<Vec<_>>();
+    let home = crate::download_cache::cargo_home(root)?;
+    if !locations.iter().any(|(_, path)| path == &home) {
+        locations.push(("cargo-home-config".into(), home));
+    }
+    cargo_config_locations(locations, ConfigPurpose::RegistrySeed, None)
+}
+
+/// Cargo install discovers only the selected Cargo home's configuration.
+pub fn install_configs(root: &Path) -> Result<BTreeMap<String, String>> {
+    cargo_config_locations(
+        vec![(
+            "cargo-home-config".into(),
+            crate::download_cache::cargo_home(root)?,
+        )],
+        ConfigPurpose::Compiled,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ConfigPurpose {
+    Compiled,
+    Downloads,
+    RegistrySeed,
 }
 
 fn cargo_config_locations(
     locations: Vec<(String, std::path::PathBuf)>,
-    downloads: bool,
+    purpose: ConfigPurpose,
+    target: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
     let mut inputs = BTreeMap::new();
-    for (role, directory) in locations {
+    for (_role, directory) in locations {
         let legacy = directory.join("config");
         let path = if legacy.try_exists()? {
             legacy
@@ -262,53 +321,227 @@ fn cargo_config_locations(
             continue;
         }
         let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024
+        {
             return Err(CiError::Message("unsafe Cargo configuration".into()));
         }
-        let bytes = artifacts::read_file(&path)?;
-        // Never retain configuration bytes or credential-bearing values in diagnostics.
-        let text = String::from_utf8_lossy(&bytes);
-        if downloads {
-            let config: toml::Value = toml::from_str(&text).map_err(|_| {
-                CiError::Message("download Cargo configuration is malformed".into())
-            })?;
-            if config.get("source").is_some()
-                || config.get("registries").is_some()
-                || config.get("registry").is_some()
-            {
+        for ancestor in path.ancestors() {
+            let metadata = std::fs::symlink_metadata(ancestor)?;
+            if metadata.file_type().is_symlink() {
                 return Err(CiError::Message(
-                    "custom download registry/source unmodeled".into(),
+                    "unsafe Cargo configuration ancestry".into(),
                 ));
             }
-            if config
-                .get("build")
-                .and_then(|build| build.get("target"))
-                .is_some()
+            #[cfg(windows)]
             {
-                return Err(CiError::Message("download target policy unmodeled".into()));
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(CiError::Message(
+                        "unsafe Cargo configuration ancestry".into(),
+                    ));
+                }
             }
         }
-        if [
-            "token",
-            "credential",
-            "include",
-            "wrapper",
-            "rustc",
-            "linker",
-            "sysroot",
-            "rustflags",
-            "rustdocflags",
-            "target-dir",
-        ]
-        .iter()
-        .any(|field| text.contains(field))
-            || text.contains('@')
-        {
-            return Err(CiError::Message("unprojected Cargo configuration".into()));
+        let bytes = artifacts::read_file(&path)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| CiError::Message("Cargo configuration is not UTF-8".into()))?;
+        let projection = if matches!(purpose, ConfigPurpose::RegistrySeed) {
+            let mut config: toml::Value = toml::from_str(text).map_err(|_| unmodeled_config())?;
+            let table = config.as_table_mut().ok_or_else(unmodeled_config)?;
+            // These finite Cargo groups only configure compilation/execution.
+            // Includes, environment, registry/source replacements and unknown
+            // groups still pass through strict source-scope classification.
+            for group in ["build", "profile", "target"] {
+                table.remove(group);
+            }
+            project_cargo_config(
+                &toml::to_string(&config).map_err(|_| unmodeled_config())?,
+                None,
+                true,
+            )?
+        } else {
+            project_cargo_config(text, target, matches!(purpose, ConfigPurpose::Downloads))?
+        };
+        // Locations are nearest-first, with Cargo home last. Resolve the small
+        // supported scalar grammar without recording comments or file spelling.
+        for (name, value) in projection {
+            inputs.entry(name).or_insert(value);
         }
-        inputs.insert(role, artifacts::checksum(&bytes));
     }
     Ok(inputs)
+}
+
+fn unmodeled_config() -> CiError {
+    CiError::Message("unprojected Cargo configuration".into())
+}
+
+/// Finite semantic projection; unknown keys fail closed, including unknown
+/// nested tables. Errors deliberately omit configuration values and secrets.
+pub fn project_cargo_config(
+    text: &str,
+    target: Option<&str>,
+    downloads: bool,
+) -> Result<BTreeMap<String, String>> {
+    if text.len() > 1024 * 1024 {
+        return Err(unmodeled_config());
+    }
+    let config: toml::Value = toml::from_str(text).map_err(|_| unmodeled_config())?;
+    let mut output = BTreeMap::new();
+    fn visit(
+        value: &toml::Value,
+        path: &mut Vec<String>,
+        output: &mut BTreeMap<String, String>,
+        target: Option<&str>,
+        downloads: bool,
+    ) -> Result<()> {
+        if path.len() > 4 || output.len() > 128 {
+            return Err(unmodeled_config());
+        }
+        if let Some(table) = value.as_table() {
+            let allowed = match path.as_slice() {
+                [] => true,
+                [group] => matches!(
+                    group.as_str(),
+                    "build" | "net" | "http" | "profile" | "registries"
+                ),
+                [group, name] => {
+                    (group == "profile" && matches!(name.as_str(), "dev" | "release" | "test"))
+                        || (group == "registries" && name == "crates-io")
+                }
+                _ => false,
+            };
+            if !allowed {
+                return Err(unmodeled_config());
+            }
+            for (key, value) in table {
+                path.push(key.clone());
+                visit(value, path, output, target, downloads)?;
+                path.pop();
+            }
+            return Ok(());
+        }
+        let name = path.join(".");
+        let operational = match path.as_slice() {
+            [group, key] if group == "build" && key == "jobs" => value
+                .as_integer()
+                .is_some_and(|v| v != 0 && (-1024..=1024).contains(&v)),
+            [group, key] if group == "net" && key == "retry" => {
+                value.as_integer().is_some_and(|v| (0..=100).contains(&v))
+            }
+            [group, key] if group == "http" && key == "timeout" => {
+                value.as_integer().is_some_and(|v| (1..=86400).contains(&v))
+            }
+            _ => false,
+        };
+        if operational {
+            return Ok(());
+        }
+        let supported = match path.as_slice() {
+            [group, key] if group == "build" && key == "incremental" => value.is_bool(),
+            [group, key] if group == "build" && key == "target" => {
+                !downloads
+                    && target.is_some_and(|actual| {
+                        value.as_str() == Some(actual)
+                            && !actual.ends_with(".json")
+                            && actual.split('-').count() >= 3
+                    })
+            }
+            [group, registry, key]
+                if group == "registries" && registry == "crates-io" && key == "protocol" =>
+            {
+                matches!(value.as_str(), Some("sparse" | "git"))
+            }
+            [group, profile, key]
+                if group == "profile" && matches!(profile.as_str(), "dev" | "release" | "test") =>
+            {
+                valid_compile_setting(key, value)
+            }
+            _ => false,
+        };
+        if !supported {
+            return Err(unmodeled_config());
+        }
+        if !downloads || name.starts_with("registries.") {
+            output.insert(name, serde_json::to_string(value)?);
+        }
+        Ok(())
+    }
+    visit(&config, &mut Vec::new(), &mut output, target, downloads)?;
+    Ok(output)
+}
+
+fn valid_compile_setting(name: &str, value: &toml::Value) -> bool {
+    match name {
+        "opt-level" => {
+            value.as_integer().is_some_and(|v| (0..=3).contains(&v))
+                || matches!(value.as_str(), Some("s" | "z"))
+        }
+        "debug" => {
+            value.as_integer().is_some_and(|v| (0..=2).contains(&v))
+                || value.is_bool()
+                || matches!(
+                    value.as_str(),
+                    Some("none" | "limited" | "full" | "line-tables-only" | "line-directives-only")
+                )
+        }
+        "debug-assertions" | "overflow-checks" | "incremental" => value.is_bool(),
+        "panic" => matches!(value.as_str(), Some("unwind" | "abort")),
+        "codegen-units" => value.as_integer().is_some_and(|v| (1..=65535).contains(&v)),
+        _ => false,
+    }
+}
+
+pub fn incremental_setting(value: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(unmodeled_config()),
+    }
+}
+
+/// Preserve ordering and duplicate options. No shell tokenization or compact
+/// spelling is accepted because their semantics are outside this adapter.
+pub fn encoded_rustflags(value: &str) -> Result<Vec<String>> {
+    if value.len() > 64 * 1024 {
+        return Err(unmodeled_config());
+    }
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tokens: Vec<_> = value.split('\u{1f}').map(str::to_owned).collect();
+    if tokens.len() > 256 || tokens.len() % 2 != 0 {
+        return Err(unmodeled_config());
+    }
+    for pair in tokens.chunks_exact(2) {
+        if pair[0] != "-C" {
+            return Err(unmodeled_config());
+        }
+        let (name, value) = pair[1].split_once('=').ok_or_else(unmodeled_config)?;
+        let valid = match name {
+            "opt-level" => matches!(value, "0" | "1" | "2" | "3" | "s" | "z"),
+            "debuginfo" => matches!(
+                value,
+                "0" | "1"
+                    | "2"
+                    | "none"
+                    | "limited"
+                    | "full"
+                    | "line-tables-only"
+                    | "line-directives-only"
+            ),
+            "debug-assertions" | "overflow-checks" => matches!(
+                value,
+                "yes" | "no" | "on" | "off" | "true" | "false" | "y" | "n"
+            ),
+            "panic" => matches!(value, "unwind" | "abort"),
+            "codegen-units" => value.parse::<u32>().is_ok_and(|v| (1..=65535).contains(&v)),
+            _ => false,
+        };
+        if !valid {
+            return Err(unmodeled_config());
+        }
+    }
+    Ok(tokens)
 }
 
 /// Seed only immutable registry downloads into an already owned fresh Cargo

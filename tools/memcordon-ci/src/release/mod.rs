@@ -62,6 +62,7 @@ pub mod native_recipe_case;
 mod native_source_identity;
 #[cfg(target_os = "linux")]
 mod native_toolchain_search;
+pub mod ordinary_consumer_cache;
 #[cfg(any(target_os = "linux", windows))]
 pub mod original_native_components;
 pub mod packages;
@@ -127,6 +128,11 @@ pub enum ReleaseCommand {
         channel: ConsumerChannel,
     },
     ConsumerCache {
+        /// Stable ordinary preparation owns job-local sources; ephemeral only reports downloads.
+        #[arg(long, value_enum, default_value = "ephemeral")]
+        layout: ordinary_consumer_cache::ConsumerBuildLayout,
+        #[arg(long)]
+        for_save: bool,
         #[arg(long, default_value = ".release/target")]
         target: PathBuf,
         #[arg(long, default_value = ".release/packages")]
@@ -135,6 +141,16 @@ pub enum ReleaseCommand {
         channel: ConsumerChannel,
         #[arg(long, value_enum, default_value = "ordinary")]
         profile: crate::cache::ConsumerProfile,
+    },
+    PrepareRestoredConsumerCache {
+        #[arg(long, value_enum, default_value = "stable-ordinary")]
+        layout: ordinary_consumer_cache::ConsumerBuildLayout,
+        #[arg(long, value_enum)]
+        mode: crate::cache_restore::RestoreMode,
+        #[arg(long, default_value = ".release/target")]
+        target: PathBuf,
+        #[arg(long, default_value = ".release/packages")]
+        packages: PathBuf,
     },
     VerifySource {
         #[arg(long, conflicts_with = "build_source")]
@@ -211,6 +227,8 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     InstalledConsumers {
+        #[arg(long, value_enum, default_value = "ephemeral")]
+        consumer_cache: ordinary_consumer_cache::ConsumerBuildLayout,
         #[arg(long, requires = "channel")]
         external_input: Option<PathBuf>,
         #[arg(long, value_enum)]
@@ -312,11 +330,27 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             },
         ),
         ReleaseCommand::ConsumerCache {
+            layout,
+            for_save,
             target,
             packages,
             channel,
             profile,
         } => {
+            ordinary_consumer_cache::validate_selection(
+                layout,
+                matches!(channel, ConsumerChannel::Cargo),
+                matches!(profile, crate::cache::ConsumerProfile::Ordinary),
+                false,
+            )?;
+            if layout == ordinary_consumer_cache::ConsumerBuildLayout::StableOrdinary {
+                return ordinary_consumer_cache::emit(root, &target, &packages, for_save);
+            }
+            if for_save {
+                return Err(CiError::Message(
+                    "--for-save requires stable-ordinary layout".into(),
+                ));
+            }
             let (native, _) = target::TargetBundle::load(&target)?;
             let (crates, _) = packages::PackageBundle::load(&packages)?;
             if native.source != crates.source {
@@ -331,6 +365,19 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 },
                 profile,
             )
+        }
+        ReleaseCommand::PrepareRestoredConsumerCache {
+            layout,
+            mode,
+            target,
+            packages,
+        } => {
+            if layout != ordinary_consumer_cache::ConsumerBuildLayout::StableOrdinary {
+                return Err(CiError::Message(
+                    "ordinary restore requires stable-ordinary layout".into(),
+                ));
+            }
+            ordinary_consumer_cache::prepare_restore(root, &target, &packages, mode)
         }
         ReleaseCommand::VerifySource {
             source,
@@ -362,36 +409,46 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             Ok(())
         }
         ReleaseCommand::InstalledConsumers {
+            consumer_cache,
             external_input,
             channel,
             target,
             packages,
             destination,
-        } => match channel {
-            Some(channel) => installed_consumer::run_channel_with_external(
-                root,
-                &target,
-                &packages,
-                &destination,
-                match channel {
-                    ConsumerChannel::Native => {
-                        crate::windows_causal_acceptance::InstalledChannel::NativeBundle
+        } => {
+            ordinary_consumer_cache::validate_selection(
+                consumer_cache,
+                matches!(channel, Some(ConsumerChannel::Cargo)),
+                true,
+                external_input.is_some(),
+            )?;
+            match channel {
+                Some(channel) => installed_consumer::run_channel_with_cache(
+                    root,
+                    &target,
+                    &packages,
+                    &destination,
+                    match channel {
+                        ConsumerChannel::Native => {
+                            crate::windows_causal_acceptance::InstalledChannel::NativeBundle
+                        }
+                        ConsumerChannel::Cargo => {
+                            crate::windows_causal_acceptance::InstalledChannel::CargoPackage
+                        }
+                    },
+                    external_input.as_deref(),
+                    consumer_cache,
+                ),
+                None => {
+                    if external_input.is_some() {
+                        return Err(CiError::Message(
+                            "--external-input requires an explicitly selected --channel".into(),
+                        ));
                     }
-                    ConsumerChannel::Cargo => {
-                        crate::windows_causal_acceptance::InstalledChannel::CargoPackage
-                    }
-                },
-                external_input.as_deref(),
-            ),
-            None => {
-                if external_input.is_some() {
-                    return Err(CiError::Message(
-                        "--external-input requires an explicitly selected --channel".into(),
-                    ));
+                    installed_consumer::run(root, &target, &packages, &destination)
                 }
-                installed_consumer::run(root, &target, &packages, &destination)
             }
-        },
+        }
         ReleaseCommand::ConsumerReadinessReport(arguments) => {
             readiness_report::run(root, &arguments)
         }

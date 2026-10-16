@@ -3,6 +3,12 @@ name: Deep CI
 on:
   push:
   workflow_dispatch:
+    inputs:
+      failure-mode:
+        description: Stop independent work after a failure or collect applicable diagnostics
+        type: choice
+        default: collect-all
+        options: [stop-after-failure, collect-all]
 
 permissions:
   contents: read
@@ -37,11 +43,12 @@ jobs:
     if: needs.performance-plan.outputs.standalone-common == 'true'
     name: Miri / ${{ matrix.shard }}
     strategy:
-      fail-fast: ${{ github.event_name != 'workflow_dispatch' }}
+      fail-fast: ${{ github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all' }}
+      max-parallel: 4
       matrix:
-        shard: [first, second]
+        shard: [quarter-one, quarter-two, quarter-three, quarter-four]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -69,88 +76,217 @@ jobs:
           path: ${{ steps.workspace-download-context.outputs.source-paths }}
           key: ${{ steps.workspace-download-context.outputs.source-key }}
           restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: archive-seed-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-archives
+      - id: archive-seed-restore
+        if: steps.archive-seed-context.outputs.seed-lookup-key != '' && steps.workspace-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.archive-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.archive-seed-context.outputs.seed-import-path }}
+      - if: steps.archive-seed-restore.outcome == 'success' && steps.archive-seed-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-archives
+      - id: index-snapshot-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-index
+      - id: index-snapshot-restore
+        if: steps.index-snapshot-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.index-snapshot-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.index-snapshot-context.outputs.seed-import-path }}
+      - if: steps.index-snapshot-restore.outcome == 'success' && steps.index-snapshot-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-index
       - id: workspace-fetch
         run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
-      - run: ./target/ci/release/memcordon-ci ci prepare --profile miri
-      - id: compiled-context-first
-        if: matrix.shard == 'first'
-        timeout-minutes: 2
+      - run: ./target/ci/release/memcordon-ci ci prepare-miri-components
+      - id: miri-sysroot-context
+        run: ./target/ci/release/memcordon-ci ci miri-cache-context
+      - id: miri-sysroot-cache
+        if: steps.miri-sysroot-context.outputs.sysroot-key != ''
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard first
-      - id: compiled-context-second
-        if: matrix.shard == 'second'
-        timeout-minutes: 2
-        continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard second
-      - id: compiled-first
-        continue-on-error: true
-        if: matrix.shard == 'first' && steps.compiled-context-first.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ steps.compiled-context-first.outputs.product-paths }}
-          key: ${{ steps.compiled-context-first.outputs.product-key }}
-          restore-keys: ${{ steps.compiled-context-first.outputs.product-restore-prefix }}
-      - name: Sanitize compiled-first discard restore
-        if: steps.compiled-first.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode discard
-      - name: Sanitize compiled-first exact restore
-        if: steps.compiled-first.outcome == 'success' && steps.compiled-first.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode exact
-      - name: Sanitize compiled-first compatible restore
-        if: steps.compiled-first.outcome == 'success' && steps.compiled-first.outputs.cache-matched-key != '' && steps.compiled-first.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard first --mode compatible
-      - id: compiled-second
+          key: ${{ steps.miri-sysroot-context.outputs.sysroot-key }}
+          path: ${{ steps.miri-sysroot-context.outputs.sysroot-path }}
+      - id: miri-sysroot-setup
+        run: ./target/ci/release/memcordon-ci ci prepare-miri-sysroot
+      - id: miri-sysroot-save-context
+        if: always() && steps.miri-sysroot-setup.outputs.miri-sysroot-ready == 'true' && steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true'
+        run: ./target/ci/release/memcordon-ci ci miri-cache-context
+      - name: Save generated Miri standard library
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.miri-sysroot-setup.outputs.miri-sysroot-ready == 'true' && steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true' && steps.miri-sysroot-context.outputs.sysroot-key != '' && steps.miri-sysroot-save-context.outputs.sysroot-key == steps.miri-sysroot-context.outputs.sysroot-key && steps.miri-sysroot-cache.outputs.cache-hit != 'true'
         continue-on-error: true
-        if: matrix.shard == 'second' && steps.compiled-context-second.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.miri-sysroot-context.outputs.sysroot-key }}
+          path: ${{ steps.miri-sysroot-context.outputs.sysroot-path }}
+      - id: compiled-context-quarter-one
+        if: matrix.shard == 'quarter-one'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-one
+      - id: compiled-context-quarter-three
+        if: matrix.shard == 'quarter-three'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-three
+      - id: compiled-context-quarter-two
+        if: matrix.shard == 'quarter-two'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-two
+      - id: compiled-context-quarter-four
+        if: matrix.shard == 'quarter-four'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-four
+      - id: compiled-quarter-one
+        continue-on-error: true
+        if: matrix.shard == 'quarter-one' && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ steps.compiled-context-second.outputs.product-paths }}
-          key: ${{ steps.compiled-context-second.outputs.product-key }}
-          restore-keys: ${{ steps.compiled-context-second.outputs.product-restore-prefix }}
-      - name: Sanitize compiled-second discard restore
-        if: steps.compiled-second.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode discard
-      - name: Sanitize compiled-second exact restore
-        if: steps.compiled-second.outcome == 'success' && steps.compiled-second.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode exact
-      - name: Sanitize compiled-second compatible restore
-        if: steps.compiled-second.outcome == 'success' && steps.compiled-second.outputs.cache-matched-key != '' && steps.compiled-second.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard second --mode compatible
-      - id: miri-first
-        if: matrix.shard == 'first'
-        run: ./target/ci/release/memcordon-ci suite miri-first
-      - id: miri-second
-        if: matrix.shard == 'second'
-        run: ./target/ci/release/memcordon-ci suite miri-second
+          path: ${{ steps.compiled-context-quarter-one.outputs.product-paths }}
+          key: ${{ steps.compiled-context-quarter-one.outputs.product-key }}
+          restore-keys: ${{ steps.compiled-context-quarter-one.outputs.product-restore-prefix }}
+      - id: compiled-quarter-three
+        continue-on-error: true
+        if: matrix.shard == 'quarter-three' && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.compiled-context-quarter-three.outputs.product-paths }}
+          key: ${{ steps.compiled-context-quarter-three.outputs.product-key }}
+          restore-keys: ${{ steps.compiled-context-quarter-three.outputs.product-restore-prefix }}
+      - name: Sanitize compiled-quarter-one discard restore
+        if: steps.compiled-quarter-one.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-one --mode discard
+      - name: Sanitize compiled-quarter-three discard restore
+        if: steps.compiled-quarter-three.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-three --mode discard
+      - name: Sanitize compiled-quarter-one exact restore
+        if: steps.compiled-quarter-one.outcome == 'success' && steps.compiled-quarter-one.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-one --mode exact
+      - name: Sanitize compiled-quarter-three exact restore
+        if: steps.compiled-quarter-three.outcome == 'success' && steps.compiled-quarter-three.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-three --mode exact
+      - name: Sanitize compiled-quarter-one compatible restore
+        if: steps.compiled-quarter-one.outcome == 'success' && steps.compiled-quarter-one.outputs.cache-matched-key != '' && steps.compiled-quarter-one.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-one --mode compatible
+      - name: Sanitize compiled-quarter-three compatible restore
+        if: steps.compiled-quarter-three.outcome == 'success' && steps.compiled-quarter-three.outputs.cache-matched-key != '' && steps.compiled-quarter-three.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-three --mode compatible
+      - id: compiled-quarter-two
+        continue-on-error: true
+        if: matrix.shard == 'quarter-two' && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.compiled-context-quarter-two.outputs.product-paths }}
+          key: ${{ steps.compiled-context-quarter-two.outputs.product-key }}
+          restore-keys: ${{ steps.compiled-context-quarter-two.outputs.product-restore-prefix }}
+      - id: compiled-quarter-four
+        continue-on-error: true
+        if: matrix.shard == 'quarter-four' && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.compiled-context-quarter-four.outputs.product-paths }}
+          key: ${{ steps.compiled-context-quarter-four.outputs.product-key }}
+          restore-keys: ${{ steps.compiled-context-quarter-four.outputs.product-restore-prefix }}
+      - name: Sanitize compiled-quarter-two discard restore
+        if: steps.compiled-quarter-two.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-two --mode discard
+      - name: Sanitize compiled-quarter-four discard restore
+        if: steps.compiled-quarter-four.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-four --mode discard
+      - name: Sanitize compiled-quarter-two exact restore
+        if: steps.compiled-quarter-two.outcome == 'success' && steps.compiled-quarter-two.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-two --mode exact
+      - name: Sanitize compiled-quarter-four exact restore
+        if: steps.compiled-quarter-four.outcome == 'success' && steps.compiled-quarter-four.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-four --mode exact
+      - name: Sanitize compiled-quarter-two compatible restore
+        if: steps.compiled-quarter-two.outcome == 'success' && steps.compiled-quarter-two.outputs.cache-matched-key != '' && steps.compiled-quarter-two.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-two --mode compatible
+      - name: Sanitize compiled-quarter-four compatible restore
+        if: steps.compiled-quarter-four.outcome == 'success' && steps.compiled-quarter-four.outputs.cache-matched-key != '' && steps.compiled-quarter-four.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose miri --shard quarter-four --mode compatible
+      - id: miri-quarter-one
+        if: matrix.shard == 'quarter-one' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-one --failure-mode stop-after-failure
+      - id: miri-quarter-one-diagnostic
+        if: matrix.shard == 'quarter-one' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-one --failure-mode collect-all
+      - id: miri-quarter-three
+        if: matrix.shard == 'quarter-three' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-three --failure-mode stop-after-failure
+      - id: miri-quarter-three-diagnostic
+        if: matrix.shard == 'quarter-three' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-three --failure-mode collect-all
+      - id: miri-quarter-two
+        if: matrix.shard == 'quarter-two' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-two --failure-mode stop-after-failure
+      - id: miri-quarter-two-diagnostic
+        if: matrix.shard == 'quarter-two' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-two --failure-mode collect-all
+      - id: miri-quarter-four
+        if: matrix.shard == 'quarter-four' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-four --failure-mode stop-after-failure
+      - id: miri-quarter-four-diagnostic
+        if: matrix.shard == 'quarter-four' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite miri-quarter-four --failure-mode collect-all
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
           name: miri-plan-${{ matrix.shard }}
           path: target/ci/reports/miri
           if-no-files-found: warn
-      - id: compiled-first-save-context
-        if: always() && steps.compiled-context-first.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled-first.outputs.cache-hit != 'true' && matrix.shard == 'first'
+      - id: compiled-quarter-one-save-context
+        if: always() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard first
-      - if: always() && steps.compiled-context-first.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled-first.outputs.cache-hit != 'true' && matrix.shard == 'first' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-first.outputs.cache-primary-key != '' && steps.compiled-first-save-context.outcome == 'success' && steps.compiled-first-save-context.outputs.product-key == steps.compiled-context-first.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-one
+      - id: compiled-quarter-three-save-context
+        if: always() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-three
+      - if: always() && success() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-one.outputs.cache-primary-key != '' && steps.compiled-quarter-one-save-context.outcome == 'success' && steps.compiled-quarter-one-save-context.outputs.product-key == steps.compiled-context-quarter-one.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ steps.compiled-context-first.outputs.product-paths }}
-          key: ${{ steps.compiled-first.outputs.cache-primary-key }}
-      - id: compiled-second-save-context
-        if: always() && steps.compiled-context-second.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled-second.outputs.cache-hit != 'true' && matrix.shard == 'second'
-        timeout-minutes: 2
-        continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard second
-      - if: always() && steps.compiled-context-second.outputs.compiled-cache-usable == 'true' && (steps.miri-first.outputs.cache-quiescent == 'true' || steps.miri-second.outputs.cache-quiescent == 'true') && steps.compiled-second.outputs.cache-hit != 'true' && matrix.shard == 'second' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-second.outputs.cache-primary-key != '' && steps.compiled-second-save-context.outcome == 'success' && steps.compiled-second-save-context.outputs.product-key == steps.compiled-context-second.outputs.product-key
+          path: ${{ steps.compiled-context-quarter-one.outputs.product-paths }}
+          key: ${{ steps.compiled-quarter-one.outputs.cache-primary-key }}
+      - if: always() && success() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-three.outputs.cache-primary-key != '' && steps.compiled-quarter-three-save-context.outcome == 'success' && steps.compiled-quarter-three-save-context.outputs.product-key == steps.compiled-context-quarter-three.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ steps.compiled-context-second.outputs.product-paths }}
-          key: ${{ steps.compiled-second.outputs.cache-primary-key }}
-      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && matrix.shard == 'first' && steps.miri-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.miri-deps.outputs.cache-primary-key != ''
+          path: ${{ steps.compiled-context-quarter-three.outputs.product-paths }}
+          key: ${{ steps.compiled-quarter-three.outputs.cache-primary-key }}
+      - id: compiled-quarter-two-save-context
+        if: always() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-two
+      - id: compiled-quarter-four-save-context
+        if: always() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose miri --shard quarter-four
+      - if: always() && success() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-two.outputs.cache-primary-key != '' && steps.compiled-quarter-two-save-context.outcome == 'success' && steps.compiled-quarter-two-save-context.outputs.product-key == steps.compiled-context-quarter-two.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.compiled-context-quarter-two.outputs.product-paths }}
+          key: ${{ steps.compiled-quarter-two.outputs.cache-primary-key }}
+      - if: always() && success() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && ((steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-four.outputs.cache-primary-key != '' && steps.compiled-quarter-four-save-context.outcome == 'success' && steps.compiled-quarter-four-save-context.outputs.product-key == steps.compiled-context-quarter-four.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.compiled-context-quarter-four.outputs.product-paths }}
+          key: ${{ steps.compiled-quarter-four.outputs.cache-primary-key }}
+      - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && matrix.shard == 'quarter-one' && steps.miri-deps.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.miri-deps.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -159,12 +295,52 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.miri-deps.outputs.cache-primary-key }}
 
+      - id: archive-seed-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true' && ((steps.miri-quarter-one.outcome == 'skipped' && steps.miri-quarter-one-diagnostic.outcome == 'skipped') || (steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-three.outcome == 'skipped' && steps.miri-quarter-three-diagnostic.outcome == 'skipped') || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-two.outcome == 'skipped' && steps.miri-quarter-two-diagnostic.outcome == 'skipped') || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-four.outcome == 'skipped' && steps.miri-quarter-four-diagnostic.outcome == 'skipped') || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-archives
+      - id: archive-seed-probe
+        if: always() && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-archives
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility && steps.archive-seed-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.archive-seed-context.outputs.seed-lookup-key != '' && (steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true' && ((steps.miri-quarter-one.outcome == 'skipped' && steps.miri-quarter-one-diagnostic.outcome == 'skipped') || (steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-three.outcome == 'skipped' && steps.miri-quarter-three-diagnostic.outcome == 'skipped') || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-two.outcome == 'skipped' && steps.miri-quarter-two-diagnostic.outcome == 'skipped') || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-four.outcome == 'skipped' && steps.miri-quarter-four-diagnostic.outcome == 'skipped') || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-archives
+      - id: index-snapshot-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true' && ((steps.miri-quarter-one.outcome == 'skipped' && steps.miri-quarter-one-diagnostic.outcome == 'skipped') || (steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-three.outcome == 'skipped' && steps.miri-quarter-three-diagnostic.outcome == 'skipped') || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-two.outcome == 'skipped' && steps.miri-quarter-two-diagnostic.outcome == 'skipped') || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-four.outcome == 'skipped' && steps.miri-quarter-four-diagnostic.outcome == 'skipped') || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-index
+      - id: index-snapshot-probe
+        if: always() && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-index
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility && steps.index-snapshot-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.index-snapshot-context.outputs.seed-lookup-key != '' && (steps.miri-sysroot-setup.outputs.miri-sysroot-quiescent == 'true' && ((steps.miri-quarter-one.outcome == 'skipped' && steps.miri-quarter-one-diagnostic.outcome == 'skipped') || (steps.miri-quarter-one.outputs.cache-quiescent || steps.miri-quarter-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-three.outcome == 'skipped' && steps.miri-quarter-three-diagnostic.outcome == 'skipped') || (steps.miri-quarter-three.outputs.cache-quiescent || steps.miri-quarter-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-two.outcome == 'skipped' && steps.miri-quarter-two-diagnostic.outcome == 'skipped') || (steps.miri-quarter-two.outputs.cache-quiescent || steps.miri-quarter-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.miri-quarter-four.outcome == 'skipped' && steps.miri-quarter-four-diagnostic.outcome == 'skipped') || (steps.miri-quarter-four.outputs.cache-quiescent || steps.miri-quarter-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-index
   fuzz:
     needs: performance-plan
     if: needs.performance-plan.outputs.standalone-common == 'true'
     name: fuzz smoke / ${{ matrix.shard }}
     strategy:
-      fail-fast: ${{ github.event_name != 'workflow_dispatch' }}
+      fail-fast: ${{ github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all' }}
       matrix:
         shard: [quarter-one, quarter-two, quarter-three, quarter-four]
     runs-on: ubuntu-24.04
@@ -196,6 +372,30 @@ jobs:
           path: ${{ steps.workspace-download-context.outputs.source-paths }}
           key: ${{ steps.workspace-download-context.outputs.source-key }}
           restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: archive-seed-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-archives
+      - id: archive-seed-restore
+        if: steps.archive-seed-context.outputs.seed-lookup-key != '' && steps.workspace-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.archive-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.archive-seed-context.outputs.seed-import-path }}
+      - if: steps.archive-seed-restore.outcome == 'success' && steps.archive-seed-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-archives
+      - id: index-snapshot-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-index
+      - id: index-snapshot-restore
+        if: steps.index-snapshot-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.index-snapshot-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.index-snapshot-context.outputs.seed-import-path }}
+      - if: steps.index-snapshot-restore.outcome == 'success' && steps.index-snapshot-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-index
       - id: workspace-fetch
         run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: cache-cargo-fuzz
@@ -224,6 +424,7 @@ jobs:
         with:
           path: ${{ steps.cache-cargo-fuzz.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-fuzz.outputs.tool-build-key }}
+          restore-keys: ${{ steps.cache-cargo-fuzz.outputs.tool-build-restore-prefix }}
       - run: rustup toolchain install nightly-2026-07-31 --profile minimal
       - id: fuzz-download-context
         run: ./target/ci/release/memcordon-ci ci download-cache-context --family fuzz
@@ -236,27 +437,31 @@ jobs:
           key: ${{ steps.fuzz-download-context.outputs.source-key }}
           restore-keys: ${{ steps.fuzz-download-context.outputs.source-restore-prefix }}
       - id: prepare-fuzz
-        run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz
+        if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
+        run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz --failure-mode stop-after-failure
+      - id: prepare-fuzz-diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
+        run: ./target/ci/release/memcordon-ci ci prepare --profile fuzz --failure-mode collect-all
       - id: compiled-context-quarter-one
         if: matrix.shard == 'quarter-one'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-one
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-one --partition fuzz-targets
       - id: compiled-context-quarter-two
         if: matrix.shard == 'quarter-two'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-two
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-two --partition fuzz-targets
       - id: compiled-context-quarter-three
         if: matrix.shard == 'quarter-three'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-three
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-three --partition fuzz-targets
       - id: compiled-context-quarter-four
         if: matrix.shard == 'quarter-four'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-four
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-four --partition fuzz-targets
       - id: compiled-quarter-one
         continue-on-error: true
         if: matrix.shard == 'quarter-one' && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true'
@@ -267,13 +472,13 @@ jobs:
           restore-keys: ${{ steps.compiled-context-quarter-one.outputs.product-restore-prefix }}
       - name: Sanitize compiled-quarter-one discard restore
         if: steps.compiled-quarter-one.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode discard --partition fuzz-targets
       - name: Sanitize compiled-quarter-one exact restore
         if: steps.compiled-quarter-one.outcome == 'success' && steps.compiled-quarter-one.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode exact --partition fuzz-targets
       - name: Sanitize compiled-quarter-one compatible restore
         if: steps.compiled-quarter-one.outcome == 'success' && steps.compiled-quarter-one.outputs.cache-matched-key != '' && steps.compiled-quarter-one.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-one --mode compatible --partition fuzz-targets
       - id: compiled-quarter-two
         continue-on-error: true
         if: matrix.shard == 'quarter-two' && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true'
@@ -284,13 +489,13 @@ jobs:
           restore-keys: ${{ steps.compiled-context-quarter-two.outputs.product-restore-prefix }}
       - name: Sanitize compiled-quarter-two discard restore
         if: steps.compiled-quarter-two.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode discard --partition fuzz-targets
       - name: Sanitize compiled-quarter-two exact restore
         if: steps.compiled-quarter-two.outcome == 'success' && steps.compiled-quarter-two.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode exact --partition fuzz-targets
       - name: Sanitize compiled-quarter-two compatible restore
         if: steps.compiled-quarter-two.outcome == 'success' && steps.compiled-quarter-two.outputs.cache-matched-key != '' && steps.compiled-quarter-two.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-two --mode compatible --partition fuzz-targets
       - id: compiled-quarter-three
         continue-on-error: true
         if: matrix.shard == 'quarter-three' && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true'
@@ -301,13 +506,13 @@ jobs:
           restore-keys: ${{ steps.compiled-context-quarter-three.outputs.product-restore-prefix }}
       - name: Sanitize compiled-quarter-three discard restore
         if: steps.compiled-quarter-three.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode discard --partition fuzz-targets
       - name: Sanitize compiled-quarter-three exact restore
         if: steps.compiled-quarter-three.outcome == 'success' && steps.compiled-quarter-three.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode exact --partition fuzz-targets
       - name: Sanitize compiled-quarter-three compatible restore
         if: steps.compiled-quarter-three.outcome == 'success' && steps.compiled-quarter-three.outputs.cache-matched-key != '' && steps.compiled-quarter-three.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-three --mode compatible --partition fuzz-targets
       - id: compiled-quarter-four
         continue-on-error: true
         if: matrix.shard == 'quarter-four' && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true'
@@ -318,25 +523,193 @@ jobs:
           restore-keys: ${{ steps.compiled-context-quarter-four.outputs.product-restore-prefix }}
       - name: Sanitize compiled-quarter-four discard restore
         if: steps.compiled-quarter-four.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode discard --partition fuzz-targets
       - name: Sanitize compiled-quarter-four exact restore
         if: steps.compiled-quarter-four.outcome == 'success' && steps.compiled-quarter-four.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode exact --partition fuzz-targets
       - name: Sanitize compiled-quarter-four compatible restore
         if: steps.compiled-quarter-four.outcome == 'success' && steps.compiled-quarter-four.outputs.cache-matched-key != '' && steps.compiled-quarter-four.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose fuzz --shard quarter-four --mode compatible --partition fuzz-targets
+      - id: fuzz-one-seed-context
+        if: matrix.shard == 'quarter-one' && steps.compiled-context-quarter-one.outputs.product-key != '' && steps.compiled-quarter-one.outputs.cache-matched-key == ''
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-one
+      - id: fuzz-one-seed
+        if: steps.fuzz-one-seed-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-one-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.fuzz-one-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.fuzz-one-seed-context.outputs.seed-import-path }}
+      - if: steps.fuzz-one-seed.outcome == 'success' && steps.fuzz-one-seed.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-one
+      - id: fuzz-one-compile
+        if: matrix.shard == 'quarter-one' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-one --failure-mode stop-after-failure
+      - id: fuzz-one-compile-diagnostic
+        if: matrix.shard == 'quarter-one' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-one --failure-mode collect-all
+      - id: fuzz-one-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-one --stage build
+      - id: fuzz-one-probe
+        if: always() && steps.fuzz-one-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-one-snapshot.outputs.input-key == steps.compiled-context-quarter-one.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-one-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-one-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Retain settled fuzz dependencies
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-one-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-one-snapshot.outputs.input-key == steps.compiled-context-quarter-one.outputs.product-key && steps.fuzz-one-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-one-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-one-snapshot.outputs.snapshot-path }}
+      - if: always() && (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-one
       - id: fuzz-one
-        if: matrix.shard == 'quarter-one'
-        run: ./target/ci/release/memcordon-ci suite fuzz-quarter-one
+        if: matrix.shard == 'quarter-one' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-one --failure-mode stop-after-failure
+      - id: fuzz-one-diagnostic
+        if: matrix.shard == 'quarter-one' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-one --failure-mode collect-all
+      - id: fuzz-two-seed-context
+        if: matrix.shard == 'quarter-two' && steps.compiled-context-quarter-two.outputs.product-key != '' && steps.compiled-quarter-two.outputs.cache-matched-key == ''
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-two
+      - id: fuzz-two-seed
+        if: steps.fuzz-two-seed-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-two-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.fuzz-two-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.fuzz-two-seed-context.outputs.seed-import-path }}
+      - if: steps.fuzz-two-seed.outcome == 'success' && steps.fuzz-two-seed.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-two
+      - id: fuzz-two-compile
+        if: matrix.shard == 'quarter-two' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-two --failure-mode stop-after-failure
+      - id: fuzz-two-compile-diagnostic
+        if: matrix.shard == 'quarter-two' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-two --failure-mode collect-all
+      - id: fuzz-two-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-two --stage build
+      - id: fuzz-two-probe
+        if: always() && steps.fuzz-two-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-two-snapshot.outputs.input-key == steps.compiled-context-quarter-two.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-two-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-two-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Retain settled fuzz dependencies
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-two-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-two-snapshot.outputs.input-key == steps.compiled-context-quarter-two.outputs.product-key && steps.fuzz-two-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-two-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-two-snapshot.outputs.snapshot-path }}
+      - if: always() && (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-two
       - id: fuzz-two
-        if: matrix.shard == 'quarter-two'
-        run: ./target/ci/release/memcordon-ci suite fuzz-quarter-two
+        if: matrix.shard == 'quarter-two' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-two --failure-mode stop-after-failure
+      - id: fuzz-two-diagnostic
+        if: matrix.shard == 'quarter-two' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-two --failure-mode collect-all
+      - id: fuzz-three-seed-context
+        if: matrix.shard == 'quarter-three' && steps.compiled-context-quarter-three.outputs.product-key != '' && steps.compiled-quarter-three.outputs.cache-matched-key == ''
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-three
+      - id: fuzz-three-seed
+        if: steps.fuzz-three-seed-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-three-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.fuzz-three-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.fuzz-three-seed-context.outputs.seed-import-path }}
+      - if: steps.fuzz-three-seed.outcome == 'success' && steps.fuzz-three-seed.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-three
+      - id: fuzz-three-compile
+        if: matrix.shard == 'quarter-three' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-three --failure-mode stop-after-failure
+      - id: fuzz-three-compile-diagnostic
+        if: matrix.shard == 'quarter-three' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-three --failure-mode collect-all
+      - id: fuzz-three-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-three --stage build
+      - id: fuzz-three-probe
+        if: always() && steps.fuzz-three-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-three-snapshot.outputs.input-key == steps.compiled-context-quarter-three.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-three-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-three-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Retain settled fuzz dependencies
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-three-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-three-snapshot.outputs.input-key == steps.compiled-context-quarter-three.outputs.product-key && steps.fuzz-three-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-three-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-three-snapshot.outputs.snapshot-path }}
+      - if: always() && (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-three
       - id: fuzz-three
-        if: matrix.shard == 'quarter-three'
-        run: ./target/ci/release/memcordon-ci suite fuzz-quarter-three
+        if: matrix.shard == 'quarter-three' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-three --failure-mode stop-after-failure
+      - id: fuzz-three-diagnostic
+        if: matrix.shard == 'quarter-three' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-three --failure-mode collect-all
+      - id: fuzz-four-seed-context
+        if: matrix.shard == 'quarter-four' && steps.compiled-context-quarter-four.outputs.product-key != '' && steps.compiled-quarter-four.outputs.cache-matched-key == ''
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-four
+      - id: fuzz-four-seed
+        if: steps.fuzz-four-seed-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-four-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.fuzz-four-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.fuzz-four-seed-context.outputs.seed-import-path }}
+      - if: steps.fuzz-four-seed.outcome == 'success' && steps.fuzz-four-seed.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-four
+      - id: fuzz-four-compile
+        if: matrix.shard == 'quarter-four' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-four --failure-mode stop-after-failure
+      - id: fuzz-four-compile-diagnostic
+        if: matrix.shard == 'quarter-four' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-compile-quarter-four --failure-mode collect-all
+      - id: fuzz-four-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-four --stage build
+      - id: fuzz-four-probe
+        if: always() && steps.fuzz-four-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-four-snapshot.outputs.input-key == steps.compiled-context-quarter-four.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-four-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-four-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Retain settled fuzz dependencies
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-four-snapshot.outputs.snapshot-ready == 'true' && steps.fuzz-four-snapshot.outputs.input-key == steps.compiled-context-quarter-four.outputs.product-key && steps.fuzz-four-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.fuzz-four-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.fuzz-four-snapshot.outputs.snapshot-path }}
+      - if: always() && (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true'
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard quarter-four
       - id: fuzz-four
-        if: matrix.shard == 'quarter-four'
-        run: ./target/ci/release/memcordon-ci suite fuzz-quarter-four
+        if: matrix.shard == 'quarter-four' && (github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-four --failure-mode stop-after-failure
+      - id: fuzz-four-diagnostic
+        if: matrix.shard == 'quarter-four' && (github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all')
+        run: ./target/ci/release/memcordon-ci suite fuzz-execute-quarter-four --failure-mode collect-all
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
@@ -344,44 +717,44 @@ jobs:
           path: target/ci/reports/fuzz
           if-no-files-found: warn
       - id: compiled-quarter-one-save-context
-        if: always() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one'
+        if: always() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-one
-      - if: always() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-one.outputs.cache-primary-key != '' && steps.compiled-quarter-one-save-context.outcome == 'success' && steps.compiled-quarter-one-save-context.outputs.product-key == steps.compiled-context-quarter-one.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-one --partition fuzz-targets
+      - if: always() && success() && steps.compiled-context-quarter-one.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-one.outputs.cache-hit != 'true' && matrix.shard == 'quarter-one' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-one.outputs.cache-primary-key != '' && steps.compiled-quarter-one-save-context.outcome == 'success' && steps.compiled-quarter-one-save-context.outputs.product-key == steps.compiled-context-quarter-one.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.compiled-context-quarter-one.outputs.product-paths }}
           key: ${{ steps.compiled-quarter-one.outputs.cache-primary-key }}
       - id: compiled-quarter-two-save-context
-        if: always() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two'
+        if: always() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-two
-      - if: always() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-two.outputs.cache-primary-key != '' && steps.compiled-quarter-two-save-context.outcome == 'success' && steps.compiled-quarter-two-save-context.outputs.product-key == steps.compiled-context-quarter-two.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-two --partition fuzz-targets
+      - if: always() && success() && steps.compiled-context-quarter-two.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-two.outputs.cache-hit != 'true' && matrix.shard == 'quarter-two' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-two.outputs.cache-primary-key != '' && steps.compiled-quarter-two-save-context.outcome == 'success' && steps.compiled-quarter-two-save-context.outputs.product-key == steps.compiled-context-quarter-two.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.compiled-context-quarter-two.outputs.product-paths }}
           key: ${{ steps.compiled-quarter-two.outputs.cache-primary-key }}
       - id: compiled-quarter-three-save-context
-        if: always() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three'
+        if: always() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-three
-      - if: always() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-three.outputs.cache-primary-key != '' && steps.compiled-quarter-three-save-context.outcome == 'success' && steps.compiled-quarter-three-save-context.outputs.product-key == steps.compiled-context-quarter-three.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-three --partition fuzz-targets
+      - if: always() && success() && steps.compiled-context-quarter-three.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-three.outputs.cache-hit != 'true' && matrix.shard == 'quarter-three' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-three.outputs.cache-primary-key != '' && steps.compiled-quarter-three-save-context.outcome == 'success' && steps.compiled-quarter-three-save-context.outputs.product-key == steps.compiled-context-quarter-three.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.compiled-context-quarter-three.outputs.product-paths }}
           key: ${{ steps.compiled-quarter-three.outputs.cache-primary-key }}
       - id: compiled-quarter-four-save-context
-        if: always() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four'
+        if: always() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-four
-      - if: always() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-four.outputs.cache-primary-key != '' && steps.compiled-quarter-four-save-context.outcome == 'success' && steps.compiled-quarter-four-save-context.outputs.product-key == steps.compiled-context-quarter-four.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose fuzz --shard quarter-four --partition fuzz-targets
+      - if: always() && success() && steps.compiled-context-quarter-four.outputs.compiled-cache-usable == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && steps.compiled-quarter-four.outputs.cache-hit != 'true' && matrix.shard == 'quarter-four' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled-quarter-four.outputs.cache-primary-key != '' && steps.compiled-quarter-four-save-context.outcome == 'success' && steps.compiled-quarter-four-save-context.outputs.product-key == steps.compiled-context-quarter-four.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -397,11 +770,11 @@ jobs:
           key: ${{ steps.fuzz-deps.outputs.cache-primary-key }}
 
       - id: fuzz-download-save-context
-        if: always() && steps.prepare-fuzz.outputs.cache-quiescent == 'true'
+        if: always() && (steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true'
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci download-cache-context --family fuzz
       - name: Save complete fuzz downloads
-        if: always() && matrix.shard == 'quarter-one' && steps.fuzz-downloads.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-downloads.outputs.cache-primary-key != '' && steps.prepare-fuzz.outputs.cache-quiescent == 'true' && steps.prepare-fuzz.outputs.fuzz-downloads-populated == 'true' && steps.fuzz-download-save-context.outcome == 'success' && steps.fuzz-download-save-context.outputs.source-key == steps.prepare-fuzz.outputs.fuzz-downloads-key && steps.fuzz-download-save-context.outputs.source-key == steps.fuzz-download-context.outputs.source-key
+        if: always() && matrix.shard == 'quarter-one' && steps.fuzz-downloads.outputs.cache-hit != 'true' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.fuzz-downloads.outputs.cache-primary-key != '' && (steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && (steps.prepare-fuzz.outputs.fuzz-downloads-populated || steps.prepare-fuzz-diagnostic.outputs.fuzz-downloads-populated) == 'true' && steps.fuzz-download-save-context.outcome == 'success' && steps.fuzz-download-save-context.outputs.source-key == (steps.prepare-fuzz.outputs.fuzz-downloads-key || steps.prepare-fuzz-diagnostic.outputs.fuzz-downloads-key) && steps.fuzz-download-save-context.outputs.source-key == steps.fuzz-download-context.outputs.source-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -409,31 +782,71 @@ jobs:
           key: ${{ steps.fuzz-downloads.outputs.cache-primary-key }}
 
       - id: cache-cargo-fuzz-save-context
-        if: always() && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true')
+        if: always() && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true')
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete
       - name: Save cache-cargo-fuzz-binary
-        if: always() && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-binary.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-binary.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-key == steps.cache-cargo-fuzz.outputs.tool-key
+        if: always() && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-binary.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-binary.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-key == steps.cache-cargo-fuzz.outputs.tool-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-fuzz.outputs.tool-path }}
           key: ${{ steps.cache-cargo-fuzz-binary.outputs.cache-primary-key }}
       - name: Save cargo-fuzz downloads
-        if: always() && steps.prepare-fuzz.outputs.cache-quiescent == 'true' && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.source-key == steps.cache-cargo-fuzz.outputs.source-key && steps.prepare-fuzz.outputs.download-cargo-fuzz-populated == 'true' && steps.cache-cargo-fuzz-save-context.outputs.source-key == steps.prepare-fuzz.outputs.download-cargo-fuzz-key
+        if: always() && (steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.source-key == steps.cache-cargo-fuzz.outputs.source-key && (steps.prepare-fuzz.outputs.download-cargo-fuzz-populated || steps.prepare-fuzz-diagnostic.outputs.download-cargo-fuzz-populated) == 'true' && steps.cache-cargo-fuzz-save-context.outputs.source-key == (steps.prepare-fuzz.outputs.download-cargo-fuzz-key || steps.prepare-fuzz-diagnostic.outputs.download-cargo-fuzz-key)
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-fuzz.outputs.source-paths }}
           key: ${{ steps.cache-cargo-fuzz-downloads.outputs.cache-primary-key }}
       - name: Save cache-cargo-fuzz-build
-        if: always() && (steps.fuzz-one.outputs.cache-quiescent == 'true' || steps.fuzz-two.outputs.cache-quiescent == 'true' || steps.fuzz-three.outputs.cache-quiescent == 'true' || steps.fuzz-four.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-build.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-build.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-build-key == steps.cache-cargo-fuzz.outputs.tool-build-key
+        if: always() && success() && ((steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true' || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-fuzz-build.outputs.cache-primary-key != '' && steps.cache-cargo-fuzz-build.outputs.cache-hit != 'true' && steps.cache-cargo-fuzz-save-context.outcome == 'success' && steps.cache-cargo-fuzz-save-context.outputs.tool-build-key == steps.cache-cargo-fuzz.outputs.tool-build-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-fuzz.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-fuzz-build.outputs.cache-primary-key }}
+      - id: archive-seed-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ((steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.fuzz-one-compile.outcome == 'skipped' && steps.fuzz-one-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-one.outcome == 'skipped' && steps.fuzz-one-diagnostic.outcome == 'skipped') || (steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two-compile.outcome == 'skipped' && steps.fuzz-two-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two.outcome == 'skipped' && steps.fuzz-two-diagnostic.outcome == 'skipped') || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three-compile.outcome == 'skipped' && steps.fuzz-three-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three.outcome == 'skipped' && steps.fuzz-three-diagnostic.outcome == 'skipped') || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four-compile.outcome == 'skipped' && steps.fuzz-four-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four.outcome == 'skipped' && steps.fuzz-four-diagnostic.outcome == 'skipped') || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-archives
+      - id: archive-seed-probe
+        if: always() && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-archives
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility && steps.archive-seed-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.archive-seed-context.outputs.seed-lookup-key != '' && ((steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.fuzz-one-compile.outcome == 'skipped' && steps.fuzz-one-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-one.outcome == 'skipped' && steps.fuzz-one-diagnostic.outcome == 'skipped') || (steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two-compile.outcome == 'skipped' && steps.fuzz-two-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two.outcome == 'skipped' && steps.fuzz-two-diagnostic.outcome == 'skipped') || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three-compile.outcome == 'skipped' && steps.fuzz-three-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three.outcome == 'skipped' && steps.fuzz-three-diagnostic.outcome == 'skipped') || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four-compile.outcome == 'skipped' && steps.fuzz-four-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four.outcome == 'skipped' && steps.fuzz-four-diagnostic.outcome == 'skipped') || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-archives
+      - id: index-snapshot-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ((steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.fuzz-one-compile.outcome == 'skipped' && steps.fuzz-one-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-one.outcome == 'skipped' && steps.fuzz-one-diagnostic.outcome == 'skipped') || (steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two-compile.outcome == 'skipped' && steps.fuzz-two-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two.outcome == 'skipped' && steps.fuzz-two-diagnostic.outcome == 'skipped') || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three-compile.outcome == 'skipped' && steps.fuzz-three-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three.outcome == 'skipped' && steps.fuzz-three-diagnostic.outcome == 'skipped') || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four-compile.outcome == 'skipped' && steps.fuzz-four-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four.outcome == 'skipped' && steps.fuzz-four-diagnostic.outcome == 'skipped') || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-index
+      - id: index-snapshot-probe
+        if: always() && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-index
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility && steps.index-snapshot-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.index-snapshot-context.outputs.seed-lookup-key != '' && ((steps.prepare-fuzz.outputs.cache-quiescent || steps.prepare-fuzz-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.fuzz-one-compile.outcome == 'skipped' && steps.fuzz-one-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-one-compile.outputs.cache-quiescent || steps.fuzz-one-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-one.outcome == 'skipped' && steps.fuzz-one-diagnostic.outcome == 'skipped') || (steps.fuzz-one.outputs.cache-quiescent || steps.fuzz-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two-compile.outcome == 'skipped' && steps.fuzz-two-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-two-compile.outputs.cache-quiescent || steps.fuzz-two-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-two.outcome == 'skipped' && steps.fuzz-two-diagnostic.outcome == 'skipped') || (steps.fuzz-two.outputs.cache-quiescent || steps.fuzz-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three-compile.outcome == 'skipped' && steps.fuzz-three-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-three-compile.outputs.cache-quiescent || steps.fuzz-three-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-three.outcome == 'skipped' && steps.fuzz-three-diagnostic.outcome == 'skipped') || (steps.fuzz-three.outputs.cache-quiescent || steps.fuzz-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four-compile.outcome == 'skipped' && steps.fuzz-four-compile-diagnostic.outcome == 'skipped') || (steps.fuzz-four-compile.outputs.cache-quiescent || steps.fuzz-four-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.fuzz-four.outcome == 'skipped' && steps.fuzz-four-diagnostic.outcome == 'skipped') || (steps.fuzz-four.outputs.cache-quiescent || steps.fuzz-four-diagnostic.outputs.cache-quiescent) == 'true'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-index
   stress:
     name: stress / ${{ matrix.id }}
     needs: performance-plan
@@ -514,7 +927,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose stress --shard complete
-      - if: always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
+      - if: always() && success() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -604,7 +1017,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose stress-packages --shard complete
-      - if: always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
+      - if: always() && success() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -706,7 +1119,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose stress-lifecycle --shard complete
-      - if: always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
+      - if: always() && success() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && steps.stress-run.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

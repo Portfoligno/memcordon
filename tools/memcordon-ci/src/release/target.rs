@@ -387,289 +387,298 @@ pub fn build_selected_with_failure(
             .checked_add(Duration::from_secs(140 * 60))
             .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?
     };
-    distribution.validate()?;
-    if distribution.target != super::distribution::native_target()? {
-        return Err(CiError::Message(
-            "selected payload target is not native".into(),
-        ));
-    }
-    let toolchain = crate::config::toolchains(root)?.stable;
-    let rustc = crate::command::CommandSpec::toolchain_program(
-        "rustup",
-        root,
-        &toolchain,
-        "rustc",
-        Duration::from_secs(60),
-    )
-    .arg("-vV")
-    .bounded_until(operation_deadline)
-    .phase(crate::command::CiPhase::ProductBuild)
-    .selection(selected, Some(&distribution.target))
-    .output_quiet()?;
-    if !rustc.status.success()
-        || !std::str::from_utf8(&rustc.stdout).ok().is_some_and(|text| {
-            text.lines()
-                .any(|line| line.strip_prefix("host: ") == Some(distribution.target.as_str()))
-        })
-    {
-        return Err(CiError::Message(
-            "selected compiler host differs from native release target".into(),
-        ));
-    }
-    let product = root.join("target/ci-build/product");
-    let mut command = rustup_cargo(
-        root,
-        &toolchain,
-        [
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "memcordon",
-            "--target-dir",
-        ],
-        Duration::from_secs(1800),
-    )
-    .arg(&product)
-    .arg("--target")
-    .arg(&distribution.target);
-    for feature in &distribution.features {
-        command = command.arg("--features").arg(feature);
-    }
-    for binary in &distribution.binaries {
-        command = command.arg("--bin").arg(binary);
-    }
-    let command = command
+    crate::preparation::with_operation(failure_mode, operation_deadline, || {
+        distribution.validate()?;
+        if distribution.target != super::distribution::native_target()? {
+            return Err(CiError::Message(
+                "selected payload target is not native".into(),
+            ));
+        }
+        let toolchain = crate::config::toolchains(root)?.stable;
+        let rustc = crate::command::CommandSpec::toolchain_program(
+            "rustup",
+            root,
+            &toolchain,
+            "rustc",
+            Duration::from_secs(60),
+        )
+        .arg("-vV")
         .bounded_until(operation_deadline)
         .phase(crate::command::CiPhase::ProductBuild)
-        .selection(selected, Some(&distribution.target));
-    let mut phases = crate::native_test_plan::commands_with_failure(true, failure_mode).into_iter();
-    let compile = phases.next().expect("native compile phase");
-    let allocation = crate::native_test_plan::build_allocation(
-        std::thread::available_parallelism().map_or(1, usize::from),
-    );
-    let product_jobs = allocation.product_jobs.to_string();
-    let test_jobs = allocation.native_jobs.to_string();
-    crate::preparation::complete_lanes_with_failure(
-        allocation.layout,
-        failure_mode,
-        || command.arg("--jobs").arg(product_jobs).run().map(|_| ()),
-        || {
-            rustup_cargo(root, &toolchain, ["test"], compile.deadline)
-                .args(compile.arguments)
-                .arg("--jobs")
-                .arg(test_jobs)
-                .bounded_until(operation_deadline)
-                .phase(crate::command::CiPhase::NativeCompile)
-                .selection(selected, Some(&distribution.target))
-                .run()
-                .map(|_| ())
-        },
-    )?;
-    for phase in phases {
-        let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
-            crate::command::CiPhase::NativeCompile
-        } else {
-            crate::command::CiPhase::NativeExecute
-        };
-        rustup_cargo(root, &toolchain, ["test"], phase.deadline)
-            .args(phase.arguments)
+        .selection(selected, Some(&distribution.target))
+        .output_quiet()?;
+        if !rustc.status.success()
+            || !std::str::from_utf8(&rustc.stdout).ok().is_some_and(|text| {
+                text.lines()
+                    .any(|line| line.strip_prefix("host: ") == Some(distribution.target.as_str()))
+            })
+        {
+            return Err(CiError::Message(
+                "selected compiler host differs from native release target".into(),
+            ));
+        }
+        let product = root.join("target/ci-build/product");
+        let mut command = rustup_cargo(
+            root,
+            &toolchain,
+            [
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "memcordon",
+                "--target-dir",
+            ],
+            Duration::from_secs(1800),
+        )
+        .arg(&product)
+        .arg("--target")
+        .arg(&distribution.target);
+        for feature in &distribution.features {
+            command = command.arg("--features").arg(feature);
+        }
+        for binary in &distribution.binaries {
+            command = command.arg("--bin").arg(binary);
+        }
+        let command = command
             .bounded_until(operation_deadline)
-            .phase(diagnostic_phase)
+            .phase(crate::command::CiPhase::ProductBuild)
+            .selection(selected, Some(&distribution.target));
+        let mut phases =
+            crate::native_test_plan::commands_with_failure(true, failure_mode).into_iter();
+        let compile = phases.next().expect("native compile phase");
+        let allocation = crate::native_test_plan::build_allocation(
+            std::thread::available_parallelism().map_or(1, usize::from),
+        );
+        let product_jobs = allocation.product_jobs.to_string();
+        let test_jobs = allocation.native_jobs.to_string();
+        crate::preparation::complete_lanes_with_allocation(
+            allocation.layout,
+            failure_mode,
+            [allocation.product_jobs, allocation.native_jobs],
+            || command.arg("--jobs").arg(product_jobs).run().map(|_| ()),
+            || {
+                rustup_cargo(root, &toolchain, ["test"], compile.deadline)
+                    .args(compile.arguments)
+                    .arg("--jobs")
+                    .arg(test_jobs)
+                    .bounded_until(operation_deadline)
+                    .phase(crate::command::CiPhase::NativeCompile)
+                    .selection(selected, Some(&distribution.target))
+                    .run()
+                    .map(|_| ())
+            },
+        )?;
+        for phase in phases {
+            let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
+                crate::command::CiPhase::NativeCompile
+            } else {
+                crate::command::CiPhase::NativeExecute
+            };
+            rustup_cargo(root, &toolchain, ["test"], phase.deadline)
+                .args(phase.arguments)
+                .bounded_until(operation_deadline)
+                .phase(diagnostic_phase)
+                .selection(selected, Some(&distribution.target))
+                .run()?;
+        }
+        let backend = if distribution.target.contains("linux") {
+            "backend-linux-cgroup"
+        } else if matches!(
+            distribution.target.as_str(),
+            "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
+        ) {
+            "backend-windows-job"
+        } else {
+            "backend-macos-watchdog"
+        };
+        // Backend suites own stateful supervision/cleanup and deliberately reject
+        // diagnostic continuation. The selected mode governs compilation and native
+        // Cargo tests above; these existing owners retain their stop boundary.
+        crate::command::CommandSpec::new(std::env::current_exe()?, root, Duration::from_secs(3600))
+            .args(["suite", backend])
+            .args(["--failure-mode", "stop-after-failure"])
+            .bounded_until(operation_deadline)
+            .phase(crate::command::CiPhase::NativeExecute)
             .selection(selected, Some(&distribution.target))
             .run()?;
-    }
-    let backend = if distribution.target.contains("linux") {
-        "backend-linux-cgroup"
-    } else if matches!(
-        distribution.target.as_str(),
-        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
-    ) {
-        "backend-windows-job"
-    } else {
-        "backend-macos-watchdog"
-    };
-    crate::command::CommandSpec::new(std::env::current_exe()?, root, Duration::from_secs(3600))
-        .args(["suite", backend])
-        .bounded_until(operation_deadline)
-        .phase(crate::command::CiPhase::NativeExecute)
-        .selection(selected, Some(&distribution.target))
-        .run()?;
-    selected.recheck(root)?;
-    if destination.exists() {
-        return Err(CiError::Message(
-            "target output requires fresh destination".into(),
-        ));
-    }
-    let mut members = BTreeMap::new();
-    let mut executable_names = BTreeSet::new();
-    let mut components = Vec::new();
-    for binary in &distribution.binaries {
-        let filename = binary_name(binary, &distribution.target);
-        let bytes = artifacts::read_file(
-            &product
-                .join(&distribution.target)
-                .join("release")
-                .join(&filename),
-        )?;
-        validate_executable(&bytes, &distribution.target)?;
-        let role = match binary.as_str() {
-            "memcordon" => RuntimeComponentRole::PublicCli,
-            "memcordon-sealed-agent" => RuntimeComponentRole::SealedAgent,
-            "memcordon-target-desktop-bootstrap" => RuntimeComponentRole::DesktopBootstrap,
-            "memcordon-session-broker" => RuntimeComponentRole::SessionBroker,
-            _ => return Err(CiError::Message("unexpected production binary".into())),
-        };
-        components.push(runtime_component(role, filename.clone(), &bytes));
-        executable_names.insert(filename.clone());
-        members.insert(filename, bytes);
-    }
-    let runtime = distribution.runtime_selection()?;
-    let manifest = if runtime == super::distribution::RuntimeSelection::CliOnly {
-        RuntimeManifest::cli_only(
-            selected.version().to_string(),
-            selected.commit().to_owned(),
-            distribution.target.clone(),
-            components,
-        )
-    } else if runtime == super::distribution::RuntimeSelection::WindowsSealed {
-        RuntimeManifest::windows(
-            selected.version().to_string(),
-            selected.commit().to_owned(),
-            distribution.target.clone(),
-            components,
-        )
-    } else if runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp {
-        RuntimeManifest::linux_combined(
-            selected.version().to_string(),
-            selected.commit().to_owned(),
-            distribution.target.clone(),
-            components,
-        )
-    } else {
-        RuntimeManifest::linux_selected(
-            selected.version().to_string(),
-            selected.commit().to_owned(),
-            distribution.target.clone(),
-            components,
-            runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp,
-        )
-    }
-    .map_err(CiError::Message)?;
-    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    manifest_bytes.push(b'\n');
-    members.insert("runtime-manifest.json".into(), manifest_bytes);
-    if !distribution.units.is_empty() {
-        let directory = unit_export_directory(Path::new("/tmp"))?;
-        crate::command::CommandSpec::new(
-            product
-                .join(&distribution.target)
-                .join("release")
-                .join("memcordon-sealed-agent"),
-            root,
-            Duration::from_secs(30),
-        )
-        .args(["__export-unit-files"])
-        .arg(directory.path())
-        .bounded_until(operation_deadline)
-        .phase(crate::command::CiPhase::ProductBuild)
-        .selection(selected, Some(&distribution.target))
-        .run()?;
-        for unit in &distribution.units {
-            members.insert(
-                unit.clone(),
-                artifacts::read_file(&directory.path().join(unit))?,
-            );
+        selected.recheck(root)?;
+        if destination.exists() {
+            return Err(CiError::Message(
+                "target output requires fresh destination".into(),
+            ));
         }
-    }
-    let package = super::compatibility::NativePackage::measured(selected, distribution, &members)?;
-    let mut package_bytes = serde_json::to_vec_pretty(&package)?;
-    package_bytes.push(b'\n');
-    members.insert("package.json".into(), package_bytes);
-    let archive_bytes = encode_archive(&distribution.target, &members, &executable_names)?;
-    let name = format!(
-        "memcordon-{}-{}.{}",
-        selected.version(),
-        distribution.target,
-        if distribution.target.contains("windows") {
-            "zip"
+        let mut members = BTreeMap::new();
+        let mut executable_names = BTreeSet::new();
+        let mut components = Vec::new();
+        for binary in &distribution.binaries {
+            let filename = binary_name(binary, &distribution.target);
+            let bytes = artifacts::read_file(
+                &product
+                    .join(&distribution.target)
+                    .join("release")
+                    .join(&filename),
+            )?;
+            validate_executable(&bytes, &distribution.target)?;
+            let role = match binary.as_str() {
+                "memcordon" => RuntimeComponentRole::PublicCli,
+                "memcordon-sealed-agent" => RuntimeComponentRole::SealedAgent,
+                "memcordon-target-desktop-bootstrap" => RuntimeComponentRole::DesktopBootstrap,
+                "memcordon-session-broker" => RuntimeComponentRole::SessionBroker,
+                _ => return Err(CiError::Message("unexpected production binary".into())),
+            };
+            components.push(runtime_component(role, filename.clone(), &bytes));
+            executable_names.insert(filename.clone());
+            members.insert(filename, bytes);
+        }
+        let runtime = distribution.runtime_selection()?;
+        let manifest = if runtime == super::distribution::RuntimeSelection::CliOnly {
+            RuntimeManifest::cli_only(
+                selected.version().to_string(),
+                selected.commit().to_owned(),
+                distribution.target.clone(),
+                components,
+            )
+        } else if runtime == super::distribution::RuntimeSelection::WindowsSealed {
+            RuntimeManifest::windows(
+                selected.version().to_string(),
+                selected.commit().to_owned(),
+                distribution.target.clone(),
+                components,
+            )
+        } else if runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp {
+            RuntimeManifest::linux_combined(
+                selected.version().to_string(),
+                selected.commit().to_owned(),
+                distribution.target.clone(),
+                components,
+            )
         } else {
-            "tar.gz"
+            RuntimeManifest::linux_selected(
+                selected.version().to_string(),
+                selected.commit().to_owned(),
+                distribution.target.clone(),
+                components,
+                runtime == super::distribution::RuntimeSelection::LinuxPrivateTcp,
+            )
         }
-    );
-    let records = members
-        .iter()
-        .map(|(name, bytes)| FileRecord {
-            name: name.clone(),
-            kind: if executable_names.contains(name) {
-                "executable"
-            } else {
-                "runtime-data"
+        .map_err(CiError::Message)?;
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        manifest_bytes.push(b'\n');
+        members.insert("runtime-manifest.json".into(), manifest_bytes);
+        if !distribution.units.is_empty() {
+            let directory = unit_export_directory(Path::new("/tmp"))?;
+            crate::command::CommandSpec::new(
+                product
+                    .join(&distribution.target)
+                    .join("release")
+                    .join("memcordon-sealed-agent"),
+                root,
+                Duration::from_secs(30),
+            )
+            .args(["__export-unit-files"])
+            .arg(directory.path())
+            .bounded_until(operation_deadline)
+            .phase(crate::command::CiPhase::ProductBuild)
+            .selection(selected, Some(&distribution.target))
+            .run()?;
+            for unit in &distribution.units {
+                members.insert(
+                    unit.clone(),
+                    artifacts::read_file(&directory.path().join(unit))?,
+                );
             }
-            .into(),
+        }
+        let package =
+            super::compatibility::NativePackage::measured(selected, distribution, &members)?;
+        let mut package_bytes = serde_json::to_vec_pretty(&package)?;
+        package_bytes.push(b'\n');
+        members.insert("package.json".into(), package_bytes);
+        let archive_bytes = encode_archive(&distribution.target, &members, &executable_names)?;
+        let name = format!(
+            "memcordon-{}-{}.{}",
+            selected.version(),
+            distribution.target,
+            if distribution.target.contains("windows") {
+                "zip"
+            } else {
+                "tar.gz"
+            }
+        );
+        let records = members
+            .iter()
+            .map(|(name, bytes)| FileRecord {
+                name: name.clone(),
+                kind: if executable_names.contains(name) {
+                    "executable"
+                } else {
+                    "runtime-data"
+                }
+                .into(),
+                target: Some(distribution.target.clone()),
+                package: None,
+                byte_len: bytes.len() as u64,
+                sha256: artifacts::checksum(bytes),
+            })
+            .collect();
+        let archive = FileRecord {
+            name,
+            kind: "archive".into(),
             target: Some(distribution.target.clone()),
             package: None,
-            byte_len: bytes.len() as u64,
-            sha256: artifacts::checksum(bytes),
-        })
-        .collect();
-    let archive = FileRecord {
-        name,
-        kind: "archive".into(),
-        target: Some(distribution.target.clone()),
-        package: None,
-        byte_len: archive_bytes.len() as u64,
-        sha256: artifacts::checksum(&archive_bytes),
-    };
-    fs::create_dir_all(destination)?;
-    fs::write(destination.join(&archive.name), archive_bytes)?;
-    let fixture_name = binary_name("memcordon-test-fixture", &distribution.target);
-    let fixture_bytes =
-        artifacts::read_file(&root.join("target/ci/native/release").join(&fixture_name))?;
-    validate_executable(&fixture_bytes, &distribution.target)?;
-    fs::write(destination.join(&fixture_name), &fixture_bytes)?;
-    let fixture = FileRecord {
-        name: fixture_name,
-        kind: "fixture".into(),
-        target: Some(distribution.target.clone()),
-        package: None,
-        byte_len: fixture_bytes.len() as u64,
-        sha256: artifacts::checksum(&fixture_bytes),
-    };
-    source::write_json(
-        &destination.join("target.json"),
-        &TargetBundle {
-            format: "memcordon.target".into(),
-            revision: 1,
-            source: selected.clone(),
-            distribution: distribution.clone(),
-            archive,
-            members: records,
-            fixture,
-        },
-    )?;
-    TargetBundle::load(destination)?;
-    if consumer_readiness
-        && matches!(
-            distribution.target.as_str(),
-            "x86_64-unknown-linux-gnu"
-                | "aarch64-unknown-linux-gnu"
-                | "x86_64-pc-windows-msvc"
-                | "aarch64-pc-windows-msvc"
-        )
-    {
-        super::native_component_harness::build_original_roles(
-            root,
-            selected,
-            &distribution.target,
-            &root.join(".release/native-components"),
-            operation_deadline,
+            byte_len: archive_bytes.len() as u64,
+            sha256: artifacts::checksum(&archive_bytes),
+        };
+        fs::create_dir_all(destination)?;
+        fs::write(destination.join(&archive.name), archive_bytes)?;
+        let fixture_name = binary_name("memcordon-test-fixture", &distribution.target);
+        let fixture_bytes =
+            artifacts::read_file(&root.join("target/ci/native/release").join(&fixture_name))?;
+        validate_executable(&fixture_bytes, &distribution.target)?;
+        fs::write(destination.join(&fixture_name), &fixture_bytes)?;
+        let fixture = FileRecord {
+            name: fixture_name,
+            kind: "fixture".into(),
+            target: Some(distribution.target.clone()),
+            package: None,
+            byte_len: fixture_bytes.len() as u64,
+            sha256: artifacts::checksum(&fixture_bytes),
+        };
+        source::write_json(
+            &destination.join("target.json"),
+            &TargetBundle {
+                format: "memcordon.target".into(),
+                revision: 1,
+                source: selected.clone(),
+                distribution: distribution.clone(),
+                archive,
+                members: records,
+                fixture,
+            },
         )?;
-    }
-    if std::time::Instant::now() >= operation_deadline {
-        return Err(CiError::Message(
-            "native operation deadline exhausted during archive assembly".into(),
-        ));
-    }
-    Ok(())
+        TargetBundle::load(destination)?;
+        if consumer_readiness
+            && matches!(
+                distribution.target.as_str(),
+                "x86_64-unknown-linux-gnu"
+                    | "aarch64-unknown-linux-gnu"
+                    | "x86_64-pc-windows-msvc"
+                    | "aarch64-pc-windows-msvc"
+            )
+        {
+            super::native_component_harness::build_original_roles(
+                root,
+                selected,
+                &distribution.target,
+                &root.join(".release/native-components"),
+                operation_deadline,
+            )?;
+        }
+        if std::time::Instant::now() >= operation_deadline {
+            return Err(CiError::Message(
+                "native operation deadline exhausted during archive assembly".into(),
+            ));
+        }
+        Ok(())
+    })
 }

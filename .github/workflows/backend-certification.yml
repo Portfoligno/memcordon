@@ -107,7 +107,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard combined
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
+      - if: always() && success() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -209,7 +209,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard native
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
+      - if: always() && success() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -311,7 +311,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard acceptance
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
+      - if: always() && success() && steps.context.outputs.compiled-cache-usable == 'true' && steps.native.outputs.cache-quiescent == 'true' && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -403,7 +403,7 @@ jobs:
       - id: context
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete --partition native-tests
       - id: products
         continue-on-error: true
         if: steps.context.outputs.compiled-cache-usable == 'true'
@@ -414,13 +414,34 @@ jobs:
           restore-keys: ${{ steps.context.outputs.product-restore-prefix }}
       - name: Sanitize products discard restore
         if: steps.products.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode discard --partition native-tests
       - name: Sanitize products exact restore
         if: steps.products.outcome == 'success' && steps.products.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode exact --partition native-tests
       - name: Sanitize products compatible restore
         if: steps.products.outcome == 'success' && steps.products.outputs.cache-matched-key != '' && steps.products.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode compatible --partition native-tests
+      - id: context-product
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete --partition product
+      - id: products-product
+        continue-on-error: true
+        if: steps.context-product.outputs.compiled-cache-usable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.context-product.outputs.product-paths }}
+          key: ${{ steps.context-product.outputs.product-key }}
+          restore-keys: ${{ steps.context-product.outputs.product-restore-prefix }}
+      - name: Sanitize products discard restore
+        if: steps.products-product.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode discard --partition product
+      - name: Sanitize products exact restore
+        if: steps.products-product.outcome == 'success' && steps.products-product.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode exact --partition product
+      - name: Sanitize products compatible restore
+        if: steps.products-product.outcome == 'success' && steps.products-product.outputs.cache-matched-key != '' && steps.products-product.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose windows-working --shard complete --mode compatible --partition product
       - id: build
         run: ./target/ci/release/memcordon-ci release working-windows-prepare
       - uses: ./.github/actions/upload-artifact
@@ -432,13 +453,24 @@ jobs:
         if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete
-      - if: always() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.context.outputs.product-key
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete --partition native-tests
+      - if: always() && success() && steps.context.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products.outputs.cache-primary-key != '' && steps.products-save-context.outcome == 'success' && steps.products-save-context.outputs.product-key == steps.context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.context.outputs.product-paths }}
           key: ${{ steps.products.outputs.cache-primary-key }}
+      - id: products-save-context-product
+        if: always() && steps.context-product.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products-product.outputs.cache-hit != 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose windows-working --shard complete --partition product
+      - if: always() && success() && steps.context-product.outputs.compiled-cache-usable == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.products-product.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.products-product.outputs.cache-primary-key != '' && steps.products-save-context-product.outcome == 'success' && steps.products-save-context-product.outputs.product-key == steps.context-product.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.context-product.outputs.product-paths }}
+          key: ${{ steps.products-product.outputs.cache-primary-key }}
       - if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.build.outputs.cache-quiescent == 'true' && steps.sources.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.sources.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -605,7 +637,7 @@ jobs:
       - id: private-context
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition native-tests
       - id: private-compiled
         if: steps.private-context.outputs.compiled-cache-usable == 'true'
         continue-on-error: true
@@ -615,25 +647,85 @@ jobs:
           key: ${{ steps.private-context.outputs.product-key }}
           restore-keys: ${{ steps.private-context.outputs.product-restore-prefix }}
       - if: steps.private-compiled.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode discard --partition native-tests
       - if: steps.private-compiled.outcome == 'success' && steps.private-compiled.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode exact --partition native-tests
       - if: steps.private-compiled.outcome == 'success' && steps.private-compiled.outputs.cache-matched-key != '' && steps.private-compiled.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode compatible --partition native-tests
+      - id: private-context-product
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition product
+      - id: private-compiled-product
+        if: steps.private-context-product.outputs.compiled-cache-usable == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.private-context-product.outputs.product-paths }}
+          key: ${{ steps.private-context-product.outputs.product-key }}
+          restore-keys: ${{ steps.private-context-product.outputs.product-restore-prefix }}
+      - if: steps.private-compiled-product.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode discard --partition product
+      - if: steps.private-compiled-product.outcome == 'success' && steps.private-compiled-product.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode exact --partition product
+      - if: steps.private-compiled-product.outcome == 'success' && steps.private-compiled-product.outputs.cache-matched-key != '' && steps.private-compiled-product.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode compatible --partition product
+      - id: private-context-private-native-tests
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition private-native-tests
+      - id: private-compiled-private-native-tests
+        if: steps.private-context-private-native-tests.outputs.compiled-cache-usable == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.private-context-private-native-tests.outputs.product-paths }}
+          key: ${{ steps.private-context-private-native-tests.outputs.product-key }}
+          restore-keys: ${{ steps.private-context-private-native-tests.outputs.product-restore-prefix }}
+      - if: steps.private-compiled-private-native-tests.outcome == 'failure'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode discard --partition private-native-tests
+      - if: steps.private-compiled-private-native-tests.outcome == 'success' && steps.private-compiled-private-native-tests.outputs.cache-hit == 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode exact --partition private-native-tests
+      - if: steps.private-compiled-private-native-tests.outcome == 'success' && steps.private-compiled-private-native-tests.outputs.cache-matched-key != '' && steps.private-compiled-private-native-tests.outputs.cache-hit != 'true'
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose private --shard complete --mode compatible --partition private-native-tests
       - id: private-run
         run: ./target/ci/release/memcordon-ci suite backend-linux-private
       - id: private-save-context
         if: always() && steps.private-run.outputs.cache-quiescent == 'true'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition native-tests
       - name: Save settled private compilation
-        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-save-context.outcome == 'success' && steps.private-save-context.outputs.product-key == steps.private-context.outputs.product-key && steps.private-compiled.outputs.cache-primary-key != '' && steps.private-compiled.outputs.cache-hit != 'true'
+        if: always() && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-save-context.outcome == 'success' && steps.private-save-context.outputs.product-key == steps.private-context.outputs.product-key && steps.private-compiled.outputs.cache-primary-key != '' && steps.private-compiled.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.private-context.outputs.product-paths }}
           key: ${{ steps.private-compiled.outputs.cache-primary-key }}
+      - id: private-save-context-product
+        if: always() && steps.private-run.outputs.cache-quiescent == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition product
+      - name: Save settled private compilation
+        if: always() && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-save-context-product.outcome == 'success' && steps.private-save-context-product.outputs.product-key == steps.private-context-product.outputs.product-key && steps.private-compiled-product.outputs.cache-primary-key != '' && steps.private-compiled-product.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.private-context-product.outputs.product-paths }}
+          key: ${{ steps.private-compiled-product.outputs.cache-primary-key }}
+      - id: private-save-context-private-native-tests
+        if: always() && steps.private-run.outputs.cache-quiescent == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose private --shard complete --partition private-native-tests
+      - name: Save settled private compilation
+        if: always() && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.private-run.outputs.cache-quiescent == 'true' && steps.private-save-context-private-native-tests.outcome == 'success' && steps.private-save-context-private-native-tests.outputs.product-key == steps.private-context-private-native-tests.outputs.product-key && steps.private-compiled-private-native-tests.outputs.cache-primary-key != '' && steps.private-compiled-private-native-tests.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ steps.private-context-private-native-tests.outputs.product-paths }}
+          key: ${{ steps.private-compiled-private-native-tests.outputs.cache-primary-key }}
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
@@ -725,7 +817,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
-      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
+      - if: always() && success() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -804,7 +896,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
-      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
+      - if: always() && success() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -883,7 +975,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose backend --shard complete
-      - if: always() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
+      - if: always() && success() && steps.backend-context.outputs.compiled-cache-usable == 'true' && steps.backend-run.outputs.cache-quiescent == 'true' && steps.backend-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.backend-compiled.outputs.cache-primary-key != '' && steps.backend-compiled-save-context.outcome == 'success' && steps.backend-compiled-save-context.outputs.product-key == steps.backend-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

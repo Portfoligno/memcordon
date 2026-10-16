@@ -135,13 +135,18 @@ jobs:
         run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose quality --shard complete --mode compatible
       - name: Run quality suite
         id: quality-run
-        run: ./target/ci/release/memcordon-ci suite quality
+        if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite quality --failure-mode stop-after-failure
+      - name: Run quality suite
+        id: quality-run-diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite quality --failure-mode collect-all
       - id: quality-compiled-save-context
-        if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality-run.outputs.cache-quiescent == 'true' && steps.quality-compiled.outputs.cache-hit != 'true'
+        if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && (steps.quality-run.outputs.cache-quiescent || steps.quality-run-diagnostic.outputs.cache-quiescent) == 'true' && steps.quality-compiled.outputs.cache-hit != 'true'
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose quality --shard complete
-      - if: always() && steps.quality-context.outputs.compiled-cache-usable == 'true' && steps.quality-run.outputs.cache-quiescent == 'true' && steps.quality-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.quality-compiled.outputs.cache-primary-key != '' && steps.quality-compiled-save-context.outcome == 'success' && steps.quality-compiled-save-context.outputs.product-key == steps.quality-context.outputs.product-key
+      - if: always() && success() && steps.quality-context.outputs.compiled-cache-usable == 'true' && (steps.quality-run.outputs.cache-quiescent || steps.quality-run-diagnostic.outputs.cache-quiescent) == 'true' && steps.quality-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.quality-compiled.outputs.cache-primary-key != '' && steps.quality-compiled-save-context.outcome == 'success' && steps.quality-compiled-save-context.outputs.product-key == steps.quality-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -149,7 +154,7 @@ jobs:
           key: ${{ steps.quality-compiled.outputs.cache-primary-key }}
       - name: Save Cargo sources
         continue-on-error: true
-        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.quality-deps.outputs.cache-hit != 'true' && (steps.quality-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.quality-deps.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.quality-deps.outputs.cache-hit != 'true' && ((steps.quality-run.outputs.cache-quiescent || steps.quality-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.quality-deps.outputs.cache-primary-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -157,11 +162,11 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.quality-deps.outputs.cache-primary-key }}
       - id: workspace-download-save-context
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.quality-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.quality-run.outputs.cache-quiescent || steps.quality-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
       - name: Save complete workspace downloads
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.quality-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.quality-run.outputs.cache-quiescent || steps.quality-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -230,13 +235,18 @@ jobs:
         run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose msrv --shard complete --mode compatible
       - name: Run MSRV suite
         id: msrv-run
-        run: ./target/ci/release/memcordon-ci suite msrv
+        if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite msrv --failure-mode stop-after-failure
+      - name: Run MSRV suite
+        id: msrv-run-diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite msrv --failure-mode collect-all
       - id: msrv-compiled-save-context
-        if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv-run.outputs.cache-quiescent == 'true' && steps.msrv-compiled.outputs.cache-hit != 'true'
+        if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && (steps.msrv-run.outputs.cache-quiescent || steps.msrv-run-diagnostic.outputs.cache-quiescent) == 'true' && steps.msrv-compiled.outputs.cache-hit != 'true'
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose msrv --shard complete
-      - if: always() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && steps.msrv-run.outputs.cache-quiescent == 'true' && steps.msrv-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.msrv-compiled.outputs.cache-primary-key != '' && steps.msrv-compiled-save-context.outcome == 'success' && steps.msrv-compiled-save-context.outputs.product-key == steps.msrv-context.outputs.product-key
+      - if: always() && success() && steps.msrv-context.outputs.compiled-cache-usable == 'true' && (steps.msrv-run.outputs.cache-quiescent || steps.msrv-run-diagnostic.outputs.cache-quiescent) == 'true' && steps.msrv-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.msrv-compiled.outputs.cache-primary-key != '' && steps.msrv-compiled-save-context.outcome == 'success' && steps.msrv-compiled-save-context.outputs.product-key == steps.msrv-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -244,7 +254,7 @@ jobs:
           key: ${{ steps.msrv-compiled.outputs.cache-primary-key }}
       - name: Save Cargo sources
         continue-on-error: true
-        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.msrv-deps.outputs.cache-hit != 'true' && (steps.msrv-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.msrv-deps.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.msrv-deps.outputs.cache-hit != 'true' && ((steps.msrv-run.outputs.cache-quiescent || steps.msrv-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.msrv-deps.outputs.cache-primary-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -252,11 +262,11 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.msrv-deps.outputs.cache-primary-key }}
       - id: workspace-download-save-context
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.msrv-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.msrv-run.outputs.cache-quiescent || steps.msrv-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
       - name: Save complete workspace downloads
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.msrv-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.msrv-run.outputs.cache-quiescent || steps.msrv-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -298,6 +308,30 @@ jobs:
           path: ${{ steps.workspace-download-context.outputs.source-paths }}
           key: ${{ steps.workspace-download-context.outputs.source-key }}
           restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: archive-seed-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-archives
+      - id: archive-seed-restore
+        if: steps.archive-seed-context.outputs.seed-lookup-key != '' && steps.workspace-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.archive-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.archive-seed-context.outputs.seed-import-path }}
+      - if: steps.archive-seed-restore.outcome == 'success' && steps.archive-seed-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-archives
+      - id: index-snapshot-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-index
+      - id: index-snapshot-restore
+        if: steps.index-snapshot-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.index-snapshot-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.index-snapshot-context.outputs.seed-import-path }}
+      - if: steps.index-snapshot-restore.outcome == 'success' && steps.index-snapshot-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-index
       - id: workspace-fetch
         run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: supply-context
@@ -330,6 +364,7 @@ jobs:
         with:
           path: ${{ steps.cache-cargo-audit.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-audit.outputs.tool-build-key }}
+          restore-keys: ${{ steps.cache-cargo-audit.outputs.tool-build-restore-prefix }}
       - id: cache-cargo-deny
         timeout-minutes: 2
         continue-on-error: true
@@ -356,12 +391,18 @@ jobs:
         with:
           path: ${{ steps.cache-cargo-deny.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-deny.outputs.tool-build-key }}
+          restore-keys: ${{ steps.cache-cargo-deny.outputs.tool-build-restore-prefix }}
       - name: Run supply-chain suite
         id: supply-run
-        run: ./target/ci/release/memcordon-ci suite supply-chain
+        if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite supply-chain --failure-mode stop-after-failure
+      - name: Run supply-chain suite
+        id: supply-run-diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
+        run: ./target/ci/release/memcordon-ci suite supply-chain --failure-mode collect-all
       - name: Save Cargo sources
         continue-on-error: true
-        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.supply-deps.outputs.cache-hit != 'true' && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.supply-deps.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-download-context.outputs.bootstrap-home-matches == 'true' && steps.supply-deps.outputs.cache-hit != 'true' && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.supply-deps.outputs.cache-primary-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -369,11 +410,11 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.supply-deps.outputs.cache-primary-key }}
       - id: workspace-download-save-context
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != ''
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci download-cache-context --family workspace
       - name: Save complete workspace downloads
-        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
+        if: always() && steps.workspace-downloads.outputs.cache-hit != 'true' && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.workspace-downloads.outputs.cache-primary-key != '' && steps.workspace-download-save-context.outcome == 'success' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-download-context.outputs.source-key && steps.workspace-fetch.outputs.cache-quiescent == 'true' && steps.workspace-fetch.outputs.workspace-downloads-populated == 'true' && steps.workspace-download-save-context.outputs.source-key == steps.workspace-fetch.outputs.workspace-downloads-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -381,57 +422,97 @@ jobs:
           key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
       - id: cache-cargo-audit-save-context
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true')
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose cargo-audit --shard complete
       - name: Save cache-cargo-audit-binary
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-binary.outputs.cache-primary-key != '' && steps.cache-cargo-audit-binary.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-key == steps.cache-cargo-audit.outputs.tool-key
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-binary.outputs.cache-primary-key != '' && steps.cache-cargo-audit-binary.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-key == steps.cache-cargo-audit.outputs.tool-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-audit.outputs.tool-path }}
           key: ${{ steps.cache-cargo-audit-binary.outputs.cache-primary-key }}
       - name: Save cargo-audit downloads
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-audit-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.source-key == steps.cache-cargo-audit.outputs.source-key && steps.supply-run.outputs.download-cargo-audit-populated == 'true' && steps.cache-cargo-audit-save-context.outputs.source-key == steps.supply-run.outputs.download-cargo-audit-key
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-audit-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.source-key == steps.cache-cargo-audit.outputs.source-key && (steps.supply-run.outputs.download-cargo-audit-populated || steps.supply-run-diagnostic.outputs.download-cargo-audit-populated) == 'true' && steps.cache-cargo-audit-save-context.outputs.source-key == (steps.supply-run.outputs.download-cargo-audit-key || steps.supply-run-diagnostic.outputs.download-cargo-audit-key)
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-audit.outputs.source-paths }}
           key: ${{ steps.cache-cargo-audit-downloads.outputs.cache-primary-key }}
       - name: Save cache-cargo-audit-build
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-build.outputs.cache-primary-key != '' && steps.cache-cargo-audit-build.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-build-key == steps.cache-cargo-audit.outputs.tool-build-key
+        if: always() && success() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-audit-build.outputs.cache-primary-key != '' && steps.cache-cargo-audit-build.outputs.cache-hit != 'true' && steps.cache-cargo-audit-save-context.outcome == 'success' && steps.cache-cargo-audit-save-context.outputs.tool-build-key == steps.cache-cargo-audit.outputs.tool-build-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-audit.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-audit-build.outputs.cache-primary-key }}
       - id: cache-cargo-deny-save-context
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true')
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose cargo-deny --shard complete
       - name: Save cache-cargo-deny-binary
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-binary.outputs.cache-primary-key != '' && steps.cache-cargo-deny-binary.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-key == steps.cache-cargo-deny.outputs.tool-key
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-binary.outputs.cache-primary-key != '' && steps.cache-cargo-deny-binary.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-key == steps.cache-cargo-deny.outputs.tool-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-deny.outputs.tool-path }}
           key: ${{ steps.cache-cargo-deny-binary.outputs.cache-primary-key }}
       - name: Save cargo-deny downloads
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-deny-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.source-key == steps.cache-cargo-deny.outputs.source-key && steps.supply-run.outputs.download-cargo-deny-populated == 'true' && steps.cache-cargo-deny-save-context.outputs.source-key == steps.supply-run.outputs.download-cargo-deny-key
+        if: always() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-downloads.outputs.cache-primary-key != '' && steps.cache-cargo-deny-downloads.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.source-key == steps.cache-cargo-deny.outputs.source-key && (steps.supply-run.outputs.download-cargo-deny-populated || steps.supply-run-diagnostic.outputs.download-cargo-deny-populated) == 'true' && steps.cache-cargo-deny-save-context.outputs.source-key == (steps.supply-run.outputs.download-cargo-deny-key || steps.supply-run-diagnostic.outputs.download-cargo-deny-key)
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-deny.outputs.source-paths }}
           key: ${{ steps.cache-cargo-deny-downloads.outputs.cache-primary-key }}
       - name: Save cache-cargo-deny-build
-        if: always() && (steps.supply-run.outputs.cache-quiescent == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-build.outputs.cache-primary-key != '' && steps.cache-cargo-deny-build.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-build-key == steps.cache-cargo-deny.outputs.tool-build-key
+        if: always() && success() && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.cache-cargo-deny-build.outputs.cache-primary-key != '' && steps.cache-cargo-deny-build.outputs.cache-hit != 'true' && steps.cache-cargo-deny-save-context.outcome == 'success' && steps.cache-cargo-deny-save-context.outputs.tool-build-key == steps.cache-cargo-deny.outputs.tool-build-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.cache-cargo-deny.outputs.tool-build-path }}
           key: ${{ steps.cache-cargo-deny-build.outputs.cache-primary-key }}
+      - id: archive-seed-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-archives
+      - id: archive-seed-probe
+        if: always() && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-archives
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility && steps.archive-seed-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.archive-seed-context.outputs.seed-lookup-key != '' && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-archives
+      - id: index-snapshot-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-index
+      - id: index-snapshot-probe
+        if: always() && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-index
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility && steps.index-snapshot-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.index-snapshot-context.outputs.seed-lookup-key != '' && ((steps.supply-run.outputs.cache-quiescent || steps.supply-run-diagnostic.outputs.cache-quiescent) == 'true')
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-index
   native:
     if: github.event.deleted != true
     name: native / ${{ matrix.id }}
@@ -452,8 +533,8 @@ jobs:
           - id: windows-arm64
             runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
-    # The job budget covers driver compilation, cache setup, and native tests.
-    timeout-minutes: 60
+    # Includes bounded compilation snapshot transfer before native execution.
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -486,12 +567,36 @@ jobs:
           path: ${{ steps.workspace-download-context.outputs.source-paths }}
           key: ${{ steps.workspace-download-context.outputs.source-key }}
           restore-keys: ${{ steps.workspace-download-context.outputs.source-restore-prefix }}
+      - id: archive-seed-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-archives
+      - id: archive-seed-restore
+        if: steps.archive-seed-context.outputs.seed-lookup-key != '' && steps.workspace-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.archive-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.archive-seed-context.outputs.seed-import-path }}
+      - if: steps.archive-seed-restore.outcome == 'success' && steps.archive-seed-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-archives
+      - id: index-snapshot-context
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind registry-index
+      - id: index-snapshot-restore
+        if: steps.index-snapshot-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.index-snapshot-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.index-snapshot-context.outputs.seed-import-path }}
+      - if: steps.index-snapshot-restore.outcome == 'success' && steps.index-snapshot-restore.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind registry-index
       - id: workspace-fetch
         run: ./target/ci/release/memcordon-ci ci fetch-downloads --family workspace
       - id: compiled-context
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete --partition native-tests
       - id: compiled
         continue-on-error: true
         if: steps.compiled-context.outputs.compiled-cache-usable == 'true'
@@ -502,13 +607,13 @@ jobs:
           restore-keys: ${{ steps.compiled-context.outputs.product-restore-prefix }}
       - name: Sanitize compiled discard restore
         if: steps.compiled.outcome == 'failure'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode discard
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode discard --partition native-tests
       - name: Sanitize compiled exact restore
         if: steps.compiled.outcome == 'success' && steps.compiled.outputs.cache-hit == 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode exact
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode exact --partition native-tests
       - name: Sanitize compiled compatible restore
         if: steps.compiled.outcome == 'success' && steps.compiled.outputs.cache-matched-key != '' && steps.compiled.outputs.cache-hit != 'true'
-        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode compatible
+        run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-debug --shard complete --mode compatible --partition native-tests
       - id: auxiliary-context
         timeout-minutes: 2
         continue-on-error: true
@@ -527,32 +632,67 @@ jobs:
         run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-auxiliary --shard complete --mode exact
       - if: steps.auxiliary-compiled.outcome == 'success' && steps.auxiliary-compiled.outputs.cache-matched-key != '' && steps.auxiliary-compiled.outputs.cache-hit != 'true'
         run: ./target/ci/release/memcordon-ci ci prepare-restored-cache --purpose native-auxiliary --shard complete --mode compatible
+      - id: native-seed-context
+        if: steps.compiled-context.outputs.product-key != '' && steps.compiled.outputs.cache-matched-key == ''
+        run: ./target/ci/release/memcordon-ci ci seed-context --kind compiled --purpose native-debug --partition native-tests --shard complete
+      - id: native-seed
+        if: steps.native-seed-context.outputs.seed-lookup-key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.native-seed-context.outputs.seed-lookup-key }}
+          restore-keys: ${{ steps.native-seed-context.outputs.seed-restore-prefix }}
+          path: ${{ steps.native-seed-context.outputs.seed-import-path }}
+      - if: steps.native-seed.outcome == 'success' && steps.native-seed.outputs.cache-matched-key != ''
+        run: ./target/ci/release/memcordon-ci ci import-cache-snapshot --kind compiled --purpose native-debug --partition native-tests --shard complete
+      - id: native-compile
+        run: ./target/ci/release/memcordon-ci suite native-compile
+      - id: native-build-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.native-compile.outputs.cache-quiescent == 'true'
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind compiled --purpose native-debug --partition native-tests --shard complete --stage build
+      - id: native-build-probe
+        if: always() && steps.native-build-snapshot.outputs.snapshot-ready == 'true' && steps.native-build-snapshot.outputs.input-key == steps.compiled-context.outputs.product-key
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.native-build-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.native-build-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Retain settled native compilation
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.native-build-snapshot.outputs.snapshot-ready == 'true' && steps.native-build-snapshot.outputs.input-key == steps.compiled-context.outputs.product-key && steps.native-build-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.native-build-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.native-build-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.native-compile.outputs.cache-quiescent == 'true'
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind compiled --purpose native-debug --partition native-tests --shard complete
       - name: Run native suite
         id: native-run
         if: github.event_name != 'workflow_dispatch' || inputs.failure-mode != 'collect-all'
-        run: ./target/ci/release/memcordon-ci suite native
+        run: ./target/ci/release/memcordon-ci suite native-execute
       - name: Collect all native diagnostic failures
         id: native-diagnostic
         if: github.event_name == 'workflow_dispatch' && inputs.failure-mode == 'collect-all'
-        run: ./target/ci/release/memcordon-ci suite native --failure-mode collect-all
+        run: ./target/ci/release/memcordon-ci suite native-execute --failure-mode collect-all
       - id: compiled-save-context
         if: always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true'
         timeout-minutes: 2
         continue-on-error: true
-        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete
+        run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-debug --shard complete --partition native-tests
       - id: auxiliary-save-context
         continue-on-error: true
         if: always() && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true')
         timeout-minutes: 2
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save
       - name: Save settled auxiliary compilation
-        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true') && steps.auxiliary-save-context.outcome == 'success' && steps.auxiliary-save-context.outputs.payload-ready == 'true' && steps.auxiliary-save-context.outputs.product-key == steps.auxiliary-context.outputs.product-key && steps.auxiliary-compiled.outputs.cache-primary-key != '' && steps.auxiliary-compiled.outputs.cache-hit != 'true'
+        if: always() && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true') && steps.auxiliary-save-context.outcome == 'success' && steps.auxiliary-save-context.outputs.payload-ready == 'true' && steps.auxiliary-save-context.outputs.product-key == steps.auxiliary-context.outputs.product-key && steps.auxiliary-compiled.outputs.cache-primary-key != '' && steps.auxiliary-compiled.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ steps.auxiliary-context.outputs.product-paths }}
           key: ${{ steps.auxiliary-compiled.outputs.cache-primary-key }}
-      - if: always() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
+      - if: always() && success() && steps.compiled-context.outputs.compiled-cache-usable == 'true' && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true') && steps.compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.compiled.outputs.cache-primary-key != '' && steps.compiled-save-context.outcome == 'success' && steps.compiled-save-context.outputs.product-key == steps.compiled-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -579,6 +719,46 @@ jobs:
           path: ${{ steps.workspace-download-context.outputs.source-paths }}
           key: ${{ steps.workspace-downloads.outputs.cache-primary-key }}
 
+      - id: archive-seed-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true' || (steps.native-compile.outputs.cache-quiescent == 'true' && steps.native-run.outcome == 'skipped' && steps.native-diagnostic.outcome == 'skipped'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-archives
+      - id: archive-seed-probe
+        if: always() && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-archives
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.archive-seed-snapshot.outputs.snapshot-ready == 'true' && steps.archive-seed-snapshot.outputs.seed-compatibility == steps.archive-seed-context.outputs.seed-compatibility && steps.archive-seed-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.archive-seed-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.archive-seed-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.archive-seed-context.outputs.seed-lookup-key != '' && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true' || (steps.native-compile.outputs.cache-quiescent == 'true' && steps.native-run.outcome == 'skipped' && steps.native-diagnostic.outcome == 'skipped'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-archives
+      - id: index-snapshot-snapshot
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true' || (steps.native-compile.outputs.cache-quiescent == 'true' && steps.native-run.outcome == 'skipped' && steps.native-diagnostic.outcome == 'skipped'))
+        run: ./target/ci/release/memcordon-ci ci cache-snapshot --kind registry-index
+      - id: index-snapshot-probe
+        if: always() && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+          lookup-only: true
+      - name: Save observed registry-index
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.index-snapshot-snapshot.outputs.snapshot-ready == 'true' && steps.index-snapshot-snapshot.outputs.seed-compatibility == steps.index-snapshot-context.outputs.seed-compatibility && steps.index-snapshot-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.index-snapshot-snapshot.outputs.snapshot-key }}
+          path: ${{ steps.index-snapshot-snapshot.outputs.snapshot-path }}
+      - if: always() && steps.index-snapshot-context.outputs.seed-lookup-key != '' && (steps.native-run.outputs.cache-quiescent == 'true' || steps.native-diagnostic.outputs.cache-quiescent == 'true' || (steps.native-compile.outputs.cache-quiescent == 'true' && steps.native-run.outcome == 'skipped' && steps.native-diagnostic.outcome == 'skipped'))
+        run: ./target/ci/release/memcordon-ci ci cleanup-cache-snapshot --kind registry-index
   macos-deadline:
     if: github.event_name != 'push'
     name: macOS deadline / ${{ matrix.id }}
@@ -649,7 +829,7 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: ./target/ci/release/memcordon-ci ci cache-context --purpose deadline --shard complete
-      - if: always() && steps.deadline-context.outputs.compiled-cache-usable == 'true' && steps.deadline-run.outputs.cache-quiescent == 'true' && steps.deadline-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deadline-compiled.outputs.cache-primary-key != '' && steps.deadline-compiled-save-context.outcome == 'success' && steps.deadline-compiled-save-context.outputs.product-key == steps.deadline-context.outputs.product-key
+      - if: always() && success() && steps.deadline-context.outputs.compiled-cache-usable == 'true' && steps.deadline-run.outputs.cache-quiescent == 'true' && steps.deadline-compiled.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.deadline-compiled.outputs.cache-primary-key != '' && steps.deadline-compiled-save-context.outcome == 'success' && steps.deadline-compiled-save-context.outputs.product-key == steps.deadline-context.outputs.product-key
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

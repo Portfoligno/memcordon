@@ -181,8 +181,8 @@ fn default_profile_cleanup_preserves_ci_driver_and_report_siblings() {
     }
     fs::remove_dir_all(root.join("target/release")).unwrap();
     assert!(
-        cache_restore::payload_ready(root, "native-auxiliary", "complete").unwrap(),
-        "one populated profile is sufficient"
+        !cache_restore::payload_ready(root, "native-auxiliary", "complete").unwrap(),
+        "a single populated profile belongs only to a partial seed"
     );
     fs::remove_dir_all(root.join("target/debug")).unwrap();
     fs::create_dir(root.join("target/debug")).unwrap();

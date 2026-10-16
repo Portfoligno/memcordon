@@ -13,6 +13,70 @@ pub enum RestoreMode {
     Discard,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompiledPartition {
+    NativeTests,
+    Product,
+    PrivateNativeTests,
+    AuxiliaryProfiles,
+    FuzzTargets,
+    MiriTargets,
+}
+
+pub fn partition_layout(
+    purpose: &str,
+    shard: &str,
+    partition: Option<CompiledPartition>,
+) -> Result<CacheLayout> {
+    let mut selected = layout(purpose, shard)?;
+    let Some(partition) = partition else {
+        return Ok(selected);
+    };
+    let path = match partition {
+        CompiledPartition::NativeTests
+            if matches!(
+                purpose,
+                "native-debug"
+                    | "native-release"
+                    | "native-readiness"
+                    | "windows-working"
+                    | "private"
+            ) =>
+        {
+            "target/ci/native"
+        }
+        CompiledPartition::Product
+            if matches!(
+                purpose,
+                "native-release" | "native-readiness" | "windows-working" | "private"
+            ) =>
+        {
+            "target/ci-build/product"
+        }
+        CompiledPartition::PrivateNativeTests if purpose == "private" => {
+            "target/ci-build/private-native-tests"
+        }
+        CompiledPartition::AuxiliaryProfiles if purpose == "native-auxiliary" => {
+            return Ok(selected);
+        }
+        CompiledPartition::FuzzTargets if purpose == "fuzz" => "fuzz/target",
+        CompiledPartition::MiriTargets if purpose == "miri" => {
+            selected.revision = 6;
+            return Ok(selected);
+        }
+        _ => {
+            return Err(CiError::Message(
+                "cache partition does not belong to purpose".into(),
+            ));
+        }
+    };
+    selected.directories = vec![path.into()];
+    selected.cargo_targets = selected.directories.clone();
+    selected.revision = 6;
+    Ok(selected)
+}
+
 /// Transport members are distinct from recursively disposable directories.
 #[derive(Clone, Debug)]
 pub struct CacheLayout {
@@ -52,7 +116,16 @@ pub fn layout(purpose: &str, shard: &str) -> Result<CacheLayout> {
 }
 
 pub fn payload_ready(root: &Path, purpose: &str, shard: &str) -> Result<bool> {
-    let layout = layout(purpose, shard)?;
+    partition_payload_ready(root, purpose, shard, None)
+}
+
+pub fn partition_payload_ready(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    partition: Option<CompiledPartition>,
+) -> Result<bool> {
+    let layout = partition_layout(purpose, shard, partition)?;
     let targets = layout
         .directories
         .iter()
@@ -64,13 +137,18 @@ pub fn payload_ready(root: &Path, purpose: &str, shard: &str) -> Result<bool> {
         }
     }
     let locks = settled_locks(&targets)?;
-    let populated = targets.iter().any(|path| {
+    let populated_profile = |path: &PathBuf| {
         walkdir::WalkDir::new(path)
             .follow_links(false)
             .into_iter()
             .filter_map(std::result::Result::ok)
             .any(|entry| entry.file_type().is_file() && entry.file_name() != ".cargo-lock")
-    });
+    };
+    let populated = if purpose == "native-auxiliary" {
+        targets.iter().all(populated_profile)
+    } else {
+        targets.iter().any(populated_profile)
+    };
     drop(locks);
     Ok(populated)
 }
@@ -91,6 +169,10 @@ pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
         }
         ("miri", "first") => &["target/ci/miri-first"],
         ("miri", "second") => &["target/ci/miri-second"],
+        ("miri", "quarter-one") => &["target/ci/miri-quarter-one"],
+        ("miri", "quarter-two") => &["target/ci/miri-quarter-two"],
+        ("miri", "quarter-three") => &["target/ci/miri-quarter-three"],
+        ("miri", "quarter-four") => &["target/ci/miri-quarter-four"],
         ("miri", "complete") => &["target/ci/miri-first", "target/ci/miri-second"],
         ("fuzz", "complete") => &["fuzz/target"],
         (
@@ -121,7 +203,7 @@ pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
     Ok(paths.iter().map(PathBuf::from).collect())
 }
 
-fn safe_root(repository: &Path, relative: &Path) -> Result<PathBuf> {
+pub(crate) fn safe_root(repository: &Path, relative: &Path) -> Result<PathBuf> {
     let repository = repository.canonicalize()?;
     let mut path = repository.clone();
     for component in relative.components() {
@@ -188,7 +270,7 @@ fn safe_root(repository: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
+pub(crate) fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
     let mut locks = Vec::new();
     for target in targets {
         if !target.try_exists()? {
@@ -218,7 +300,7 @@ fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
     Ok(locks)
 }
 
-fn cargo_marker_present(target: &Path) -> Result<bool> {
+pub(crate) fn cargo_marker_present(target: &Path) -> Result<bool> {
     use std::io::Read;
     const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
     let marker = target.join("CACHEDIR.TAG");
@@ -273,8 +355,18 @@ fn cargo_marker_present(target: &Path) -> Result<bool> {
 }
 
 pub fn prepare(root: &Path, purpose: &str, shard: &str, mode: RestoreMode) -> Result<()> {
+    prepare_partition(root, purpose, shard, None, mode)
+}
+
+pub fn prepare_partition(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    partition: Option<CompiledPartition>,
+    mode: RestoreMode,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5 * 60);
-    let layout = layout(purpose, shard)?;
+    let layout = partition_layout(purpose, shard, partition)?;
     // Validate every root before making the first mutation.
     let targets: Vec<_> = layout
         .directories

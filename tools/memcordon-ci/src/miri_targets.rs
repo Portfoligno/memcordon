@@ -26,10 +26,50 @@ pub fn plan_shard(
     package_name: &str,
     shard: MiriShard,
 ) -> Result<Vec<MiriTarget>> {
+    plan_partition(metadata, package_name, shard.spec())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiriQuarter {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+impl MiriQuarter {
+    pub fn spec(self) -> crate::target_shard::ShardSpec {
+        let ordinal = match self {
+            Self::One => 0,
+            Self::Two => 1,
+            Self::Three => 2,
+            Self::Four => 3,
+        };
+        crate::target_shard::ShardSpec::new(
+            ordinal,
+            std::num::NonZeroUsize::new(4).expect("nonzero partition"),
+        )
+        .expect("valid four-way partition")
+    }
+}
+
+pub fn plan_quarter(
+    metadata: &[u8],
+    package_name: &str,
+    quarter: MiriQuarter,
+) -> Result<Vec<MiriTarget>> {
+    plan_partition(metadata, package_name, quarter.spec())
+}
+
+pub fn plan_partition(
+    metadata: &[u8],
+    package_name: &str,
+    partition: crate::target_shard::ShardSpec,
+) -> Result<Vec<MiriTarget>> {
     let targets: Vec<_> = plan(metadata, package_name)?
         .into_iter()
         .enumerate()
-        .filter_map(|(ordinal, target)| shard.spec().selects(ordinal).then_some(target))
+        .filter_map(|(ordinal, target)| partition.selects(ordinal).then_some(target))
         .collect();
     if targets.is_empty() {
         return Err(CiError::Message(

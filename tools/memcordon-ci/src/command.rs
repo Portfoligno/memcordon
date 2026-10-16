@@ -34,9 +34,18 @@ pub struct CommandSpec {
     phase: Option<CiPhase>,
     selection: Option<serde_json::Value>,
     isolated_cargo_home: Option<PathBuf>,
+    miri_sysroot: Option<PathBuf>,
     clear_environment: bool,
     output_limit: usize,
     defer_group_failure: bool,
+    peer_stop_policy: Option<PeerStopPolicy>,
+}
+
+/// Reviewed native ownership behavior when an independent peer fails.
+#[derive(Clone, Copy, Debug)]
+pub enum PeerStopPolicy {
+    CancelAndSettle,
+    FinishOwnedPhase,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,9 +109,11 @@ impl CommandSpec {
             phase: None,
             selection: None,
             isolated_cargo_home: None,
+            miri_sysroot: None,
             clear_environment: false,
             output_limit: 16 * 1024 * 1024,
             defer_group_failure: false,
+            peer_stop_policy: None,
         }
     }
 
@@ -148,6 +159,11 @@ impl CommandSpec {
         self
     }
 
+    pub fn peer_stop_policy(mut self, policy: PeerStopPolicy) -> Self {
+        self.peer_stop_policy = Some(policy);
+        self
+    }
+
     pub fn bounded_until(mut self, deadline: Instant) -> Self {
         self.operation_deadline = Some(deadline);
         self
@@ -168,7 +184,15 @@ impl CommandSpec {
     }
 
     fn available_budget(&self) -> Result<Duration> {
-        match self.operation_deadline {
+        if crate::preparation::active_group().is_some_and(|group| !group.may_start()) {
+            return Err(CiError::NotStartedAfterFailure);
+        }
+        let deadline = match (self.operation_deadline, crate::preparation::active_group()) {
+            (Some(deadline), Some(group)) => Some(deadline.min(group.deadline())),
+            (None, Some(group)) => Some(group.deadline()),
+            (deadline, None) => deadline,
+        };
+        match deadline {
             Some(deadline) => remaining_budget(
                 self.deadline,
                 deadline.saturating_duration_since(Instant::now()),
@@ -192,9 +216,17 @@ impl CommandSpec {
         self
     }
 
+    pub fn miri_sysroot(mut self, root: &Path) -> Self {
+        self.miri_sysroot = Some(root.to_path_buf());
+        self
+    }
+
     pub fn apply_environment(&self, command: &mut Command) {
         if self.clear_environment {
             command.env_clear();
+        }
+        if let Some(root) = &self.miri_sysroot {
+            command.env("MIRI_SYSROOT", root);
         }
         if let Some(home) = &self.isolated_cargo_home {
             for (name, _) in std::env::vars_os() {
@@ -284,8 +316,82 @@ impl CommandSpec {
             }
             None => {}
         }
-        command.args(&self.arguments).current_dir(&self.current_dir);
+        let mut arguments = self.arguments.clone();
+        if matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+            && arguments.first().is_some_and(|argument| {
+                matches!(
+                    argument.to_str(),
+                    Some("build" | "check" | "clippy" | "rustdoc" | "test" | "install")
+                )
+            })
+            && let Some(group) = crate::preparation::active_group()
+        {
+            let mut selected = false;
+            let mut index = 0;
+            while index < arguments.len() {
+                if arguments[index] == "--" {
+                    break;
+                }
+                if let Some(count) = arguments[index].to_str().and_then(|text| {
+                    text.strip_prefix("--jobs=")
+                        .or_else(|| text.strip_prefix("-j").filter(|suffix| !suffix.is_empty()))
+                }) {
+                    let count = count
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| *count > 0)
+                        .ok_or_else(|| {
+                            CiError::Message("Cargo jobs must be a positive typed count".into())
+                        })?;
+                    arguments[index] = OsString::from("--jobs");
+                    arguments.insert(
+                        index + 1,
+                        count.min(group.compiler_jobs()).to_string().into(),
+                    );
+                    selected = true;
+                }
+                if arguments[index] == "--jobs" || arguments[index] == "-j" {
+                    let jobs = arguments
+                        .get_mut(index + 1)
+                        .ok_or_else(|| CiError::Message("Cargo job argument is missing".into()))?;
+                    let count = jobs
+                        .to_str()
+                        .and_then(|text| text.parse::<usize>().ok())
+                        .filter(|count| *count > 0)
+                        .ok_or_else(|| {
+                            CiError::Message("Cargo jobs must be a positive typed count".into())
+                        })?;
+                    *jobs = count.min(group.compiler_jobs()).to_string().into();
+                    selected = true;
+                    index += 1;
+                }
+                index += 1;
+            }
+            if !selected {
+                let index = arguments
+                    .iter()
+                    .position(|argument| argument == "--")
+                    .unwrap_or(arguments.len());
+                arguments.splice(
+                    index..index,
+                    [
+                        OsString::from("--jobs"),
+                        group.compiler_jobs().to_string().into(),
+                    ],
+                );
+            }
+        }
+        command.args(&arguments).current_dir(&self.current_dir);
         self.apply_environment(&mut command);
+        if matches!(&self.toolchain,
+            Some(ToolchainInvocation::Program { executable, .. })
+                if executable.file_name().is_some_and(|name| matches!(name.to_str(), Some("cargo-fuzz" | "cargo-fuzz.exe"))))
+            && let Some(group) = crate::preparation::active_group()
+        {
+            // cargo-fuzz owns its Cargo invocation; use Cargo's standard compiler
+            // limit without altering the fuzz campaign or harness arguments.
+            command.env("CARGO_BUILD_JOBS", group.compiler_jobs().to_string());
+        }
         Ok(command)
     }
 
@@ -492,6 +598,14 @@ impl CommandSpec {
             };
             let mut value = serde_json::json!({"phase": phase.name(), "state": state, "program": self.program.to_string_lossy(), "arguments": self.arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>(), "toolchain": format!("{:?}", self.toolchain), "original-budget-ms": self.deadline.as_millis(), "available-budget-ms": observed_budget.as_millis(), "elapsed-ms": started.elapsed().as_millis()});
             value["selection"] = self.selection.clone().unwrap_or(serde_json::Value::Null);
+            if let Some(group) = &group {
+                let (failure, stop, elapsed) = group.timing();
+                value["operation-timing"] = serde_json::json!({
+                    "first-failure-observed-us": failure,
+                    "peer-stop-requested-us": stop,
+                    "owner-observed-us": elapsed,
+                });
+            }
             if let Some(result) = result {
                 match result {
                     Ok(output) => {
@@ -605,7 +719,12 @@ impl CommandSpec {
             || matches!(&self.toolchain,
                 Some(ToolchainInvocation::Program { executable, .. })
                 if executable.file_name().is_some_and(|name| matches!(name.to_str(), Some("cargo-audit" | "cargo-audit.exe" | "cargo-deny" | "cargo-deny.exe"))));
-        let cancellation = if ordinary {
+        let cancel_safe = match self.peer_stop_policy {
+            Some(PeerStopPolicy::CancelAndSettle) => true,
+            Some(PeerStopPolicy::FinishOwnedPhase) => false,
+            None => ordinary,
+        };
+        let cancellation = if cancel_safe {
             group.as_ref().map(|group| group.requested.clone())
         } else {
             None
@@ -711,12 +830,21 @@ impl CommandSpec {
                     sender,
                     omitted: omitted.clone(),
                 });
-                let result = memcordon_testkit::run_with_deadline_controlled_output_limit(
+                let failure = if self.defer_group_failure {
+                    None
+                } else {
+                    group.clone().map(|group| {
+                        std::sync::Arc::new(move || group.request_after_failure())
+                            as std::sync::Arc<dyn Fn() + Send + Sync>
+                    })
+                };
+                let result = memcordon_testkit::run_with_deadline_notified_output_limit(
                     command,
                     budget,
                     self.output_limit,
                     cancellation,
                     progress,
+                    failure,
                 );
                 done.store(true, std::sync::atomic::Ordering::Release);
                 // Incomplete reader settlement cannot keep the logger waiting for
@@ -734,6 +862,37 @@ impl CommandSpec {
             && let Some(group) = &group
         {
             group.request_after_failure();
+        }
+        if let (Err(error), Some(group)) = (&result, &group) {
+            use memcordon_testkit::ProcessTestError;
+            let unsettled = match error {
+                ProcessTestError::Wait(_) | ProcessTestError::Output(_) => true,
+                ProcessTestError::Callback {
+                    cleanup,
+                    capture_complete,
+                    ..
+                } => cleanup.is_err() || !capture_complete,
+                ProcessTestError::OutputLimit { cleanup, .. } => cleanup.is_err(),
+                ProcessTestError::Timeout {
+                    cleanup,
+                    observation,
+                    ..
+                } => cleanup.is_err() || !observation.callback_completed,
+                ProcessTestError::Cancelled {
+                    cleanup,
+                    observation,
+                    ..
+                } => {
+                    cleanup.is_err()
+                        || !observation.callback_completed
+                        || !observation.stdout_reader_finished
+                        || !observation.stderr_reader_finished
+                }
+                ProcessTestError::Spawn(_) => false,
+            };
+            if unsettled {
+                group.close_admission();
+            }
         }
         let state = if result.as_ref().is_ok_and(|output| output.status.success()) {
             "completed"

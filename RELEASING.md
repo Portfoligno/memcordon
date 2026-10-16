@@ -76,7 +76,9 @@ Native Cargo execution stops scheduling test executables after a failure by
 default. Local `suite native --failure-mode collect-all` retains diagnostic
 execution and still returns failure. Applicable suite and target commands expose
 the same typed failure choice. Automated Miri/fuzz matrices stop peer shards;
-manual matrices retain all shards. Native and publication jobs retain their own
+manual matrices retain all shards only when `collect-all` is selected. Deep CI
+manual runs default to `collect-all`; CI and Release default to
+`stop-after-failure`. Native and publication jobs retain their own
 cleanup and original deadlines. Publication's shared concurrency group never
 cancels an active publisher.
 
@@ -130,13 +132,28 @@ Creation produces an unsigned annotated tag and verifies its local object.
 Push transfers only that recorded tag without force. A failed or ambiguous push
 must be reconciled against the same object and reference before another effect.
 
-The workflow fans out from source selection to packages, source checks, both Miri
-halves, both Fuzz halves and six native producers. Each installed consumer uses its
+The workflow fans out from source selection to packages, source checks, four Miri
+quarters, four Fuzz quarters and six native producers. Legacy local half and full
+suites retain their original selection. Each installed consumer uses its
 own target's archive and the exact packaged crates. Windows native and Cargo
 channels run on separate fresh hosts; Linux and macOS channels complete teardown
 before the next channel starts. Assembly waits for every required successful leaf.
 The credentialed publisher consumes the prepared bytes and publication executable
 without a checkout, Cargo build or compilation cache.
+
+Selection retains source, package, version, policy and release-note checks without
+restoring or fetching the complete Workspace download family. Each real consumer
+still acquires its own required sources. Cache saves use the selected failure-mode
+branch's actual settlement and acquisition outputs.
+
+Action transfers remain serial until the pinned actions and full workflow parser
+pass a controlled runner trial of background/wait/parallel support. The paused CI
+loop supplies no such execution evidence. A future rollout must cap concurrent
+cache transfers at two and target downloads at three, join before output use or
+sanitation, and preserve exact artifact IDs and disjoint destinations. No hosted
+timing or queue improvement is claimed by local workflow tests. Existing Backend
+host-mutating operations retain their original owner and do not expose unsupported
+collect-all dispatch behavior.
 
 Assembly is followed by `Release rehearsal` for both candidates and tagged
 preparation. Selection builds the separate unpublished
