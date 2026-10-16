@@ -1,5 +1,7 @@
 use memcordon_readiness_verifier::windows_acceptance::validate_policy_refusal_mutation;
 use serde_json::{Value, json};
+#[path = "support/capability_extinction.rs"]
+mod capability_extinction;
 #[path = "support/persisted_case.rs"]
 mod persisted_actor_support;
 
@@ -174,6 +176,7 @@ fn persist_actor_effect(
         recovery_invocation: None,
         recovery_exit: None,
         recovery_stderr: None,
+        extinction_recovery: None,
         control_worker_site: None,
         control_worker_held: None,
     };
@@ -341,8 +344,147 @@ fn persist_actor_late_effect(
             "recovery-exit.json",
             &json!({"format":"memcordon.windows-component-recovery-exit","revision":1,"invocation_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&command).unwrap()),"stdout_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&recovery).unwrap()),"stderr_sha256":memcordon_readiness_verifier::sha256(b""),"native_status":1}),
         ));
+        let held = read(case, actor.held_before.as_ref().unwrap());
+        let deadline = read(case, &actor.settlement_deadline);
+        let mut staging = command.clone();
+        staging.as_object_mut().unwrap().remove("native_target");
+        staging["format"] = json!("memcordon.windows-capability-extinction-staging-command");
+        staging["source_commit"] = json!(case.index.source_commit);
+        staging["provider"] = provider.clone();
+        staging["original_cleanup_deadline_unix_millis"] =
+            deadline["cleanup_deadline_unix_millis"].clone();
+        staging["argv_utf16"] = json!(
+            ["windows-recover", "converge", "1000"]
+                .map(|value| value.encode_utf16().collect::<Vec<_>>())
+        );
+        let inventory = json!({"schema_version":1,"challenge":"b".repeat(64),"provider_generation":provider["generation"],
+            "current_boot_identity":"original-native-boot","executing":0,"incomplete_proof":0,"unacknowledged_outboxes":1,
+            "ack_retirement_in_progress":0,"completed_tombstones":0,"active_admissions":0,"quarantined":0});
+        let staging_invocation = put(case, "extinction-staging-invocation.json", &staging);
+        let staging_stdout = put(case, "extinction-staging.json", &inventory);
+        let staging_stderr = format!("{prefix}/extinction-staging.stderr.bin");
+        case.write(&staging_stderr, b"");
+        let staging_exit = put(
+            case,
+            "extinction-staging-exit.json",
+            &json!({"format":"memcordon.windows-capability-extinction-staging-exit","revision":1,
+            "invocation_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&staging).unwrap()),
+            "stdout_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&inventory).unwrap()),"stderr_sha256":memcordon_readiness_verifier::sha256(b""),"native_status":1}),
+        );
+        let mut terminal_command = staging.clone();
+        terminal_command["format"] = json!("memcordon.windows-failed-collection-recovery-command");
+        terminal_command["argv_utf16"] = command["argv_utf16"].clone();
+        terminal_command["held_association"] = held.clone();
+        terminal_command["certification_failure_preserved"] = json!(false);
+        let response = capability_extinction::response(attempt, nonce, digest, provider, &held);
+        let authority_bytes = response.terminal_authority_json().unwrap();
+        let terminal_authority = format!("{prefix}/extinction-terminal-authority.json");
+        case.write(&terminal_authority, authority_bytes.as_bytes());
+        let authority = memcordon_readiness_verifier::sha256(authority_bytes.as_bytes());
+        let recovered = json!({"schema_version":1,"provider_response":response,"provider_request":recovery["provider_request"],
+            "frontend_delivery":{"schema_version":1,"attempt_id":attempt,"nonce":nonce,"request_sha256":digest,"authority_sha256":authority,
+                "retired_sha256":"c".repeat(64),"retired_confirmed":true}});
+        let terminal_invocation = put(
+            case,
+            "extinction-terminal-recovery-invocation.json",
+            &terminal_command,
+        );
+        let terminal_stdout = put(case, "extinction-terminal-recovery.json", &recovered);
+        let terminal_stderr = format!("{prefix}/extinction-terminal-recovery.stderr.bin");
+        case.write(&terminal_stderr, b"");
+        let terminal_exit = put(
+            case,
+            "extinction-terminal-recovery-exit.json",
+            &json!({"format":"memcordon.windows-failed-collection-recovery-exit","revision":1,
+            "invocation_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&terminal_command).unwrap()),
+            "stdout_sha256":memcordon_readiness_verifier::sha256(&serde_json::to_vec(&recovered).unwrap()),"stderr_sha256":memcordon_readiness_verifier::sha256(b""),
+            "native_status":0,"certification_failure_preserved":false}),
+        );
+        actor.extinction_recovery =
+            Some(memcordon_readiness_verifier::ComponentExtinctionRecovery {
+                staging_invocation,
+                staging_exit,
+                staging_stdout,
+                staging_stderr,
+                terminal_invocation,
+                terminal_exit,
+                terminal_stdout,
+                terminal_authority,
+                terminal_stderr,
+            });
     }
     case.json(&actor.observation, &observation);
+}
+
+#[test]
+fn capability_extinction_requires_actual_staging_and_acknowledged_terminal_delivery() {
+    let mut case = persisted_actor_facet("postresume");
+    case.validate().unwrap();
+    let stdout = "actors/7/extinction-terminal-recovery.json";
+    let exit = "actors/7/extinction-terminal-recovery-exit.json";
+    let original = std::fs::read(case.root.path().join(stdout)).unwrap();
+    let original_exit = std::fs::read(case.root.path().join(exit)).unwrap();
+    for (field, value) in [
+        ("retired_confirmed", json!(false)),
+        ("authority_sha256", json!("d".repeat(64))),
+        ("nonce", json!("foreign-nonce")),
+    ] {
+        case.mutate(stdout, |body| body["frontend_delivery"][field] = value);
+        let digest = memcordon_readiness_verifier::sha256(
+            &std::fs::read(case.root.path().join(stdout)).unwrap(),
+        );
+        case.mutate(exit, |body| body["stdout_sha256"] = json!(digest));
+        assert!(
+            case.validate().is_err(),
+            "accepted substituted terminal delivery {field}"
+        );
+        case.write(stdout, &original);
+        case.write(exit, &original_exit);
+    }
+    let authority_path = "actors/7/extinction-terminal-authority.json";
+    let original_authority = std::fs::read(case.root.path().join(authority_path)).unwrap();
+    for pointer in [
+        "/provider_response/rejection/disposition/receipt/retirement_proof/capability_extinction/contract/kill_on_close_verified",
+        "/provider_response/rejection/disposition/receipt/retirement_proof/capability_extinction/job_holder_processes_extinct",
+        "/provider_response/rejection/disposition/receipt/retirement_proof/native_job_empty_observed",
+        "/provider_response/rejection/disposition/receipt/process_observation/final_accounting",
+    ] {
+        let mut body: Value =
+            serde_json::from_slice(&std::fs::read(case.root.path().join(stdout)).unwrap()).unwrap();
+        let flag = body.pointer_mut(pointer).unwrap();
+        *flag = flag.as_bool().map_or_else(|| json!({"total_processes_native_u32":1,"active_processes_native_u32":0,"observed_after_target_retirement":true,"counter_regression_observed":false}), |value| json!(!value));
+        let mut authority = body["provider_response"].clone();
+        authority["rejection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_failure");
+        authority["rejection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("guardian_causal_receipt");
+        let bytes = serde_json::to_vec(&authority).unwrap();
+        body["frontend_delivery"]["authority_sha256"] =
+            json!(memcordon_readiness_verifier::sha256(&bytes));
+        case.write(authority_path, &bytes);
+        case.json(stdout, &body);
+        let digest = memcordon_readiness_verifier::sha256(
+            &std::fs::read(case.root.path().join(stdout)).unwrap(),
+        );
+        case.mutate(exit, |body| body["stdout_sha256"] = json!(digest));
+        assert!(
+            case.validate().is_err(),
+            "accepted dishonest extinction fact {pointer}"
+        );
+        case.write(stdout, &original);
+        case.write(exit, &original_exit);
+        case.write(authority_path, &original_authority);
+    }
+    let staging_exit = "actors/7/extinction-staging-exit.json";
+    case.mutate(staging_exit, |body| body["native_status"] = json!(0));
+    assert!(
+        case.validate().is_err(),
+        "accepted successful staging while terminal authority remains unacknowledged"
+    );
 }
 
 fn persisted_actor_facet(facet: &str) -> persisted_actor_support::PersistedCase {

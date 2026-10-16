@@ -443,26 +443,31 @@ fn collect_context(
             continue;
         }
         if name == "CARGO_ENCODED_RUSTFLAGS" {
-            if let Ok(value) = std::env::var(&name) {
-                if let Ok(flags) = crate::cache_inputs::encoded_rustflags(&value) {
-                    if !inputs.keys().any(|key| key.starts_with("profile.")) {
-                        inputs.insert(name, serde_json::to_string(&flags)?);
-                        continue;
-                    }
+            let flags = std::env::var(&name)
+                .ok()
+                .and_then(|value| crate::cache_inputs::encoded_rustflags(&value).ok());
+            match flags {
+                Some(flags) if !inputs.keys().any(|key| key.starts_with("profile.")) => {
+                    inputs.insert(name, serde_json::to_string(&flags)?);
+                    continue;
                 }
+                _ => {}
             }
         }
         if name == "CARGO_INCREMENTAL" {
-            if let Ok(value) = std::env::var(&name) {
-                if let Ok(value) = crate::cache_inputs::incremental_setting(&value) {
+            let value = std::env::var(&name)
+                .ok()
+                .and_then(|value| crate::cache_inputs::incremental_setting(&value).ok());
+            match value {
+                Some(value)
                     if !inputs
                         .keys()
-                        .any(|key| key == "build.incremental" || key.ends_with(".incremental"))
-                    {
-                        inputs.insert(name, value.to_string());
-                        continue;
-                    }
+                        .any(|key| key == "build.incremental" || key.ends_with(".incremental")) =>
+                {
+                    inputs.insert(name, value.to_string());
+                    continue;
                 }
+                _ => {}
             }
         }
         if matches!(

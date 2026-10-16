@@ -1698,7 +1698,7 @@ jobs:
       - if: always() && steps.index-snapshot-context.outputs.seed-lookup-key != '' && ((steps.prepare.outputs.cache-quiescent || steps.prepare-diagnostic.outputs.cache-quiescent) == 'true' && ((steps.quarter-one-compile.outcome == 'skipped' && steps.quarter-one-compile-diagnostic.outcome == 'skipped') || (steps.quarter-one-compile.outputs.cache-quiescent || steps.quarter-one-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-three-compile.outcome == 'skipped' && steps.quarter-three-compile-diagnostic.outcome == 'skipped') || (steps.quarter-three-compile.outputs.cache-quiescent || steps.quarter-three-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-one.outcome == 'skipped' && steps.quarter-one-diagnostic.outcome == 'skipped') || (steps.quarter-one.outputs.cache-quiescent || steps.quarter-one-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-three.outcome == 'skipped' && steps.quarter-three-diagnostic.outcome == 'skipped') || (steps.quarter-three.outputs.cache-quiescent || steps.quarter-three-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-two-compile.outcome == 'skipped' && steps.quarter-two-compile-diagnostic.outcome == 'skipped') || (steps.quarter-two-compile.outputs.cache-quiescent || steps.quarter-two-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-four-compile.outcome == 'skipped' && steps.quarter-four-compile-diagnostic.outcome == 'skipped') || (steps.quarter-four-compile.outputs.cache-quiescent || steps.quarter-four-compile-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-two.outcome == 'skipped' && steps.quarter-two-diagnostic.outcome == 'skipped') || (steps.quarter-two.outputs.cache-quiescent || steps.quarter-two-diagnostic.outputs.cache-quiescent) == 'true') && ((steps.quarter-four.outcome == 'skipped' && steps.quarter-four-diagnostic.outcome == 'skipped') || (steps.quarter-four.outputs.cache-quiescent || steps.quarter-four-diagnostic.outputs.cache-quiescent) == 'true'))
         run: ./.release/tool/memcordon-ci ci cleanup-cache-snapshot --kind registry-index
   native-linux-x64:
-    name: native-linux-x64
+    name: ${{ matrix.producer-job }}
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -1707,6 +1707,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            producer-job: native-linux-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     outputs:
@@ -1899,13 +1900,13 @@ jobs:
           overwrite: false
 
   native-linux-arm64:
-    name: native-linux-arm64
+    name: ${{ matrix.producer-job }}
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm}]
+        include: [{target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, producer-job: native-linux-arm64}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     outputs:
@@ -1939,13 +1940,13 @@ jobs:
     steps: *native-target-steps
 
   native-windows-x64:
-    name: native-windows-x64
+    name: ${{ matrix.producer-job }}
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025}]
+        include: [{target: x86_64-pc-windows-msvc, runner: windows-2025, producer-job: native-windows-x64}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     outputs:
@@ -1953,13 +1954,13 @@ jobs:
     steps: *native-target-steps
 
   native-windows-arm64:
-    name: native-windows-arm64
+    name: ${{ matrix.producer-job }}
     needs: select
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
       fail-fast: false
       matrix:
-        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm}]
+        include: [{target: aarch64-pc-windows-msvc, runner: windows-11-arm, producer-job: native-windows-arm64}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     outputs:
@@ -1967,7 +1968,7 @@ jobs:
     steps: *native-target-steps
 
   candidate-linux-x64-native:
-    name: candidate-linux-x64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-linux-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2109,7 +2110,7 @@ jobs:
           overwrite: false
 
   candidate-linux-arm64-native:
-    name: candidate-linux-arm64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-linux-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2122,7 +2123,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-linux-x64-cargo:
-    name: candidate-linux-x64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-linux-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2135,7 +2136,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-linux-arm64-cargo:
-    name: candidate-linux-arm64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-linux-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2148,7 +2149,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-windows-x64-native:
-    name: candidate-windows-x64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-windows-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2161,7 +2162,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-windows-x64-cargo:
-    name: candidate-windows-x64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-windows-x64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2174,7 +2175,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-windows-arm64-native:
-    name: candidate-windows-arm64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-windows-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2187,7 +2188,7 @@ jobs:
     steps: *installed-target-steps
 
   candidate-windows-arm64-cargo:
-    name: candidate-windows-arm64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, packages, native-windows-arm64]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2581,7 +2582,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.registry-auth.outputs.token }}
 
   public-linux-x64-native:
-    name: public-linux-x64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: &public-readiness-condition always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'
     permissions: &public-readiness-permissions
@@ -2650,7 +2651,7 @@ jobs:
           overwrite: false
 
   public-linux-x64-cargo:
-    name: public-linux-x64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2664,7 +2665,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-linux-arm64-native:
-    name: public-linux-arm64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2678,7 +2679,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-linux-arm64-cargo:
-    name: public-linux-arm64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2692,7 +2693,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-windows-x64-native:
-    name: public-windows-x64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2706,7 +2707,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-windows-x64-cargo:
-    name: public-windows-x64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2720,7 +2721,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-windows-arm64-native:
-    name: public-windows-arm64-native
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions
@@ -2734,7 +2735,7 @@ jobs:
     steps: *public-readiness-steps
 
   public-windows-arm64-cargo:
-    name: public-windows-arm64-cargo
+    name: ${{ matrix.producer-job }}
     needs: [select, assemble, publish, recovery-inputs, recovery-publish]
     if: *public-readiness-condition
     permissions: *public-readiness-permissions

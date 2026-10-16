@@ -56,6 +56,7 @@ mod windows_pe;
 mod windows_process_observation;
 mod windows_recovery_authorization;
 mod windows_sealed;
+mod windows_startup_diagnostic;
 
 pub use error::{
     BoundarySetupFailure, BoundarySetupPhase, Error, ErrorCategory, InitialSpawnFailure,
@@ -116,7 +117,8 @@ pub use supervision::{
 };
 pub use windows_capability_owner::{
     WINDOWS_CAPABILITY_OWNER_MANIFEST_SCHEMA_VERSION, WINDOWS_CAPABILITY_OWNER_ROLE_COUNT,
-    WindowsCapabilityOwnerEntryV1, WindowsCapabilityOwnerManifestV1, WindowsCapabilityOwnerRoleV1,
+    WindowsCapabilityExtinctionProofV1, WindowsCapabilityOwnerEntryV1,
+    WindowsCapabilityOwnerManifestV1, WindowsCapabilityOwnerRoleV1, WindowsJobClosureContractV1,
 };
 pub use windows_guardian_receipt::{
     WindowsGuardianCleanupTriggerV1, WindowsGuardianReceiptBinding, WindowsGuardianReceiptV2,
@@ -195,4 +197,9 @@ pub use windows_sealed::{
     windows_certification_argument_prelude_len, windows_certification_transition_allowed,
     windows_provider_replacement_quiescence, windows_service_attestation_challenge_is_valid,
     windows_terminal_outbox_is_bound, windows_terminal_outbox_is_bound_v3,
+};
+pub use windows_startup_diagnostic::{
+    WINDOWS_LAUNCHER_STARTUP_DIAGNOSTIC_BYTES, WINDOWS_LAUNCHER_STARTUP_DIAGNOSTIC_MAX_AGE_MILLIS,
+    WindowsLauncherStartupDiagnosticV1, WindowsLauncherStartupReasonV1,
+    WindowsLauncherStartupStageV1,
 };

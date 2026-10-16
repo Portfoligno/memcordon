@@ -2342,6 +2342,109 @@ mod native {
                     record,
                 )?;
             }
+            if fault
+                == Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
+            {
+                let remaining = recovery_cutoff
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        CiError::Message("extinction staging deadline exhausted".into())
+                    })?;
+                let millis = remaining.as_millis().to_string();
+                let mut staging =
+                    crate::command::CommandSpec::new(&config.cli.path, directory, remaining)
+                        .args(["windows-recover", "converge", millis.as_str()])
+                        .materialize()?;
+                staging.env_clear();
+                let invocation = serde_json::to_vec(&serde_json::json!({
+                    "format":"memcordon.windows-capability-extinction-staging-command","revision":1,
+                    "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
+                    "provider":config.provider,"executable_sha256":config.cli.sha256,
+                    "program_utf16":staging.get_program().encode_wide().collect::<Vec<_>>(),
+                    "argv_utf16":staging.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                    "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
+                    "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
+                }))?;
+                retain(
+                    &directory.join("extinction-staging-invocation.json"),
+                    &invocation,
+                    record,
+                )?;
+                let output = memcordon_testkit::run_with_deadline_output_limit(
+                    &mut staging,
+                    remaining,
+                    256 * 1024,
+                )
+                .map_err(|error| CiError::Message(error.to_string()))?;
+                retain(
+                    &directory.join("extinction-staging.json"),
+                    &output.stdout,
+                    record,
+                )?;
+                retain(
+                    &directory.join("extinction-staging.stderr.bin"),
+                    &output.stderr,
+                    record,
+                )?;
+                retain(
+                    &directory.join("extinction-staging-exit.json"),
+                    &serde_json::to_vec(&serde_json::json!({
+                        "format":"memcordon.windows-capability-extinction-staging-exit","revision":1,
+                        "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                        "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
+                        "stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),"native_status":output.status.code()
+                    }))?,
+                    record,
+                )?;
+                let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
+                    serde_json::from_slice(&output.stdout)?;
+                if output.status.code() != Some(1)
+                    || !inventory.is_consistent()
+                    || inventory.provider_generation != config.provider.generation.as_str()
+                    || inventory.unacknowledged_outboxes != 1
+                    || inventory.incomplete_proof != 0
+                {
+                    return Err(CiError::Message(
+                        "extinction staging did not retain exact terminal authority for caller ACK"
+                            .into(),
+                    ));
+                }
+                let held = live
+                    .lock()
+                    .map_err(|_| CiError::Message("component association poisoned".into()))?
+                    .clone()
+                    .ok_or_else(|| {
+                        CiError::Message("extinction original association absent".into())
+                    })?;
+                recover_held_attempt(
+                    config,
+                    input,
+                    directory,
+                    record,
+                    &held,
+                    recovery_cutoff,
+                    "extinction-terminal-recovery",
+                    collection.is_err(),
+                    None,
+                )?;
+                let recovered: serde_json::Value = serde_json::from_slice(&read(
+                    &directory.join("extinction-terminal-recovery.json"),
+                    256 * 1024,
+                )?)?;
+                let response: memcordon_core::WindowsProviderResponseV3 = serde_json::from_value(
+                    recovered.get("provider_response").cloned().ok_or_else(|| {
+                        CiError::Message("extinction terminal response absent".into())
+                    })?,
+                )?;
+                retain(
+                    &directory.join("extinction-terminal-authority.json"),
+                    response
+                        .terminal_authority_json()
+                        .map_err(|error| CiError::Message(error.to_string()))?
+                        .as_bytes(),
+                    record,
+                )?;
+            }
             let failed_collection_recovery = if collection.is_err() {
                 let held = live
                     .lock()

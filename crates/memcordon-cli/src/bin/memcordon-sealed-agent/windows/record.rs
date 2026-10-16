@@ -79,6 +79,8 @@ pub struct WindowsAttemptRecordV1 {
     pub target_released: bool,
     pub cleanup_state: WindowsCleanupStateV1,
     pub owner_manifest: Option<memcordon_core::WindowsCapabilityOwnerManifestV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_closure_contract: Option<memcordon_core::WindowsJobClosureContractV1>,
     pub recovery_authorization: Option<memcordon_core::WindowsRecoveryAuthorizationV1>,
     pub terminal_publication_reserved: bool,
     pub terminal_seed: Option<memcordon_core::WindowsTerminalSeedV2>,
@@ -271,6 +273,7 @@ impl WindowsAttemptRecordV1 {
             target_released: false,
             cleanup_state: WindowsCleanupStateV1::default(),
             owner_manifest: None,
+            job_closure_contract: None,
             recovery_authorization: None,
             terminal_publication_reserved: false,
             terminal_seed: None,
@@ -1306,6 +1309,9 @@ impl WindowsAttemptRecordV1 {
             self.store()?;
         }
         stage_ack_tombstone(self, tombstone)?;
+        if self.job_closure_contract.is_some() {
+            retire_admission(&self.attempt_id)?;
+        }
         remove_guardian_receipt(&self.attempt_id)?;
         super::attempt_store::retire(&self.attempt_id)?;
         let _owner = super::attempt_store::PublicationGuard::acquire(&self.attempt_id)?;
@@ -1538,6 +1544,106 @@ pub fn recover() -> Result<(), String> {
     recover_until(Instant::now() + Duration::from_secs(35)).map_err(|error| error.to_string())
 }
 
+pub(super) struct StartupPendingTerminal {
+    expected_ack: Option<TerminalAckTombstoneV1>,
+    original: WindowsAttemptRecordV1,
+}
+
+pub(super) enum StartupRecoveryOutcome {
+    Clear,
+    RecoveryOnly(Vec<StartupPendingTerminal>),
+}
+
+/// Pending authenticated outboxes need the recovery listener in order to ACK.
+/// They never grant admission or make strict package cleanup succeed.
+pub(super) fn recover_for_startup() -> Result<StartupRecoveryOutcome, String> {
+    let mut pending = Vec::new();
+    reconcile_until(Instant::now() + Duration::from_secs(35), Some(&mut pending))
+        .map_err(|error| error.to_string())?;
+    Ok(if pending.is_empty() {
+        StartupRecoveryOutcome::Clear
+    } else {
+        StartupRecoveryOutcome::RecoveryOnly(pending)
+    })
+}
+
+pub(super) fn startup_outboxes_acknowledged(
+    pending: &[StartupPendingTerminal],
+) -> Result<bool, String> {
+    for original in pending {
+        let retired = &original.original;
+        let (_, replay) = replay_record(&retired.attempt_id, &retired.request_sha256)?;
+        let Some(ack) = replay.acknowledged else {
+            return Ok(false);
+        };
+        let exact = match &original.expected_ack {
+            Some(expected) => &ack == expected,
+            None => {
+                ack.retirement_complete
+                    && ack.authority_is_consistent()
+                    && ack.retired.attempt_id == retired.attempt_id
+                    && ack.retired.nonce == retired.nonce
+                    && ack.retired.request_sha256 == retired.request_sha256
+                    && ack.provider_generation == retired.provider_generation
+                    && ack.launch_incarnation == retired.launch_incarnation
+                    && ack.original_boot_id == retired.boot_identity
+                    && ack.job_identity == retired.job_identity_sha256
+                    && ack.owner_manifest_sha256
+                        == retired
+                            .owner_manifest
+                            .as_ref()
+                            .ok_or("startup original manifest absent")?
+                            .canonical_sha256()
+                            .map_err(str::to_owned)?
+                    && ack.caller_process_identity == retired.caller_process_identity
+                    && ack.caller_token_sha256 == retired.caller_token_sha256
+                    && Some(&ack.recovery_authorization) == retired.recovery_authorization.as_ref()
+            }
+        };
+        if !exact
+            || record_path(&retired.attempt_id)?
+                .try_exists()
+                .map_err(|error| error.to_string())?
+            || guardian_receipt_path(&retired.attempt_id)?
+                .try_exists()
+                .map_err(|error| error.to_string())?
+            || admissions_root()
+                .join(&retired.attempt_id)
+                .with_extension("json")
+                .try_exists()
+                .map_err(|error| error.to_string())?
+            || admissions_root()
+                .join(&retired.attempt_id)
+                .with_extension("writer.json")
+                .try_exists()
+                .map_err(|error| error.to_string())?
+            || admissions_root()
+                .join(&retired.attempt_id)
+                .with_extension("reader.json")
+                .try_exists()
+                .map_err(|error| error.to_string())?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn retain_startup_outbox(
+    pending: &mut Vec<StartupPendingTerminal>,
+    record: &WindowsAttemptRecordV1,
+) -> Result<(), String> {
+    authenticate(record, &record.attempt_id)?;
+    let retired = record.terminal_retired_receipt(&record.nonce)?;
+    let mut expected_ack = ack_tombstone_for(record, &retired)?;
+    expected_ack.retirement_complete = true;
+    pending.push(StartupPendingTerminal {
+        expected_ack: Some(expected_ack),
+        original: record.clone(),
+    });
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) enum PackageCleanupError {
     Active(String),
@@ -1572,14 +1678,38 @@ pub fn converge_package_cleanup(deadline: Instant) -> Result<(), PackageCleanupE
 }
 
 fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
+    reconcile_until(deadline, None)
+}
+
+fn reconcile_until(
+    deadline: Instant,
+    mut startup_pending: Option<&mut Vec<StartupPendingTerminal>>,
+) -> Result<(), PackageCleanupError> {
+    use memcordon_core::{
+        WindowsLauncherStartupReasonV1 as Reason, WindowsLauncherStartupStageV1 as Stage,
+    };
+    let startup = startup_pending.is_some();
+    let stage = |value| {
+        if startup {
+            super::startup_diagnostics::launcher_stage(value);
+        }
+    };
+    let blocker = |reason| {
+        if startup {
+            super::startup_diagnostics::launcher_blocker(reason);
+        }
+    };
+    stage(Stage::WriterQuarantine);
     super::attempt_store::ensure_no_quarantined_writer()?;
     let attempts = attempts_root();
     fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
     fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
     fs::create_dir_all(replay_root()).map_err(|error| error.to_string())?;
+    stage(Stage::StagedAck);
     recover_staged_ack_tombstones().map_err(PackageCleanupError::Ambiguous)?;
     fs::create_dir_all(admissions_root()).map_err(|error| error.to_string())?;
     fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
+    stage(Stage::WriterQuarantine);
     let mut ambiguous = fs::read_dir(quarantine_root())
         .map_err(|error| error.to_string())?
         .map(|entry| {
@@ -1588,6 +1718,10 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if !ambiguous.is_empty() {
+        blocker(Reason::RetainedAmbiguity);
+    }
+    stage(Stage::GuardianDirectory);
     for entry in fs::read_dir(guardian_receipts_root()).map_err(|error| error.to_string())? {
         let path = entry.map_err(|error| error.to_string())?.path();
         let parsed = (|| {
@@ -1601,6 +1735,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
             for child in fs::read_dir(&path).map_err(|error| error.to_string())? {
                 let child = child.map_err(|error| error.to_string())?;
                 if child.file_name() != std::ffi::OsStr::new("receipt.json") {
+                    blocker(Reason::UnknownGuardianChild);
                     return Err(
                         "guardian receipt directory has an unpublished or unknown child".into(),
                     );
@@ -1617,6 +1752,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                     .and_then(|()| require_empty_guardian_slot_state())
                     .and_then(|()| remove_guardian_receipt(&attempt_id));
                 if let Err(error) = retirement {
+                    blocker(Reason::RetainedAmbiguity);
                     ambiguous.push(format!(
                         "{} (guardian receipt directory remains owned: {error})",
                         path.display()
@@ -1625,6 +1761,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
             }
             Ok(_) => {}
             Err(error) => {
+                blocker(Reason::InvalidRecord);
                 // An active guardian may still hold the CREATE_NEW staging
                 // handle. Preserve its directory and all evidence in place.
                 ambiguous.push(format!(
@@ -1635,6 +1772,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
         }
     }
     for entry in fs::read_dir(admissions_root()).map_err(|error| error.to_string())? {
+        stage(Stage::ReaderAdmission);
         let entry = entry.map_err(|error| error.to_string())?;
         if entry
             .file_name()
@@ -1657,6 +1795,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                 .into_iter()
                 .any(|owner| process_identity_is_live(owner).unwrap_or(true))
             {
+                blocker(Reason::LiveReader);
                 ambiguous.push("retained reader reservation remains charged".to_owned());
             } else {
                 fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
@@ -1668,43 +1807,78 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
             .to_str()
             .and_then(|name| name.strip_suffix(".writer.json"))
         {
+            stage(Stage::WriterAdmission);
             if let Err(error) = retire_writer_admission(attempt_id, false) {
+                blocker(Reason::UnconfirmedWriter);
                 ambiguous.push(format!("writer reservation remains charged: {error}"));
             }
             continue;
         }
+        stage(Stage::OwnedAdmission);
+        if let Some(attempt_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+        {
+            let path = record_path(attempt_id)?;
+            if path.try_exists().map_err(|error| error.to_string())? {
+                stage(Stage::RecordRead);
+                let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
+                let record: WindowsAttemptRecordV1 =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                stage(Stage::RecordAuthentication);
+                authenticate(&record, attempt_id)?;
+                if record.job_closure_contract.is_some()
+                    && record.authorization_unix_millis.is_some()
+                {
+                    stage(Stage::OwnedAdmission);
+                    validate_admission(attempt_id, &record.request_sha256)?;
+                    // This exact authenticated attempt still owns the charge.
+                    // Only its real terminal ACK may retire it.
+                    continue;
+                }
+            }
+        }
+        stage(Stage::OwnedAdmission);
         let quarantined = quarantine(&entry.path())?;
+        blocker(Reason::UnjoinedAdmission);
         ambiguous.push(format!(
             "{} (abandoned launch admission)",
             quarantined.to_string_lossy()
         ));
     }
     for entry in fs::read_dir(&attempts).map_err(|error| error.to_string())? {
+        stage(Stage::RecordRead);
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         if reserved_writer_stage(&path, &admissions_root())? {
+            blocker(Reason::UnconfirmedWriter);
             ambiguous.push(format!(
                 "{} (live writer publication remains reserved)",
                 path.to_string_lossy()
             ));
             continue;
         }
+        stage(Stage::ReaderAdmission);
         let _reader = if let Ok(attempt_id) = record_attempt_id(&path) {
             Some(RecordReaderReservation::acquire(&attempt_id, &attempt_id)?)
         } else {
             None
         };
+        stage(Stage::RecordRead);
         let parsed = (|| {
             let attempt_id = record_attempt_id(&path)?;
             let bytes = read_record_bounded(&path).map_err(|error| error.to_string())?;
             let record: WindowsAttemptRecordV1 =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            stage(Stage::RecordAuthentication);
             authenticate(&record, &attempt_id)?;
             Ok::<_, String>(record)
         })();
         let mut record = match parsed {
             Ok(record) => record,
             Err(error) => {
+                blocker(Reason::InvalidRecord);
                 let quarantined = quarantine(&path)?;
                 ambiguous.push(format!("{} ({error})", quarantined.to_string_lossy()));
                 continue;
@@ -1715,20 +1889,28 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
             continue;
         }
         if record.terminal_response_json.is_some() {
-            ambiguous.push(format!(
-                "{} (unacknowledged durable terminal outbox)",
-                path.to_string_lossy()
-            ));
+            stage(Stage::PendingOutbox);
+            if let Some(pending) = startup_pending.as_deref_mut() {
+                retain_startup_outbox(pending, &record)?;
+            } else {
+                blocker(Reason::RetainedAmbiguity);
+                ambiguous.push(format!(
+                    "{} (unacknowledged durable terminal outbox)",
+                    path.to_string_lossy()
+                ));
+            }
             continue;
         }
         if record.authorization_unix_millis.is_some()
             || record.resume_attempted
             || record.target_released
         {
+            stage(Stage::NativeOwnerClosure);
             let current_boot = boot_identity()?;
             let progress = if record.boot_identity != current_boot {
                 stage_recovered_closure(&mut record, &current_boot, None)
             } else if guardian_receipt_path(&record.attempt_id)?.exists() {
+                stage(Stage::GuardianReceiptBinding);
                 let guardian = read_guardian_receipt(&record.attempt_id)?;
                 if guardian_receipt_binds_record(&guardian, &record)?
                     && frozen_manifest_owners_extinct(&record)?
@@ -1737,9 +1919,38 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
                 } else {
                     Err("guardian or owner closure evidence is incomplete".to_owned())
                 }
+            } else if record.job_closure_contract.is_some() && startup_pending.is_some() {
+                stage(Stage::UnresolvedContract);
+                // The authenticated closure contract authorizes recovery
+                // serving, never admission or a claim of completed closure.
+                if let Some(pending) = startup_pending.as_deref_mut() {
+                    pending.push(StartupPendingTerminal {
+                        expected_ack: None,
+                        original: record.clone(),
+                    });
+                    continue;
+                }
+                unreachable!("startup pending was checked");
             } else {
-                Err("guardian native zero receipt is unavailable".to_owned())
+                stage(Stage::NativeOwnerClosure);
+                if let Some(extinction) = capability_extinction(&record)? {
+                    stage_recovered_closure_with_extinction(
+                        &mut record,
+                        &current_boot,
+                        None,
+                        Some(extinction),
+                    )
+                } else {
+                    Err("guardian native zero receipt is unavailable".to_owned())
+                }
             };
+            if progress.is_ok() {
+                if let Some(pending) = startup_pending.as_deref_mut() {
+                    retain_startup_outbox(pending, &record)?;
+                    continue;
+                }
+            }
+            blocker(Reason::RetainedAmbiguity);
             ambiguous.push(format!(
                 "{} ({})",
                 path.to_string_lossy(),
@@ -1847,6 +2058,7 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
             }
         }
     }
+    stage(Stage::FinalAmbiguity);
     if ambiguous.is_empty() {
         Ok(())
     } else {
@@ -3004,6 +3216,9 @@ pub fn recover_attempt_for_caller(
                         Some(&guardian),
                     )?;
                 } else {
+                    if record.job_closure_contract.is_some() {
+                        return Ok(None);
+                    }
                     return Err(format!(
                         "exact recovery pending checked closure: guardian receipt absent on original boot; durable-state={:?}; resume-attempted={}; target-released={}; termination-requested={}; active-processes-zero={}; guardian-reaped={}; final-handles-closed={}; terminal-seed-present={}; retirement-proof-present={}; owner-manifest-present={}; terminal-publication-reserved={}; first-terminalization-error={}",
                         record.state,
@@ -3079,6 +3294,65 @@ fn bound_recovery_terminal_response(
 
 fn frozen_manifest_owners_extinct(record: &WindowsAttemptRecordV1) -> Result<bool, String> {
     frozen_manifest_owner_blocker(record).map(|blocker| blocker.is_none())
+}
+
+fn capability_extinction(
+    record: &WindowsAttemptRecordV1,
+) -> Result<Option<memcordon_core::WindowsCapabilityExtinctionProofV1>, String> {
+    let Some(contract) = record.job_closure_contract.as_ref() else {
+        return Ok(None);
+    };
+    contract.validate().map_err(str::to_owned)?;
+    if record.boot_identity != boot_identity()? || record.authorization_unix_millis.is_none() {
+        return Ok(None);
+    }
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or("closure contract manifest absent")?;
+    // A dead thread cannot establish closure of handles held by a live
+    // process. This proof deliberately requires every original Job holder's
+    // exact process to be extinct, including the guardian transfer recipient.
+    for identity in [
+        record.worker_identity.as_ref(),
+        record.guardian_identity.as_ref(),
+        record.target_identity.as_ref(),
+    ] {
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        if process_identity_is_live(identity.clone())? {
+            return Ok(None);
+        }
+    }
+    for entry in &manifest.entries {
+        if entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::DesktopBootstrapProcess
+            && entry.present
+        {
+            let Some(identity) = entry.process_identity.as_ref() else {
+                return Ok(None);
+            };
+            if process_identity_is_live(identity.clone())? {
+                return Ok(None);
+            }
+        }
+    }
+    if !frozen_manifest_owners_extinct(record)?
+        || !super::launcher_service::attempt_job_registration_is_absent(&record.attempt_id)?
+    {
+        return Ok(None);
+    }
+    let proof = memcordon_core::WindowsCapabilityExtinctionProofV1 {
+        contract: contract.clone(),
+        owner_manifest: manifest.clone(),
+        current_boot_id: boot_identity()?,
+        job_holder_processes_extinct: true,
+        target_process_extinct: true,
+        relay_capabilities_retired: true,
+        launch_gate_closed: true,
+    };
+    proof.validate().map_err(str::to_owned)?;
+    Ok(Some(proof))
 }
 
 fn frozen_manifest_owner_blocker(
@@ -3186,8 +3460,18 @@ fn stage_recovered_closure(
     current_boot_identity: &str,
     guardian_receipt: Option<&memcordon_core::WindowsGuardianReceiptV2>,
 ) -> Result<(), String> {
+    stage_recovered_closure_with_extinction(record, current_boot_identity, guardian_receipt, None)
+}
+
+fn stage_recovered_closure_with_extinction(
+    record: &mut WindowsAttemptRecordV1,
+    current_boot_identity: &str,
+    guardian_receipt: Option<&memcordon_core::WindowsGuardianReceiptV2>,
+    extinction: Option<memcordon_core::WindowsCapabilityExtinctionProofV1>,
+) -> Result<(), String> {
     if current_boot_identity.is_empty()
-        || (current_boot_identity == record.boot_identity) != guardian_receipt.is_some()
+        || (current_boot_identity == record.boot_identity)
+            != (guardian_receipt.is_some() || extinction.is_some())
         || record.authorization_unix_millis.is_none()
         || record.target_identity.is_none()
         || record.owner_manifest.is_none()
@@ -3241,7 +3525,9 @@ fn stage_recovered_closure(
     let guardian_recovery = guardian_receipt.is_some();
     let proof = memcordon_core::WindowsRetirementProofV2 {
         schema_version: 2,
-        source: if guardian_recovery {
+        source: if extinction.is_some() {
+            memcordon_core::WindowsRetirementProofSourceV2::CapabilityExtinction
+        } else if guardian_recovery {
             memcordon_core::WindowsRetirementProofSourceV2::GuardianRecovery
         } else {
             memcordon_core::WindowsRetirementProofSourceV2::PriorBoot
@@ -3265,7 +3551,9 @@ fn stage_recovered_closure(
         policy_reference_bound: record.workload_admission.is_none()
             || record.workload_checkpoint.is_some(),
         guardian_receipt_sha256: guardian_receipt.map(|receipt| receipt.integrity_sha256.clone()),
-        current_boot_id: (!guardian_recovery).then(|| current_boot_identity.to_owned()),
+        current_boot_id: (!guardian_recovery && extinction.is_none())
+            .then(|| current_boot_identity.to_owned()),
+        capability_extinction: extinction.clone(),
     };
     let restart_safety = memcordon_core::RestartSafetyProof {
         direct_child_reaped: false,
@@ -3300,7 +3588,9 @@ fn stage_recovered_closure(
         guardian_causal_receipt: None,
         code: "MCSEALED-WINDOWS-OWNER-LOST".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::Retirement,
-        detail: if guardian_recovery {
+        detail: if extinction.is_some() {
+            "original Job-holder processes exited; checked kill-on-last-handle policy proves capability extinction; native Job-zero and historical execution outcome were not observed".to_owned()
+        } else if guardian_recovery {
             "original worker exited before authenticated terminal delivery; guardian proved Job zero and owner processes exited".to_owned()
         } else {
             "prior boot ended before authenticated terminal delivery; execution outcome unavailable"
@@ -5486,6 +5776,7 @@ fn decoded_v4(record: &WindowsAttemptRecordV1) -> memcordon_core::WindowsDurable
             final_handles_closed: record.cleanup_state.final_handles_closed,
         },
         owner_manifest: record.owner_manifest.clone(),
+        job_closure_contract: record.job_closure_contract.clone(),
         recovery_authorization: record.recovery_authorization.clone(),
         terminal_publication_reserved: record.terminal_publication_reserved,
         terminal_seed: record.terminal_seed.clone(),

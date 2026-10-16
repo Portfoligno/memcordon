@@ -535,7 +535,7 @@ pub fn emit(root: &Path, target: &Path, packages: &Path, for_save: bool) -> Resu
         source::write_json(&slot.context(), &state)?;
         return emit_state(&state, slot, false, &distribution.target);
     };
-    let _settled = crate::cache_restore::settled_locks(&[slot.build.clone()])?;
+    let _settled = crate::cache_restore::settled_locks(std::slice::from_ref(&slot.build))?;
     emit_state(&state, &slot, for_save, &distribution.target)
 }
 
@@ -693,7 +693,7 @@ pub fn complete(
         }
         fs::remove_dir_all(slot.install())?;
     }
-    let _settled = crate::cache_restore::settled_locks(&[slot.build.clone()])?;
+    let _settled = crate::cache_restore::settled_locks(std::slice::from_ref(&slot.build))?;
     if slot.build.try_exists()? {
         slot.mark_build_layout()?;
     }

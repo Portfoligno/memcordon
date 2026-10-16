@@ -2456,10 +2456,45 @@ fn validate_windows_record_fields(record: &Value, durable: bool) -> Verification
             "worker_thread_identity",
             "terminal_response_json",
             "terminal_disposition",
+            "job_closure_contract",
         ],
     )?;
     if number(record, "schema_version")? != 4 {
         return Err("unknown protected native record revision".into());
+    }
+    if record["retirement_proof"]["source"] == "capability-extinction"
+        && (record["job_closure_contract"].is_null()
+            || record["retirement_proof"]["capability_extinction"]["owner_manifest"]
+                != record["owner_manifest"])
+    {
+        return Err("protected extinction proof lacks original frozen contract or owners".into());
+    }
+    if let Some(contract) = record
+        .get("job_closure_contract")
+        .filter(|value| !value.is_null())
+    {
+        validate_job_closure_contract(contract)?;
+        for (contract_field, record_field) in [
+            ("attempt_id", "attempt_id"),
+            ("nonce", "nonce"),
+            ("request_sha256", "request_sha256"),
+            ("provider_generation", "provider_generation"),
+            ("launch_incarnation", "launch_incarnation"),
+            ("original_boot_id", "boot_identity"),
+            ("job_identity", "job_identity_sha256"),
+        ] {
+            if contract[contract_field] != record[record_field] {
+                return Err("protected Job closure contract crosses original record".into());
+            }
+        }
+        if contract["owner_manifest_sha256"] != manifest_wire_sha256(&record["owner_manifest"])? {
+            return Err("protected Job contract frozen manifest differs".into());
+        }
+        if record["retirement_proof"]["source"] == "capability-extinction"
+            && record["retirement_proof"]["capability_extinction"]["contract"] != *contract
+        {
+            return Err("protected extinction proof substitutes closure contract".into());
+        }
     }
     if ![
         "boundary-created",
@@ -2716,10 +2751,20 @@ pub(crate) fn validate_windows_runtime(
             "launch_gate_closed",
             "policy_reference_bound",
         ],
-        &["guardian_receipt_sha256", "current_boot_id"],
+        &[
+            "guardian_receipt_sha256",
+            "current_boot_id",
+            "capability_extinction",
+        ],
     )?;
     if number(proof, "schema_version")? != 2
-        || !["live-native", "guardian-recovery", "prior-boot"].contains(&text(proof, "source")?)
+        || ![
+            "live-native",
+            "guardian-recovery",
+            "prior-boot",
+            "capability-extinction",
+        ]
+        .contains(&text(proof, "source")?)
     {
         return Err("unknown native retirement proof variant".into());
     }
@@ -2917,10 +2962,20 @@ pub(crate) fn validate_windows_delivery_and_sample(
             "launch_gate_closed",
             "policy_reference_bound",
         ],
-        &["guardian_receipt_sha256", "current_boot_id"],
+        &[
+            "guardian_receipt_sha256",
+            "current_boot_id",
+            "capability_extinction",
+        ],
     )?;
     if number(proof, "schema_version")? != 2
-        || !["live-native", "guardian-recovery", "prior-boot"].contains(&text(proof, "source")?)
+        || ![
+            "live-native",
+            "guardian-recovery",
+            "prior-boot",
+            "capability-extinction",
+        ]
+        .contains(&text(proof, "source")?)
     {
         return Err("unknown native retirement proof source/revision".into());
     }
@@ -3012,8 +3067,13 @@ pub(crate) fn validate_windows_delivery_and_sample(
         ],
         &[],
     )?;
-    yes(
-        safety,
+    let safety_fields: &[&str] = if proof["source"] == "capability-extinction" {
+        &[
+            "workload_empty",
+            "containment_removed",
+            "containment_incapable_of_live_members",
+        ]
+    } else {
         &[
             "direct_child_reaped",
             "workload_empty",
@@ -3021,8 +3081,9 @@ pub(crate) fn validate_windows_delivery_and_sample(
             "containment_removed",
             "containment_incapable_of_live_members",
             "sealed_boundary_retired",
-        ],
-    )?;
+        ]
+    };
+    yes(safety, safety_fields)?;
     empty_array(safety, "errors")?;
     let observed = terminal
         .get("process_observation")
@@ -3106,7 +3167,8 @@ pub(crate) fn validate_windows_delivery_and_sample(
             {
                 return Err("orderly case substituted unavailable worker coverage".into());
             }
-            if !observed.get("root_identity").is_none_or(Value::is_null)
+            if (!observed.get("root_identity").is_none_or(Value::is_null)
+                && proof["source"] != "capability-extinction")
                 || !observed.get("final_accounting").is_none_or(Value::is_null)
                 || !observed.get("required_witness").is_none_or(Value::is_null)
             {
@@ -3269,6 +3331,256 @@ pub(crate) fn validate_windows_delivery_and_sample(
     Ok(())
 }
 
+fn validate_job_closure_contract(contract: &Value) -> VerificationResult<()> {
+    object(
+        contract,
+        &[
+            "schema_version",
+            "attempt_id",
+            "nonce",
+            "request_sha256",
+            "provider_generation",
+            "launch_incarnation",
+            "original_boot_id",
+            "job_identity",
+            "owner_manifest_sha256",
+            "guardian_job_transfer_sha256",
+            "kill_on_close_verified",
+            "breakaway_denied",
+            "job_handles_noninheritable",
+            "closed_job_owner_set",
+            "job_unnamed",
+            "target_handle_list_verified",
+        ],
+        &[],
+    )?;
+    if number(contract, "schema_version")? != 1 {
+        return Err("unknown Job closure contract revision".into());
+    }
+    for field in [
+        "attempt_id",
+        "request_sha256",
+        "job_identity",
+        "owner_manifest_sha256",
+        "guardian_job_transfer_sha256",
+    ] {
+        digest(text(contract, field)?)?;
+    }
+    for field in [
+        "nonce",
+        "provider_generation",
+        "launch_incarnation",
+        "original_boot_id",
+    ] {
+        if text(contract, field)?.is_empty() {
+            return Err("Job closure contract identity absent".into());
+        }
+    }
+    yes(
+        contract,
+        &[
+            "kill_on_close_verified",
+            "breakaway_denied",
+            "job_handles_noninheritable",
+            "closed_job_owner_set",
+            "job_unnamed",
+            "target_handle_list_verified",
+        ],
+    )
+}
+
+fn manifest_wire_sha256(manifest: &Value) -> VerificationResult<String> {
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Identity {
+        process_id: u32,
+        creation_time_100ns: u64,
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Entry {
+        role: String,
+        present: bool,
+        process_identity: Option<Identity>,
+        capability_binding_sha256: Option<String>,
+    }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Manifest {
+        schema_version: u32,
+        attempt_id: String,
+        provider_generation: String,
+        launch_incarnation: String,
+        entries: Vec<Entry>,
+    }
+    let canonical: Manifest =
+        serde_json::from_value(manifest.clone()).map_err(|error| error.to_string())?;
+    Ok(crate::sha256(
+        &serde_json::to_vec(&canonical).map_err(|error| error.to_string())?,
+    ))
+}
+
+fn validate_capability_extinction(terminal: &Value) -> VerificationResult<()> {
+    let proof = &terminal["retirement_proof"];
+    let witness = &proof["capability_extinction"];
+    object(
+        witness,
+        &[
+            "contract",
+            "owner_manifest",
+            "current_boot_id",
+            "job_holder_processes_extinct",
+            "target_process_extinct",
+            "relay_capabilities_retired",
+            "launch_gate_closed",
+        ],
+        &[],
+    )?;
+    yes(
+        witness,
+        &[
+            "job_holder_processes_extinct",
+            "target_process_extinct",
+            "relay_capabilities_retired",
+            "launch_gate_closed",
+        ],
+    )?;
+    let contract = &witness["contract"];
+    validate_job_closure_contract(contract)?;
+    for field in [
+        "attempt_id",
+        "nonce",
+        "request_sha256",
+        "provider_generation",
+        "launch_incarnation",
+        "original_boot_id",
+        "job_identity",
+        "owner_manifest_sha256",
+    ] {
+        if contract[field] != proof[field] {
+            return Err("extinction contract crosses original proof binding".into());
+        }
+    }
+    if witness["current_boot_id"] != contract["original_boot_id"] {
+        return Err("extinction proof crosses boot".into());
+    }
+    let manifest = &witness["owner_manifest"];
+    object(
+        manifest,
+        &[
+            "schema_version",
+            "attempt_id",
+            "provider_generation",
+            "launch_incarnation",
+            "entries",
+        ],
+        &[],
+    )?;
+    if manifest["schema_version"] != 1 {
+        return Err("unknown extinction owner manifest".into());
+    }
+    for field in ["attempt_id", "provider_generation", "launch_incarnation"] {
+        if manifest[field] != contract[field] {
+            return Err("extinction owner manifest crosses contract".into());
+        }
+    }
+    let roles = [
+        "launcher-job",
+        "active-registry-duplicate",
+        "direct-target-process",
+        "desktop-bootstrap-job",
+        "desktop-bootstrap-process",
+        "guardian-process",
+        "control-relay",
+        "frontend-relay",
+        "broker-holder",
+        "session-broker-transfer",
+        "launch-gate",
+        "policy-reference",
+    ];
+    let entries = manifest["entries"]
+        .as_array()
+        .ok_or("extinction owner entries absent")?;
+    if entries.len() != roles.len() {
+        return Err("extinction owner inventory differs".into());
+    }
+    for (entry, role) in entries.iter().zip(roles) {
+        object(
+            entry,
+            &[
+                "role",
+                "present",
+                "process_identity",
+                "capability_binding_sha256",
+            ],
+            &[],
+        )?;
+        let present = entry["present"]
+            .as_bool()
+            .ok_or("extinction owner presence malformed")?;
+        let required = matches!(
+            role,
+            "launcher-job"
+                | "active-registry-duplicate"
+                | "direct-target-process"
+                | "guardian-process"
+                | "control-relay"
+                | "frontend-relay"
+                | "launch-gate"
+        );
+        if entry["role"] != role
+            || (required && !present)
+            || present == entry["capability_binding_sha256"].is_null()
+            || (!present && !entry["process_identity"].is_null())
+        {
+            return Err("extinction owner role or presence differs".into());
+        }
+        if present {
+            digest(text(entry, "capability_binding_sha256")?)?;
+            if role != "policy-reference" || !entry["process_identity"].is_null() {
+                let identity = &entry["process_identity"];
+                object(identity, &["process_id", "creation_time_100ns"], &[])?;
+                if number(identity, "process_id")? == 0
+                    || number(identity, "process_id")? > u64::from(u32::MAX)
+                    || number(identity, "creation_time_100ns")? == 0
+                {
+                    return Err("extinction native owner identity absent".into());
+                }
+            }
+        }
+        if role == "direct-target-process"
+            && entry["process_identity"] != terminal["process_observation"]["root_identity"]
+        {
+            return Err("extinction target root differs".into());
+        }
+    }
+    // Wire canonicalization is independent of provider Rust types. The finite
+    // schema preserves its documented declaration order for the digest.
+    if manifest_wire_sha256(manifest)? != text(contract, "owner_manifest_sha256")? {
+        return Err("extinction frozen manifest digest differs".into());
+    }
+    let safety = &terminal["restart_safety"];
+    for field in [
+        "direct_child_reaped",
+        "helpers_reaped",
+        "sealed_boundary_retired",
+    ] {
+        if safety[field] != false {
+            return Err("extinction proof invents historical native observation".into());
+        }
+    }
+    yes(
+        safety,
+        &[
+            "workload_empty",
+            "containment_removed",
+            "containment_incapable_of_live_members",
+        ],
+    )?;
+    empty_array(safety, "errors")?;
+    Ok(())
+}
+
 pub(crate) fn validate_windows_proof_matrix(terminal: &Value) -> VerificationResult<()> {
     let proof = terminal
         .get("retirement_proof")
@@ -3294,6 +3606,9 @@ pub(crate) fn validate_windows_proof_matrix(terminal: &Value) -> VerificationRes
             return Err("retirement native fact is not boolean".into());
         }
     }
+    if text(proof, "source")? != "capability-extinction" && !absent("capability_extinction") {
+        return Err("unrelated retirement source carries extinction witness".into());
+    }
     match (text(payload, "kind")?, text(proof, "source")?) {
         ("execution", "live-native") => {
             yes(proof, &facts)?;
@@ -3306,7 +3621,10 @@ pub(crate) fn validate_windows_proof_matrix(terminal: &Value) -> VerificationRes
                 return Err("live-native proof contains recovery fields or wrong root".into());
             }
         }
-        ("recovered-closure", source @ ("guardian-recovery" | "prior-boot")) => {
+        (
+            "recovered-closure",
+            source @ ("guardian-recovery" | "prior-boot" | "capability-extinction"),
+        ) => {
             let original = payload
                 .get("primary_failure")
                 .ok_or("recovery original failure absent")?;
@@ -3321,7 +3639,17 @@ pub(crate) fn validate_windows_proof_matrix(terminal: &Value) -> VerificationRes
             {
                 return Err("recovery proof invents creation or lacks original cause".into());
             }
-            if source == "guardian-recovery" {
+            if source == "capability-extinction" {
+                if facts
+                    .iter()
+                    .any(|field| proof.get(*field) != Some(&Value::Bool(false)))
+                    || !absent("guardian_receipt_sha256")
+                    || !absent("current_boot_id")
+                {
+                    return Err("extinction proof invents native completion".into());
+                }
+                validate_capability_extinction(terminal)?;
+            } else if source == "guardian-recovery" {
                 yes(
                     proof,
                     &["native_job_empty_observed", "guardian_completion_observed"],

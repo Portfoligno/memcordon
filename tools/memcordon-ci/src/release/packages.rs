@@ -711,10 +711,8 @@ impl PackageConsumer {
                     .arg(target)
                     .arg("--package")
                     .arg(&package.id.repr);
-                    if explicit {
-                        if let Some(target) = &self.selected_target {
-                            clean = clean.arg("--target").arg(target);
-                        }
+                    if let (true, Some(target)) = (explicit, &self.selected_target) {
+                        clean = clean.arg("--target").arg(target);
                     }
                     clean.run()?;
                 }

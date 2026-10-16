@@ -2841,6 +2841,25 @@ pub fn normalize_actors(
                 recovery_invocation: optional("terminal-recovery-invocation.json")?,
                 recovery_exit: optional("terminal-recovery-exit.json")?,
                 recovery_stderr: optional("terminal-recovery.stderr.bin")?,
+                extinction_recovery: if assessment.selector["fault"]
+                    == "all-job-owners-closed-after-authorization"
+                {
+                    Some(memcordon_readiness_verifier::ComponentExtinctionRecovery {
+                        staging_invocation: reference("extinction-staging-invocation.json")?,
+                        staging_exit: reference("extinction-staging-exit.json")?,
+                        staging_stdout: reference("extinction-staging.json")?,
+                        staging_stderr: reference("extinction-staging.stderr.bin")?,
+                        terminal_invocation: reference(
+                            "extinction-terminal-recovery-invocation.json",
+                        )?,
+                        terminal_exit: reference("extinction-terminal-recovery-exit.json")?,
+                        terminal_stdout: reference("extinction-terminal-recovery.json")?,
+                        terminal_authority: reference("extinction-terminal-authority.json")?,
+                        terminal_stderr: reference("extinction-terminal-recovery.stderr.bin")?,
+                    })
+                } else {
+                    None
+                },
             });
         }
         let source = &members[0].1;

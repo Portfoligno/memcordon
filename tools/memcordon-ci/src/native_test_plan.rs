@@ -5,7 +5,30 @@ const STANDARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 // fixture graphs as well as the workspace tests. Keep compilation finite,
 // independently of the shorter execution deadline and enclosing lane budget.
 const BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
-const DESKTOP_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(40 * 60);
+const MACOS_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(40 * 60);
+// A cold Windows x64 workspace/test graph exceeded forty minutes while
+// actively compiling with three workers. Leave finite cold-build headroom;
+// the enclosing identity-bound operation deadline still limits every command.
+const WINDOWS_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePlatform {
+    Windows,
+    MacOs,
+    Other,
+}
+
+impl NativePlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Other
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildAllocation {
@@ -46,6 +69,14 @@ pub fn commands_with_failure(
     release_mode: bool,
     mode: crate::failure_mode::FailureMode,
 ) -> Vec<NativeTestCommand> {
+    commands_for_platform(release_mode, mode, NativePlatform::current())
+}
+
+pub fn commands_for_platform(
+    release_mode: bool,
+    mode: crate::failure_mode::FailureMode,
+    platform: NativePlatform,
+) -> Vec<NativeTestCommand> {
     let mut arguments = vec![
         "--target-dir",
         "target/ci/native",
@@ -68,10 +99,10 @@ pub fn commands_with_failure(
     vec![
         NativeTestCommand {
             arguments: build_arguments,
-            deadline: if cfg!(any(windows, target_os = "macos")) && release_mode {
-                DESKTOP_RELEASE_BUILD_DEADLINE
-            } else {
-                BUILD_DEADLINE
+            deadline: match (release_mode, platform) {
+                (true, NativePlatform::Windows) => WINDOWS_RELEASE_BUILD_DEADLINE,
+                (true, NativePlatform::MacOs) => MACOS_RELEASE_BUILD_DEADLINE,
+                _ => BUILD_DEADLINE,
             },
         },
         NativeTestCommand {

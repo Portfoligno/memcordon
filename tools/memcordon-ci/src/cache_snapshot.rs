@@ -881,14 +881,19 @@ pub fn import(
     // Path safety is blocking even when the optional payload is malformed.
     let index_path = selected.stage.join("index.json");
     ordinary(&index_path)?;
-    if index_path.try_exists()? && fs::metadata(&index_path)?.len() <= selected.metadata as u64 {
-        if let Ok(index) = artifacts::read_file(&index_path)
+    let index = if index_path.try_exists()?
+        && fs::metadata(&index_path)?.len() <= selected.metadata as u64
+    {
+        artifacts::read_file(&index_path)
             .and_then(|bytes| Ok(serde_json::from_slice::<Index>(&bytes)?))
-        {
-            for item in &index.files {
-                if let Ok(path) = destination(&selected, item, kind) {
-                    ordinary(&path)?;
-                }
+            .ok()
+    } else {
+        None
+    };
+    if let Some(index) = index {
+        for item in &index.files {
+            if let Ok(path) = destination(&selected, item, kind) {
+                ordinary(&path)?;
             }
         }
     }
@@ -924,10 +929,13 @@ fn cleanup_stage(root: &Path, stage: &Path) -> Result<()> {
         .strip_prefix(root.canonicalize()?)
         .map_err(|_| CiError::Message("snapshot staging escaped checkout".into()))?;
     let checked = cache_restore::safe_root(root, relative)?;
-    if checked.try_exists()? {
-        if let Err(error) = fs::remove_dir_all(checked) {
-            eprintln!("optional owned snapshot staging cleanup incomplete: {error}");
-        }
+    let removal = if checked.try_exists()? {
+        fs::remove_dir_all(checked)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = removal {
+        eprintln!("optional owned snapshot staging cleanup incomplete: {error}");
     }
     Ok(())
 }

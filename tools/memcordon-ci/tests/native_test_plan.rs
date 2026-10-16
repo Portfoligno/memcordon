@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use memcordon_ci::{
     failure_mode::FailureMode,
-    native_test_plan::{build_allocation, commands, commands_with_failure},
+    native_test_plan::{
+        NativePlatform, build_allocation, commands, commands_for_platform, commands_with_failure,
+    },
     performance_plan::Layout,
 };
 
@@ -33,7 +35,9 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
     assert_eq!(release.len(), 2);
     assert_eq!(
         release[0].deadline,
-        Duration::from_secs(if cfg!(any(windows, target_os = "macos")) {
+        Duration::from_secs(if cfg!(windows) {
+            60 * 60
+        } else if cfg!(target_os = "macos") {
             40 * 60
         } else {
             25 * 60
@@ -108,5 +112,43 @@ fn explicit_collect_all_only_changes_cargo_execution_policy() {
         expected.push("--no-fail-fast");
         assert_eq!(collect[1].arguments, expected);
         assert_eq!(stop[1].deadline, collect[1].deadline);
+    }
+}
+
+#[test]
+fn cold_platform_build_allowances_preserve_the_complete_execution_graph() {
+    for (platform, release_minutes) in [
+        (NativePlatform::Windows, 60),
+        (NativePlatform::MacOs, 40),
+        (NativePlatform::Other, 25),
+    ] {
+        for release in [false, true] {
+            for mode in [FailureMode::StopAfterFailure, FailureMode::CollectAll] {
+                let plan = commands_for_platform(release, mode, platform);
+                assert_eq!(
+                    plan[0].deadline,
+                    Duration::from_secs(if release { release_minutes } else { 25 } * 60)
+                );
+                assert_eq!(plan[1].deadline, Duration::from_secs(15 * 60));
+                let build_inputs: Vec<_> = plan[0]
+                    .arguments
+                    .iter()
+                    .copied()
+                    .filter(|arg| *arg != "--no-run")
+                    .collect();
+                let execution_inputs: Vec<_> = plan[1]
+                    .arguments
+                    .iter()
+                    .copied()
+                    .filter(|arg| *arg != "--no-fail-fast")
+                    .collect();
+                assert_eq!(build_inputs, execution_inputs);
+                for required in ["--workspace", "--all-targets", "--all-features", "--locked"] {
+                    assert!(plan[0].arguments.contains(&required));
+                }
+                assert!(!plan[0].arguments.contains(&"--exclude"));
+                assert!(!plan[1].arguments.contains(&"--ignored"));
+            }
+        }
     }
 }

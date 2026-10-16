@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn startup_recovery_keeps_admission_closed_until_exact_ack_retirement() {
+    let gate = StartupRecoveryAdmission::new(true);
+    assert!(gate.require_clear(|| Ok(false)).is_err());
+    let failure = gate
+        .require_clear(|| Err("authenticated retirement could not be read".into()))
+        .unwrap_err();
+    assert_eq!(failure, "authenticated retirement could not be read");
+    assert!(gate.require_clear(|| Ok(false)).is_err());
+    gate.require_clear(|| Ok(true)).unwrap();
+    gate.require_clear(|| {
+        panic!("settled startup bindings must not inspect unrelated later live attempts")
+    })
+    .unwrap();
+}
+
+#[test]
+fn clean_startup_admits_work_without_recovery_or_global_idle_requirement() {
+    let gate = StartupRecoveryAdmission::new(false);
+    gate.require_clear(|| panic!("clean startup must permit ordinary concurrent admission"))
+        .unwrap();
+}
+
 fn anonymous_control_pipe() -> (OwnedHandle, OwnedHandle) {
     let mut read = ptr::null_mut();
     let mut write = ptr::null_mut();

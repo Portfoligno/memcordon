@@ -142,6 +142,7 @@ pub fn postauthorization_failure(
         owner_manifest_sha256: manifest_sha256,
         guardian_receipt_sha256: None,
         current_boot_id: None,
+        capability_extinction: None,
         target_completion_observed: true,
         native_job_empty_observed: true,
         relay_closure_observed: true,

@@ -1501,6 +1501,8 @@ pub struct WindowsDurableAttemptRecordV4 {
     pub target_released: bool,
     pub cleanup_state: WindowsDurableCleanupStateV1,
     pub owner_manifest: Option<crate::WindowsCapabilityOwnerManifestV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_closure_contract: Option<crate::WindowsJobClosureContractV1>,
     pub recovery_authorization: Option<crate::WindowsRecoveryAuthorizationV1>,
     pub terminal_publication_reserved: bool,
     pub terminal_seed: Option<WindowsTerminalSeedV2>,
@@ -1593,6 +1595,25 @@ pub fn authenticate_decoded_windows_attempt_record_v4(
             return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=owner-manifest");
         }
     }
+    if let Some(contract) = &record.job_closure_contract {
+        if contract.validate().is_err()
+            || contract.attempt_id != record.attempt_id
+            || contract.nonce != record.nonce
+            || contract.request_sha256 != record.request_sha256
+            || contract.provider_generation != record.provider_generation
+            || contract.launch_incarnation != record.launch_incarnation
+            || contract.original_boot_id != record.boot_identity
+            || contract.job_identity != record.job_identity_sha256
+            || record
+                .owner_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.canonical_sha256().ok())
+                .as_deref()
+                != Some(contract.owner_manifest_sha256.as_str())
+        {
+            return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=job-closure-contract");
+        }
+    }
     let preauthorization_abort_release = record.target_released
         && record.authorization_unix_millis.is_none()
         && !record.resume_attempted
@@ -1650,6 +1671,13 @@ pub fn authenticate_decoded_windows_attempt_record_v4(
                 .and_then(|manifest| manifest.canonical_sha256().ok())
                 .as_deref()
                 != Some(proof.owner_manifest_sha256.as_str())
+            || proof
+                .capability_extinction
+                .as_ref()
+                .is_some_and(|extinction| {
+                    record.job_closure_contract.as_ref() != Some(&extinction.contract)
+                        || record.owner_manifest.as_ref() != Some(&extinction.owner_manifest)
+                })
         {
             return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=retirement-proof");
         }
@@ -4173,6 +4201,7 @@ pub enum WindowsRetirementProofSourceV2 {
     LiveNative,
     GuardianRecovery,
     PriorBoot,
+    CapabilityExtinction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4192,6 +4221,8 @@ pub struct WindowsRetirementProofV2 {
     pub guardian_receipt_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_extinction: Option<crate::WindowsCapabilityExtinctionProofV1>,
     pub target_completion_observed: bool,
     pub native_job_empty_observed: bool,
     pub relay_closure_observed: bool,
@@ -4238,6 +4269,11 @@ impl WindowsTerminalReceiptV2 {
             || !proof.policy_reference_bound
         {
             return Err("retirement_proof");
+        }
+        if proof.source != WindowsRetirementProofSourceV2::CapabilityExtinction
+            && proof.capability_extinction.is_some()
+        {
+            return Err("retirement_proof.unexpected_capability_extinction");
         }
         match (&self.payload, proof.source) {
             (
@@ -4293,6 +4329,55 @@ impl WindowsTerminalReceiptV2 {
                     .as_deref()
                     .is_some_and(|boot| !boot.is_empty() && boot != proof.original_boot_id)
                 && self.cleanup_process_creation.is_none() => {}
+            (
+                WindowsTerminalPayloadV2::RecoveredClosure {
+                    primary_failure, ..
+                },
+                WindowsRetirementProofSourceV2::CapabilityExtinction,
+            ) if match primary_failure {
+                crate::OriginalFailureV1::Observed { event } => event.sequence != 0,
+                crate::OriginalFailureV1::Unavailable { reason } => {
+                    *reason != crate::OriginalUnavailableReasonV1::NoEarlierErrorObserved
+                }
+            } && !proof.target_completion_observed
+                && !proof.native_job_empty_observed
+                && !proof.relay_closure_observed
+                && !proof.guardian_completion_observed
+                && proof.guardian_receipt_sha256.is_none()
+                && proof.current_boot_id.is_none()
+                && self.cleanup_process_creation.is_none()
+                && !self.restart_safety.direct_child_reaped
+                && !self.restart_safety.helpers_reaped
+                && !self.restart_safety.sealed_boundary_retired
+                && self.restart_safety.workload_empty == Some(true)
+                && self.restart_safety.containment_removed
+                && self.restart_safety.containment_incapable_of_live_members
+                && self.restart_safety.errors.is_empty()
+                && proof
+                    .capability_extinction
+                    .as_ref()
+                    .is_some_and(|extinction| {
+                        let contract = &extinction.contract;
+                        extinction.validate().is_ok()
+                            && contract.attempt_id == proof.attempt_id
+                            && contract.nonce == proof.nonce
+                            && contract.request_sha256 == proof.request_sha256
+                            && contract.provider_generation == proof.provider_generation
+                            && contract.launch_incarnation == proof.launch_incarnation
+                            && contract.original_boot_id == proof.original_boot_id
+                            && contract.job_identity == proof.job_identity
+                            && contract.owner_manifest_sha256 == proof.owner_manifest_sha256
+                            && extinction
+                                .owner_manifest
+                                .entries
+                                .iter()
+                                .find(|entry| {
+                                    entry.role
+                                        == crate::WindowsCapabilityOwnerRoleV1::DirectTargetProcess
+                                })
+                                .and_then(|entry| entry.process_identity.as_ref())
+                                == self.process_observation.root_identity.as_ref()
+                    }) => {}
             _ => return Err("retirement_proof.source"),
         }
         if let WindowsTerminalPayloadV2::Execution {

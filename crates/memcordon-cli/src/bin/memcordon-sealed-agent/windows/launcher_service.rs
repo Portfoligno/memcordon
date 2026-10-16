@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::ptr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use memcordon_core::{
@@ -47,6 +48,47 @@ const CANCEL_STATUS: u32 = 0xC000_013A;
 const DEADLINE_STATUS: u32 = 0xC000_0102;
 const GUARDIAN_STARTUP_TIMEOUT_MILLIS: u32 = 10_000;
 const RELAY_EVENT_WAIT_ACCESS: u32 = 0x0010_0000;
+
+struct StartupRecoveryAdmission {
+    pending: AtomicBool,
+}
+
+impl StartupRecoveryAdmission {
+    fn new(pending: bool) -> Self {
+        Self {
+            pending: AtomicBool::new(pending),
+        }
+    }
+
+    fn require_clear(
+        &self,
+        acknowledged: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<(), String> {
+        if !self.pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if acknowledged()? {
+            self.pending.store(false, Ordering::Release);
+            return Ok(());
+        }
+        if !self.pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err("startup terminal recovery requires the original authenticated ACK retirement".into())
+    }
+}
+
+static STARTUP_RECOVERY: OnceLock<(
+    StartupRecoveryAdmission,
+    Vec<super::record::StartupPendingTerminal>,
+)> = OnceLock::new();
+
+fn require_startup_admission() -> Result<(), String> {
+    let (gate, pending) = STARTUP_RECOVERY
+        .get()
+        .ok_or("startup recovery admission was not initialized")?;
+    gate.require_clear(|| super::record::startup_outboxes_acknowledged(pending))
+}
 
 struct LaunchAttemptError {
     workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
@@ -916,20 +958,41 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
         eprintln!("{error}");
         return;
     }
+    if let Err(error) = super::startup_diagnostics::clear_launcher() {
+        eprintln!("launcher startup diagnostic cleanup failed: {error}");
+    }
     let startup = (|| -> Result<(PipeListener, OwnedHandle), (u32, String)> {
+        use memcordon_core::WindowsLauncherStartupStageV1 as Stage;
+        super::startup_diagnostics::launcher_stage(Stage::ProcessProtection);
         super::security::protect_current_service_process(WINDOWS_LAUNCHER_SERVICE_NAME)
             .map_err(|error| (STARTUP_PROCESS_PROTECTION, error))?;
+        super::startup_diagnostics::launcher_stage(Stage::TokenPolicy);
         let token_policy = super::security::converge_current_service_token_peer_query(
             WINDOWS_LAUNCHER_SERVICE_NAME,
         );
         token_policy.map_err(|error| {
             super::security::token_dacl_startup_error(WINDOWS_LAUNCHER_SERVICE_NAME, error)
         })?;
-        // Recovery is a capability gate: SCM must not observe RUNNING until
-        // every durable attempt has been reconciled or quarantined.
+        // Reconcile before exposing the protected listener. Valid pending
+        // outboxes need this listener to replay and ACK, but cannot admit work.
+        super::startup_diagnostics::launcher_stage(Stage::GuardianSlots);
         super::process::recover_guardian_slots()
             .map_err(|error| (STARTUP_STATE_RECOVERY, error))?;
-        super::record::recover().map_err(|error| (STARTUP_STATE_RECOVERY, error))?;
+        let pending = match super::record::recover_for_startup()
+            .map_err(|error| (STARTUP_STATE_RECOVERY, error))?
+        {
+            super::record::StartupRecoveryOutcome::Clear => Vec::new(),
+            super::record::StartupRecoveryOutcome::RecoveryOnly(pending) => pending,
+        };
+        STARTUP_RECOVERY
+            .set((StartupRecoveryAdmission::new(!pending.is_empty()), pending))
+            .map_err(|_| {
+                (
+                    STARTUP_STATE_RECOVERY,
+                    "startup recovery was initialized twice".into(),
+                )
+            })?;
+        super::startup_diagnostics::launcher_stage(Stage::PipePreparation);
         let listener = PipeListener::new(
             WINDOWS_LAUNCHER_PIPE,
             SecurityDescriptor::from_sddl(
@@ -938,15 +1001,22 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
             .map_err(|error| (STARTUP_PIPE_PREPARATION, error))?,
         );
         let first = listener.prepare().map_err(pipe_startup_error)?;
+        super::startup_diagnostics::launcher_stage(Stage::RunningAnnouncement);
         super::service::announce_running()
             .map_err(|error| (STARTUP_RUNNING_ANNOUNCEMENT, error))?;
         Ok((listener, first))
     })();
     let result = startup.and_then(|(listener, first)| {
+        super::startup_diagnostics::launcher_stage(
+            memcordon_core::WindowsLauncherStartupStageV1::ServiceLoop,
+        );
         serve(listener, first).map_err(|error| (STARTUP_SERVICE_LOOP, error))
     });
     if let Err((code, error)) = result {
         eprintln!("{error}");
+        if let Err(diagnostic_error) = super::startup_diagnostics::record_launcher(code) {
+            eprintln!("launcher startup diagnostic publication failed: {diagnostic_error}");
+        }
         super::service::announce_startup_failed(code);
     } else {
         super::service::announce_stopped(0);
@@ -1503,7 +1573,6 @@ fn handle_control(
         } => {
             // This lease spans the following Launch request, including rejection
             // staging performed after launch_attempt returns an error.
-            let mut _settlement = Some(SETTLEMENT.enter()?);
             let process = OwnedHandle::new(remote_process_handle as usize as HANDLE)?;
             if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
                 || attempt_id.is_empty()
@@ -1512,6 +1581,7 @@ fn handle_control(
             {
                 return Err("membership request has an invalid binding".to_owned());
             }
+            let mut _settlement = Some(SETTLEMENT.enter()?);
             let inside_active_job = ACTIVE_JOBS
                 .lock()
                 .map_err(|_| "active Job registry is poisoned".to_owned())?
@@ -1537,6 +1607,22 @@ fn handle_control(
             match launch {
                 WindowsLauncherRequestV3::Launch(request) => {
                     let transferred = LaunchTransferredHandles::adopt(&request)?;
+                    if let Err(detail) = require_startup_admission() {
+                        return pipe::write_frame(
+                            connection,
+                            &WindowsLauncherResponseV3::Reject {
+                                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                                attempt_id,
+                                nonce,
+                                request_sha256,
+                                rejection: super::record::pretarget_rejection_at(
+                                    "MCSEALED-WINDOWS-STARTUP-RECOVERY",
+                                    memcordon_core::BoundarySetupPhase::RequestValidation,
+                                    detail,
+                                ),
+                            },
+                        );
+                    }
                     #[cfg(feature = "test-support")]
                     let mut _diagnostic_settlement = None;
                     #[cfg(feature = "test-support")]
@@ -2448,6 +2534,7 @@ fn launch_attempt(
         ));
     }
     let active_handle = super::process::duplicate_owned(job.handle())?;
+    super::process::verify_not_inheritable(active_handle.raw())?;
     let active_job_handle = active_handle.raw() as usize as u64;
     let active_primary = super::process::duplicate_owned(primary_token.raw())?;
     ACTIVE_JOBS
@@ -3239,6 +3326,40 @@ fn launch_attempt(
         service_relay_event_handle,
     )?;
     cleanup_guard.record.owner_manifest = Some(owner_manifest);
+    // Only this audited, closed main-Job transfer set can support recovery
+    // after every native Job handle holder has exited.
+    if request.certification_mutant.is_none()
+        && creation.handle_list_present
+        && creation.job_list_present
+    {
+        job.verify_configuration(request.launch.policy.memory_limit_bytes)?;
+        super::process::verify_not_inheritable(job.handle())?;
+        let manifest = cleanup_guard
+            .record
+            .owner_manifest
+            .as_ref()
+            .expect("just frozen");
+        let contract = memcordon_core::WindowsJobClosureContractV1 {
+            schema_version: 1,
+            attempt_id: cleanup_guard.record.attempt_id.clone(),
+            nonce: cleanup_guard.record.nonce.clone(),
+            request_sha256: cleanup_guard.record.request_sha256.clone(),
+            provider_generation: cleanup_guard.record.provider_generation.clone(),
+            launch_incarnation: cleanup_guard.record.launch_incarnation.clone(),
+            original_boot_id: cleanup_guard.record.boot_identity.clone(),
+            job_identity: cleanup_guard.record.job_identity_sha256.clone(),
+            owner_manifest_sha256: manifest.canonical_sha256().map_err(str::to_owned)?,
+            guardian_job_transfer_sha256: guardian.job_transfer_sha256().to_owned(),
+            kill_on_close_verified: true,
+            breakaway_denied: true,
+            job_handles_noninheritable: true,
+            closed_job_owner_set: true,
+            job_unnamed: true,
+            target_handle_list_verified: true,
+        };
+        contract.validate().map_err(str::to_owned)?;
+        cleanup_guard.record.job_closure_contract = Some(contract);
+    }
     if let Err(detail) = cleanup_guard.record.authorize() {
         retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
@@ -4139,6 +4260,7 @@ fn authoritative_terminal_receipt(
             || record.workload_checkpoint.is_some(),
         guardian_receipt_sha256: None,
         current_boot_id: None,
+        capability_extinction: None,
     };
     let receipt = memcordon_core::WindowsTerminalReceiptV2 {
         policy_enforcement: match historical.policy_enforcement {

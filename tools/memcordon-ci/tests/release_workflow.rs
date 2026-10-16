@@ -26,6 +26,58 @@ fn unique_step(steps: &[Value], role: &str, predicate: impl Fn(&Value) -> bool) 
 }
 
 #[test]
+fn assessed_producers_use_one_exact_matrix_derived_job_name() {
+    let workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();
+    check(&workflow).unwrap();
+    for producer in [
+        "native-linux-x64",
+        "candidate-linux-x64-native",
+        "public-linux-x64-native",
+    ] {
+        for mutation in [
+            "missing-name",
+            "static-name",
+            "other-expression",
+            "wrong-producer",
+            "duplicate-row",
+            "additional-axis",
+        ] {
+            let mut changed = workflow.clone();
+            let job = &mut changed["jobs"][producer];
+            match mutation {
+                "missing-name" => {
+                    job.as_mapping_mut()
+                        .unwrap()
+                        .remove(Value::String("name".into()));
+                }
+                "static-name" => job["name"] = producer.into(),
+                "other-expression" => job["name"] = "${{ matrix.target }}".into(),
+                "wrong-producer" => {
+                    job["strategy"]["matrix"]["include"][0]["producer-job"] =
+                        "unrelated-producer".into();
+                }
+                "duplicate-row" => {
+                    let rows = job["strategy"]["matrix"]["include"]
+                        .as_sequence_mut()
+                        .unwrap();
+                    rows.push(rows[0].clone());
+                }
+                "additional-axis" => {
+                    job["strategy"]["matrix"]["extra"] =
+                        serde_yaml::from_str("[first, second]").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&changed).is_err(),
+                "{producer} accepted {mutation} in assessed job identity"
+            );
+        }
+    }
+}
+
+#[test]
 fn release_assembly_provisions_selected_metadata_toolchain_before_rechecking_source() {
     let workflow: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/release.yml")).unwrap();

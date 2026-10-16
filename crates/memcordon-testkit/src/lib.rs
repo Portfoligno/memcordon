@@ -450,11 +450,11 @@ fn observe_deadline_child(
     } = control;
     let notified = std::cell::Cell::new(false);
     let notify = || {
-        if !notified.replace(true)
-            && let Some(notify) = &failure
-        {
-            // An observational hook cannot unwind through the exact child owner.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify()));
+        if !notified.replace(true) {
+            if let Some(notify) = &failure {
+                // An observational hook cannot unwind through the exact child owner.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify()));
+            }
         }
     };
     let boundary = match OuterTestBoundary::after_spawn(&child) {

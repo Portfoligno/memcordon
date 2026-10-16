@@ -82,6 +82,7 @@ pub fn rejection() -> WindowsProviderRejectionV2 {
         cleanup_process_creation: None,
         restart_safety: restart_safety.clone(),
         retirement_proof: WindowsRetirementProofV2 {
+            capability_extinction: None,
             schema_version: 2,
             source: WindowsRetirementProofSourceV2::LiveNative,
             attempt_id,

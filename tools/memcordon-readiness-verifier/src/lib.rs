@@ -807,6 +807,19 @@ fn validate_producer_bundle(
                     {
                         nested.push(path);
                     }
+                    if let Some(extinction) = &actor.extinction_recovery {
+                        nested.extend([
+                            extinction.staging_invocation.as_str(),
+                            extinction.staging_exit.as_str(),
+                            extinction.staging_stdout.as_str(),
+                            extinction.staging_stderr.as_str(),
+                            extinction.terminal_invocation.as_str(),
+                            extinction.terminal_exit.as_str(),
+                            extinction.terminal_stdout.as_str(),
+                            extinction.terminal_authority.as_str(),
+                            extinction.terminal_stderr.as_str(),
+                        ]);
+                    }
                 }
             }
             if let Some(capacity) = &semantic.windows_capacity {
@@ -2044,8 +2057,24 @@ pub struct ComponentActor {
     pub recovery_invocation: Option<String>,
     pub recovery_exit: Option<String>,
     pub recovery_stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extinction_recovery: Option<ComponentExtinctionRecovery>,
     pub control_worker_site: Option<String>,
     pub control_worker_held: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentExtinctionRecovery {
+    pub staging_invocation: String,
+    pub staging_exit: String,
+    pub staging_stdout: String,
+    pub staging_stderr: String,
+    pub terminal_invocation: String,
+    pub terminal_exit: String,
+    pub terminal_stdout: String,
+    pub terminal_authority: String,
+    pub terminal_stderr: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

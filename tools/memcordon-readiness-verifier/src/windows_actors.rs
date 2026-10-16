@@ -16,6 +16,330 @@ fn shape(value: &Value, required: &[&str], optional: &[&str]) -> VerificationRes
     Ok(())
 }
 
+fn validate_extinction_recovery(
+    context: &WindowsAcceptanceContext<'_>,
+    actor: &crate::ComponentActor,
+    command: &Value,
+    binding: (&str, &str, &str),
+    cleanup: u64,
+    executable_sha: &str,
+) -> VerificationResult<()> {
+    let evidence = actor
+        .extinction_recovery
+        .as_ref()
+        .ok_or("all-owner extinction lacks actual staging and terminal ACK custody")?;
+    let json = |path: &str| crate::wire::json(context.custody.bytes(path)?);
+    let (attempt, nonce, request) = binding;
+    let staging = json(&evidence.staging_invocation)?;
+    let terminal = json(&evidence.terminal_invocation)?;
+    let observation = json(&actor.observation)?;
+    let provider = &observation["launch"]["expected_provider_binding"];
+    let held = json(
+        actor
+            .held_before
+            .as_deref()
+            .ok_or("extinction held owner identities absent")?,
+    )?;
+    for (invocation, format) in [
+        (
+            &staging,
+            "memcordon.windows-capability-extinction-staging-command",
+        ),
+        (
+            &terminal,
+            "memcordon.windows-failed-collection-recovery-command",
+        ),
+    ] {
+        shape(
+            invocation,
+            &[
+                "format",
+                "revision",
+                "run_id",
+                "recipe_id",
+                "source_commit",
+                "provider",
+                "executable_sha256",
+                "program_utf16",
+                "argv_utf16",
+                "cwd_utf16",
+                "environment_cleared",
+                "original_cleanup_deadline_unix_millis",
+            ],
+            if format == "memcordon.windows-failed-collection-recovery-command" {
+                &["held_association", "certification_failure_preserved"]
+            } else {
+                &[]
+            },
+        )?;
+        if invocation["format"] != format
+            || invocation["revision"] != 1
+            || invocation["run_id"] != command["run_id"]
+            || invocation["recipe_id"] != command["recipe_id"]
+            || invocation["source_commit"] != context.index.source_commit
+            || invocation["executable_sha256"] != executable_sha
+            || invocation["program_utf16"] != command["program_utf16"]
+            || invocation["cwd_utf16"] != command["cwd_utf16"]
+            || invocation["environment_cleared"] != true
+            || invocation["original_cleanup_deadline_unix_millis"] != cleanup
+            || invocation["provider"]["generation"].as_str()
+                != context.native.provider_generation.as_deref()
+            || invocation["provider"]["source_commit"] != context.index.source_commit
+            || invocation["provider"] != *provider
+        {
+            return Err(
+                "extinction recovery invocation crosses original authority or cutoff".into(),
+            );
+        }
+    }
+    let args = staging["argv_utf16"]
+        .as_array()
+        .ok_or("extinction staging argv absent")?;
+    let units = |text: &str| serde_json::json!(text.encode_utf16().collect::<Vec<_>>());
+    if args.len() != 3 || args[0] != units("windows-recover") || args[1] != units("converge") {
+        return Err("extinction staging is not actual bounded convergence".into());
+    }
+    let budget: Vec<u16> =
+        serde_json::from_value(args[2].clone()).map_err(|error| error.to_string())?;
+    let budget = String::from_utf16(&budget)
+        .map_err(|error| error.to_string())?
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    if budget == 0 || budget > 90_000 {
+        return Err("extinction staging budget exceeds owned cleanup bound".into());
+    }
+    let expected_args = ["windows-recover", "attempt", attempt, nonce, request]
+        .iter()
+        .map(|argument| argument.encode_utf16().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if terminal["argv_utf16"] != serde_json::json!(expected_args)
+        || terminal["certification_failure_preserved"] != false
+        || terminal["held_association"] != held
+    {
+        return Err("extinction terminal recovery differs from original held attempt".into());
+    }
+    for (invocation, exit, stdout, stderr, format, status) in [
+        (
+            &evidence.staging_invocation,
+            &evidence.staging_exit,
+            &evidence.staging_stdout,
+            &evidence.staging_stderr,
+            "memcordon.windows-capability-extinction-staging-exit",
+            1,
+        ),
+        (
+            &evidence.terminal_invocation,
+            &evidence.terminal_exit,
+            &evidence.terminal_stdout,
+            &evidence.terminal_stderr,
+            "memcordon.windows-failed-collection-recovery-exit",
+            0,
+        ),
+    ] {
+        let observed = json(exit)?;
+        shape(
+            &observed,
+            &[
+                "format",
+                "revision",
+                "native_status",
+                "invocation_sha256",
+                "stdout_sha256",
+                "stderr_sha256",
+            ],
+            if status == 0 {
+                &["certification_failure_preserved"]
+            } else {
+                &[]
+            },
+        )?;
+        if observed["format"] != format
+            || observed["revision"] != 1
+            || (status == 0 && observed["certification_failure_preserved"] != false)
+            || observed["native_status"] != status
+            || observed["invocation_sha256"] != context.custody.hash(invocation)?
+            || observed["stdout_sha256"] != context.custody.hash(stdout)?
+            || observed["stderr_sha256"] != context.custody.hash(stderr)?
+        {
+            return Err("extinction recovery native wait or capture was reassociated".into());
+        }
+    }
+    let staged = json(&evidence.staging_stdout)?;
+    shape(
+        &staged,
+        &[
+            "schema_version",
+            "challenge",
+            "provider_generation",
+            "current_boot_identity",
+            "executing",
+            "incomplete_proof",
+            "unacknowledged_outboxes",
+            "ack_retirement_in_progress",
+            "completed_tombstones",
+            "active_admissions",
+            "quarantined",
+        ],
+        &[],
+    )?;
+    crate::digest(
+        staged["challenge"]
+            .as_str()
+            .ok_or("staging challenge absent")?,
+    )?;
+    if staged["schema_version"] != 1
+        || staged["current_boot_identity"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || staged["completed_tombstones"].as_u64().is_none()
+        || staged["active_admissions"].as_u64().is_none()
+        || staged["provider_generation"].as_str() != context.native.provider_generation.as_deref()
+        || staged["executing"] != 0
+        || staged["incomplete_proof"] != 0
+        || staged["unacknowledged_outboxes"] != 1
+        || staged["ack_retirement_in_progress"] != 0
+        || staged["quarantined"] != 0
+    {
+        return Err(
+            "extinction staging must retain one real unacknowledged terminal outbox".into(),
+        );
+    }
+    let recovered = json(&evidence.terminal_stdout)?;
+    shape(
+        &recovered,
+        &[
+            "schema_version",
+            "provider_request",
+            "provider_response",
+            "frontend_delivery",
+        ],
+        &[],
+    )?;
+    let recovery_request = &recovered["provider_request"];
+    shape(
+        recovery_request,
+        &[
+            "kind",
+            "schema_version",
+            "attempt_id",
+            "nonce",
+            "request_sha256",
+            "challenge",
+        ],
+        &[],
+    )?;
+    if recovered["schema_version"] != 1
+        || recovery_request["kind"] != "recover-attempt"
+        || recovery_request["schema_version"] != 3
+        || recovery_request["attempt_id"] != attempt
+        || recovery_request["nonce"] != nonce
+        || recovery_request["request_sha256"] != request
+    {
+        return Err("extinction terminal response crosses original recovery request".into());
+    }
+    crate::digest(
+        recovery_request["challenge"]
+            .as_str()
+            .ok_or("extinction recovery challenge absent")?,
+    )?;
+    let response = &recovered["provider_response"];
+    if recovered["provider_response"]["rejection"]["provider_failure"]["provider_binding"]
+        != *provider
+    {
+        return Err("extinction terminal diagnostic crosses original provider identity".into());
+    }
+    validate_frame(response, attempt, nonce, request)?;
+    let receipt = &response["rejection"]["disposition"]["receipt"];
+    shape(
+        receipt,
+        &[
+            "schema_version",
+            "attempt_id",
+            "nonce",
+            "request_sha256",
+            "payload",
+            "process_observation",
+            "restart_safety",
+            "retirement_proof",
+        ],
+        &["policy_enforcement", "cleanup_process_creation"],
+    )?;
+    validate_terminal_shapes(receipt)?;
+    crate::wire::validate_windows_proof_matrix(receipt)?;
+    if response["kind"] != "reject"
+        || response["rejection"]["disposition"]["disposition"] != "postauthorization-failure"
+        || receipt["retirement_proof"]["source"] != "capability-extinction"
+        || receipt["retirement_proof"]["provider_generation"] != staged["provider_generation"]
+        || receipt["attempt_id"] != attempt
+        || receipt["nonce"] != nonce
+        || receipt["request_sha256"] != request
+    {
+        return Err("extinction terminal proof uses different source or binding".into());
+    }
+    let extinction = &receipt["retirement_proof"]["capability_extinction"];
+    if extinction["current_boot_id"] != staged["current_boot_identity"] {
+        return Err("extinction staging and terminal proof cross native boots".into());
+    }
+    for (role, expected) in [
+        ("launcher-job", &held["worker_process_identity"]),
+        ("guardian-process", &held["guardian_identity"]),
+        ("direct-target-process", &held["live_target_identity"]),
+    ] {
+        let actual = extinction["owner_manifest"]["entries"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["role"] == role))
+            .map(|entry| &entry["process_identity"])
+            .ok_or("extinction original owner absent")?;
+        if actual != expected {
+            return Err("extinction proof substitutes an original held owner identity".into());
+        }
+    }
+    let delivery = &recovered["frontend_delivery"];
+    shape(
+        delivery,
+        &[
+            "schema_version",
+            "attempt_id",
+            "nonce",
+            "request_sha256",
+            "authority_sha256",
+            "retired_sha256",
+            "retired_confirmed",
+        ],
+        &[],
+    )?;
+    crate::digest(
+        delivery["retired_sha256"]
+            .as_str()
+            .ok_or("retired ACK digest absent")?,
+    )?;
+    let authority = json(&evidence.terminal_authority)?;
+    let mut expected_authority = response.clone();
+    expected_authority["rejection"]
+        .as_object_mut()
+        .ok_or("extinction authority rejection absent")?
+        .remove("provider_failure");
+    expected_authority["rejection"]
+        .as_object_mut()
+        .ok_or("extinction authority rejection absent")?
+        .remove("guardian_causal_receipt");
+    if expected_authority["rejection"]["loader_qualification"]["kind"] == "failed" {
+        expected_authority["rejection"]["loader_qualification"]["failure"]["support_debug_observation"] =
+            Value::Null;
+    }
+    if authority != expected_authority
+        || delivery["schema_version"] != 1
+        || delivery["retired_confirmed"] != true
+        || delivery["attempt_id"] != attempt
+        || delivery["nonce"] != nonce
+        || delivery["request_sha256"] != request
+        || delivery["authority_sha256"] != context.custody.hash(&evidence.terminal_authority)?
+    {
+        return Err("extinction terminal delivery lacks exact authenticated ACK retirement".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationResult<bool> {
     let key = &context.record.key;
     if !key.target.ends_with("windows-msvc")
@@ -691,6 +1015,18 @@ pub(crate) fn validate(context: &WindowsAcceptanceContext<'_>) -> VerificationRe
             || actor.recovery_stderr.is_some()
         {
             return Err("actor invented recovery without native response".into());
+        }
+        if selector == "all-job-owners-closed-after-authorization" {
+            validate_extinction_recovery(
+                context,
+                actor,
+                &command,
+                (attempt, nonce, request),
+                cleanup,
+                executable_sha,
+            )?;
+        } else if actor.extinction_recovery.is_some() {
+            return Err("extinction recovery evidence substituted into another actor".into());
         }
         if let Some(before_path) = &actor.held_before {
             let before = json(before_path)?;
@@ -1813,7 +2149,14 @@ fn validate_frame(
                 )?;
                 let sequence = diagnostic["diagnostic_sequence"]
                     .as_u64()
-                    .filter(|value| *value > 0)
+                    .filter(|value| {
+                        *value > 0
+                            || (rejection["disposition"]["receipt"]["retirement_proof"]["source"]
+                                == "capability-extinction"
+                                && diagnostic["original"]["unavailable"]["reason"]
+                                    == "worker-lost-before-observation"
+                                && diagnostic["secondary"] == serde_json::json!([]))
+                    })
                     .ok_or("actual actor diagnostic sequence absent")?;
                 if (!diagnostic["durable_through_sequence"].is_null()
                     && diagnostic["durable_through_sequence"]
@@ -2221,7 +2564,11 @@ fn validate_terminal_shapes(terminal: &Value) -> VerificationResult<()> {
             "launch_gate_closed",
             "policy_reference_bound",
         ],
-        &["guardian_receipt_sha256", "current_boot_id"],
+        &[
+            "guardian_receipt_sha256",
+            "current_boot_id",
+            "capability_extinction",
+        ],
     )?;
     if proof["schema_version"] != 2
         || [
@@ -2393,8 +2740,13 @@ fn validate_terminal_shapes(terminal: &Value) -> VerificationResult<()> {
         "sealed_boundary_retired",
     ]
     .iter()
-    .any(|field| safety[*field] != true)
-        || safety["errors"] != serde_json::json!([])
+    .any(|field| {
+        let historical = matches!(
+            *field,
+            "direct_child_reaped" | "helpers_reaped" | "sealed_boundary_retired"
+        );
+        safety[*field] != Value::Bool(!(proof["source"] == "capability-extinction" && historical))
+    }) || safety["errors"] != serde_json::json!([])
     {
         return Err("actor terminal original native restart safety incomplete".into());
     }
@@ -2462,7 +2814,9 @@ fn validate_terminal_shapes(terminal: &Value) -> VerificationResult<()> {
                         | "legacy-observation-unavailable"
                         | "target-not-created"
                 )
-            ) || !processes["root_identity"].is_null()
+            ) || (!processes["root_identity"].is_null()
+                && !(proof["source"] == "capability-extinction"
+                    && coverage["reason"] == "worker-lost-before-freeze"))
                 || !processes["final_accounting"].is_null()
             {
                 return Err("actor unavailable process observation reason/facts differ".into());

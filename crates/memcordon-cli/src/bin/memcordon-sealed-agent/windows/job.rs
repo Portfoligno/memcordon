@@ -403,7 +403,7 @@ impl Job {
         Ok(flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) != 0)
     }
 
-    fn verify_configuration(&self, memory_limit: Option<u64>) -> Result<(), String> {
+    pub fn verify_configuration(&self, memory_limit: Option<u64>) -> Result<(), String> {
         let limits = self.query_limits()?;
         let flags = limits.BasicLimitInformation.LimitFlags;
         if flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0

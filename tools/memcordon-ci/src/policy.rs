@@ -1694,14 +1694,34 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                     "complete compiled caches require actual successful compilation; failed settled output belongs only to snapshot seeds",
                 ));
             }
-            if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
-                && !condition.contains(
+            if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"] {
+                if !condition.contains(
                     "steps.workspace-download-context.outputs.bootstrap-home-matches == 'true'",
-                )
-            {
-                return Err(failure(
-                    "bootstrap seed save requires actual home association",
-                ));
+                ) {
+                    return Err(failure(
+                        "bootstrap seed save requires actual home association",
+                    ));
+                }
+                let mut contexts = steps.iter().enumerate().filter(|(_, candidate)| {
+                    candidate["id"].as_str() == Some("workspace-download-context")
+                });
+                let (context_ordinal, context) = contexts.next().ok_or_else(|| {
+                    failure("bootstrap seed save requires workspace home context")
+                })?;
+                if contexts.next().is_some()
+                    || context_ordinal >= ordinal
+                    || context["run"]
+                        .as_str()
+                        .and_then(ordinary_command)
+                        .as_deref()
+                        != Some(
+                            "./target/ci/release/memcordon-ci ci download-cache-context --family workspace",
+                        )
+                {
+                    return Err(failure(
+                        "bootstrap seed save requires one preceding workspace home context",
+                    ));
+                }
             }
             if !condition.contains("always()")
                 || !condition.contains("github.event_name == 'push'")
@@ -3245,6 +3265,26 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             public_owners.push(format!("public-{platform}-{channel}"));
         }
     }
+    for name in candidate_owners.iter().skip(1).chain(public_owners.iter()) {
+        let job = jobs
+            .get(name)
+            .ok_or_else(|| failure("Release producer absent"))?;
+        let matrix = job["strategy"]["matrix"]
+            .as_mapping()
+            .ok_or_else(|| failure("Release producer matrix absent"))?;
+        exact_mapping_keys(matrix, &["include"], "Release producer matrix")?;
+        let rows = matrix["include"]
+            .as_sequence()
+            .ok_or_else(|| failure("Release producer matrix rows absent"))?;
+        if job["name"].as_str() != Some("${{ matrix.producer-job }}")
+            || rows.len() != 1
+            || rows[0]["producer-job"].as_str() != Some(name.as_str())
+        {
+            return Err(failure(
+                "Release producer must have one uniquely named matrix row",
+            ));
+        }
+    }
     for (name, scope, condition) in [
         (
             "readiness-candidate-report",
@@ -3356,7 +3396,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 != Some(
                     "always() && (needs.publish.result == 'success' || needs.recovery-publish.result == 'success') && needs.select.outputs.preparation-kind == 'tagged'",
                 )
-                || job["name"].as_str() != Some(name.as_str())
+                || job["name"].as_str() != Some("${{ matrix.producer-job }}")
                 || job["outputs"]["artifact-id"].as_str()
                     != Some("${{ steps.readiness-upload.outputs.artifact-id }}")
                 || job["outputs"]["artifact-digest"].as_str()
@@ -5018,6 +5058,7 @@ struct RustPolicy {
     standard_compiler_mutations: usize,
     cleared_environments: usize,
     cargo_home_mutations: usize,
+    offline_download_fixture_mutations: usize,
     cargo_job_budget_mutations: usize,
     managed_miri_sysroot_mutations: usize,
     standard_output_mutations: usize,
@@ -5115,6 +5156,13 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 self.cargo_home_mutations += 1;
             }
             if expression.method == "env"
+                && expression.args.len() == 2
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "CARGO_NET_OFFLINE")
+                && matches!(expression.args.iter().nth(1), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. })) if value.value() == "true")
+            {
+                self.offline_download_fixture_mutations += 1;
+            }
+            if expression.method == "env"
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "CARGO_BUILD_JOBS")
                 && matches!(expression.args.iter().nth(1), Some(syn::Expr::MethodCall(serialized)) if serialized.method == "to_string" && serialized.args.is_empty()
                     && matches!(&*serialized.receiver, syn::Expr::MethodCall(jobs) if jobs.method == "compiler_jobs" && jobs.args.is_empty()
@@ -5201,13 +5249,21 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
 }
 
 fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    // Only the authored-registry installation fixture forces Cargo offline;
+    // other transport fixtures retain the existing home/output-only boundary.
+    let offline = if relative == Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs") {
+        visitor.offline_download_fixture_mutations
+    } else {
+        0
+    };
     [
         Path::new("tools/memcordon-ci/tests/cache_download_families.rs"),
+        Path::new("tools/memcordon-ci/tests/cache_snapshot_transport.rs"),
         Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs"),
     ]
     .contains(&relative)
         && visitor.subprocess_env_mutations
-            == visitor.cargo_home_mutations + visitor.standard_output_mutations
+            == visitor.cargo_home_mutations + visitor.standard_output_mutations + offline
         && visitor.cleared_environments == 0
 }
 

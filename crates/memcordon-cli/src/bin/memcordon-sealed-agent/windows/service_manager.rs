@@ -1544,6 +1544,52 @@ pub fn query_status(service: &ScHandle) -> Result<SERVICE_STATUS_PROCESS, String
     Ok(status)
 }
 
+pub(super) fn launcher_startup_observation(minimum_tick: u64) -> Result<String, String> {
+    let manager = manager_connect()?;
+    let service = open(
+        &manager,
+        memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+        SERVICE_QUERY_STATUS,
+    )?;
+    let status = status_process(&service)?;
+    let expected = if status.dwProcessId == 0 {
+        Ok(None)
+    } else {
+        super::process::process_identity_for_pid(status.dwProcessId).and_then(|identity| {
+            identity
+                .map(Some)
+                .ok_or_else(|| "queried launcher process exited".to_owned())
+        })
+    };
+    let projected = match expected {
+        Ok(expected) if status.dwServiceSpecificExitCode != 0 => {
+            super::startup_diagnostics::read_launcher(
+                status.dwServiceSpecificExitCode,
+                expected.as_ref(),
+                minimum_tick,
+            )
+        }
+        Ok(_) => Ok(None),
+        Err(_) => Err("launcher startup process identity unavailable".to_owned()),
+    };
+    let diagnostic_status = match &projected {
+        Ok(Some(_)) => "available",
+        Ok(None) => "absent",
+        Err(_) => "rejected-or-unavailable",
+    };
+    let diagnostic = projected.unwrap_or(None);
+    let diagnostic: Option<serde_json::Value> = diagnostic
+        .map(|text| serde_json::from_str(&text))
+        .transpose()
+        .map_err(|_| "validated launcher diagnostic encoding failed")?;
+    serde_json::to_string(&serde_json::json!({
+        "certification_authority":false,"diagnostic":diagnostic,"diagnostic_status":diagnostic_status,
+        "state":status.dwCurrentState,"process_id":status.dwProcessId,
+        "win32_exit":status.dwWin32ExitCode,"service_exit":status.dwServiceSpecificExitCode,
+        "checkpoint":status.dwCheckPoint,"wait_hint_millis":status.dwWaitHint
+    })).map_err(|_| "launcher startup observation encoding failed".to_owned())
+}
+
 fn startup_diagnostic(service_exit: u32) -> String {
     if service_exit == super::control_service::STARTUP_POLICY_REGISTRY {
         "; startup_diagnostic=role=control operation=startup stage=policy-registry".to_owned()

@@ -206,6 +206,85 @@ fn isolated_cargo_boundary_only_may_select_standard_cargo_home() {
 }
 
 #[test]
+fn reviewed_download_fixtures_preserve_isolated_home_and_output_boundaries() {
+    let fixtures = [
+        (
+            "tools/memcordon-ci/tests/cache_download_families.rs",
+            include_str!("cache_download_families.rs"),
+        ),
+        (
+            "tools/memcordon-ci/tests/cache_snapshot_transport.rs",
+            include_str!("cache_snapshot_transport.rs"),
+        ),
+        (
+            "tools/memcordon-ci/tests/tool_download_roundtrip.rs",
+            include_str!("tool_download_roundtrip.rs"),
+        ),
+    ];
+    let standard = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", home).env("GITHUB_OUTPUT", output); }"#;
+    for (relative, actual) in fixtures {
+        let path = Path::new(relative);
+        validate_rust_policy_bytes(path, actual.as_bytes()).unwrap();
+        validate_rust_policy_bytes(path, standard).unwrap();
+        for forbidden in [
+            br#"fn run(command: &mut std::process::Command) { command.env("CUSTOM_CI_FLAG", "value"); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command, key: &str) { command.env(key, "value"); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.envs([("CARGO_HOME", home)]); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.env_clear().env("CARGO_HOME", home); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.env_remove("CARGO_HOME"); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.env("PATH", "/unowned/bin"); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.env("RUSTC", "/unowned/rustc"); }"#.as_slice(),
+            br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", home).env("CUSTOM_CI_FLAG", "value"); }"#.as_slice(),
+        ] {
+            assert!(
+                validate_rust_policy_bytes(path, forbidden).is_err(),
+                "{relative} accepted unreviewed environment source: {}",
+                String::from_utf8_lossy(forbidden)
+            );
+        }
+    }
+    for relative in [
+        "tools/memcordon-ci/tests/unreviewed_download_fixture.rs",
+        "tools/memcordon-ci/src/download_cache.rs",
+        "crates/example/src/lib.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(relative), standard).is_err());
+    }
+}
+
+#[test]
+fn offline_download_permission_is_exact_in_path_key_and_value() {
+    let fixture = Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs");
+    let offline = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_NET_OFFLINE", "true"); }"#;
+    validate_rust_policy_bytes(fixture, offline).unwrap();
+    let combined = br#"fn run(command: &mut std::process::Command) { command.env("CARGO_HOME", home).env("CARGO_NET_OFFLINE", "true").env("GITHUB_OUTPUT", output); }"#;
+    validate_rust_policy_bytes(fixture, combined).unwrap();
+    for relative in [
+        "tools/memcordon-ci/tests/cache_download_families.rs",
+        "tools/memcordon-ci/tests/cache_snapshot_transport.rs",
+        "tools/memcordon-ci/tests/unreviewed_download_fixture.rs",
+        "tools/memcordon-ci/src/command.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(relative), offline).is_err());
+    }
+    for forbidden in [
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_NET_OFFLINE", "false"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_NET_OFFLINE", "1"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_NET_OFFLINE", value); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command, key: &str) { command.env(key, "true"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.envs([("CARGO_NET_OFFLINE", "true")]); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CUSTOM_CI_OFFLINE", "true"); }"#.as_slice(),
+        br#"fn run(command: &mut std::process::Command) { command.env("CARGO_NET_OFFLINE", "true").env("CARGO_NET_OFFLINE", "false"); }"#.as_slice(),
+    ] {
+        assert!(
+            validate_rust_policy_bytes(fixture, forbidden).is_err(),
+            "offline fixture accepted unreviewed source: {}",
+            String::from_utf8_lossy(forbidden)
+        );
+    }
+}
+
+#[test]
 fn cargo_fuzz_budget_is_reviewed_only_at_the_owned_command_boundary() {
     let boundary = Path::new("tools/memcordon-ci/src/command.rs");
     let actual = include_str!("../src/command.rs");

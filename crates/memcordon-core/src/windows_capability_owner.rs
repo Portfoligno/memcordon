@@ -77,6 +77,102 @@ pub struct WindowsCapabilityOwnerManifestV1 {
     pub entries: [WindowsCapabilityOwnerEntryV1; WINDOWS_CAPABILITY_OWNER_ROLE_COUNT],
 }
 
+/// Immutable preauthorization readback of the finite Job ownership contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsJobClosureContractV1 {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub provider_generation: String,
+    pub launch_incarnation: String,
+    pub original_boot_id: String,
+    pub job_identity: String,
+    pub owner_manifest_sha256: String,
+    pub guardian_job_transfer_sha256: String,
+    pub kill_on_close_verified: bool,
+    pub breakaway_denied: bool,
+    pub job_handles_noninheritable: bool,
+    pub closed_job_owner_set: bool,
+    pub job_unnamed: bool,
+    pub target_handle_list_verified: bool,
+}
+
+impl WindowsJobClosureContractV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1
+            || !valid_sha256(&self.attempt_id)
+            || self.nonce.is_empty()
+            || !valid_sha256(&self.request_sha256)
+            || self.provider_generation.is_empty()
+            || self.launch_incarnation.is_empty()
+            || self.original_boot_id.is_empty()
+            || !valid_sha256(&self.job_identity)
+            || !valid_sha256(&self.owner_manifest_sha256)
+            || !valid_sha256(&self.guardian_job_transfer_sha256)
+            || !self.kill_on_close_verified
+            || !self.breakaway_denied
+            || !self.job_handles_noninheritable
+            || !self.closed_job_owner_set
+            || !self.job_unnamed
+            || !self.target_handle_list_verified
+        {
+            return Err("job_closure_contract.binding_or_readback");
+        }
+        Ok(())
+    }
+
+    pub fn canonical_sha256(&self) -> Result<String, &'static str> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| "job_closure_contract.serialization")?;
+        let mut text = String::with_capacity(Sha256::output_size() * 2);
+        for byte in Sha256::digest(bytes) {
+            write!(text, "{byte:02x}").expect("String formatting cannot fail");
+        }
+        Ok(text)
+    }
+}
+
+/// Same-boot closure derived from checked capability extinction, without a
+/// native Job-zero observation or a guardian completion receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsCapabilityExtinctionProofV1 {
+    pub contract: WindowsJobClosureContractV1,
+    pub owner_manifest: WindowsCapabilityOwnerManifestV1,
+    pub current_boot_id: String,
+    pub job_holder_processes_extinct: bool,
+    pub target_process_extinct: bool,
+    pub relay_capabilities_retired: bool,
+    pub launch_gate_closed: bool,
+}
+
+impl WindowsCapabilityExtinctionProofV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.contract.validate()?;
+        self.owner_manifest.validate()?;
+        if self.current_boot_id != self.contract.original_boot_id
+            || self.owner_manifest.attempt_id != self.contract.attempt_id
+            || self.owner_manifest.provider_generation != self.contract.provider_generation
+            || self.owner_manifest.launch_incarnation != self.contract.launch_incarnation
+            || self.owner_manifest.canonical_sha256()? != self.contract.owner_manifest_sha256
+            || !self.job_holder_processes_extinct
+            || !self.target_process_extinct
+            || !self.relay_capabilities_retired
+            || !self.launch_gate_closed
+            || self.owner_manifest.entries.iter().any(|entry| {
+                entry.present
+                    && entry.role != WindowsCapabilityOwnerRoleV1::PolicyReference
+                    && entry.process_identity.is_none()
+            })
+        {
+            return Err("capability_extinction.binding_or_owner_closure");
+        }
+        Ok(())
+    }
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == Sha256::output_size() * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

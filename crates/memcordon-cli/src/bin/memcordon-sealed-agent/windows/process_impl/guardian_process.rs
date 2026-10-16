@@ -558,11 +558,15 @@ impl Drop for GuardianSlotLease {
 
 pub struct GuardianProcess {
     process: OwnedHandle,
+    job_transfer_sha256: String,
     _slot: GuardianSlotLease,
     handoff_retirement_verified: Option<WindowsProcessIdentityV1>,
 }
 
 impl GuardianProcess {
+    pub fn job_transfer_sha256(&self) -> &str {
+        &self.job_transfer_sha256
+    }
     #[cfg(feature = "test-support")]
     pub fn handoff_worker_loss(self, attempt_id: &str) -> Result<(), String> {
         let binding = self
@@ -883,6 +887,9 @@ pub fn create_guardian(
             access,
         });
     }
+    let job_transfer_sha256 = super::record::digest(
+        &serde_json::to_vec(&(&binding, &manifest)).map_err(|error| error.to_string())?,
+    );
     super::pipe::write_frame(
         bootstrap.raw(),
         &super::guardian::GuardianBootstrapMessageV1::Capabilities {
@@ -922,6 +929,7 @@ pub fn create_guardian(
     Ok((
         GuardianProcess {
             process: process_handle,
+            job_transfer_sha256,
             _slot: slot,
             handoff_retirement_verified: None,
         },

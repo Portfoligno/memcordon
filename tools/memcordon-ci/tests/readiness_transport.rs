@@ -43,6 +43,49 @@ fn budget() -> ReadBudget {
     ReadBudget::new(Instant::now() + Duration::from_secs(5))
 }
 #[test]
+fn producer_outcomes_require_exact_names_and_preserve_actual_conclusions() {
+    let observed = Replies {
+        metadata: serde_json::to_vec(&serde_json::json!({"jobs":[
+            {"name":"native-linux-x64 (x86_64-unknown-linux-gnu, ubuntu-24.04)","run_id":12,"run_attempt":3,"conclusion":"success"},
+            {"name":"candidate-linux-x64-native","run_id":12,"run_attempt":3,"conclusion":"success"},
+            {"name":"candidate-linux-x64-cargo","run_id":12,"run_attempt":3,"conclusion":"cancelled"},
+            {"name":"candidate-windows-x64-native","run_id":12,"run_attempt":3,"conclusion":"skipped"},
+            {"name":"candidate-windows-x64-cargo","run_id":12,"run_attempt":3,"conclusion":"failure"}
+        ]})).unwrap(),
+        zip: Vec::new(),
+    };
+    let result = readiness_transport::job_outcomes(
+        &observed,
+        &budget(),
+        &[],
+        "owner/repository",
+        12,
+        3,
+        &[
+            "native-linux-x64",
+            "candidate-linux-x64-native",
+            "candidate-linux-x64-cargo",
+            "candidate-windows-x64-native",
+            "candidate-windows-x64-cargo",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|outcome| outcome.result)
+            .collect::<Vec<_>>(),
+        [
+            JobResult::Missing,
+            JobResult::Success,
+            JobResult::Cancelled,
+            JobResult::Skipped,
+            JobResult::Failure,
+        ]
+    );
+}
+
+#[test]
 fn actual_job_attempts_and_missing_owners_cannot_be_relabelled() {
     let observed=Replies{metadata:serde_json::to_vec(&serde_json::json!({"jobs":[{"name":"candidate-linux-x64-native","run_id":12,"run_attempt":3,"conclusion":"success"}]})).unwrap(),zip:Vec::new()};
     let result = readiness_transport::job_outcomes(

@@ -1685,6 +1685,9 @@ fn replay_terminal_session(
     }
 }
 
+static LAST_AUTHENTICATED_LAUNCHER_TICK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn authenticated_launcher_detailed() -> Result<
     (
         OwnedHandle,
@@ -1693,8 +1696,22 @@ fn authenticated_launcher_detailed() -> Result<
     ),
     LauncherAuthenticationError,
 > {
+    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    let _ = LAST_AUTHENTICATED_LAUNCHER_TICK.compare_exchange(
+        0,
+        now,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
     let launcher = pipe::connect(WINDOWS_LAUNCHER_PIPE).map_err(|error| {
-        LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PIPE_CONNECT, error)
+        let observation = super::service_manager::launcher_startup_observation(
+            LAST_AUTHENTICATED_LAUNCHER_TICK.load(std::sync::atomic::Ordering::Acquire),
+        )
+        .unwrap_or_else(|_| "unavailable".to_owned());
+        LauncherAuthenticationError::new(
+            STARTUP_LAUNCHER_AUTHENTICATION_PIPE_CONNECT,
+            format!("{error}; launcher_startup_observation={observation}"),
+        )
     })?;
     let pipe_policy = super::security::private_pipe_sddl().map_err(|error| {
         LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PIPE_POLICY, error)
@@ -1781,6 +1798,10 @@ fn authenticated_launcher_detailed() -> Result<
     let identity = super::process::process_identity(launcher_process.raw()).map_err(|error| {
         LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PROCESS_IDENTITY, error)
     })?;
+    LAST_AUTHENTICATED_LAUNCHER_TICK.fetch_max(
+        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() },
+        std::sync::atomic::Ordering::Release,
+    );
     Ok((launcher, launcher_process, identity))
 }
 
