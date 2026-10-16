@@ -152,8 +152,11 @@ fn validate_producer_bundle(
         let member = archive
             .by_index(ordinal)
             .map_err(|error| error.to_string())?;
-        let name = member.name();
-        let path = name.strip_suffix('/').unwrap_or(name);
+        let name = member
+            .name()
+            .map_err(|error| error.to_string())?
+            .into_owned();
+        let path = name.strip_suffix('/').unwrap_or(&name);
         custody::validate_path(path)?;
         if !members.insert(name.to_owned()) || member.size() > MAX_ARTIFACT_BYTES {
             return Err("producer ZIP member duplicate/oversized".into());

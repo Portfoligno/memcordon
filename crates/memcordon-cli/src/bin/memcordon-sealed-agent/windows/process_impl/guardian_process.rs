@@ -444,8 +444,8 @@ pub fn certify_guardian_loader_context_negatives() -> Result<(), String> {
     }
 }
 
-pub(super) static LEASED_GUARDIAN_SLOTS: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+pub(super) static LEASED_GUARDIAN_SLOTS: LazyLock<Mutex<BTreeMap<usize, Option<GuardianProcess>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 pub fn recover_guardian_slots() -> Result<(), String> {
     let manager = super::service_manager::manager_connect()?;
@@ -482,6 +482,11 @@ pub(super) struct GuardianSlotLease {
     durable: Option<GuardianSlotLeaseV1>,
     durable_path: Option<PathBuf>,
 }
+
+// SAFETY: the lease exclusively owns its SCM handle. SCM query/stop handles
+// are process capabilities usable from any thread; the registry serializes
+// ownership transfer and no borrowed handle crosses the transfer.
+unsafe impl Send for GuardianSlotLease {}
 
 #[derive(Clone, Serialize)]
 pub(super) struct GuardianSlotLeaseV1 {
@@ -554,9 +559,35 @@ impl Drop for GuardianSlotLease {
 pub struct GuardianProcess {
     process: OwnedHandle,
     _slot: GuardianSlotLease,
+    handoff_retirement_verified: Option<WindowsProcessIdentityV1>,
 }
 
 impl GuardianProcess {
+    #[cfg(feature = "test-support")]
+    pub fn handoff_worker_loss(self, attempt_id: &str) -> Result<(), String> {
+        let binding = self
+            ._slot
+            .durable
+            .as_ref()
+            .ok_or("guardian slot binding absent")?;
+        // nonce_sha256 belongs to the guardian bootstrap, not the admitted
+        // frontend nonce. Preserve it verbatim in the durable slot binding.
+        if binding.attempt_id != attempt_id {
+            return Err("guardian handoff differs from original attempt".into());
+        }
+        let mut slots = LEASED_GUARDIAN_SLOTS
+            .lock()
+            .map_err(|_| "guardian slot lease mutex poisoned")?;
+        let entry = slots
+            .get_mut(&self._slot.index)
+            .ok_or("guardian handoff slot is not reserved")?;
+        if entry.is_some() {
+            return Err("guardian handoff slot already has an owner".into());
+        }
+        *entry = Some(self);
+        Ok(())
+    }
+
     pub const fn raw(&self) -> HANDLE {
         self.process.raw()
     }
@@ -601,13 +632,93 @@ impl GuardianProcess {
     }
 }
 
+pub fn retire_handed_off_guardian(
+    attempt_id: &str,
+    guardian: &WindowsProcessIdentityV1,
+) -> Result<(), String> {
+    let mut slots = LEASED_GUARDIAN_SLOTS
+        .lock()
+        .map_err(|_| "guardian slot lease mutex poisoned")?;
+    let Some(index) = slots.iter().find_map(|(index, owner)| {
+        owner
+            .as_ref()
+            .filter(|owner| {
+                owner
+                    ._slot
+                    .durable
+                    .as_ref()
+                    .is_some_and(|binding| binding.attempt_id == attempt_id)
+            })
+            .map(|_| *index)
+    }) else {
+        return Ok(());
+    };
+    let owner = slots
+        .get_mut(&index)
+        .and_then(Option::as_mut)
+        .ok_or("guardian handoff owner absent")?;
+    let binding = owner
+        ._slot
+        .durable
+        .as_ref()
+        .ok_or("guardian handoff binding absent")?;
+    let path = owner
+        ._slot
+        .durable_path
+        .as_ref()
+        .ok_or("guardian handoff durable path absent")?;
+    let expected = serde_json::to_vec_pretty(binding).map_err(|error| error.to_string())?;
+    if super::record::read_record_bounded(path).map_err(|error| error.to_string())? != expected {
+        return Err("guardian handoff durable binding differs".into());
+    }
+    let status = super::service_manager::status_process(&owner._slot.service)?;
+    if status.dwCurrentState != SERVICE_STOPPED || status.dwProcessId != 0 {
+        return Err("guardian handoff service has not retired".into());
+    }
+    if let Some(verified) = &owner.handoff_retirement_verified {
+        if verified != guardian {
+            return Err("guardian handoff retired identity differs".into());
+        }
+    } else {
+        if process_identity(owner.process.raw())? != *guardian {
+            return Err("guardian handoff recovery identity differs".into());
+        }
+        // SAFETY: this registry still owns the original guardian process handle.
+        match unsafe { WaitForSingleObject(owner.process.raw(), 0) } {
+            WAIT_OBJECT_0 => {}
+            windows_sys::Win32::Foundation::WAIT_FAILED => {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {
+                return Err("guardian handoff process has not retired".into());
+            }
+            status => {
+                return Err(format!(
+                    "unexpected guardian handoff wait status {status:#x}"
+                ));
+            }
+        }
+        owner.process.close_checked()?;
+        owner.handoff_retirement_verified = Some(guardian.clone());
+    }
+    std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    // Leave the reservation in place until the original slot destructor has
+    // finished its stop/remove operations; a new owner cannot race that Drop.
+    let retired = slots.get_mut(&index).and_then(Option::take);
+    drop(slots);
+    // The original normal destructor now sees a stopped service. It must run
+    // outside the registry lock because the slot destructor removes its entry.
+    drop(retired);
+    Ok(())
+}
+
 pub(super) fn acquire_guardian_slot() -> Result<GuardianSlotLease, String> {
     let manager = super::service_manager::manager_connect()?;
     let mut leased = LEASED_GUARDIAN_SLOTS
         .lock()
         .map_err(|_| "guardian slot lease mutex poisoned".to_owned())?;
     for index in 0..memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT {
-        if leased.contains(&index) {
+        if leased.contains_key(&index) {
             continue;
         }
         let name = super::security::guardian_slot_name(index)?;
@@ -628,7 +739,7 @@ pub(super) fn acquire_guardian_slot() -> Result<GuardianSlotLease, String> {
         )?;
         let status = super::service_manager::status_process(&service)?;
         if status.dwCurrentState == SERVICE_STOPPED && status.dwProcessId == 0 {
-            leased.insert(index);
+            leased.insert(index, None);
             return Ok(GuardianSlotLease {
                 index,
                 name,
@@ -677,6 +788,7 @@ pub fn create_guardian(
     let launcher_identity = process_identity(unsafe { GetCurrentProcess() })?;
     let nonce = guardian_nonce()?;
     slot.bind(attempt_id, &nonce, &launcher_identity)?;
+    super::record::prepare_guardian_receipt_directory(attempt_id, &slot.name)?;
     let pipe_name = format!("{}{}", memcordon_core::WINDOWS_GUARDIAN_PIPE_PREFIX, nonce);
     let listener = PipeListener::new(
         &pipe_name,
@@ -811,6 +923,7 @@ pub fn create_guardian(
         GuardianProcess {
             process: process_handle,
             _slot: slot,
+            handoff_retirement_verified: None,
         },
         process_id,
     ))

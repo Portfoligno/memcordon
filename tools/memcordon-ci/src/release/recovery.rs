@@ -343,13 +343,14 @@ pub fn validate_original(
         let mut expanded = 0_u64;
         for index in 0..archive.len() {
             let mut file = archive.by_index(index)?;
-            super::artifacts::safe_relative(Path::new(file.name()))?;
+            let name = file.name()?.into_owned();
+            super::artifacts::safe_relative(Path::new(&name))?;
             expanded = expanded
                 .checked_add(file.size())
                 .ok_or_else(|| CiError::Message("recovery artifact expanded overflow".into()))?;
             if file.is_symlink()
                 || file.is_dir()
-                || !folded_names.insert(file.name().to_ascii_lowercase())
+                || !folded_names.insert(name.to_ascii_lowercase())
                 || folded_names.len() > 256
                 || expanded > 1024 * 1024 * 1024
             {
@@ -357,8 +358,8 @@ pub fn validate_original(
                     "unsafe/duplicate/oversized original artifact".into(),
                 ));
             }
-            names.insert(file.name().to_owned());
-            let output = extracted.path().join(file.name());
+            names.insert(name.clone());
+            let output = extracted.path().join(&name);
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)?;
             }

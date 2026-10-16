@@ -280,6 +280,36 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
     }
 
     let baseline = &deep["jobs"]["miri"];
+    for (field, replacement) in [
+        ("path", "~/.cargo"),
+        ("path", "~/.cargo/credentials.toml"),
+        ("path", "target/ci/reports"),
+        (
+            "key",
+            "${{ steps.fuzz-download-context.outputs.source-key }}",
+        ),
+        (
+            "restore-keys",
+            "${{ steps.workspace-download-context.outputs.product-restore-prefix }}",
+        ),
+    ] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["id"] == "workspace-downloads")
+            .unwrap()["with"][field] = replacement.into();
+        assert_ne!(&job, baseline);
+        assert!(finite_cache_paths(&job, "miri").is_err());
+    }
+    let mut missing_source_context = baseline.clone();
+    missing_source_context["steps"]
+        .as_sequence_mut()
+        .unwrap()
+        .retain(|step| step["id"] != "workspace-download-context");
+    assert_ne!(&missing_source_context, baseline);
+    assert!(finite_cache_paths(&missing_source_context, "miri").is_err());
     for replacement in [
         "~/.cargo",
         "~/.cargo/credentials.toml",
@@ -366,6 +396,30 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
     };
     let reference =
         |context: &str, output: &str| format!("${{{{ steps.{context}.outputs.{output} }}}}");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut source_roles = std::collections::BTreeMap::from([(
+        "workspace-downloads",
+        (
+            "workspace-download-context",
+            memcordon_ci::download_cache::DownloadFamily::Workspace,
+        ),
+    )]);
+    if family == "fuzz" {
+        source_roles.insert(
+            "fuzz-downloads",
+            (
+                "fuzz-download-context",
+                memcordon_ci::download_cache::DownloadFamily::Fuzz,
+            ),
+        );
+        source_roles.insert(
+            "cache-cargo-fuzz-downloads",
+            (
+                "cache-cargo-fuzz",
+                memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz,
+            ),
+        );
+    }
     let mut roles = std::collections::BTreeMap::new();
     for shard in shards {
         let (id, context) = if *shard == "complete" {
@@ -434,6 +488,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
     }
     let mut downloads = 0;
     let mut saves = 0;
+    let mut paired_saves = 0;
     let mut seen = std::collections::BTreeSet::new();
     for (ordinal, step) in steps.iter().enumerate() {
         let Some(uses) = step["uses"].as_str() else {
@@ -450,24 +505,62 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         require(seen.insert(id))?;
         let key = step["with"]["key"].as_str().ok_or("restore key absent")?;
         let path = step["with"]["path"].as_str().ok_or("restore path absent")?;
-        if key.starts_with("mc-download-v4-${{ runner.os }}-") {
+        let source_role = source_roles.remove(id);
+        if key.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-") {
             downloads += 1;
             require(
                 path.lines().collect::<Vec<_>>() == ["~/.cargo/registry/cache", "~/.cargo/git/db"],
             )?;
             require(
-                key.contains("hashFiles('Cargo.lock')")
+                key == "mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}"
                     && step["if"].as_str().is_some_and(|condition| {
                         condition.contains("hashFiles('Cargo.lock') != ''")
                     }),
             )?;
             if family == "fuzz" {
-                require(
-                    key.contains("hashFiles('fuzz/Cargo.lock')")
-                        && step["if"].as_str().is_some_and(|condition| {
-                            condition.contains("hashFiles('fuzz/Cargo.lock') != ''")
-                        }),
-                )?;
+                require(step["if"].as_str().is_some_and(|condition| {
+                    condition.contains("hashFiles('fuzz/Cargo.lock') != ''")
+                }))?;
+            }
+        } else if let Some((context, source_family)) = source_role {
+            require(key == reference(context, "source-key"))?;
+            require(path == reference(context, "source-paths"))?;
+            require(
+                step["with"]["restore-keys"].as_str()
+                    == Some(&reference(context, "source-restore-prefix")),
+            )?;
+            let command = if source_family
+                == memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz
+            {
+                "./target/ci/release/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete".to_owned()
+            } else {
+                format!(
+                    "./target/ci/release/memcordon-ci ci download-cache-context --family {}",
+                    source_family.name()
+                )
+            };
+            require(
+                steps[..ordinal]
+                    .iter()
+                    .filter(|candidate| {
+                        candidate["id"] == context && candidate["run"].as_str() == Some(&command)
+                    })
+                    .count()
+                    == 1,
+            )?;
+            let cwd = if source_family == memcordon_ci::download_cache::DownloadFamily::Fuzz {
+                repository.join("fuzz")
+            } else {
+                repository.clone()
+            };
+            let home = memcordon_ci::download_cache::cargo_home(&cwd)
+                .map_err(|error| error.to_string())?;
+            for root in [home.join("registry/cache"), home.join("git/db")] {
+                require(root.is_absolute())?;
+                require(!root.to_string_lossy().contains('*'))?;
+                require(!home.join("credentials.toml").starts_with(&root))?;
+                require(!home.join("config.toml").starts_with(&root))?;
+                require(!repository.join("target/ci/reports").starts_with(&root))?;
             }
         } else {
             let (expected_key, expected_path, prefix, roots) =
@@ -514,11 +607,23 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
                     && save["with"]["key"].as_str() == Some(&reference(id, "cache-primary-key"))
             })
             .collect();
-        require(
+        require(if source_role.is_some() {
+            paired.len() <= 1
+        } else {
             paired.len() == 1
-                && paired[0].0 > ordinal
-                && paired[0].1["with"]["path"].as_str() == Some(path),
-        )?;
+        })?;
+        for (save_ordinal, save) in &paired {
+            require(*save_ordinal > ordinal && save["with"]["path"].as_str() == Some(path))?;
+        }
+        paired_saves += paired.len();
     }
-    require(downloads == 1 && roles.is_empty() && saves == seen.len())
+    require(
+        downloads == 1 && roles.is_empty() && source_roles.is_empty() && saves == paired_saves,
+    )?;
+    // The finite catalog checks custody; production policy checks every declared
+    // save's current population, owner settlement and recomputed recipe identity.
+    let mut workflow: Value =
+        serde_yaml::from_str(include_str!("../../../.github/workflows/deep-ci.yml")).unwrap();
+    workflow["jobs"][family] = job.clone();
+    check(".github/workflows/deep-ci.yml", &workflow).map_err(|error| error.to_string())
 }

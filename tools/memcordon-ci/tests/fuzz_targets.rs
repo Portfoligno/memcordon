@@ -189,7 +189,7 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
     for (field, from, to) in [
         (
             "key",
-            "hashFiles('fuzz/Cargo.lock')",
+            "hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml')",
             "hashFiles('missing.lock')",
         ),
         ("path", "~/.cargo/registry/cache", "target/ci"),
@@ -208,15 +208,25 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             .as_sequence_mut()
             .unwrap()
             .remove(index);
-        if step["id"]
-            .as_str()
-            .is_some_and(|id| id.ends_with("save-context"))
-        {
-            // An absent optional refresh leaves its save condition false.
+        let source_refresh = matches!(
+            step["id"].as_str(),
+            Some("fuzz-download-save-context" | "cache-cargo-fuzz-save-context")
+        );
+        let optional_refresh_or_seed = step["id"].as_str().is_some_and(|id| {
+            id == "workspace-downloads" || (id.ends_with("save-context") && !source_refresh)
+        });
+        let optional_source_save = matches!(
+            step["name"].as_str(),
+            Some("Save complete fuzz downloads" | "Save cargo-fuzz downloads")
+        );
+        if optional_refresh_or_seed || optional_source_save {
+            // Missing seeds/saves leave required population intact. Compiled
+            // refreshes may be absent; paired source saves require their refresh.
             assert_ne!(&job, baseline);
             validate(&job).unwrap();
         } else {
-            reject(job);
+            assert_ne!(&job, baseline);
+            assert!(validate(&job).is_err(), "accepted removed step: {step:?}");
         }
         if step["run"].as_str().is_none() {
             // Cache transfers and retained diagnostics intentionally remain optional.
@@ -227,13 +237,38 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             .as_mapping_mut()
             .unwrap()
             .insert("continue-on-error".into(), true.into());
-        reject(job);
+        let run = step["run"].as_str().unwrap();
+        let advisory_context = run.contains(" ci download-cache-context ")
+            || (run.contains(" ci cache-context ") && step["timeout-minutes"].as_u64() == Some(2));
+        if advisory_context {
+            // A missing cache context disables caching, while the required
+            // fetch, preparation and suite steps still propagate failures.
+            validate(&job).unwrap();
+        } else {
+            reject(job);
+        }
     }
     let mut job = baseline.clone();
     let driver = steps
         .iter()
         .position(|step| step["name"].as_str() == Some("Build ordinary CI driver"))
         .unwrap();
+    for index in [driver, step_id("prepare-fuzz")] {
+        let mut job = baseline.clone();
+        job.get_mut(&steps_key)
+            .unwrap()
+            .as_sequence_mut()
+            .unwrap()
+            .swap(step_id("workspace-fetch"), index);
+        reject(job);
+    }
+    let mut conditional_fetch = baseline.clone();
+    conditional_fetch
+        .get_mut(&steps_key)
+        .unwrap()
+        .as_sequence_mut()
+        .unwrap()[step_id("workspace-fetch")]["if"] = "success()".into();
+    reject(conditional_fetch);
     job.get_mut(&steps_key)
         .unwrap()
         .as_sequence_mut()

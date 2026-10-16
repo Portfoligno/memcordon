@@ -711,17 +711,19 @@ pub fn run_case(
         }
         let (mode, memory, deadline, raw) = match (key.family.as_str(), key.scenario.as_str()) {
             ("C-STATUS", "deadline") => ("population-deadline", "+2GiB", "+30s", false),
-            ("C-STATUS", "memory") => ("memory-pressure-descendant", "+128M", "+300s", false),
-            ("L-LIFE-03", "memory") => ("joint-memory", "+512M", "+300s", false),
+            ("C-STATUS", "memory") => ("memory-pressure-descendant", "+128MiB", "+300s", false),
+            ("L-LIFE-03", "memory") => ("joint-memory", "+512MiB", "+300s", false),
             ("L-LIFE-03", "deadline") => ("joint", "+2GiB", "+300s", false),
             ("L-LIFE-03", "cancellation") => ("joint", "+2GiB", "+300s", false),
             ("L-LIFE-03", "reserved-target-exit") => {
                 ("joint-reserved-exit", "+2GiB", "+300s", false)
             }
             ("C-IO", "bounded-large-output") | ("L-MIX-05", "bounded-large-output") => {
-                ("bounded-large-output", "+256M", "+30s", true)
+                ("bounded-large-output", "+256MiB", "+30s", true)
             }
-            ("L-LIFE-05", "relay-backpressure") => ("bounded-large-output", "+256M", "+30s", true),
+            ("L-LIFE-05", "relay-backpressure") => {
+                ("bounded-large-output", "+256MiB", "+30s", true)
+            }
             _ => {
                 return Err(CiError::Message(
                     "case does not belong to this concrete limit mechanism".into(),

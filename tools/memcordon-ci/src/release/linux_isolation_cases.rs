@@ -1166,7 +1166,7 @@ impl AccountRefusalReport {
                     caller_uid: 65534,
                     caller_gid: 65534,
                     target_arguments: &arguments,
-                    memory: std::ffi::OsStr::new("+256M"),
+                    memory: std::ffi::OsStr::new("+256MiB"),
                     deadline: std::ffi::OsStr::new("+30000ms"),
                 },
             )?);

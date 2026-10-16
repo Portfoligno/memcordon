@@ -1,6 +1,6 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};

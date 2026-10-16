@@ -88,6 +88,8 @@ fn relative_cargo_home_is_resolved_at_actual_operation_cwd_and_fetch_emits_curre
     let fixture = fixture();
     let root = fixture.path();
     let output_file = root.join("outputs");
+    let expected_cache = root.join("relative-home").join("registry").join("cache");
+    assert!(!expected_cache.exists());
     fs::write(&output_file, "").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon-ci"))
         .current_dir(root)
@@ -102,13 +104,15 @@ fn relative_cargo_home_is_resolved_at_actual_operation_cwd_and_fetch_emits_curre
         String::from_utf8_lossy(&output.stderr)
     );
     let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let emitted_cache = PathBuf::from(context["entry"]["paths"][0].as_str().unwrap());
+    assert!(emitted_cache.is_absolute());
+    fs::create_dir_all(&expected_cache).unwrap();
+    // Windows short names and extended canonical prefixes may spell the same
+    // directory differently. Compare existing native paths without changing
+    // the lossless context emitted for a cold Cargo home.
     assert_eq!(
-        context["entry"]["paths"][0],
-        root.canonicalize()
-            .unwrap()
-            .join("relative-home/registry/cache")
-            .display()
-            .to_string()
+        emitted_cache.canonicalize().unwrap(),
+        expected_cache.canonicalize().unwrap()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon-ci"))
         .current_dir(root)

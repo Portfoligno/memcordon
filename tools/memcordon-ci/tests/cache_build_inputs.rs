@@ -244,6 +244,60 @@ fn isolated_home_seeds_third_party_archives_without_credentials_or_public_images
 }
 
 #[test]
+fn tracked_fixture_targets_are_hashed_without_accepting_untracked_or_external_sources() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("checkout");
+    let manifest = root.join("tests/fixtures/example/Cargo.toml");
+    let source = root.join("tests/fixtures/example/src/main.rs");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname=\"fixture\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[[bin]]\nname=\"fixture\"\npath=\"src/main.rs\"\n",
+    )
+    .unwrap();
+    fs::write(&source, "fn main() {}\n").unwrap();
+    let git = Git::new(&root).unwrap();
+    git.text(["init", "--quiet"]).unwrap();
+    git.text(["add", "Cargo.toml", "tests"]).unwrap();
+    let initial = cache_inputs::local_files(&root, "native-readiness").unwrap();
+    assert!(initial.contains_key("tests/fixtures/example/src/main.rs"));
+    fs::write(&source, "fn main() { println!(\"changed\"); }\n").unwrap();
+    assert_ne!(
+        initial,
+        cache_inputs::local_files(&root, "native-readiness").unwrap()
+    );
+    fs::write(
+        source.parent().unwrap().join("untracked.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname=\"fixture\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[[bin]]\nname=\"fixture\"\npath=\"src/untracked.rs\"\n",
+    )
+    .unwrap();
+    assert!(cache_inputs::local_files(&root, "native-readiness").is_err());
+    fs::write(fixture.path().join("outside.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname=\"fixture\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[[bin]]\nname=\"fixture\"\npath=\"../../../../outside.rs\"\n",
+    )
+    .unwrap();
+    assert!(cache_inputs::local_files(&root, "native-readiness").is_err());
+}
+
+#[test]
+fn checkout_native_readiness_projection_models_all_tracked_manifest_inputs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    cache_inputs::local_files(root, "native-readiness").unwrap();
+}
+
+#[test]
 fn external_or_untracked_local_dependencies_disable_workspace_projection() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("checkout");

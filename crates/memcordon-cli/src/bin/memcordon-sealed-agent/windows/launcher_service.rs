@@ -977,25 +977,37 @@ fn serve(listener: PipeListener, first: OwnedHandle) -> Result<(), String> {
             break;
         }
         std::thread::spawn(move || {
-            let response_written = handle_control(connection.raw())
-                .map_err(|error| {
-                    eprintln!("MCSEALED-WINDOWS-LAUNCHER-CONNECTION: {error}");
-                    error
-                })
-                .is_ok();
+            let raw = connection.raw();
+            let mut connection = Some(connection);
+            let response_written = handle_control(raw, &mut || {
+                connection
+                    .as_mut()
+                    .ok_or("launcher connection already retired")?
+                    .close_checked()?;
+                drop(connection.take());
+                Ok(())
+            })
+            .map_err(|error| {
+                eprintln!("MCSEALED-WINDOWS-LAUNCHER-CONNECTION: {error}");
+                error
+            })
+            .is_ok();
             if response_written {
-                if let Err(error) = pipe::finish_server_response(connection.raw()) {
+                if let Err(error) = pipe::finish_server_response(raw) {
                     eprintln!("MCSEALED-WINDOWS-LAUNCHER-RESPONSE-DRAIN: {error}");
                 }
             } else {
-                pipe::disconnect(connection.raw());
+                pipe::disconnect(raw);
             }
         });
     }
     Ok(())
 }
 
-fn handle_control(connection: HANDLE) -> Result<(), String> {
+fn handle_control(
+    connection: HANDLE,
+    retire_connection: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     // Authenticate the kernel-bound pipe peer before deserializing any request
     // or adopting any peer-supplied handle value.
     if let Err(error) = authenticate_control(connection) {
@@ -1575,7 +1587,9 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                 Some(super::support_loader_diagnostic::Scope::enter(execution)?);
                         }
                     }
-                    let _diagnostic_scope = super::diagnostics::AttemptDiagnosticScope::enter();
+                    let mut _diagnostic_scope =
+                        Some(super::diagnostics::AttemptDiagnosticScope::enter());
+                    let mut membership_process = Some(process);
                     let certification_mutant = request.certification_mutant;
                     match launch_attempt(
                         connection,
@@ -1584,6 +1598,20 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                         &attempt_id,
                         &nonce,
                         &request_sha256,
+                        &mut || {
+                            if let Some(mut process) = membership_process.take() {
+                                process.close_checked()?;
+                            }
+                            retire_connection()?;
+                            drop(_diagnostic_scope.take());
+                            #[cfg(feature = "test-support")]
+                            {
+                                drop(_loader_debug_scope.take());
+                                drop(_diagnostic_settlement.take());
+                            }
+                            drop(_settlement.take());
+                            Ok(())
+                        },
                     ) {
                         Ok(()) => Ok(()),
                         Err(mut failure) => {
@@ -2250,6 +2278,7 @@ fn launch_attempt(
     expected_attempt_id: &str,
     expected_nonce: &str,
     expected_request_sha256: &str,
+    _retire_worker_scopes: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), LaunchAttemptError> {
     // Adopt every transferred handle before any fallible validation so every
     // rejection path closes the launcher's copies.
@@ -3336,6 +3365,11 @@ fn launch_attempt(
             drop(relay_retired_event);
             drop(target_token);
             drop(target);
+            #[cfg(feature = "test-support")]
+            guardian
+                .handoff_worker_loss(&request.attempt_id)
+                .map_err(LaunchAttemptError::authority_loss)?;
+            #[cfg(not(feature = "test-support"))]
             drop(guardian);
             drop(ready);
             drop(disarm);
@@ -3350,6 +3384,7 @@ fn launch_attempt(
                 drop(frontend_canaries);
                 drop(primary_token);
                 drop(frontend);
+                _retire_worker_scopes().map_err(LaunchAttemptError::authority_loss)?;
                 // SAFETY: this explicit component-only fault runs on the
                 // owned per-attempt worker. Both cleanup barriers were handed
                 // to the live guardian before all local Job/target handles

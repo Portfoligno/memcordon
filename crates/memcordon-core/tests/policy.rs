@@ -30,6 +30,22 @@ fn parses_exact_binary_and_decimal_units() {
 }
 
 #[test]
+fn readiness_memory_limits_require_explicit_binary_units() {
+    for (token, mebibytes) in [("128MiB", 128_u64), ("256MiB", 256), ("512MiB", 512)] {
+        assert_eq!(
+            token.parse::<ByteSize>().map(ByteSize::bytes),
+            Ok(mebibytes * 1024 * 1024)
+        );
+    }
+    for token in ["128M", "256M", "512M"] {
+        assert!(matches!(
+            token.parse::<ByteSize>(),
+            Err(ByteSizeParseError::InvalidUnit(_))
+        ));
+    }
+}
+
+#[test]
 fn policy_constructors_preserve_one_shot_defaults_and_validate_deadlines() {
     assert_eq!(Policy::default().memory.map(ByteSize::bytes), Some(1 << 30));
     assert_eq!(

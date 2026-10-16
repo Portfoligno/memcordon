@@ -4551,6 +4551,66 @@ fn package_leaf_attestation_is_read_control_only() {
 }
 
 #[test]
+fn guardian_receipt_parent_grants_only_assigned_slot_creation_without_child_mutation() {
+    use crate::windows::security::{
+        GUARDIAN_RECEIPT_DIRECTORY_ACCESS, guardian_receipt_directory_sddl,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, GetAce, GetSecurityDescriptorDacl,
+    };
+    let slot = guardian_slot_name(0).unwrap();
+    let assigned_sid = service_sid(&slot).unwrap();
+    let other_sid = service_sid(&guardian_slot_name(1).unwrap()).unwrap();
+    let policy = guardian_receipt_directory_sddl(&slot).unwrap();
+    let descriptor = SecurityDescriptor::from_sddl(&policy).unwrap();
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: the parsed descriptor and all returned ACL/ACE borrows remain live.
+    assert_ne!(
+        unsafe {
+            GetSecurityDescriptorDacl(descriptor.raw(), &mut present, &mut acl, &mut defaulted)
+        },
+        0
+    );
+    assert_ne!(present, 0);
+    assert!(!acl.is_null());
+    let mut assigned = 0;
+    for index in 0..unsafe { (*acl).AceCount } {
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(acl, u32::from(index), &mut raw) }, 0);
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid =
+            crate::windows::token::sid_string(std::ptr::addr_of!(ace.SidStart).cast_mut().cast())
+                .unwrap();
+        assert_ne!(
+            sid, other_sid,
+            "another slot must not receive attempt authority"
+        );
+        if sid == assigned_sid {
+            assigned += 1;
+            assert_eq!(ace.Header.AceType, 0); // ACCESS_ALLOWED_ACE_TYPE
+            assert_eq!(
+                ace.Header.AceFlags, 0,
+                "slot rights must never inherit to receipt files"
+            );
+            assert_eq!(ace.Mask, GUARDIAN_RECEIPT_DIRECTORY_ACCESS);
+            assert_eq!(
+                ace.Mask & (0x4 | 0x40 | 0x10000 | 0x40000 | 0x80000),
+                0,
+                "slot cannot create subdirectories, delete children, delete parent, or mutate security"
+            );
+            assert_eq!(ace.Mask & 0x2, 0x2, "assigned slot needs FILE_ADD_FILE");
+        }
+    }
+    assert_eq!(assigned, 1);
+    assert!(guardian_receipt_directory_sddl("MemCordonSealedGuardian-invalid").is_err());
+    assert!(
+        guardian_receipt_directory_sddl(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).is_err()
+    );
+}
+
+#[test]
 fn certification_workspace_policy_supports_all_target_classes_and_handle_scoped_publication() {
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
     let control = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME).unwrap();

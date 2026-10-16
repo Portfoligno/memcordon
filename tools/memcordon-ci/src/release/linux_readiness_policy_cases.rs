@@ -1154,7 +1154,7 @@ pub fn restart_fresh_admission(
             caller_gid: 65534,
             target_arguments: &args,
             deadline: &duration,
-            memory: OsStr::new("+256M"),
+            memory: OsStr::new("+256MiB"),
         })?;
         report.observations[index].invocation =
             Some(directory.join("frontend/frontend-invocation.json"));
@@ -1529,7 +1529,7 @@ fn execute_transition(
             caller_gid: 65534,
             target_arguments: &arguments,
             deadline: &duration,
-            memory: OsStr::new("+256M"),
+            memory: OsStr::new("+256MiB"),
         })?;
         report.observations[index].invocation =
             Some(directory.join("frontend/frontend-invocation.json"));
@@ -1718,7 +1718,7 @@ fn execute_transition(
                 caller_gid: 65534,
                 target_arguments: &fresh_arguments,
                 deadline: &fresh_duration,
-                memory: OsStr::new("+256M"),
+                memory: OsStr::new("+256MiB"),
             })?;
             let fresh_result = fresh.result.clone();
             let fresh_stdout = fresh.stdout.clone();
@@ -2224,7 +2224,7 @@ fn execute_binding(
             caller_gid: caller,
             target_arguments: &target_arguments,
             deadline: &native_deadline,
-            memory: OsStr::new("+256M"),
+            memory: OsStr::new("+256MiB"),
         })?;
         report.observations[index].invocation =
             Some(directory.join("frontend/frontend-invocation.json"));

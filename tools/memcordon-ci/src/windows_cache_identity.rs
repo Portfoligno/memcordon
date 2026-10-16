@@ -28,6 +28,14 @@ fn normal(path: &Path, directory: bool) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Compare existing native tool destinations after the same strict path checks
+/// used for selected executables. Display spelling is not filesystem identity.
+pub fn native_tool_path_matches(candidate: &Path, selected: &Path) -> Result<bool> {
+    let candidate = normal(candidate, false)?;
+    let selected = normal(selected, false)?;
+    Ok(candidate.canonicalize()? == selected.canonicalize()?)
+}
+
 fn text(value: &std::ffi::OsStr) -> Result<String> {
     let text = value
         .to_str()
@@ -36,6 +44,33 @@ fn text(value: &std::ffi::OsStr) -> Result<String> {
         return Err(CiError::Message("native selector exceeds bound".into()));
     }
     Ok(text.into())
+}
+
+/// Validate effective INCLUDE/LIB entries from the pinned native resolver.
+/// Its absent prior selector contributes one empty trailing entry; an explicit
+/// user selector never receives that allowance. Raw values remain identity inputs.
+pub fn native_search_paths(value: &std::ffi::OsStr, ambient_present: bool) -> Result<Vec<PathBuf>> {
+    let mut paths = std::env::split_paths(value).collect::<Vec<_>>();
+    if paths.len() > 64 {
+        return Err(CiError::Message("native search path bound exceeded".into()));
+    }
+    if !ambient_present
+        && paths.len() > 1
+        && paths.last().is_some_and(|path| path.as_os_str().is_empty())
+    {
+        paths.pop();
+    }
+    if paths.is_empty() {
+        return Err(CiError::Message("native search selection empty".into()));
+    }
+    for (ordinal, path) in paths.iter().enumerate() {
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            return Err(CiError::Message(format!(
+                "native search entry {ordinal} is empty or not absolute"
+            )));
+        }
+    }
+    Ok(paths)
 }
 
 pub fn discover_native(target: &str, deadline: Instant) -> Result<BTreeMap<String, String>> {
@@ -94,7 +129,8 @@ pub fn discover_native(target: &str, deadline: Instant) -> Result<BTreeMap<Strin
         }
         let tool = find_msvc_tools::find_tool(target, name)
             .ok_or_else(|| CiError::Message(format!("native tool unavailable: {name}")))?;
-        let path = normal(tool.path(), false)?;
+        let path = normal(tool.path(), false)
+            .map_err(|error| CiError::Message(format!("selected native tool {name}: {error}")))?;
         let components = path
             .components()
             .map(|part| part.as_os_str().to_os_string())
@@ -203,12 +239,12 @@ pub fn discover_native(target: &str, deadline: Instant) -> Result<BTreeMap<Strin
         if value.is_empty() {
             return Err(CiError::Message("unknown SDK search selection".into()));
         }
-        let paths = std::env::split_paths(value).collect::<Vec<_>>();
-        if paths.len() > 64 {
-            return Err(CiError::Message("native search path bound exceeded".into()));
-        }
-        for path in paths {
-            let path = normal(&path, true)?;
+        let paths = native_search_paths(std::ffi::OsStr::new(value), ambient.contains_key(name))
+            .map_err(|error| CiError::Message(format!("native {name} selection: {error}")))?;
+        for (ordinal, path) in paths.into_iter().enumerate() {
+            let path = normal(&path, true).map_err(|error| {
+                CiError::Message(format!("native {name} entry {ordinal}: {error}"))
+            })?;
             if path.starts_with(&root) {
                 continue;
             }
@@ -285,17 +321,22 @@ pub fn discover_native(target: &str, deadline: Instant) -> Result<BTreeMap<Strin
             }
         }
     }
-    // PATH shadowing must match the resolver used by ordinary native builds.
+    // Ordinary MSVC builds execute the resolver's explicit tool path and apply
+    // its child environment. Validate that effective search, retaining ambient
+    // PATH as a raw identity input rather than inventing a different selection.
     for name in ["link.exe", "cl.exe", "lib.exe"] {
-        if let Some(path) = ambient.get("PATH").and_then(|value| {
+        if let Some(path) = environment.get("PATH").and_then(|value| {
             std::env::split_paths(value)
                 .map(|path| path.join(name))
                 .find(|path| path.is_file())
         }) {
-            if text(path.as_os_str())? != identity[&format!("windows-tool-{name}-path")] {
-                return Err(CiError::Message(
-                    "ambient PATH shadows selected native tool".into(),
-                ));
+            let selected = Path::new(&identity[&format!("windows-tool-{name}-path")]);
+            if !native_tool_path_matches(&path, selected)? {
+                return Err(CiError::Message(format!(
+                    "effective PATH shadows selected native tool {name}: candidate={}, selected={}",
+                    text(path.as_os_str())?,
+                    text(selected.as_os_str())?
+                )));
             }
         }
     }

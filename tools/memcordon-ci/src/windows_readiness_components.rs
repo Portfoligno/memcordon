@@ -128,6 +128,53 @@ pub fn transport_injection_authority(
     }
 }
 
+/// Consume original authenticated transport authority before terminal ACK can
+/// retire its receipt. A later tombstone never substitutes for this observation.
+pub fn authenticated_transport_injection_authority(
+    response: &memcordon_core::WindowsProviderResponseV3,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    nonce: &str,
+    request: &str,
+) -> bool {
+    use memcordon_core::*;
+    let WindowsProviderResponseV3::Reject {
+        schema_version,
+        attempt_id,
+        nonce: actual_nonce,
+        request_sha256,
+        rejection,
+    } = response
+    else {
+        return false;
+    };
+    if *schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION
+        || attempt_id != attempt
+        || actual_nonce != nonce
+        || request_sha256 != request
+        || !rejection.is_consistent()
+        || !rejection.provider_failure.as_ref().is_some_and(|failure| {
+            transport_injection_authority(failure, selected, provider, attempt, request)
+        })
+    {
+        return false;
+    }
+    let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+        &rejection.disposition
+    else {
+        return false;
+    };
+    receipt.validate_for_attempt().is_ok()
+        && receipt.attempt_id == attempt
+        && receipt.nonce == nonce
+        && receipt.request_sha256 == request
+        && receipt.retirement_proof.provider_generation == provider.generation.as_str()
+        && receipt
+            .execution()
+            .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. }))
+}
+
 /// These are actual native injection points, not installed-product case rows.
 #[derive(Clone, Debug)]
 pub struct ObservedFrontendKill {
@@ -285,6 +332,21 @@ pub fn envelope_mutants() -> Vec<memcordon_core::WindowsSealedMutant> {
     ]
 }
 
+/// A replacement recovery executor must be a different native process and must
+/// match the SCM observation. It never substitutes for the original owner.
+pub fn control_service_recovery_process_matches(
+    original: &memcordon_core::WindowsProcessIdentityV1,
+    replacement: &memcordon_core::WindowsProcessIdentityV1,
+    scm_process_id: u32,
+) -> bool {
+    original.process_id != 0
+        && original.creation_time_100ns != 0
+        && replacement.process_id != 0
+        && replacement.creation_time_100ns != 0
+        && replacement != original
+        && replacement.process_id == scm_process_id
+}
+
 #[cfg(windows)]
 pub fn run_installed(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
@@ -318,6 +380,7 @@ mod native {
         ffi::OsString,
         fs::{self, OpenOptions},
         io::{self, Write},
+        os::windows::ffi::OsStrExt,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -326,6 +389,137 @@ mod native {
         thread: std::os::windows::io::OwnedHandle,
         process: memcordon_testkit::WindowsImageProcess,
         identity: memcordon_core::WindowsWorkerThreadIdentityV1,
+    }
+
+    #[allow(unsafe_code)] // WaitNamedPipe is a query only; the later recovery command authenticates provider authority.
+    fn wait_control_service_recovery(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &ComponentInput,
+        original: &HeldWorker,
+        directory: &std::path::Path,
+        record: &mut ComponentAssessment,
+        cutoff: Instant,
+    ) -> Result<memcordon_testkit::WindowsImageProcess> {
+        use windows_sys::Win32::{
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT},
+            System::Pipes::{NMPWAIT_NOWAIT, WaitNamedPipeW},
+        };
+        let status = super::worker_wait::wait_until(&original.thread, cutoff)?;
+        if status != 0xC000_013A {
+            return Err(CiError::Message(
+                "original control service fault exit differs".into(),
+            ));
+        }
+        let original_identity = memcordon_core::WindowsProcessIdentityV1 {
+            process_id: original.process.identity.pid,
+            creation_time_100ns: u64::try_from(original.process.identity.birth).map_err(|_| {
+                CiError::Message("original control service birth exceeds bound".into())
+            })?,
+        };
+        let pipe: Vec<_> = memcordon_core::WINDOWS_CONTROL_PIPE
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        loop {
+            let remaining = cutoff
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| *remaining > Duration::from_millis(10))
+                .ok_or_else(|| {
+                    CiError::Message("original control service recovery cutoff exhausted".into())
+                })?;
+            if original.process.has_exited()? {
+                let scm = crate::windows_readiness_faults::observe_control_service_status()?;
+                if scm["name"] != memcordon_core::WINDOWS_CONTROL_SERVICE_NAME {
+                    return Err(CiError::Message(
+                        "recovery SCM service identity differs".into(),
+                    ));
+                }
+                if scm["current_state"] == windows_sys::Win32::System::Services::SERVICE_RUNNING {
+                    let pid = scm["process_id"]
+                        .as_u64()
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .filter(|pid| *pid != 0)
+                        .ok_or_else(|| {
+                            CiError::Message("recovery SCM process identity absent".into())
+                        })?;
+                    let mut matches = memcordon_testkit::windows_processes_for_image_until(
+                        &config.installed_agent.path,
+                        cutoff,
+                    )?
+                    .into_iter()
+                    .filter(|held| held.identity.pid == pid);
+                    if let Some(replacement) = matches.next() {
+                        if matches.next().is_some() {
+                            return Err(CiError::Message(
+                                "recovery SCM process image is ambiguous".into(),
+                            ));
+                        }
+                        let replacement_identity = memcordon_core::WindowsProcessIdentityV1 {
+                            process_id: replacement.identity.pid,
+                            creation_time_100ns: u64::try_from(replacement.identity.birth)
+                                .map_err(|_| {
+                                    CiError::Message("recovery SCM birth exceeds bound".into())
+                                })?,
+                        };
+                        if !super::control_service_recovery_process_matches(
+                            &original_identity,
+                            &replacement_identity,
+                            pid,
+                        ) || replacement.has_exited()?
+                        {
+                            return Err(CiError::Message(
+                                "recovery SCM replacement identity differs".into(),
+                            ));
+                        }
+                        if crate::windows_readiness_faults::observe_control_service_status()? == scm
+                        {
+                            if crate::windows_causal_acceptance::sha256(&read(
+                                &config.installed_agent.path,
+                                512 * 1024 * 1024,
+                            )?) != config.installed_agent.sha256
+                            {
+                                return Err(CiError::Message(
+                                    "recovery service selected image changed".into(),
+                                ));
+                            }
+                            // SAFETY: the fixed endpoint is NUL terminated and NOWAIT cannot renew the cutoff.
+                            let available =
+                                unsafe { WaitNamedPipeW(pipe.as_ptr(), NMPWAIT_NOWAIT) } != 0;
+                            if available {
+                                if Instant::now() >= cutoff || replacement.has_exited()?
+                                    || crate::windows_readiness_faults::observe_control_service_status()? != scm
+                                {
+                                    return Err(CiError::Message("recovery service changed at endpoint readiness".into()));
+                                }
+                                retain(
+                                    &directory.join("control-service-recovery-ready.json"),
+                                    &serde_json::to_vec(&serde_json::json!({
+                                        "format":"memcordon.windows-component-control-service-recovery","revision":1,
+                                        "original_process":original_identity,"original_process_exit_observed":true,
+                                        "original_thread_exit_status":status,"replacement_process":replacement_identity,
+                                        "selected_image_sha256":config.installed_agent.sha256,"control_service":scm,
+                                        "endpoint_available":true,"provider_authority_authenticated":false,
+                                        "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
+                                    }))?,
+                                    record,
+                                )?;
+                                return Ok(replacement);
+                            }
+                            let error = io::Error::last_os_error();
+                            if !matches!(
+                                error
+                                    .raw_os_error()
+                                    .and_then(|code| u32::try_from(code).ok()),
+                                Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY | ERROR_SEM_TIMEOUT)
+                            ) {
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
     }
     #[allow(unsafe_code)] // Query-only held thread is joined to authenticated native process birth.
     fn hold_worker(
@@ -418,6 +612,25 @@ mod native {
             return Err(io::Error::last_os_error());
         }
         Ok(status)
+    }
+
+    #[allow(unsafe_code)] // Query only the original retained synchronization handle.
+    fn worker_retired(worker: &HeldWorker) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        match unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                worker.thread.as_raw_handle(),
+                0,
+            )
+        } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other(
+                "unexpected held worker synchronization status",
+            )),
+        }
     }
 
     fn retain(
@@ -602,6 +815,7 @@ mod native {
                 config,
                 input,
                 base,
+                &suite.local_policy,
                 Some(fault),
                 None,
                 &selector,
@@ -645,6 +859,7 @@ mod native {
                 config,
                 input,
                 base,
+                &suite.local_policy,
                 None,
                 Some(mutant),
                 &selector,
@@ -675,10 +890,181 @@ mod native {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn recover_held_attempt(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &ComponentInput,
+        directory: &std::path::Path,
+        record: &mut ComponentAssessment,
+        held: &memcordon_core::WindowsGuardianAttemptObservation,
+        cutoff: Instant,
+        capture_stem: &str,
+        certification_failure_preserved: bool,
+        pending_frontend: Option<&memcordon_core::WindowsProcessIdentityV1>,
+    ) -> Result<bool> {
+        let binding = crate::windows_component_failed_recovery::RecoveryBinding::from_held(
+            held,
+            &config.provider,
+        )
+        .map_err(CiError::Message)?;
+        let remaining = cutoff
+            .checked_duration_since(Instant::now())
+            .filter(|budget| !budget.is_zero())
+            .ok_or_else(|| {
+                CiError::Message("original failed collection recovery cutoff exhausted".into())
+            })?;
+        let mut command = crate::command::CommandSpec::new(&config.cli.path, directory, remaining)
+            .args([
+                "windows-recover",
+                "attempt",
+                binding.attempt.as_str(),
+                binding.nonce.as_str(),
+                binding.request.as_str(),
+            ])
+            .materialize()?;
+        command.env_clear();
+        let invocation = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.windows-failed-collection-recovery-command","revision":1,
+            "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
+            "provider":config.provider,"held_association":held,"certification_failure_preserved":certification_failure_preserved,
+            "executable_sha256":config.cli.sha256,
+            "program_utf16":command.get_program().encode_wide().collect::<Vec<_>>(),
+            "argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
+            "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis,
+        }))?;
+        retain(
+            &directory.join(format!("{capture_stem}-invocation.json")),
+            &invocation,
+            record,
+        )?;
+        let remaining = cutoff
+            .checked_duration_since(Instant::now())
+            .filter(|budget| !budget.is_zero())
+            .ok_or_else(|| {
+                CiError::Message("original failed collection recovery cutoff exhausted".into())
+            })?;
+        let captured = memcordon_testkit::run_with_deadline_output_limit(
+            &mut command,
+            remaining,
+            2 * 1024 * 1024,
+        );
+        if let Err(error) = &captured {
+            if let memcordon_testkit::ProcessTestError::Timeout { stdout, stderr, .. }
+            | memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, .. } = error
+            {
+                retain(
+                    &directory.join(format!("{capture_stem}.partial.stdout.bin")),
+                    stdout,
+                    record,
+                )?;
+                retain(
+                    &directory.join(format!("{capture_stem}.partial.stderr.bin")),
+                    stderr,
+                    record,
+                )?;
+            }
+            retain(
+                &directory.join(format!("{capture_stem}-failure.json")),
+                &serde_json::to_vec(&serde_json::json!({
+                    "format":"memcordon.windows-failed-collection-recovery-failure","revision":1,
+                    "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                    "failure":error.to_string(),"capture_complete":false,
+                    "certification_failure_preserved":certification_failure_preserved,
+                }))?,
+                record,
+            )?;
+        }
+        let output = captured.map_err(|error| CiError::Message(error.to_string()))?;
+        retain(
+            &directory.join(format!("{capture_stem}.json")),
+            &output.stdout,
+            record,
+        )?;
+        retain(
+            &directory.join(format!("{capture_stem}.stderr.bin")),
+            &output.stderr,
+            record,
+        )?;
+        retain(
+            &directory.join(format!("{capture_stem}-exit.json")),
+            &serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.windows-failed-collection-recovery-exit","revision":1,
+                "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
+                "stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),
+                "native_status":output.status.code(),"certification_failure_preserved":certification_failure_preserved,
+            }))?,
+            record,
+        )?;
+        if let Some(frontend) = pending_frontend {
+            if output.status.code() == Some(1) {
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
+                    .map_err(CiError::Message)?;
+                let recovered: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                if crate::windows_component_failed_recovery::pending_original_frontend_relay(
+                    &recovered,
+                    held,
+                    &config.provider,
+                    frontend,
+                    output.status.code(),
+                )
+                .map_err(CiError::Message)?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        crate::command::require_successful_output("failed collection owner recovery", &output)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
+            .map_err(CiError::Message)?;
+        let recovered: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        if recovered.get("schema_version") != Some(&serde_json::json!(1)) {
+            return Err(CiError::Message(
+                "failed collection recovery wrapper schema differs".into(),
+            ));
+        }
+        let response: memcordon_core::WindowsProviderResponseV3 =
+            serde_json::from_value(recovered.get("provider_response").cloned().ok_or_else(
+                || CiError::Message("failed collection recovery omitted provider response".into()),
+            )?)?;
+        binding
+            .validate_response(&response)
+            .map_err(CiError::Message)?;
+        Ok(true)
+    }
+
+    fn worker_recovery_receipt_authority(
+        receipt: &memcordon_core::WindowsTerminalReceiptV2,
+        provider_generation: &str,
+        attempt: &str,
+        nonce: &str,
+        request: &str,
+    ) -> Result<bool> {
+        receipt
+            .validate_for_attempt()
+            .map_err(|error| CiError::Message(error.into()))?;
+        Ok(receipt.attempt_id == attempt
+            && receipt.nonce == nonce
+            && receipt.request_sha256 == request
+            && receipt.retirement_proof.provider_generation == provider_generation
+            && matches!(
+                &receipt.payload,
+                memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
+                    primary_failure: memcordon_core::OriginalFailureV1::Unavailable {
+                        reason:
+                            memcordon_core::OriginalUnavailableReasonV1::WorkerLostBeforeObservation
+                    },
+                    ..
+                }
+            ))
+    }
+
     fn exercise(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &ComponentInput,
         base: &crate::windows_consumer_readiness::CaseInput,
+        local_policy: &std::path::Path,
         fault: Option<memcordon_core::WindowsSealedFault>,
         mutant: Option<memcordon_core::WindowsSealedMutant>,
         selector: &serde_json::Value,
@@ -729,11 +1115,59 @@ mod native {
         case.descriptor.transcript = case.descriptor.output_root.join("fixture-events.bin");
         case.descriptor_path = directory.join("input.json");
         fs::create_dir_all(&case.descriptor.output_root)?;
-        case.workload_contract = config
+        let prepared_contract = config
             .output_directory
             .join("W-JOINT")
             .join("ordinary")
             .join("requested-contract.json");
+        let requested = memcordon_core::workload_contract::WorkloadContractV1::parse(&read(
+            &prepared_contract,
+            256 * 1024,
+        )?)
+        .map_err(CiError::Message)?;
+        let configured = memcordon_core::workload_registry::RuntimePolicyRegistry::parse(&read(
+            local_policy,
+            256 * 1024,
+        )?)
+        .map_err(CiError::Message)?;
+        let policy_budget = deadlines.work_budget(Duration::from_secs(90))?;
+        let mut apply = crate::command::CommandSpec::new(
+            &config.installed_agent.path,
+            directory,
+            policy_budget,
+        )
+        .args(["package", "policy", "apply", "--file"])
+        .arg(local_policy)
+        .materialize()?;
+        apply.env_clear();
+        let activated = memcordon_testkit::run_with_deadline_output_limit(
+            &mut apply,
+            policy_budget,
+            256 * 1024,
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?;
+        retain(
+            &directory.join("policy-activation.stdout.bin"),
+            &activated.stdout,
+            record,
+        )?;
+        retain(
+            &directory.join("policy-activation.stderr.bin"),
+            &activated.stderr,
+            record,
+        )?;
+        crate::command::require_successful_output("component case policy activation", &activated)?;
+        let contract = crate::windows_policy_activation::refresh_contract(
+            &requested,
+            &configured,
+            &activated.stdout,
+        )?;
+        case.workload_contract = directory.join("requested-contract.json");
+        retain(
+            &case.workload_contract,
+            &serde_json::to_vec(&contract)?,
+            record,
+        )?;
         retain(
             &case.descriptor_path,
             &serde_json::to_vec(&case.descriptor)?,
@@ -789,7 +1223,6 @@ mod native {
                 .args(wrapper_arguments)
                 .materialize()?;
         command.env_clear();
-        use std::os::windows::ffi::OsStrExt;
         // The owned TCP fixture needs the native Winsock provider's SystemRoot
         // expansion. Keep ambient controller data excluded, and use the same
         // measured OS prerequisites as the positive readiness frontend.
@@ -873,6 +1306,14 @@ mod native {
         );
         let control_process_loss = fault
             == Some(memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization);
+        let progression_config = config.clone();
+        let progression_input = input.clone();
+        let mut progression_record = record.clone();
+        progression_record.artifacts.clear();
+        let progression_record = Arc::new(Mutex::new(progression_record));
+        let callback_progression_record = Arc::clone(&progression_record);
+        let progression_response = Arc::new(Mutex::new(None));
+        let callback_progression_response = Arc::clone(&progression_response);
         let output = memcordon_testkit::run_with_deadline_owned_spawn_with_io_output_limit(
             command,
             actor_cutoff
@@ -1132,8 +1573,139 @@ mod native {
                         .map_err(|_| io::Error::other("control worker ownership poisoned"))? =
                         Some(held);
                 }
-                crate::windows_consumer_readiness::native::signal(&gate)
+                crate::windows_consumer_readiness::native::signal(&gate)?;
+                if fault
+                    == Some(
+                        memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization,
+                    )
+                {
+                    // The original frontend continues capturing authenticated
+                    // replay while this callback settles the exact held owner.
+                    // Replay alone cannot stage a recovered terminal outbox.
+                    loop {
+                        if Instant::now() >= actor_cutoff {
+                            return Err(io::Error::other(
+                                "original worker recovery progression cutoff exhausted",
+                            ));
+                        }
+                        let worker = held_worker
+                            .lock()
+                            .map_err(|_| io::Error::other("component worker ownership poisoned"))?;
+                        let worker = worker.as_ref().ok_or_else(|| {
+                            io::Error::other("original worker was not held before fault")
+                        })?;
+                        let retired = worker_retired(worker)?;
+                        if retired && worker_exit(worker)? != 0xC000_013A {
+                            return Err(io::Error::other(
+                                "original worker exit differs from selected native loss",
+                            ));
+                        }
+                        let guardian = held_guardian.lock().map_err(|_| {
+                            io::Error::other("component guardian ownership poisoned")
+                        })?;
+                        let guardian = guardian.as_ref().ok_or_else(|| {
+                            io::Error::other("original guardian was not held before fault")
+                        })?;
+                        if retired && guardian.has_retired().map_err(io::Error::other)? {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let association = held_live
+                        .lock()
+                        .map_err(|_| io::Error::other("component association poisoned"))?
+                        .clone()
+                        .ok_or_else(|| io::Error::other("original held association absent"))?;
+                    let mut evidence = callback_progression_record
+                        .lock()
+                        .map_err(|_| io::Error::other("component recovery evidence poisoned"))?;
+                    let frontend = held_frontend
+                        .lock()
+                        .map_err(|_| io::Error::other("component frontend ownership poisoned"))?;
+                    let frontend = frontend
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("original frontend was not held"))?;
+                    let frontend_identity = memcordon_core::WindowsProcessIdentityV1 {
+                        process_id: frontend.identity.pid,
+                        creation_time_100ns: frontend
+                            .identity
+                            .birth
+                            .try_into()
+                            .map_err(io::Error::other)?,
+                    };
+                    let mut sequence = 0_usize;
+                    loop {
+                        // Keep ordering retries within the original finite
+                        // capture envelope; every outcome remains retained.
+                        if evidence
+                            .artifacts
+                            .len()
+                            .checked_add(4)
+                            .is_none_or(|files| files > 128)
+                            || Instant::now() >= actor_cutoff
+                        {
+                            return Err(io::Error::other(
+                                "original worker recovery evidence/cutoff exhausted",
+                            ));
+                        }
+                        let stem = format!("worker-retirement-recovery-{sequence}");
+                        let completed = recover_held_attempt(
+                            &progression_config,
+                            &progression_input,
+                            &cwd,
+                            &mut evidence,
+                            &association,
+                            actor_cutoff,
+                            &stem,
+                            false,
+                            Some(&frontend_identity),
+                        )
+                        .map_err(io::Error::other)?;
+                        let retained_bytes =
+                            evidence
+                                .artifacts
+                                .iter()
+                                .try_fold(0_u64, |total, artifact| {
+                                    total
+                                        .checked_add(std::fs::metadata(&artifact.path)?.len())
+                                        .ok_or_else(|| {
+                                            io::Error::other("recovery evidence size overflow")
+                                        })
+                                })?;
+                        if retained_bytes > 4 * 1024 * 1024 || evidence.artifacts.len() > 128 {
+                            return Err(io::Error::other(
+                                "original worker recovery evidence bound exceeded",
+                            ));
+                        }
+                        if completed {
+                            *callback_progression_response.lock().map_err(|_| {
+                                io::Error::other("component recovery response poisoned")
+                            })? = Some(cwd.join(format!("{stem}.json")));
+                            break;
+                        }
+                        sequence = sequence.checked_add(1).ok_or_else(|| {
+                            io::Error::other("recovery evidence sequence overflow")
+                        })?;
+                        let remaining = actor_cutoff
+                            .checked_duration_since(Instant::now())
+                            .ok_or_else(|| {
+                                io::Error::other(
+                                    "original worker recovery progression cutoff exhausted",
+                                )
+                            })?;
+                        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                    }
+                }
+                Ok(())
             },
+        );
+        record.artifacts.extend(
+            progression_record
+                .lock()
+                .map_err(|_| CiError::Message("component recovery evidence poisoned".into()))?
+                .artifacts
+                .iter()
+                .cloned(),
         );
         if let Some(live) = live
             .lock()
@@ -1378,6 +1950,36 @@ mod native {
                 let bytes: Vec<u8> = serde_json::from_value(raw.clone())?;
                 let response: memcordon_core::WindowsProviderResponseV3 =
                     serde_json::from_slice(&bytes)?;
+                if fault
+                    == Some(
+                        memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization,
+                    )
+                {
+                    let held = live
+                        .lock()
+                        .map_err(|_| CiError::Message("component association poisoned".into()))?;
+                    rejected |=
+                        crate::windows_component_failed_recovery::worker_loss_recovery_authority(
+                            &response,
+                            held.as_ref().ok_or_else(|| {
+                                CiError::Message("original held association absent".into())
+                            })?,
+                            &config.provider,
+                        )
+                        .map_err(CiError::Message)?;
+                }
+                if fault.is_some_and(|selected| {
+                    authenticated_transport_injection_authority(
+                        &response,
+                        selected,
+                        &config.provider,
+                        attempt,
+                        nonce,
+                        request,
+                    )
+                }) {
+                    rejected = true;
+                }
                 if let memcordon_core::WindowsProviderResponseV3::CertificationMutantObserved(
                     ref receipt,
                 ) = response
@@ -1419,6 +2021,49 @@ mod native {
                     }
                 }
             }
+            if !rejected
+                && fault
+                    == Some(
+                        memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization,
+                    )
+            {
+                // The concurrent exact recovery may already ACK its delivery.
+                // Assess its retained authenticated receipt, not a second
+                // recovery's receipt-free retirement tombstone or helper Ok.
+                let response_path = progression_response
+                    .lock()
+                    .map_err(|_| CiError::Message("component recovery response poisoned".into()))?
+                    .clone()
+                    .ok_or_else(|| {
+                        CiError::Message("original worker recovery response absent".into())
+                    })?;
+                let bytes = read(&response_path, 2 * 1024 * 1024)?;
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&bytes)
+                    .map_err(CiError::Message)?;
+                let recovered: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if recovered.get("schema_version") != Some(&serde_json::json!(1)) {
+                    return Err(CiError::Message(
+                        "worker recovery wrapper schema differs".into(),
+                    ));
+                }
+                let response: memcordon_core::WindowsProviderResponseV3 = serde_json::from_value(
+                    recovered.get("provider_response").cloned().ok_or_else(|| {
+                        CiError::Message("worker recovery omitted provider response".into())
+                    })?,
+                )?;
+                let held = live
+                    .lock()
+                    .map_err(|_| CiError::Message("component association poisoned".into()))?;
+                rejected =
+                    crate::windows_component_failed_recovery::worker_loss_recovery_authority(
+                        &response,
+                        held.as_ref().ok_or_else(|| {
+                            CiError::Message("original held association absent".into())
+                        })?,
+                        &config.provider,
+                    )
+                    .map_err(CiError::Message)?;
+            }
             if !rejected && fault.is_some() {
                 let recovery_budget = deadlines.cleanup_budget(Duration::from_secs(90))?;
                 let recovery_cutoff = Instant::now()
@@ -1459,6 +2104,26 @@ mod native {
                         ));
                     }
                 }
+                let _restarted_control_service = if control_process_loss {
+                    let original = control_worker.lock().map_err(|_| {
+                        CiError::Message("control worker ownership poisoned".into())
+                    })?;
+                    let original = original.as_ref().ok_or_else(|| {
+                        CiError::Message(
+                            "control service recovery lacks original held owner".into(),
+                        )
+                    })?;
+                    Some(wait_control_service_recovery(
+                        config,
+                        input,
+                        original,
+                        directory,
+                        record,
+                        recovery_cutoff,
+                    )?)
+                } else {
+                    None
+                };
                 let recovery_budget = recovery_cutoff
                     .checked_duration_since(Instant::now())
                     .filter(|budget| !budget.is_zero())
@@ -1538,6 +2203,12 @@ mod native {
                         // physical ownership; this is never a terminal ACK.
                         rejected=true;
                     }
+                    let selected_worker_original = if fault == Some(memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) {
+                        let held = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
+                        crate::windows_component_failed_recovery::worker_loss_recovery_authority(
+                            &response, held.as_ref().ok_or_else(|| CiError::Message("original held association absent".into()))?,
+                            &config.provider).map_err(CiError::Message)?
+                    } else { false };
                     let receipt = match &response {
                         memcordon_core::WindowsProviderResponseV3::Terminal(receipt) => Some(receipt),
                         memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. } => rejection.terminal_receipt(),
@@ -1566,10 +2237,10 @@ mod native {
                                     && event.native_code.is_none()))
                                 || ((selected_transport_original || selected_frontend_guardian_original) && receipt.execution().is_some_and(|(_, outcome, _)|
                                     matches!(outcome, memcordon_core::RunOutcome::MonitorFailed { .. })))
-                                || (worker_loss && fault!=Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization) && matches!(&receipt.payload,
-                                    memcordon_core::WindowsTerminalPayloadV2::RecoveredClosure {
-                                        primary_failure: memcordon_core::OriginalFailureV1::Unavailable {
-                                            reason: memcordon_core::OriginalUnavailableReasonV1::WorkerLostBeforeObservation }, .. }))
+                                || (worker_loss && fault!=Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
+                                    && if fault == Some(memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) {
+                                        selected_worker_original
+                                    } else { worker_recovery_receipt_authority(receipt, config.provider.generation.as_str(), attempt, nonce, request)? })
                                 || fault.is_some_and(|selected| {
                                     use memcordon_core::WindowsSealedFault::*;
                                     matches!(selected, Resume | TerminateJob | ActiveProcessQuery | RelayRetire | GuardianReap | FinalHandleClose)
@@ -1604,7 +2275,104 @@ mod native {
         })();
         let retirement = (|| -> Result<()> {
             let recovery_budget = deadlines.cleanup_budget(Duration::from_secs(90))?;
-            let recovery_millis = recovery_budget.as_millis().min(90000).to_string();
+            let recovery_cutoff = Instant::now()
+                .checked_add(recovery_budget)
+                .ok_or_else(|| {
+                    CiError::Message("failed collection recovery cutoff overflow".into())
+                })?
+                .min(deadlines.cleanup);
+            // Certification custody failure must remain a failure, but cannot
+            // suppress the separately authenticated settlement of an attempt
+            // whose original native association we held before the fault.
+            if let Err(error) = &collection {
+                // Query the original retained handles before recovery can
+                // return early. This text is diagnostic only: live processes,
+                // absent handles and query failures are all retained verbatim.
+                // None of these observations supplies terminal authority.
+                let mut status = Vec::new();
+                writeln!(status, "diagnostic-only; certification-authority=false")?;
+                writeln!(status, "original-collection-error={error}")?;
+                match guardian.lock() {
+                    Ok(held) => match held.as_ref() {
+                        Some(held) => writeln!(
+                            status,
+                            "original-guardian={:?}; retired={:?}; native-exit-status={:?}; held-slot-current-state-pid-win32-service-specific={:?}",
+                            held.identity,
+                            held.has_retired(),
+                            held.native_exit_status(),
+                            held.service_exit_status()
+                        )?,
+                        None => writeln!(status, "original-guardian=not-held")?,
+                    },
+                    Err(error) => writeln!(status, "original-guardian-lock-error={error}")?,
+                }
+                match worker.lock() {
+                    Ok(held) => match held.as_ref() {
+                        Some(held) => writeln!(
+                            status,
+                            "original-worker-process={:?}; process-retired={:?}; process-native-exit-status={:?}; original-thread={:?}; thread-native-exit-status={:?}",
+                            held.process.identity,
+                            held.process.has_exited(),
+                            held.process.native_exit_status(),
+                            held.identity,
+                            worker_exit(held)
+                        )?,
+                        None => writeln!(status, "original-worker=not-held")?,
+                    },
+                    Err(error) => writeln!(status, "original-worker-lock-error={error}")?,
+                }
+                match family.lock() {
+                    Ok(held) => {
+                        writeln!(status, "original-target-handle-count={}", held.len())?;
+                        for target in held.iter() {
+                            writeln!(
+                                status,
+                                "original-target={:?}; retired={:?}; native-exit-status={:?}",
+                                target.identity,
+                                target.has_exited(),
+                                target.native_exit_status()
+                            )?;
+                        }
+                    }
+                    Err(error) => writeln!(status, "original-target-lock-error={error}")?,
+                }
+                retain(
+                    &directory.join("held-owner-status-after-collection.txt"),
+                    &status,
+                    record,
+                )?;
+            }
+            let failed_collection_recovery = if collection.is_err() {
+                let held = live
+                    .lock()
+                    .map_err(|_| CiError::Message("component association poisoned".into()))?
+                    .clone();
+                held.as_ref()
+                    .map(|held| {
+                        recover_held_attempt(
+                            config,
+                            input,
+                            directory,
+                            record,
+                            held,
+                            recovery_cutoff,
+                            "failed-collection-recovery",
+                            true,
+                            None,
+                        )
+                    })
+                    .transpose()
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            let recovery_budget = recovery_cutoff
+                .checked_duration_since(Instant::now())
+                .filter(|budget| !budget.is_zero())
+                .ok_or_else(|| {
+                    CiError::Message("original failed collection recovery cutoff exhausted".into())
+                })?;
+            let recovery_millis = recovery_budget.as_millis().to_string();
             let mut converge =
                 crate::command::CommandSpec::new(&config.cli.path, directory, recovery_budget)
                     .args(["windows-recover", "converge", recovery_millis.as_str()])
@@ -1657,6 +2425,7 @@ mod native {
                     String::from_utf8_lossy(excerpt),
                 )));
             }
+            failed_collection_recovery?;
             let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
                 serde_json::from_slice(&output.stdout)?;
             if !inventory.is_consistent()

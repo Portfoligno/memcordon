@@ -1522,6 +1522,33 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
             "deep shard checkout and toolchain must precede driver build",
         ));
     }
+    let workspace_fetches: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["run"].as_str()
+                == Some("./target/ci/release/memcordon-ci ci fetch-downloads --family workspace")
+        })
+        .collect();
+    let first_work = steps
+        .iter()
+        .position(|step| {
+            step["run"].as_str().is_some_and(|run| {
+                run.split_whitespace().any(|part| part == "suite")
+                    || run.ends_with("ci prepare --profile fuzz")
+            })
+        })
+        .ok_or_else(|| failure("deep shard required work absent"))?;
+    if workspace_fetches.len() != 1
+        || workspace_fetches[0].0 <= driver
+        || workspace_fetches[0].0 >= first_work
+        || workspace_fetches[0].1["id"].as_str() != Some("workspace-fetch")
+        || !workspace_fetches[0].1["if"].is_null()
+    {
+        return Err(failure(
+            "deep shard workspace population must precede required work",
+        ));
+    }
     let mut invocations = Vec::new();
     let mut restores = 0;
     let mut saves = 0;
@@ -1683,6 +1710,17 @@ fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64)
             .ok_or_else(|| failure("fuzz pinned tool preparation absent"))?;
         if tool_context >= prepare {
             return Err(failure("fuzz tool restore must precede installation"));
+        }
+        let nightly = steps
+            .iter()
+            .position(|step| {
+                step["run"].as_str()
+                    == Some("rustup toolchain install nightly-2026-07-31 --profile minimal")
+                    && step["if"].is_null()
+            })
+            .ok_or_else(|| failure("fuzz pinned nightly installation absent"))?;
+        if nightly <= driver || nightly >= prepare {
+            return Err(failure("fuzz pinned nightly must precede preparation"));
         }
     }
     Ok(())

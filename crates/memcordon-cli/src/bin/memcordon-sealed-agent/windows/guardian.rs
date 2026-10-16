@@ -454,10 +454,12 @@ pub struct GuardianFailure {
     role: Option<GuardianHandleRole>,
     native_code: Option<i32>,
     detail_class: &'static str,
+    runtime_class: Option<u32>,
+    source: Option<String>,
 }
 
 impl GuardianFailure {
-    const fn new(
+    fn new(
         subphase: GuardianStartupSubphase,
         role: Option<GuardianHandleRole>,
         detail_class: &'static str,
@@ -467,6 +469,8 @@ impl GuardianFailure {
             role,
             native_code: None,
             detail_class,
+            runtime_class: runtime_class(detail_class),
+            source: None,
         }
     }
 
@@ -480,6 +484,8 @@ impl GuardianFailure {
             role,
             native_code: io::Error::last_os_error().raw_os_error(),
             detail_class,
+            runtime_class: runtime_class(detail_class),
+            source: None,
         }
     }
 
@@ -498,6 +504,8 @@ impl GuardianFailure {
             role: None,
             native_code: error.native_code,
             detail_class: "policy-attestation",
+            runtime_class: None,
+            source: None,
         }
     }
 
@@ -507,6 +515,19 @@ impl GuardianFailure {
             role: None,
             native_code: error.native_code,
             detail_class: error.subphase.name(),
+            runtime_class: None,
+            source: None,
+        }
+    }
+
+    fn receipt(error: super::record::GuardianReceiptWriteError) -> Self {
+        Self {
+            subphase: GuardianStartupSubphase::Runtime,
+            role: None,
+            native_code: error.native_code,
+            detail_class: error.stage.name(),
+            runtime_class: Some(error.stage.exit_class()),
+            source: Some(error.source),
         }
     }
 
@@ -551,7 +572,10 @@ impl GuardianFailure {
             GuardianStartupSubphase::CapabilityManifest => EXIT_MANIFEST,
             GuardianStartupSubphase::LoaderContext => EXIT_LOADER_CONTEXT,
             GuardianStartupSubphase::ReadyWait => return 125,
-            GuardianStartupSubphase::Runtime => return 125,
+            GuardianStartupSubphase::Runtime => match self.runtime_class {
+                Some(class) => class,
+                None => return 125,
+            },
         };
         EXIT_MAGIC
             | (class << 16)
@@ -576,7 +600,36 @@ impl fmt::Display for GuardianFailure {
         if let Some(native_code) = self.native_code {
             write!(formatter, " native_code={native_code}")?;
         }
+        if let Some(source) = &self.source {
+            write!(formatter, " source={source}")?;
+        }
         Ok(())
+    }
+}
+
+fn runtime_class(detail: &str) -> Option<u32> {
+    match detail {
+        "authority-wait" => Some(28),
+        "job-terminate" => Some(29),
+        "job-accounting" => Some(30),
+        "job-empty-timeout" => Some(31),
+        _ => None,
+    }
+}
+
+pub(crate) fn runtime_detail_for_exit_code(exit: u32) -> Option<&'static str> {
+    if exit & 0xff00_0000 != EXIT_MAGIC {
+        return None;
+    }
+    match (exit >> 16) & 0xff {
+        28 => Some("authority-wait"),
+        29 => Some("job-terminate"),
+        30 => Some("job-accounting"),
+        31 => Some("job-empty-timeout"),
+        class => super::record::GuardianReceiptStage::ALL
+            .into_iter()
+            .find(|stage| stage.exit_class() == class)
+            .map(super::record::GuardianReceiptStage::name),
     }
 }
 
@@ -661,8 +714,31 @@ pub(crate) fn startup_exit_code_for_test(
         role,
         native_code,
         detail_class: "test",
+        runtime_class: None,
+        source: None,
     }
     .exit_code()
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_failure_for_test(detail: &'static str, native: Option<i32>) -> u32 {
+    let mut error = GuardianFailure::new(GuardianStartupSubphase::Runtime, None, detail);
+    error.native_code = native;
+    error.exit_code()
+}
+
+#[cfg(test)]
+pub(crate) fn receipt_failure_for_test(
+    stage: super::record::GuardianReceiptStage,
+    native_code: Option<i32>,
+    source: &str,
+) -> (u32, String) {
+    let error = GuardianFailure::receipt(super::record::GuardianReceiptWriteError {
+        stage,
+        native_code,
+        source: source.to_owned(),
+    });
+    (error.exit_code(), error.to_string())
 }
 
 pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
@@ -1041,9 +1117,7 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
             &binding.guardian_identity,
             trigger,
         )
-        .map_err(|_| {
-            GuardianFailure::new(GuardianStartupSubphase::Runtime, None, "terminal-receipt")
-        })
+        .map_err(GuardianFailure::receipt)
     })();
     match result {
         Ok(()) => Ok(()),

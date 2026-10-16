@@ -324,7 +324,7 @@ pub fn download_producer(
         let member = zip
             .by_index(index)
             .map_err(|error| CiError::Message(error.to_string()))?;
-        let name = member.name();
+        let name = member.name()?.into_owned();
         artifacts::safe_relative(Path::new(name.trim_end_matches('/')))?;
         if !zip_names.insert(name.to_owned())
             || member

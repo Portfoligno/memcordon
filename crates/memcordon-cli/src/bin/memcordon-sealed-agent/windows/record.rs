@@ -1591,20 +1591,45 @@ fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
     for entry in fs::read_dir(guardian_receipts_root()).map_err(|error| error.to_string())? {
         let path = entry.map_err(|error| error.to_string())?.path();
         let parsed = (|| {
-            let attempt_id = record_attempt_id(&path)?;
-            read_guardian_receipt(&attempt_id)?;
+            let attempt_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("guardian receipt directory name is not UTF-8")?
+                .to_owned();
+            validate_attempt_id(&attempt_id)?;
+            verify_guardian_receipt_directory(&path)?;
+            for child in fs::read_dir(&path).map_err(|error| error.to_string())? {
+                let child = child.map_err(|error| error.to_string())?;
+                if child.file_name() != std::ffi::OsStr::new("receipt.json") {
+                    return Err(
+                        "guardian receipt directory has an unpublished or unknown child".into(),
+                    );
+                }
+                read_guardian_receipt(&attempt_id)?;
+            }
             Ok::<_, String>(attempt_id)
         })();
         match parsed {
             Ok(attempt_id) if !record_path(&attempt_id)?.exists() => {
-                fs::remove_file(path).map_err(|error| error.to_string())?;
+                // Provisioning precedes the first durable guardian association.
+                // Do not race a live writer or a still-owned guardian slot.
+                let retirement = retire_writer_admission(&attempt_id, false)
+                    .and_then(|()| require_empty_guardian_slot_state())
+                    .and_then(|()| remove_guardian_receipt(&attempt_id));
+                if let Err(error) = retirement {
+                    ambiguous.push(format!(
+                        "{} (guardian receipt directory remains owned: {error})",
+                        path.display()
+                    ));
+                }
             }
             Ok(_) => {}
             Err(error) => {
-                let quarantined = quarantine(&path)?;
+                // An active guardian may still hold the CREATE_NEW staging
+                // handle. Preserve its directory and all evidence in place.
                 ambiguous.push(format!(
                     "{} (invalid guardian terminal receipt: {error})",
-                    quarantined.to_string_lossy()
+                    path.display()
                 ));
             }
         }
@@ -2722,7 +2747,7 @@ fn complete_ack_tombstone(
     attempt_id: &str,
     request_sha256: &str,
 ) -> Result<memcordon_core::WindowsTerminalRetiredV2, String> {
-    if record_path(attempt_id)?.exists() || guardian_receipt_path(attempt_id)?.exists() {
+    if record_path(attempt_id)?.exists() || guardian_receipts_root().join(attempt_id).exists() {
         return Err(
             "ACK tombstone completion still has active record or guardian receipt".to_owned(),
         );
@@ -2969,6 +2994,10 @@ pub fn recover_attempt_for_caller(
                     if let Some(blocker) = frozen_manifest_owner_blocker(&record)? {
                         return Err(format!("exact recovery pending checked closure: {blocker}"));
                     }
+                    super::process::retire_handed_off_guardian(
+                        attempt_id,
+                        &guardian.guardian_identity,
+                    )?;
                     stage_recovered_closure(
                         &mut record,
                         &caller.current_boot_identity,
@@ -4863,6 +4892,53 @@ pub fn guardian_receipts_root() -> PathBuf {
     package::state_root().join("guardian-receipts")
 }
 
+pub(crate) fn prepare_guardian_receipt_directory(
+    attempt_id: &str,
+    slot: &str,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    validate_attempt_id(attempt_id)?;
+    super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
+        .verify_path(&guardian_receipts_root())?;
+    let directory = guardian_receipts_root().join(attempt_id);
+    let security = super::security::SecurityDescriptor::from_sddl(
+        &super::security::guardian_receipt_directory_sddl(slot)?,
+    )?;
+    let attributes = security.attributes(false);
+    let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
+    // A fresh attempt gets exactly one launcher-created, protected directory.
+    // Existing names are refused rather than adopting another writer's state.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(wide.as_ptr(), &attributes)
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    verify_guardian_receipt_directory(&directory)?;
+    security.verify_path(&directory)
+}
+
+fn verify_guardian_receipt_directory(directory: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("guardian receipt directory is not a plain directory".into());
+    }
+    // Only the launcher can create/rename these directories or change their
+    // protected descriptor. A slot gets no inheritable child or directory
+    // mutation rights. Match the complete policy, not merely an allowed ACE.
+    for index in 0..memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT {
+        let slot = super::security::guardian_slot_name(index)?;
+        let security = super::security::SecurityDescriptor::from_sddl(
+            &super::security::guardian_receipt_directory_sddl(&slot)?,
+        )?;
+        if security.verify_path(directory).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("guardian receipt directory has no exact protected slot policy".into())
+}
+
 fn directory_empty(path: &Path) -> Result<bool, String> {
     match fs::read_dir(path) {
         Ok(mut entries) => Ok(entries.next().is_none()),
@@ -4896,110 +4972,218 @@ fn record_path(attempt_id: &str) -> Result<PathBuf, String> {
     Ok(attempts_root().join(format!("{attempt_id}.json")))
 }
 
-pub fn write_guardian_receipt(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardianReceiptStage {
+    Attempt,
+    Directory,
+    RecordRead,
+    RecordDecode,
+    RecordAuthenticate,
+    OwnerBinding,
+    Build,
+    Validate,
+    Serialize,
+    Security,
+    Create,
+    Write,
+    Sync,
+    Verify,
+    Publish,
+}
+
+impl GuardianReceiptStage {
+    pub(crate) const ALL: [Self; 15] = [
+        Self::Attempt,
+        Self::Directory,
+        Self::RecordRead,
+        Self::RecordDecode,
+        Self::RecordAuthenticate,
+        Self::OwnerBinding,
+        Self::Build,
+        Self::Validate,
+        Self::Serialize,
+        Self::Security,
+        Self::Create,
+        Self::Write,
+        Self::Sync,
+        Self::Verify,
+        Self::Publish,
+    ];
+    pub(crate) const fn exit_class(self) -> u32 {
+        40 + self as u32
+    }
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Attempt => "receipt-attempt",
+            Self::Directory => "receipt-directory",
+            Self::RecordRead => "receipt-record-read",
+            Self::RecordDecode => "receipt-record-decode",
+            Self::RecordAuthenticate => "receipt-record-authenticate",
+            Self::OwnerBinding => "receipt-owner-binding",
+            Self::Build => "receipt-build",
+            Self::Validate => "receipt-validate",
+            Self::Serialize => "receipt-serialize",
+            Self::Security => "receipt-security",
+            Self::Create => "receipt-create",
+            Self::Write => "receipt-write",
+            Self::Sync => "receipt-sync",
+            Self::Verify => "receipt-verify",
+            Self::Publish => "receipt-publish",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GuardianReceiptWriteError {
+    pub stage: GuardianReceiptStage,
+    pub native_code: Option<i32>,
+    pub source: String,
+}
+
+pub(crate) fn write_guardian_receipt(
     attempt_id: &str,
     worker_identity: &WindowsProcessIdentityV1,
     guardian_identity: &WindowsProcessIdentityV1,
     cleanup_trigger: memcordon_core::WindowsGuardianCleanupTriggerV1,
-) -> Result<(), String> {
-    validate_attempt_id(attempt_id)?;
-    fs::create_dir_all(guardian_receipts_root()).map_err(|error| error.to_string())?;
-    let bytes =
-        read_record_bounded(&record_path(attempt_id)?).map_err(|error| error.to_string())?;
-    let record: WindowsAttemptRecordV1 =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    authenticate(&record, attempt_id)?;
-    match &cleanup_trigger {
-        memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, .. }
-        | memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
-            frontend,
-            ..
-        } if frontend != &record.caller_process_identity => {
+) -> Result<(), GuardianReceiptWriteError> {
+    let mut stage = GuardianReceiptStage::Attempt;
+    let mut native_code = None;
+    let result = (|| -> Result<(), String> {
+        validate_attempt_id(attempt_id)?;
+        stage = GuardianReceiptStage::Directory;
+        verify_guardian_receipt_directory(&guardian_receipts_root().join(attempt_id))?;
+        stage = GuardianReceiptStage::RecordRead;
+        let bytes = read_record_bounded(&record_path(attempt_id)?).map_err(|error| {
+            native_code = error.raw_os_error();
+            error.to_string()
+        })?;
+        stage = GuardianReceiptStage::RecordDecode;
+        let record: WindowsAttemptRecordV1 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        stage = GuardianReceiptStage::RecordAuthenticate;
+        authenticate(&record, attempt_id)?;
+        stage = GuardianReceiptStage::OwnerBinding;
+        match &cleanup_trigger {
+            memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, .. }
+            | memcordon_core::WindowsGuardianCleanupTriggerV1::FrontendExitStatusUnavailable {
+                frontend,
+                ..
+            } if frontend != &record.caller_process_identity => {
+                return Err(
+                    "guardian observed frontend identity differs from authenticated caller".into(),
+                );
+            }
+            _ => {}
+        }
+        if record.worker_identity.as_ref() != Some(worker_identity)
+            || record.guardian_identity.as_ref() != Some(guardian_identity)
+        {
             return Err(
-                "guardian observed frontend identity differs from authenticated caller".into(),
+                "guardian receipt worker or guardian identity differs from durable record"
+                    .to_owned(),
             );
         }
-        _ => {}
-    }
-    if record.worker_identity.as_ref() != Some(worker_identity)
-        || record.guardian_identity.as_ref() != Some(guardian_identity)
-    {
-        return Err(
-            "guardian receipt worker or guardian identity differs from durable record".to_owned(),
-        );
-    }
-    let manifest = record
-        .owner_manifest
-        .as_ref()
-        .ok_or_else(|| "guardian receipt has no authorized owner manifest".to_owned())?;
-    let mut receipt = memcordon_core::WindowsGuardianReceiptV2 {
-        schema_version: 2,
-        attempt_id: attempt_id.to_owned(),
-        nonce: record.nonce.clone(),
-        request_sha256: record.request_sha256.clone(),
-        provider_generation: record.provider_generation.clone(),
-        launch_incarnation: record.launch_incarnation.clone(),
-        original_boot_id: record.boot_identity.clone(),
-        job_identity: record.job_identity_sha256.clone(),
-        guardian_identity: guardian_identity.clone(),
-        worker_identity: worker_identity.clone(),
-        owner_manifest_sha256: manifest.canonical_sha256().map_err(str::to_owned)?,
-        termination_requested: true,
-        native_job_query_succeeded: true,
-        active_processes_zero_observed: true,
-        cleanup_trigger: Some(cleanup_trigger),
-        observed_unix_millis: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis()
-            .try_into()
-            .map_err(|_| "guardian observation timestamp overflow".to_owned())?,
-        integrity_sha256: String::new(),
-    };
-    receipt.integrity_sha256 = receipt.canonical_sha256().map_err(str::to_owned)?;
-    if !receipt.is_consistent() {
-        return Err("guardian native receipt failed V2 validation".to_owned());
-    }
-    let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    let path = guardian_receipt_path(attempt_id)?;
-    let staged = path.with_extension("json.new");
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::FromRawHandle;
-    let security = guardian_receipt_file_security()?;
-    let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: security.raw(),
-        bInheritHandle: 0,
-    };
-    let wide: Vec<u16> = staged
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: the path and descriptor remain live; CREATE_NEW fails on collision.
-    let handle = unsafe {
-        windows_sys::Win32::Storage::FileSystem::CreateFileW(
-            wide.as_ptr(),
-            GENERIC_WRITE_ACCESS | READ_CONTROL_ACCESS,
-            0,
-            &attributes,
-            windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
-            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    // SAFETY: CREATE_NEW returned a uniquely owned Win32 file handle.
-    let mut file = unsafe { fs::File::from_raw_handle(handle as _) };
-    use std::io::Write;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    drop(file);
-    security.verify_path(&staged)?;
-    replace_atomically(&staged, &path)
+        let manifest = record
+            .owner_manifest
+            .as_ref()
+            .ok_or_else(|| "guardian receipt has no authorized owner manifest".to_owned())?;
+        stage = GuardianReceiptStage::Build;
+        let mut receipt = memcordon_core::WindowsGuardianReceiptV2 {
+            schema_version: 2,
+            attempt_id: attempt_id.to_owned(),
+            nonce: record.nonce.clone(),
+            request_sha256: record.request_sha256.clone(),
+            provider_generation: record.provider_generation.clone(),
+            launch_incarnation: record.launch_incarnation.clone(),
+            original_boot_id: record.boot_identity.clone(),
+            job_identity: record.job_identity_sha256.clone(),
+            guardian_identity: guardian_identity.clone(),
+            worker_identity: worker_identity.clone(),
+            owner_manifest_sha256: manifest.canonical_sha256().map_err(str::to_owned)?,
+            termination_requested: true,
+            native_job_query_succeeded: true,
+            active_processes_zero_observed: true,
+            cleanup_trigger: Some(cleanup_trigger),
+            observed_unix_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_millis()
+                .try_into()
+                .map_err(|_| "guardian observation timestamp overflow".to_owned())?,
+            integrity_sha256: String::new(),
+        };
+        receipt.integrity_sha256 = receipt.canonical_sha256().map_err(str::to_owned)?;
+        stage = GuardianReceiptStage::Validate;
+        if !receipt.is_consistent() {
+            return Err("guardian native receipt failed V2 validation".to_owned());
+        }
+        stage = GuardianReceiptStage::Serialize;
+        let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        let path = guardian_receipt_path(attempt_id)?;
+        let staged = path.with_extension("json.new");
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        stage = GuardianReceiptStage::Security;
+        let security = guardian_receipt_file_security()?;
+        let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: security.raw(),
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = staged
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: the path and descriptor remain live; CREATE_NEW fails on collision.
+        stage = GuardianReceiptStage::Create;
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE_ACCESS | READ_CONTROL_ACCESS | DELETE_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            native_code = error.raw_os_error();
+            return Err(error.to_string());
+        }
+        // SAFETY: CREATE_NEW returned a uniquely owned Win32 file handle.
+        let mut staged_file = CreateOnceStagingFile {
+            file: unsafe { fs::File::from_raw_handle(handle as _) },
+            path: staged.clone(),
+        };
+        use std::io::Write;
+        stage = GuardianReceiptStage::Write;
+        staged_file.file_mut().write_all(&bytes).map_err(|error| {
+            native_code = error.raw_os_error();
+            error.to_string()
+        })?;
+        stage = GuardianReceiptStage::Sync;
+        staged_file.sync_all().map_err(|error| {
+            native_code = error.raw_os_error();
+            error.to_string()
+        })?;
+        stage = GuardianReceiptStage::Verify;
+        security.verify_path(&staged)?;
+        stage = GuardianReceiptStage::Publish;
+        publish_create_once_atomically(staged_file, &path).map_err(|error| {
+            native_code = error.native_code();
+            error.to_string()
+        })
+    })();
+    result.map_err(|source| GuardianReceiptWriteError {
+        stage,
+        native_code,
+        source,
+    })
 }
 
 fn guardian_receipt_file_security() -> Result<super::security::SecurityDescriptor, String> {
@@ -5014,6 +5198,7 @@ fn read_guardian_receipt(
     super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
         .verify_path(&guardian_receipts_root())?;
     let path = guardian_receipt_path(attempt_id)?;
+    verify_guardian_receipt_directory(path.parent().ok_or("guardian receipt parent is absent")?)?;
     let security = guardian_receipt_file_security()?;
     let bytes = read_record_bounded_with_limit_and_security(
         &path,
@@ -5093,15 +5278,35 @@ fn guardian_causal_projection_if_eligible(
 
 fn guardian_receipt_path(attempt_id: &str) -> Result<PathBuf, String> {
     validate_attempt_id(attempt_id)?;
-    Ok(guardian_receipts_root().join(format!("{attempt_id}.json")))
+    Ok(guardian_receipts_root()
+        .join(attempt_id)
+        .join("receipt.json"))
 }
 
 fn remove_guardian_receipt(attempt_id: &str) -> Result<(), String> {
-    match fs::remove_file(guardian_receipt_path(attempt_id)?) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+    let path = guardian_receipt_path(attempt_id)?;
+    let directory = path.parent().ok_or("guardian receipt parent is absent")?;
+    match fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => verify_guardian_receipt_directory(directory)?,
     }
+    // Check the entire bounded namespace before deleting any original proof.
+    // A retained stage or unknown child keeps the receipt and failure evidence.
+    for child in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let child = child.map_err(|error| error.to_string())?;
+        if child.file_name() != std::ffi::OsStr::new("receipt.json") {
+            return Err("guardian receipt directory has an unpublished or unknown child".into());
+        }
+        read_guardian_receipt(attempt_id)?;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    // Never recursively delete unknown or staged evidence.
+    fs::remove_dir(directory).map_err(|error| error.to_string())
 }
 
 fn record_name_refusal(path: &Path, reason: &str) -> String {
@@ -5308,7 +5513,7 @@ fn authenticate(record: &WindowsAttemptRecordV1, file_attempt_id: &str) -> Resul
     .map_err(str::to_owned)
 }
 
-fn read_record_bounded(path: &Path) -> io::Result<Vec<u8>> {
+pub(super) fn read_record_bounded(path: &Path) -> io::Result<Vec<u8>> {
     read_record_bounded_with_limit(path, memcordon_core::WINDOWS_MAX_FRAME_BYTES)
 }
 

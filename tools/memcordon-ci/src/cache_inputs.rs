@@ -204,6 +204,7 @@ fn validate_manifest_paths(
                 name.starts_with("crates/")
                     || name.starts_with("tools/")
                     || name.starts_with("fuzz/")
+                    || name.starts_with("tests/")
             };
         if !modeled
             || !tracked.split('\0').any(|record| {

@@ -473,7 +473,7 @@ jobs:
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal
       - name: Initialize genuine auxiliary Cargo target
-        run: rustup run 1.97.1 cargo clean --locked --offline --package memcordon-ci --target-dir target
+        run: rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target
       - name: Build ordinary CI driver
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci
       - id: workspace-download-context

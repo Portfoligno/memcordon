@@ -28,7 +28,7 @@ environment_allowlist = [
 allowed_run_commands = [
   "./.release/tool/memcordon-ci ci fetch-downloads --family workspace",
   "rustup toolchain install nightly-2026-07-31 --profile minimal",
-  "rustup run 1.97.1 cargo clean --locked --offline --package memcordon-ci --target-dir target",
+  "rustup run 1.97.1 cargo clean --locked --package memcordon-ci --target-dir target",
   "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save",
   "./target/ci/release/memcordon-ci ci download-cache-context --family workspace",
   "./target/ci/release/memcordon-ci ci download-cache-context --family fuzz",

@@ -44,6 +44,7 @@ pub mod windows_cache_identity;
 mod windows_caller_snapshot_diagnostic;
 pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
+pub mod windows_component_failed_recovery;
 pub mod windows_component_query_evidence;
 pub mod windows_consumer_readiness;
 pub mod windows_execution_acceptance;
@@ -51,6 +52,7 @@ pub mod windows_installed_cases;
 pub mod windows_owned_guardian;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
+pub mod windows_policy_activation;
 #[cfg(windows)]
 mod windows_readiness_acl;
 pub mod windows_readiness_adapter;

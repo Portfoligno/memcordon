@@ -78,6 +78,11 @@ pub(crate) fn observe_running_control_service() -> std::io::Result<serde_json::V
 }
 
 #[cfg(windows)]
+pub(crate) fn observe_control_service_status() -> std::io::Result<serde_json::Value> {
+    serde_json::to_value(native::control_service_status()?).map_err(std::io::Error::other)
+}
+
+#[cfg(windows)]
 mod native {
     use super::*;
     use crate::command::CommandSpec;
@@ -346,8 +351,20 @@ mod native {
         Ok(())
     }
 
-    #[allow(unsafe_code)] // Query-only SCM handle ownership; process image/birth are separately held and measured.
     pub(super) fn control_service() -> io::Result<ControlServiceObservation> {
+        let status = control_service_status()?;
+        if status.process_id == 0
+            || status.current_state != windows_sys::Win32::System::Services::SERVICE_RUNNING
+        {
+            return Err(io::Error::other(
+                "owned control service is not live/running before native fault",
+            ));
+        }
+        Ok(status)
+    }
+
+    #[allow(unsafe_code)] // Query-only SCM status; replacement process authority is separately held and measured.
+    pub(super) fn control_service_status() -> io::Result<ControlServiceObservation> {
         use windows_sys::Win32::System::Services::{
             CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
             SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS,
@@ -386,13 +403,6 @@ mod native {
         }
         if ok == 0 {
             return Err(error);
-        }
-        if status.dwProcessId == 0
-            || status.dwCurrentState != windows_sys::Win32::System::Services::SERVICE_RUNNING
-        {
-            return Err(io::Error::other(
-                "owned control service is not live/running before native fault",
-            ));
         }
         Ok(ControlServiceObservation {
             name: memcordon_core::WINDOWS_CONTROL_SERVICE_NAME.into(),

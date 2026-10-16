@@ -393,7 +393,7 @@ pub fn begin_case(
             caller_gid: 65534,
             target_arguments: &args,
             deadline: std::ffi::OsStr::new("+300s"),
-            memory: std::ffi::OsStr::new("+512M"),
+            memory: std::ffi::OsStr::new("+512MiB"),
         },
         delivery,
         None,

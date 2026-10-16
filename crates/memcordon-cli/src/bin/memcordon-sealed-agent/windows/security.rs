@@ -360,6 +360,25 @@ pub fn launcher_state_sddl() -> Result<String, String> {
     ))
 }
 
+pub(crate) const GUARDIAN_RECEIPT_DIRECTORY_ACCESS: u32 = 0x0002_00a2;
+
+pub(crate) fn guardian_receipt_directory_sddl(slot: &str) -> Result<String, String> {
+    let valid = (0..memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT)
+        .map(guardian_slot_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !valid.iter().any(|name| name == slot) {
+        return Err("guardian receipt directory slot is not canonical".into());
+    }
+    let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
+    let guardian = service_sid(slot)?;
+    // Only this attempt's assigned slot may create a leaf. No inherited slot
+    // ACE, subdirectory creation, delete-child, owner or DACL mutation exists.
+    // The protected System-only receipt keeps its own immutable file policy.
+    Ok(format!(
+        "O:BAD:P(D;;WDWO;;;OW)(A;;FA;;;SY)(A;;RC;;;BA)(A;;FA;;;{launcher})(A;;0x{GUARDIAN_RECEIPT_DIRECTORY_ACCESS:08x};;;{guardian})"
+    ))
+}
+
 pub fn replay_state_sddl() -> Result<String, String> {
     let control = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;

@@ -48,10 +48,9 @@ fn real_workflows_reject_mixed_family_population_home_and_order_mutations() {
             );
         }
         if file == "ci.yml" {
-            let changed = source.replace(
-                "cargo clean --locked --offline --package memcordon-ci --target-dir target",
-                "cargo clean --locked --offline --target-dir target",
-            );
+            let initializer = "cargo clean --locked --package memcordon-ci --target-dir target";
+            assert!(source.contains(initializer));
+            let changed = source.replace(initializer, "cargo clean --locked --target-dir target");
             assert!(
                 policy::validate_workflow_bytes(
                     &root,

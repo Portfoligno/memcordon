@@ -7,6 +7,9 @@ mod private_policy_fixture_build;
 #[path = "src/bin/memcordon-sealed-agent/private_policy_fixture_schema.rs"]
 mod private_policy_fixture_schema;
 
+#[path = "build_support/source_identity.rs"]
+mod source_identity;
+
 fn generate_private_policy_fixture(manifest: &Path, output: &Path) -> Result<(), String> {
     let source = manifest.join(private_policy_fixture_build::SOURCE_RELATIVE);
     let destination = output.join(private_policy_fixture_build::OUTPUT_NAME);
@@ -75,7 +78,7 @@ fn valid_commit(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn watch_git_identity(manifest: &Path) {
+fn watch_git_identity(manifest: &Path, output_root: Option<&Path>) {
     let Some(git) = git_directory(manifest) else {
         return;
     };
@@ -83,10 +86,13 @@ fn watch_git_identity(manifest: &Path) {
     println!("cargo:rerun-if-changed={}", head_path.display());
     if let Ok(head) = fs::read_to_string(&head_path) {
         if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed={}", git.join(reference).display());
             println!(
                 "cargo:rerun-if-changed={}",
-                git.join("packed-refs").display()
+                source_identity::watch_path(&git.join(reference), output_root).display()
+            );
+            println!(
+                "cargo:rerun-if-changed={}",
+                source_identity::watch_path(&git.join("packed-refs"), output_root).display()
             );
         }
     }
@@ -108,6 +114,15 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
     let mut file = fs::File::create(output).unwrap();
     writeln!(file, "pub const SOURCE_COMMIT: &str = {commit:?};").unwrap();
-    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
-    watch_git_identity(&manifest);
+    let output_root = source_identity::output_root(&output_directory);
+    println!(
+        "cargo:rerun-if-changed={}",
+        source_identity::watch_path(
+            &manifest.join(".cargo_vcs_info.json"),
+            output_root.as_deref()
+        )
+        .display()
+    );
+    println!("cargo:rerun-if-changed=build_support/source_identity.rs");
+    watch_git_identity(&manifest, output_root.as_deref());
 }

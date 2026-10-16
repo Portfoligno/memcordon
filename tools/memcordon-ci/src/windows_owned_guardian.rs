@@ -498,6 +498,29 @@ mod native {
     }
 
     impl HeldGuardian {
+        /// Diagnostic SCM fields from the held slot at query time. Process exit
+        /// zero does not convey a service callback's reported failure status;
+        /// a stopped slot alone cannot prove that no intervening reuse occurred.
+        pub fn service_exit_status(&self) -> Result<(u32, u32, u32, u32)> {
+            if config_hash(&self.slot.service)? != self.slot.config_sha256 {
+                return Err(CiError::Message(
+                    "held guardian service configuration changed during status query".into(),
+                ));
+            }
+            let current = status(&self.slot)?;
+            if current.dwProcessId != 0 && current.dwProcessId != self.identity.process_id {
+                return Err(CiError::Message(
+                    "held guardian slot now belongs to another process".into(),
+                ));
+            }
+            Ok((
+                current.dwCurrentState,
+                current.dwProcessId,
+                current.dwWin32ExitCode,
+                current.dwServiceSpecificExitCode,
+            ))
+        }
+
         pub fn native_exit_status(&self) -> Result<Option<u32>> {
             if !self.has_retired()? {
                 return Ok(None);

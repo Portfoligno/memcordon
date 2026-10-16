@@ -7,6 +7,65 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::windows::guardian::{GuardianCapabilityV1, GuardianHandleRole, GuardianStartupSubphase};
 
+#[test]
+fn runtime_scm_diagnostics_preserve_operation_native_code_and_receipt_source() {
+    use crate::windows::{guardian, record::GuardianReceiptStage};
+    let mut codes = std::collections::BTreeSet::new();
+    for detail in [
+        "authority-wait",
+        "job-terminate",
+        "job-accounting",
+        "job-empty-timeout",
+    ] {
+        let code = guardian::runtime_failure_for_test(detail, Some(5));
+        assert!(codes.insert(code));
+        assert_eq!(guardian::runtime_detail_for_exit_code(code), Some(detail));
+        assert_eq!(
+            guardian::startup_detail_for_exit_code(code),
+            (GuardianStartupSubphase::Runtime, None, Some(5))
+        );
+    }
+    for stage in GuardianReceiptStage::ALL {
+        let (code, text) =
+            guardian::receipt_failure_for_test(stage, Some(32), "original write/validation source");
+        assert!(codes.insert(code));
+        assert_eq!(
+            guardian::runtime_detail_for_exit_code(code),
+            Some(stage.name())
+        );
+        assert_eq!(guardian::startup_detail_for_exit_code(code).2, Some(32));
+        assert!(text.contains("source=original write/validation source"));
+        assert!(text.contains(stage.name()));
+        for native in [None, Some(-1), Some(65536)] {
+            let (code, _) = guardian::receipt_failure_for_test(stage, native, "original source");
+            assert_eq!(guardian::startup_detail_for_exit_code(code).2, None);
+        }
+    }
+    assert_eq!(guardian::runtime_detail_for_exit_code(125), None);
+    assert_eq!(guardian::runtime_failure_for_test("unknown", None), 125);
+}
+
+#[test]
+fn receipt_writer_retains_actual_validation_error_before_filesystem_work() {
+    let identity = memcordon_core::WindowsProcessIdentityV1 {
+        process_id: 42,
+        creation_time_100ns: 1234,
+    };
+    let error = crate::windows::record::write_guardian_receipt(
+        "invalid-attempt",
+        &identity,
+        &identity,
+        memcordon_core::WindowsGuardianCleanupTriggerV1::WorkerLost,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.stage,
+        crate::windows::record::GuardianReceiptStage::Attempt
+    );
+    assert_eq!(error.native_code, None);
+    assert!(!error.source.is_empty());
+}
+
 fn event(signaled: bool) -> crate::windows::pipe::OwnedHandle {
     // SAFETY: null security/name create a private manual-reset test event.
     crate::windows::pipe::OwnedHandle::new(unsafe {

@@ -201,7 +201,7 @@ pub fn decode_archive(bytes: &[u8], target: &str) -> Result<BTreeMap<String, Vec
             if file.is_dir() || file.is_symlink() {
                 return Err(CiError::Message("forbidden target ZIP member".into()));
             }
-            let name = file.name().to_owned();
+            let name = file.name()?.into_owned();
             let size = file.size();
             insert(name, size, &mut file)?;
         }

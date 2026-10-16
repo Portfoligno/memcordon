@@ -1085,7 +1085,7 @@ fn probe_loader_closure(
         caller_gid: 65534,
         target_arguments: &arguments,
         deadline: std::ffi::OsStr::new(&budget),
-        memory: std::ffi::OsStr::new("+512M"),
+        memory: std::ffi::OsStr::new("+512MiB"),
     })?;
     let index = report.launches.len();
     report.launches.push(launch);
@@ -1371,7 +1371,7 @@ fn export_case(
         caller_gid: 65534,
         target_arguments: &arguments,
         deadline: std::ffi::OsStr::new(&product_budget),
-        memory: std::ffi::OsStr::new("+512M"),
+        memory: std::ffi::OsStr::new("+512MiB"),
     })?;
     let launch_index = report.launches.len();
     report.launches.push(launch);
