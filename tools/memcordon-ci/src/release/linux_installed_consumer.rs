@@ -3180,13 +3180,8 @@ fn run_owned(
 
 /// Ordinary branch CI builds real selected binaries and Cargo sources. It
 /// neither creates a release tag nor asks publication to accept working input.
-pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
-    use super::{
-        distribution::{TargetDistribution, native_target},
-        packages::{self, PackageConsumer},
-        source::BuildSourceIdentity,
-        target,
-    };
+fn working_distribution() -> Result<super::distribution::TargetDistribution> {
+    use super::distribution::{TargetDistribution, native_target};
     let native = native_target()?;
     if !matches!(
         native,
@@ -3196,7 +3191,6 @@ pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
             "private installed suite requires native GNU Linux".into(),
         ));
     }
-    let source = BuildSourceIdentity::working(root)?;
     let distribution = TargetDistribution {
         target: native.into(),
         features: vec!["sealed-runtime".into(), "private-tcp".into()],
@@ -3215,6 +3209,15 @@ pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
         .collect(),
     };
     distribution.validate()?;
+    Ok(distribution)
+}
+
+/// Produce actual source-associated payloads on one host. Native operation
+/// records stay on that host and are never part of the transferred directory.
+pub fn prepare_working(root: &Path, destination: &Path) -> Result<()> {
+    use super::{packages, source::BuildSourceIdentity, target};
+    let distribution = working_distribution()?;
+    let source = BuildSourceIdentity::working(root)?;
     fs::create_dir_all(destination)?;
     let target_directory = destination.join("native-payload");
     let package_directory = destination.join("cargo-payload");
@@ -3225,6 +3228,23 @@ pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
         &package_directory,
     )?;
     target::build_selected(root, &source, &distribution, &target_directory)?;
+    source.recheck(root)
+}
+
+/// Consume only mandatory, byte-validated payloads from the exact working
+/// source. A missing or foreign producer never triggers replacement builds.
+pub fn run_prepared(root: &Path, prepared: &Path, destination: &Path) -> Result<()> {
+    use super::{packages::PackageConsumer, source::BuildSourceIdentity, target::TargetBundle};
+    let distribution = working_distribution()?;
+    let source = BuildSourceIdentity::working(root)?;
+    let target_directory = prepared.join("native-payload");
+    let package_directory = prepared.join("cargo-payload");
+    let (bundle, _) = TargetBundle::load(&target_directory)?;
+    if bundle.source != source || bundle.distribution != distribution {
+        return Err(CiError::Message(
+            "working private producer selection differs".into(),
+        ));
+    }
     // The extracted consumer is constructed here too, before native privileges
     // are used, so stale archives cannot bypass its exact source checks.
     let consumer = PackageConsumer::prepare_selected(root, &package_directory, &distribution)?;
@@ -3241,6 +3261,12 @@ pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
     )?;
     run_native_observer_cases(root, &destination.join("native-observer"))?;
     source.recheck(root)
+}
+
+/// Complete local compatibility retains every preparation and runtime case.
+pub fn run_working(root: &Path, destination: &Path) -> Result<()> {
+    prepare_working(root, destination)?;
+    run_prepared(root, destination, destination)
 }
 
 fn compile_native_cases(root: &Path, output: &Path) -> Result<std::path::PathBuf> {
@@ -3266,6 +3292,8 @@ fn compile_native_cases(root: &Path, output: &Path) -> Result<std::path::PathBuf
         Duration::from_secs(1800),
     )
     .arg(root.join("target/ci-build/private-native-tests"))
+    .arg("--jobs")
+    .arg(crate::preparation::compiler_budget().to_string())
     .output_quiet()?;
     fs::write(output.join("compile.stdout.bin"), &compiled.stdout)?;
     fs::write(output.join("compile.stderr.bin"), &compiled.stderr)?;

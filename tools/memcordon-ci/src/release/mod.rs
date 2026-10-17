@@ -202,6 +202,30 @@ pub enum ReleaseCommand {
         #[arg(long, default_value = ".release/target")]
         destination: PathBuf,
     },
+    CompileTarget {
+        #[arg(long, value_enum, default_value = "stop-after-failure")]
+        failure_mode: crate::failure_mode::FailureMode,
+        #[arg(long)]
+        consumer_readiness: bool,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
+        #[arg(long, default_value = ".release/target")]
+        destination: PathBuf,
+    },
+    ValidatePackage {
+        #[arg(long, value_enum, default_value = "stop-after-failure")]
+        failure_mode: crate::failure_mode::FailureMode,
+        #[arg(long)]
+        consumer_readiness: bool,
+        #[arg(long, conflicts_with = "build_source")]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        build_source: Option<PathBuf>,
+        #[arg(long, default_value = ".release/target")]
+        destination: PathBuf,
+    },
     Assemble {
         #[arg(long)]
         consumer_readiness: bool,
@@ -483,6 +507,65 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
                 root,
                 &selected,
                 &distribution,
+                &destination,
+                consumer_readiness,
+                failure_mode,
+            )
+        }
+        ReleaseCommand::CompileTarget {
+            failure_mode,
+            consumer_readiness,
+            source,
+            build_source,
+            destination: _,
+        } => {
+            let selected =
+                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
+            let distribution = distribution::Distribution::read(root)?;
+            let distribution = if consumer_readiness {
+                distribution.consumer_readiness()?
+            } else {
+                distribution
+            };
+            let distribution = distribution.native()?;
+            let outer = std::time::Instant::now() + std::time::Duration::from_secs(140 * 60);
+            crate::preparation::with_operation(failure_mode, outer, || {
+                let prepared = target::prepare_native_compile(
+                    root,
+                    &selected,
+                    distribution,
+                    failure_mode,
+                    target::NativeCompileMode::Split,
+                )?;
+                crate::preparation::with_operation(
+                    failure_mode,
+                    prepared.operation_deadline,
+                    || {
+                        target::compile_native_pair(root, &selected, distribution, prepared)
+                            .into_result()
+                    },
+                )
+            })
+        }
+        ReleaseCommand::ValidatePackage {
+            failure_mode,
+            consumer_readiness,
+            source,
+            build_source,
+            destination,
+        } => {
+            let selected =
+                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
+            let distribution = distribution::Distribution::read(root)?;
+            let distribution = if consumer_readiness {
+                distribution.consumer_readiness()?
+            } else {
+                distribution
+            };
+            target::validate_selected(
+                root,
+                &selected,
+                distribution.native()?,
                 &destination,
                 consumer_readiness,
                 failure_mode,

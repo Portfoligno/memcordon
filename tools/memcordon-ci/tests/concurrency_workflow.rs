@@ -64,9 +64,9 @@ fn full_workflows_reject_incomplete_quarters_and_unpaired_mode_branches() {
             let ordinal = steps
                 .iter()
                 .position(|step| {
-                    step["id"]
-                        .as_str()
-                        .is_some_and(|id| id.ends_with("-diagnostic"))
+                    step["run"].as_str().is_some_and(|run| {
+                        run.contains(" ci segment ") && run.contains("quarter-four")
+                    })
                 })
                 .unwrap();
             steps.remove(ordinal);

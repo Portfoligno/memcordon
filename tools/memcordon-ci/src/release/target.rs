@@ -372,22 +372,164 @@ pub fn build_selected_with_failure(
     consumer_readiness: bool,
     failure_mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
-    selected.recheck(root)?;
-    let operation_deadline = if consumer_readiness
-        && matches!(
-            distribution.target.as_str(),
-            "x86_64-unknown-linux-gnu"
-                | "aarch64-unknown-linux-gnu"
-                | "x86_64-pc-windows-msvc"
-                | "aarch64-pc-windows-msvc"
-        ) {
-        super::native_component_harness::original_deadline(root, selected, &distribution.target)?
+    let mode = if consumer_readiness
+        && (distribution.target.contains("linux") || distribution.target.contains("windows"))
+    {
+        NativeCompileMode::Original
     } else {
-        std::time::Instant::now()
+        NativeCompileMode::Local
+    };
+    let outer = std::time::Instant::now() + Duration::from_secs(140 * 60);
+    crate::preparation::with_operation(failure_mode, outer, || {
+        let prepared = prepare_native_compile(root, selected, distribution, failure_mode, mode)?;
+        let deadline = prepared.operation_deadline.min(outer);
+        crate::preparation::with_operation(failure_mode, deadline, || {
+            compile_native_pair(root, selected, distribution, prepared).into_result()?;
+            validate_and_package_native(
+                root,
+                selected,
+                distribution,
+                destination,
+                consumer_readiness,
+                failure_mode,
+                deadline,
+            )
+        })
+    })
+}
+
+pub struct PreparedNativeCompile {
+    command: crate::command::CommandSpec,
+    toolchain: String,
+    compile: crate::native_test_plan::NativeTestCommand,
+    pub operation_deadline: std::time::Instant,
+    retain_inputs: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum NativeCompileMode {
+    /// Complete local build: in-memory clock and product data, no handoff files.
+    Local,
+    /// Existing local component owner retains its original clock for readiness.
+    Original,
+    /// Fresh split workflow compiler: strict begin and local byte inputs.
+    Split,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeProductInputs {
+    source: BuildSourceIdentity,
+    distribution: TargetDistribution,
+    products: BTreeMap<String, String>,
+}
+
+fn product_inputs(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+) -> Result<NativeProductInputs> {
+    let mut products = BTreeMap::new();
+    for binary in &distribution.binaries {
+        let filename = binary_name(binary, &distribution.target);
+        let bytes = artifacts::read_file(
+            &root
+                .join("target/ci-build/product")
+                .join(&distribution.target)
+                .join("release")
+                .join(&filename),
+        )?;
+        validate_executable(&bytes, &distribution.target)?;
+        products.insert(filename, artifacts::checksum(&bytes));
+    }
+    Ok(NativeProductInputs {
+        source: selected.clone(),
+        distribution: distribution.clone(),
+        products,
+    })
+}
+
+fn retain_product_inputs(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+) -> Result<()> {
+    let inputs = product_inputs(root, selected, distribution)?;
+    let path = crate::ci_operation_time::record_path(
+        root,
+        Path::new("target/ci-session/native-products.json"),
+    )?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&serde_json::to_vec(&inputs)?)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn verify_product_inputs(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+) -> Result<()> {
+    let path = crate::ci_operation_time::record_path(
+        root,
+        Path::new("target/ci-session/native-products.json"),
+    )?;
+    let retained: NativeProductInputs = source::read_json(&path)?;
+    let actual = product_inputs(root, selected, distribution)?;
+    if retained.source != actual.source
+        || retained.distribution != actual.distribution
+        || retained.products != actual.products
+    {
+        return Err(CiError::Message(
+            "native product input paths/bytes or source changed between phases".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Construct the same two compiler recipes after checking actual source and host.
+pub fn prepare_native_compile(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    failure_mode: crate::failure_mode::FailureMode,
+    mode: NativeCompileMode,
+) -> Result<PreparedNativeCompile> {
+    if matches!(mode, NativeCompileMode::Split) {
+        selected.validate()?;
+    } else {
+        selected.recheck(root)?;
+    }
+    let operation_deadline = match mode {
+        NativeCompileMode::Local => std::time::Instant::now()
             .checked_add(Duration::from_secs(140 * 60))
-            .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?
+            .ok_or_else(|| CiError::Message("native operation budget overflow".into()))?,
+        NativeCompileMode::Original
+            if root
+                .join(".release/native-operation-deadline.json")
+                .try_exists()? =>
+        {
+            super::native_component_harness::original_deadline(
+                root,
+                selected,
+                &distribution.target,
+            )?
+        }
+        NativeCompileMode::Original | NativeCompileMode::Split => {
+            super::native_component_harness::begin_original_deadline(
+                root,
+                selected,
+                &distribution.target,
+            )?
+        }
     };
     crate::preparation::with_operation(failure_mode, operation_deadline, || {
+        if matches!(mode, NativeCompileMode::Split) {
+            selected.recheck(root)?;
+        }
         distribution.validate()?;
         if distribution.target != super::distribution::native_target()? {
             return Err(CiError::Message(
@@ -395,7 +537,7 @@ pub fn build_selected_with_failure(
             ));
         }
         let toolchain = crate::config::toolchains(root)?.stable;
-        let rustc = crate::command::CommandSpec::toolchain_program(
+        crate::command::CommandSpec::toolchain_program(
             "rustup",
             root,
             &toolchain,
@@ -406,17 +548,22 @@ pub fn build_selected_with_failure(
         .bounded_until(operation_deadline)
         .phase(crate::command::CiPhase::ProductBuild)
         .selection(selected, Some(&distribution.target))
-        .output_quiet()?;
-        if !rustc.status.success()
-            || !std::str::from_utf8(&rustc.stdout).ok().is_some_and(|text| {
-                text.lines()
-                    .any(|line| line.strip_prefix("host: ") == Some(distribution.target.as_str()))
-            })
-        {
-            return Err(CiError::Message(
-                "selected compiler host differs from native release target".into(),
-            ));
-        }
+        .output_owned()
+        .map_validated(|rustc| {
+            if !rustc.status.success()
+                || !std::str::from_utf8(&rustc.stdout).ok().is_some_and(|text| {
+                    text.lines().any(|line| {
+                        line.strip_prefix("host: ") == Some(distribution.target.as_str())
+                    })
+                })
+            {
+                return Err(CiError::Message(
+                    "selected compiler host differs from native release target".into(),
+                ));
+            }
+            Ok(())
+        })
+        .into_result()?;
         let product = root.join("target/ci-build/product");
         let mut command = rustup_cargo(
             root,
@@ -444,65 +591,183 @@ pub fn build_selected_with_failure(
             .bounded_until(operation_deadline)
             .phase(crate::command::CiPhase::ProductBuild)
             .selection(selected, Some(&distribution.target));
-        let mut phases =
-            crate::native_test_plan::commands_with_failure(true, failure_mode).into_iter();
-        let compile = phases.next().expect("native compile phase");
-        let allocation = crate::native_test_plan::build_allocation(
-            std::thread::available_parallelism().map_or(1, usize::from),
-        );
-        let product_jobs = allocation.product_jobs.to_string();
-        let test_jobs = allocation.native_jobs.to_string();
-        crate::preparation::complete_lanes_with_allocation(
-            allocation.layout,
-            failure_mode,
-            [allocation.product_jobs, allocation.native_jobs],
-            || command.arg("--jobs").arg(product_jobs).run().map(|_| ()),
-            || {
-                rustup_cargo(root, &toolchain, ["test"], compile.deadline)
-                    .args(compile.arguments)
-                    .arg("--jobs")
-                    .arg(test_jobs)
-                    .bounded_until(operation_deadline)
-                    .phase(crate::command::CiPhase::NativeCompile)
-                    .selection(selected, Some(&distribution.target))
-                    .run()
-                    .map(|_| ())
-            },
-        )?;
-        for phase in phases {
-            let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
-                crate::command::CiPhase::NativeCompile
-            } else {
-                crate::command::CiPhase::NativeExecute
-            };
-            rustup_cargo(root, &toolchain, ["test"], phase.deadline)
-                .args(phase.arguments)
-                .bounded_until(operation_deadline)
-                .phase(diagnostic_phase)
-                .selection(selected, Some(&distribution.target))
-                .run()?;
+        let compile = crate::native_test_plan::commands_with_failure(true, failure_mode)
+            .into_iter()
+            .next()
+            .expect("native compile phase");
+        Ok(PreparedNativeCompile {
+            command,
+            toolchain,
+            compile,
+            operation_deadline,
+            retain_inputs: matches!(mode, NativeCompileMode::Split),
+        })
+    })
+}
+
+/// Fixed product/native attribution survives failure of either compiler owner.
+pub fn compile_native_pair(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    prepared: PreparedNativeCompile,
+) -> crate::preparation::PairOutcome<(), ()> {
+    use crate::preparation::{PairClass, allocate_pair, compiler_budget};
+    let allocation = allocate_pair(
+        std::num::NonZeroUsize::new(compiler_budget()).expect("positive inherited budget"),
+        true,
+        crate::preparation::active_group().is_some_and(|group| group.inside_parallel_lane()),
+        PairClass::ProductAndNative,
+    );
+    let layout = if allocation.parallel {
+        crate::performance_plan::Layout::Parallel
+    } else {
+        crate::performance_plan::Layout::Serial
+    };
+    let PreparedNativeCompile {
+        command,
+        toolchain,
+        compile,
+        operation_deadline,
+        retain_inputs,
+    } = prepared;
+    crate::preparation::complete_owned_pair(
+        layout,
+        [allocation.first.get(), allocation.second.get()],
+        || {
+            crate::work_outcome::WorkOutcome::not_started(())
+                .postcondition(crate::workflow_output::revoke_compilation(
+                    "compiled-product-complete",
+                ))
+                .then_owned(|_| {
+                    command
+                        .arg("--jobs")
+                        .arg(allocation.first.get().to_string())
+                        .run_owned()
+                        .map(|_| ())
+                        .validate_after(|_| {
+                            crate::workflow_output::compilation_complete(
+                                "compiled-product-complete",
+                            )
+                        })
+                        .validate_after(|_| {
+                            if retain_inputs {
+                                retain_product_inputs(root, selected, distribution)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                })
+        },
+        || {
+            crate::work_outcome::WorkOutcome::not_started(())
+                .postcondition(crate::workflow_output::revoke_compilation(
+                    "compiled-native-complete",
+                ))
+                .then_owned(|_| {
+                    rustup_cargo(root, &toolchain, ["test"], compile.deadline)
+                        .args(compile.arguments)
+                        .arg("--jobs")
+                        .arg(allocation.second.get().to_string())
+                        .bounded_until(operation_deadline)
+                        .phase(crate::command::CiPhase::NativeCompile)
+                        .selection(selected, Some(&distribution.target))
+                        .run_owned()
+                        .map(|_| ())
+                        .validate_after(|_| {
+                            crate::workflow_output::compilation_complete("compiled-native-complete")
+                        })
+                })
+        },
+    )
+}
+
+pub fn validate_selected(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    consumer_readiness: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+) -> Result<()> {
+    let deadline =
+        super::native_component_harness::original_deadline(root, selected, &distribution.target)?;
+    crate::preparation::with_operation(failure_mode, deadline, || {
+        selected.recheck(root)?;
+        distribution.validate()?;
+        if distribution.target != super::distribution::native_target()? {
+            return Err(CiError::Message(
+                "selected payload target is not native".into(),
+            ));
         }
-        let backend = if distribution.target.contains("linux") {
-            "backend-linux-cgroup"
-        } else if matches!(
-            distribution.target.as_str(),
-            "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
-        ) {
-            "backend-windows-job"
+        // No product rebuild here. Validate actual bytes before any later work.
+        verify_product_inputs(root, selected, distribution)?;
+        validate_and_package_native(
+            root,
+            selected,
+            distribution,
+            destination,
+            consumer_readiness,
+            failure_mode,
+            deadline,
+        )
+    })
+}
+
+fn validate_and_package_native(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    consumer_readiness: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+    operation_deadline: std::time::Instant,
+) -> Result<()> {
+    let product = root.join("target/ci-build/product");
+    let toolchain = crate::config::toolchains(root)?.stable;
+    for phase in crate::native_test_plan::commands_with_failure(true, failure_mode)
+        .into_iter()
+        .skip(1)
+    {
+        crate::workflow_output::revoke_compilation("compiled-native-complete")?;
+        let diagnostic_phase = if phase.arguments.contains(&"--no-run") {
+            crate::command::CiPhase::NativeCompile
         } else {
-            "backend-macos-watchdog"
+            crate::command::CiPhase::NativeExecute
         };
-        // Backend suites own stateful supervision/cleanup and deliberately reject
-        // diagnostic continuation. The selected mode governs compilation and native
-        // Cargo tests above; these existing owners retain their stop boundary.
-        crate::command::CommandSpec::new(std::env::current_exe()?, root, Duration::from_secs(3600))
-            .args(["suite", backend])
-            .args(["--failure-mode", "stop-after-failure"])
+        rustup_cargo(root, &toolchain, ["test"], phase.deadline)
+            .args(phase.arguments)
             .bounded_until(operation_deadline)
-            .phase(crate::command::CiPhase::NativeExecute)
+            .phase(diagnostic_phase)
             .selection(selected, Some(&distribution.target))
             .run()?;
-        selected.recheck(root)?;
+        crate::workflow_output::compilation_complete("compiled-native-complete")?;
+    }
+    let backend = if distribution.target.contains("linux") {
+        "backend-linux-cgroup"
+    } else if matches!(
+        distribution.target.as_str(),
+        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc"
+    ) {
+        "backend-windows-job"
+    } else {
+        "backend-macos-watchdog"
+    };
+    // Backend suites own stateful supervision/cleanup and deliberately reject
+    // diagnostic continuation. The selected mode governs compilation and native
+    // Cargo tests above; these existing owners retain their stop boundary.
+    crate::command::CommandSpec::new(std::env::current_exe()?, root, Duration::from_secs(3600))
+        .args(["suite", backend])
+        .args(["--failure-mode", "stop-after-failure"])
+        .bounded_until(operation_deadline)
+        .phase(crate::command::CiPhase::NativeExecute)
+        .selection(selected, Some(&distribution.target))
+        .run()?;
+    let mut assembly = crate::work_outcome::WorkSequence::after_settled();
+    let result = (|| {
+        assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            selected.recheck(root),
+        ))?;
         if destination.exists() {
             return Err(CiError::Message(
                 "target output requires fresh destination".into(),
@@ -568,20 +833,22 @@ pub fn build_selected_with_failure(
         members.insert("runtime-manifest.json".into(), manifest_bytes);
         if !distribution.units.is_empty() {
             let directory = unit_export_directory(Path::new("/tmp"))?;
-            crate::command::CommandSpec::new(
-                product
-                    .join(&distribution.target)
-                    .join("release")
-                    .join("memcordon-sealed-agent"),
-                root,
-                Duration::from_secs(30),
-            )
-            .args(["__export-unit-files"])
-            .arg(directory.path())
-            .bounded_until(operation_deadline)
-            .phase(crate::command::CiPhase::ProductBuild)
-            .selection(selected, Some(&distribution.target))
-            .run()?;
+            assembly.observe(
+                crate::command::CommandSpec::new(
+                    product
+                        .join(&distribution.target)
+                        .join("release")
+                        .join("memcordon-sealed-agent"),
+                    root,
+                    Duration::from_secs(30),
+                )
+                .args(["__export-unit-files"])
+                .arg(directory.path())
+                .bounded_until(operation_deadline)
+                .phase(crate::command::CiPhase::ProductBuild)
+                .selection(selected, Some(&distribution.target))
+                .run_owned(),
+            )?;
             for unit in &distribution.units {
                 members.insert(
                     unit.clone(),
@@ -666,13 +933,15 @@ pub fn build_selected_with_failure(
                     | "aarch64-pc-windows-msvc"
             )
         {
-            super::native_component_harness::build_original_roles(
-                root,
-                selected,
-                &distribution.target,
-                &root.join(".release/native-components"),
-                operation_deadline,
-            )?;
+            assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+                super::native_component_harness::build_original_roles(
+                    root,
+                    selected,
+                    &distribution.target,
+                    &root.join(".release/native-components"),
+                    operation_deadline,
+                ),
+            ))?;
         }
         if std::time::Instant::now() >= operation_deadline {
             return Err(CiError::Message(
@@ -680,5 +949,10 @@ pub fn build_selected_with_failure(
             ));
         }
         Ok(())
-    })
+    })();
+    assembly.finish(result)
 }
+
+#[cfg(test)]
+#[path = "../../tests/private/native_compile_handoff.rs"]
+mod native_compile_handoff_tests;

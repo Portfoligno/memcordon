@@ -33,7 +33,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn available(root: &Path, family: DownloadFamily) -> memcordon_ci::cache::CacheEntry {
-    match download_cache::context(root, family) {
+    match download_cache::context(root, family).unwrap() {
         OptionalCache::Available { entry } => entry,
         other => panic!("fixture acquisition must be identified: {other:?}"),
     }
@@ -158,7 +158,7 @@ fn unknown_target_policy_suppresses_complete_context_without_failing_builds() {
     )
     .unwrap();
     assert!(matches!(
-        download_cache::context(fixture.path(), DownloadFamily::Workspace),
+        download_cache::context(fixture.path(), DownloadFamily::Workspace).unwrap(),
         OptionalCache::Unavailable { .. }
     ));
 }

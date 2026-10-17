@@ -81,31 +81,39 @@ impl BuildSourceIdentity {
         let git = Git::new(root)?;
         git.require_clean()?;
         let commit = git.text(["rev-parse", "--verify", "HEAD"])?;
-        let metadata = metadata(root)?;
-        let selected = metadata
-            .workspace_packages()
-            .into_iter()
-            .find(|package| package.name.as_str() == "memcordon-core")
-            .ok_or_else(|| CiError::Message("working public core package absent".into()))?
-            .version
-            .clone();
-        public_order(&metadata, &selected)?;
-        let value = Self::Working {
-            version: selected,
-            commit,
-        };
-        value.validate()?;
-        Ok(value)
+        crate::work_outcome::WorkOutcome::from_result(metadata(root))
+            .map_validated(|metadata| {
+                let selected = metadata
+                    .workspace_packages()
+                    .into_iter()
+                    .find(|package| package.name.as_str() == "memcordon-core")
+                    .ok_or_else(|| CiError::Message("working public core package absent".into()))?
+                    .version
+                    .clone();
+                public_order(&metadata, &selected)?;
+                let value = Self::Working {
+                    version: selected,
+                    commit,
+                };
+                value.validate()?;
+                Ok(value)
+            })
+            .into_result()
     }
     pub fn recheck(&self, root: &Path) -> Result<()> {
-        self.validate()?;
+        crate::work_outcome::WorkOutcome::before_start(self.validate())?;
         match self {
             Self::Tagged { source } => source.recheck(root),
             Self::Working { .. } => {
-                if Self::working(root)? != *self {
-                    return Err(CiError::Message("working source identity changed".into()));
-                }
-                Ok(())
+                crate::work_outcome::WorkOutcome::from_result(Self::working(root))
+                    .validate_after(|actual| {
+                        if actual != self {
+                            return Err(CiError::Message("working source identity changed".into()));
+                        }
+                        Ok(())
+                    })
+                    .map(|_| ())
+                    .into_result()
             }
         }
     }
@@ -272,23 +280,27 @@ pub fn public_order(metadata: &Metadata, expected_version: &Version) -> Result<V
 }
 
 pub fn metadata(root: &Path) -> Result<Metadata> {
-    let toolchain = crate::config::toolchains(root)?.stable;
-    let bytes = crate::command::rustup_cargo(
+    let toolchain =
+        crate::work_outcome::WorkOutcome::before_start(crate::config::toolchains(root))?.stable;
+    crate::command::rustup_cargo(
         root,
         &toolchain,
         ["metadata", "--locked", "--format-version", "1", "--no-deps"],
         std::time::Duration::from_secs(120),
     )
     .phase(crate::command::CiPhase::SourceCheck)
-    .output_quiet()?;
-    if !bytes.status.success() {
-        return Err(CiError::Message(format!(
-            "Cargo metadata failed with {} using toolchain {toolchain}: {}",
-            bytes.status,
-            crate::command::bounded_excerpt(&bytes.stderr).trim(),
-        )));
-    }
-    Ok(serde_json::from_slice(&bytes.stdout)?)
+    .output_owned()
+    .map_validated(|bytes| {
+        if !bytes.status.success() {
+            return Err(CiError::Message(format!(
+                "Cargo metadata failed with {} using toolchain {toolchain}: {}",
+                bytes.status,
+                crate::command::bounded_excerpt(&bytes.stderr).trim(),
+            )));
+        }
+        Ok(serde_json::from_slice(&bytes.stdout)?)
+    })
+    .into_result()
 }
 
 pub fn select(root: &Path, repository: &str, full_ref: &str) -> Result<SelectedSource> {
@@ -300,13 +312,19 @@ pub fn select(root: &Path, repository: &str, full_ref: &str) -> Result<SelectedS
     let git = Git::new(root)?;
     git.require_clean()?;
     let selected = git.tag(full_ref)?;
-    let head = git.text(["rev-parse", "--verify", "HEAD"])?;
-    if selected.commit != head {
-        return Err(CiError::Message(
-            "tag does not select checked-out HEAD".into(),
-        ));
-    }
-    public_order(&metadata(root)?, &version)?;
+    crate::work_outcome::WorkOutcome::from_result(git.text(["rev-parse", "--verify", "HEAD"]))
+        .validate_after(|head| {
+            if selected.commit != *head {
+                return Err(CiError::Message(
+                    "tag does not select checked-out HEAD".into(),
+                ));
+            }
+            Ok(())
+        })
+        .into_result()?;
+    crate::work_outcome::WorkOutcome::from_result(metadata(root))
+        .validate_after(|metadata| public_order(metadata, &version).map(|_| ()))
+        .into_result()?;
     Ok(SelectedSource {
         format: "memcordon.selected-source".into(),
         revision: 1,
@@ -334,10 +352,15 @@ impl SelectedSource {
     }
 
     pub fn recheck(&self, root: &Path) -> Result<()> {
-        self.validate()?;
-        if select(root, &self.repository, &self.tag_ref)? != *self {
-            return Err(CiError::Message("selected source changed".into()));
-        }
-        Ok(())
+        crate::work_outcome::WorkOutcome::before_start(self.validate())?;
+        crate::work_outcome::WorkOutcome::from_result(select(root, &self.repository, &self.tag_ref))
+            .validate_after(|actual| {
+                if actual != self {
+                    return Err(CiError::Message("selected source changed".into()));
+                }
+                Ok(())
+            })
+            .map(|_| ())
+            .into_result()
     }
 }

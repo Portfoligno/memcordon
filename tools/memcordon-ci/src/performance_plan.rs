@@ -1,4 +1,4 @@
-//! Optional execution layouts selected from queue-inclusive measurements.
+//! Source-selected execution layouts and optional queue-inclusive measurements.
 //! These records select performance only; they never authorize runtime work.
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,7 @@ impl PerformancePlan {
         for entry in &self.stress {
             entry.validate_layout()?;
         }
-        self.macos_release.validate()?;
+        self.macos_release.validate_layout()?;
         self.preparation.validate_layout()?;
         self.quality.validate_layout()?;
         Ok(())

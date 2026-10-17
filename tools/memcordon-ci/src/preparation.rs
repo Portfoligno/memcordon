@@ -1,4 +1,7 @@
 //! Pinned tool preparation for selected CI work.
+#[cfg(test)]
+#[path = "../tests/private/owned_reporting.rs"]
+mod owned_reporting;
 use crate::performance_plan::{Layout, PerformancePlan};
 use crate::{
     CiError, Result,
@@ -11,6 +14,263 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairClass {
+    Balanced,
+    ProductAndNative,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Allocation {
+    pub parallel: bool,
+    pub first: std::num::NonZeroUsize,
+    pub second: std::num::NonZeroUsize,
+}
+
+pub fn allocate_pair(
+    inherited: std::num::NonZeroUsize,
+    requested_parallel: bool,
+    already_in_lane: bool,
+    class: PairClass,
+) -> Allocation {
+    let workers = inherited.get().min(4);
+    let parallel = requested_parallel && !already_in_lane && workers >= 2;
+    let (first, second) = if !parallel {
+        (workers, workers)
+    } else {
+        match class {
+            PairClass::Balanced => (workers.div_ceil(2), workers / 2),
+            PairClass::ProductAndNative => (1, workers - 1),
+        }
+    };
+    Allocation {
+        parallel,
+        first: std::num::NonZeroUsize::new(first).expect("positive root allocation"),
+        second: std::num::NonZeroUsize::new(second).expect("positive root allocation"),
+    }
+}
+
+/// A root discovers capacity once; every descendant spends its inherited share.
+pub fn compiler_budget() -> usize {
+    active_group().map_or_else(
+        || {
+            std::thread::available_parallelism()
+                .map_or(1, |count| count.get())
+                .clamp(1, 4)
+        },
+        |group| group.compiler_jobs(),
+    )
+}
+
+/// Retention is a separate owner phase with an already reserved absolute tail.
+/// A work stop never grants extra time and never prevents required retirement.
+pub(crate) fn with_finalization<T>(
+    deadline: Instant,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let previous = ACTIVE_GROUP.with(|group| group.replace(None));
+    let inherited_jobs = previous.as_ref().map(GroupStop::compiler_jobs);
+    let inherited_parallel_lane = previous
+        .as_ref()
+        .is_some_and(GroupStop::inside_parallel_lane);
+    let _restore = GroupGuard(previous);
+    let mut finalization = new_group(crate::failure_mode::FailureMode::CollectAll, deadline);
+    if let Some(jobs) = inherited_jobs {
+        finalization.compiler_jobs = jobs;
+    }
+    finalization.inside_parallel_lane = inherited_parallel_lane;
+    // Optional copy/context errors are reported by their controller. They must
+    // neither notify the work observer nor create a competing primary cause.
+    let _owner = GroupGuard::install(finalization);
+    with_operation(
+        crate::failure_mode::FailureMode::CollectAll,
+        deadline,
+        operation,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaneId {
+    First,
+    Second,
+}
+
+#[derive(Debug)]
+pub struct PairOutcome<A, B> {
+    pub first: crate::work_outcome::WorkOutcome<A>,
+    pub second: crate::work_outcome::WorkOutcome<B>,
+    pub first_cause: Option<LaneId>,
+    pub timing: (Option<u64>, Option<u64>, u64),
+}
+
+impl PairOutcome<(), ()> {
+    pub fn into_result(self) -> Result<()> {
+        let (primary, secondary) = if self.first_cause == Some(LaneId::Second) {
+            (self.second, self.first)
+        } else {
+            (self.first, self.second)
+        };
+        crate::work_outcome::join_completed(primary, secondary).into_result()
+    }
+}
+
+/// Retain outcomes in fixed slots while the existing scoped owner handles
+/// admission, cancellation and joins. No outcome or settlement is deserialized.
+pub fn complete_owned_pair<A: Send, B: Send>(
+    layout: Layout,
+    allocation: [usize; 2],
+    first: impl FnOnce() -> crate::work_outcome::WorkOutcome<A> + Send,
+    second: impl FnOnce() -> crate::work_outcome::WorkOutcome<B> + Send,
+) -> PairOutcome<A, B> {
+    let first_slot = std::sync::Mutex::new(None);
+    let second_slot = std::sync::Mutex::new(None);
+    let cause = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let observed_cause = std::sync::Mutex::new(None);
+    let nested = active_group().is_some_and(|group| group.inside_parallel_lane());
+    let owner_errors = std::sync::Mutex::new([None, None]);
+    let started = Instant::now();
+    let observe = |ordinal, failed| {
+        if failed {
+            let _ = cause.compare_exchange(
+                usize::MAX,
+                ordinal,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        if failed {
+            Err(CiError::SettledCommandFailure(
+                "owned lane failed; full outcome retained".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let mode = active_group().map_or(crate::failure_mode::FailureMode::StopAfterFailure, |g| {
+        g.mode()
+    });
+    let owner_result = complete_lanes_observed(
+        layout,
+        mode,
+        allocation,
+        Some(&owner_errors),
+        || {
+            *observed_cause.lock().expect("pair observation slot") = active_group()
+                .filter(|group| group.inside_parallel_lane)
+                .map(|group| group.pair_failure);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(first))
+                .unwrap_or_else(|_| {
+                    crate::work_outcome::WorkOutcome::from_result(Err(CiError::Message(
+                        "first owned lane panicked".into(),
+                    )))
+                });
+            let failed = !outcome.is_ok();
+            if outcome.writers() == crate::work_outcome::WriterSettlement::Unknown
+                && let Some(group) = active_group()
+            {
+                group.close_admission();
+                group.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+                    cause: memcordon_testkit::NativeFailureCause::OwnershipUncertain,
+                    status: None,
+                });
+            }
+            *first_slot.lock().expect("first outcome slot") = Some(outcome);
+            observe(0, failed)
+        },
+        || {
+            *observed_cause.lock().expect("pair observation slot") = active_group()
+                .filter(|group| group.inside_parallel_lane)
+                .map(|group| group.pair_failure);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(second))
+                .unwrap_or_else(|_| {
+                    crate::work_outcome::WorkOutcome::from_result(Err(CiError::Message(
+                        "second owned lane panicked".into(),
+                    )))
+                });
+            let failed = !outcome.is_ok();
+            if outcome.writers() == crate::work_outcome::WriterSettlement::Unknown
+                && let Some(group) = active_group()
+            {
+                group.close_admission();
+                group.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+                    cause: memcordon_testkit::NativeFailureCause::OwnershipUncertain,
+                    status: None,
+                });
+            }
+            *second_slot.lock().expect("second outcome slot") = Some(outcome);
+            observe(1, failed)
+        },
+    );
+    let [first_owner_error, second_owner_error] =
+        owner_errors.into_inner().expect("scoped owner errors");
+    let owner_cause = if first_owner_error.is_some() {
+        Some(LaneId::First)
+    } else if second_owner_error.is_some() {
+        Some(LaneId::Second)
+    } else {
+        None
+    };
+    let mut owner_error = if first_owner_error.is_none()
+        && second_owner_error.is_none()
+        && cause.load(std::sync::atomic::Ordering::Acquire) == usize::MAX
+    {
+        owner_result.err()
+    } else {
+        None
+    };
+    let first = first_slot
+        .into_inner()
+        .expect("first outcome slot")
+        .unwrap_or_else(|| {
+            crate::work_outcome::WorkOutcome::observed(
+                Err(first_owner_error
+                    .or_else(|| owner_error.take())
+                    .unwrap_or(CiError::NotStartedAfterFailure)),
+                crate::work_outcome::WriterSettlement::NotStarted,
+            )
+        });
+    // Different value types require a separate construction for the second slot.
+    let second = second_slot
+        .into_inner()
+        .expect("second outcome slot")
+        .unwrap_or_else(|| {
+            crate::work_outcome::WorkOutcome::observed(
+                Err(second_owner_error
+                    .or_else(|| owner_error.take())
+                    .unwrap_or(CiError::NotStartedAfterFailure)),
+                crate::work_outcome::WriterSettlement::NotStarted,
+            )
+        });
+    let observed = observed_cause
+        .into_inner()
+        .expect("pair observation slot")
+        .map(|slot| slot.load(std::sync::atomic::Ordering::Acquire));
+    let first_cause = match observed.filter(|_| !nested) {
+        Some(1) => Some(LaneId::First),
+        Some(2) => Some(LaneId::Second),
+        _ => match cause.load(std::sync::atomic::Ordering::Acquire) {
+            0 => Some(LaneId::First),
+            1 => Some(LaneId::Second),
+            _ => None,
+        },
+    }
+    .or(owner_cause);
+    let timing = active_group().map_or(
+        (
+            None,
+            None,
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        ),
+        |g| g.timing(),
+    );
+    PairOutcome {
+        first,
+        second,
+        first_cause,
+        timing,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GroupStop {
     pub requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -20,9 +280,21 @@ pub struct GroupStop {
     compiler_jobs: usize,
     lane: usize,
     first_failure: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pair_failure: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     started: Instant,
     first_failure_micros: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stop_requested_micros: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    notice: std::sync::Arc<std::sync::OnceLock<FailureNotice>>,
+    notice_sender: Option<std::sync::mpsc::SyncSender<FailureNotice>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FailureNotice {
+    pub operation: &'static str,
+    pub lane: usize,
+    pub elapsed_micros: u64,
+    pub cause: memcordon_testkit::NativeFailureCause,
+    pub status: Option<std::process::ExitStatus>,
 }
 
 struct GroupGuard(Option<GroupStop>);
@@ -45,6 +317,39 @@ pub fn with_operation<T>(
     deadline: Instant,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    if active_group().is_none() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<FailureNotice>(1);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        return std::thread::scope(|scope| {
+            let observer_done = &done;
+            let observer = std::thread::Builder::new().name("ci-failure-observer".into())
+                .spawn_scoped(scope, move || {
+                    loop {
+                        match receiver.recv_timeout(Duration::from_millis(25)) {
+                            Ok(notice) => eprintln!("[ci failure] operation={} lane={} observed-us={} cause={:?} status={:?}; settling owned work", notice.operation, notice.lane, notice.elapsed_micros, notice.cause, notice.status),
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if observer_done.load(std::sync::atomic::Ordering::Acquire) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                        }
+                    }
+                }).map_err(CiError::Io)?;
+            let mut root = new_group(mode, deadline);
+            root.notice_sender = Some(sender);
+            let notice = root.notice.clone();
+            let guard = GroupGuard::install(root);
+            let result = with_operation(mode, deadline, operation);
+            drop(guard);
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let observed = observer
+                .join()
+                .map_err(|_| CiError::Message("failure observer panicked".into()));
+            // The retained slot survives even if a bounded notification could not queue.
+            let _ = notice.get();
+            crate::work_outcome::WorkOutcome::from_result(result)
+                .postcondition(observed)
+                .into_result()
+        });
+    }
     if active_group().is_some_and(|group| group.mode != mode) {
         return Err(CiError::Message(
             "nested operation cannot replace the root failure mode".into(),
@@ -61,9 +366,12 @@ pub fn with_operation<T>(
                 .clamp(1, 4),
             lane: 0,
             first_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            pair_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             started: Instant::now(),
             first_failure_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             stop_requested_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            notice: std::sync::Arc::new(std::sync::OnceLock::new()),
+            notice_sender: None,
         },
         |mut inherited| {
             inherited.deadline = inherited.deadline.min(deadline);
@@ -74,8 +382,21 @@ pub fn with_operation<T>(
         return Err(CiError::NotStartedAfterFailure);
     }
     let _guard = GroupGuard::install(stop.clone());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
-        .unwrap_or_else(|_| Err(CiError::Message("operation panicked".into())));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+            crate::work_outcome::WorkOutcome::observed(
+                Err(CiError::Message("operation panicked".into())),
+                crate::work_outcome::WriterSettlement::Unknown,
+            )
+            .into_result()
+        });
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(crate::work_outcome::has_unresolved_owner)
+    {
+        stop.close_admission();
+    }
     if result.is_err() {
         stop.request_after_failure();
     }
@@ -114,6 +435,10 @@ impl GroupStop {
     pub fn may_start(&self) -> bool {
         if Instant::now() >= self.deadline {
             self.close_admission();
+            self.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+                cause: memcordon_testkit::NativeFailureCause::DeadlineReached,
+                status: None,
+            });
         }
         !self.requested.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -126,19 +451,63 @@ impl GroupStop {
     pub fn compiler_jobs(&self) -> usize {
         self.compiler_jobs
     }
+    pub fn inside_parallel_lane(&self) -> bool {
+        self.inside_parallel_lane
+    }
     pub fn request_after_failure(&self) {
-        let _ = self.first_failure.compare_exchange(
+        self.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+            cause: memcordon_testkit::NativeFailureCause::InputOrAssertionFailure,
+            status: None,
+        });
+    }
+    pub fn request_failure_notice(&self, observed: memcordon_testkit::NativeFailureNotice) {
+        self.request_command_failure_notice("operation", observed);
+    }
+    pub(crate) fn request_command_failure_notice(
+        &self,
+        operation: &'static str,
+        observed: memcordon_testkit::NativeFailureNotice,
+    ) {
+        let elapsed_micros = self.elapsed_micros();
+        // Close admission before the observer can block on any output consumer.
+        if self.mode == crate::failure_mode::FailureMode::StopAfterFailure {
+            self.close_admission();
+        }
+        let first_root_cause = self
+            .first_failure
+            .compare_exchange(
+                usize::MAX,
+                self.lane,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        let _ = self.pair_failure.compare_exchange(
             usize::MAX,
             self.lane,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         );
-        let _ = self.first_failure_micros.compare_exchange(
-            u64::MAX,
-            self.elapsed_micros(),
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
+        if first_root_cause {
+            let _ = self.first_failure_micros.compare_exchange(
+                u64::MAX,
+                elapsed_micros,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            let notice = FailureNotice {
+                operation,
+                lane: self.lane,
+                elapsed_micros,
+                cause: observed.cause,
+                status: observed.status,
+            };
+            if self.notice.set(notice).is_ok()
+                && let Some(sender) = &self.notice_sender
+            {
+                let _ = sender.try_send(notice);
+            }
+        }
         if self.mode == crate::failure_mode::FailureMode::StopAfterFailure {
             self.close_admission();
         }
@@ -173,6 +542,27 @@ impl GroupStop {
             self.elapsed_micros(),
         )
     }
+    pub fn first_notice(&self) -> Option<FailureNotice> {
+        self.notice.get().copied()
+    }
+}
+
+fn new_group(mode: crate::failure_mode::FailureMode, deadline: Instant) -> GroupStop {
+    GroupStop {
+        requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mode,
+        deadline,
+        inside_parallel_lane: false,
+        compiler_jobs: compiler_budget(),
+        lane: 0,
+        first_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+        pair_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+        started: Instant::now(),
+        first_failure_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        stop_requested_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        notice: std::sync::Arc::new(std::sync::OnceLock::new()),
+        notice_sender: None,
+    }
 }
 
 /// Two scoped owners, completion-order failures and no abandoned active lane.
@@ -199,6 +589,11 @@ pub fn complete_lanes_with_failure(
     first: impl FnOnce() -> Result<()> + Send,
     second: impl FnOnce() -> Result<()> + Send,
 ) -> Result<()> {
+    if active_group().is_none() {
+        return with_operation(mode, Instant::now() + Duration::from_secs(45 * 60), || {
+            complete_lanes_with_failure(layout, mode, first, second)
+        });
+    }
     let workers = active_group().map_or_else(
         || {
             std::thread::available_parallelism()
@@ -224,6 +619,22 @@ pub fn complete_lanes_with_allocation(
     first: impl FnOnce() -> Result<()> + Send,
     second: impl FnOnce() -> Result<()> + Send,
 ) -> Result<()> {
+    complete_lanes_observed(layout, mode, compiler_jobs, None, first, second)
+}
+
+fn complete_lanes_observed(
+    layout: Layout,
+    mode: crate::failure_mode::FailureMode,
+    compiler_jobs: [usize; 2],
+    owner_errors: Option<&std::sync::Mutex<[Option<CiError>; 2]>>,
+    first: impl FnOnce() -> Result<()> + Send,
+    second: impl FnOnce() -> Result<()> + Send,
+) -> Result<()> {
+    if active_group().is_none() {
+        return with_operation(mode, Instant::now() + Duration::from_secs(45 * 60), || {
+            complete_lanes_observed(layout, mode, compiler_jobs, owner_errors, first, second)
+        });
+    }
     if active_group().is_some_and(|group| group.mode != mode) {
         return Err(CiError::Message(
             "nested lanes cannot replace the root failure mode".into(),
@@ -239,12 +650,15 @@ pub fn complete_lanes_with_allocation(
             .clamp(1, 4),
         lane: 0,
         first_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+        pair_failure: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
         started: Instant::now(),
         first_failure_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         stop_requested_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        notice: std::sync::Arc::new(std::sync::OnceLock::new()),
+        notice_sender: None,
     });
     if !stop.inside_parallel_lane {
-        stop.first_failure = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        stop.pair_failure = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
     }
     let mode = stop.mode;
     let layout = if stop.inside_parallel_lane || stop.compiler_jobs == 1 {
@@ -292,26 +706,40 @@ pub fn complete_lanes_with_allocation(
             let mut second_stop = first_stop.clone();
             second_stop.lane = 2;
             second_stop.compiler_jobs = compiler_jobs[1].min(stop.compiler_jobs);
-            let first = std::thread::Builder::new()
-                .name("ci-source-lane".into())
-                .spawn_scoped(scope, move || {
-                    let result = run(Box::new(first), first_stop);
-                    let _ = first_sender.send((0, result));
-                });
+            let first = owner_spawn_admission(0).and_then(|()| {
+                std::thread::Builder::new()
+                    .name("ci-source-lane".into())
+                    .spawn_scoped(scope, move || {
+                        let result = run(Box::new(first), first_stop);
+                        let _ = first_sender.send((0, result));
+                    })
+            });
             if first.is_err() {
-                stop.request_after_failure();
-            }
-            let second = std::thread::Builder::new()
-                .name("ci-auxiliary-lane".into())
-                .spawn_scoped(scope, move || {
-                    let result = run(Box::new(second), second_stop);
-                    let _ = sender.send((1, result));
+                let mut failed = stop.clone();
+                failed.lane = 1;
+                failed.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+                    cause: memcordon_testkit::NativeFailureCause::OwnerSpawnFailure,
+                    status: None,
                 });
+            }
+            let second = owner_spawn_admission(1).and_then(|()| {
+                std::thread::Builder::new()
+                    .name("ci-auxiliary-lane".into())
+                    .spawn_scoped(scope, move || {
+                        let result = run(Box::new(second), second_stop);
+                        let _ = sender.send((1, result));
+                    })
+            });
             let mut results = [None, None];
             let mut primary = if first.is_err() {
                 Some(0)
             } else if second.is_err() {
-                stop.request_after_failure();
+                let mut failed = stop.clone();
+                failed.lane = 2;
+                failed.request_failure_notice(memcordon_testkit::NativeFailureNotice {
+                    cause: memcordon_testkit::NativeFailureCause::OwnerSpawnFailure,
+                    status: None,
+                });
                 Some(1)
             } else {
                 None
@@ -341,12 +769,15 @@ pub fn complete_lanes_with_allocation(
                         .join()
                         .map_err(|_| CiError::Message("scoped owner panicked".into()))
                 }) {
-                    results[ordinal] = Some(Err(error));
+                    if let Some(owner_errors) = owner_errors {
+                        owner_errors.lock().expect("scoped owner errors")[ordinal] = Some(error);
+                        results[ordinal] = Some(Err(CiError::NotStartedAfterFailure));
+                    } else {
+                        results[ordinal] = Some(Err(error));
+                    }
                 }
             }
-            let observed = stop
-                .first_failure
-                .load(std::sync::atomic::Ordering::Acquire);
+            let observed = stop.pair_failure.load(std::sync::atomic::Ordering::Acquire);
             let primary = if observed == 1 || observed == 2 {
                 observed - 1
             } else {
@@ -358,30 +789,39 @@ pub fn complete_lanes_with_allocation(
             )
         }),
     };
-    match (first, second) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(first), Ok(())) => Err(first),
-        (Ok(()), Err(second)) => Err(second),
-        (Err(first), Err(second)) => Err(CiError::LaneFailures {
-            primary: Box::new(first),
-            secondary: Box::new(second),
-        }),
-    }
+    crate::work_outcome::join_completed(
+        crate::work_outcome::WorkOutcome::from_result(first),
+        crate::work_outcome::WorkOutcome::from_result(second),
+    )
+    .into_result()
 }
 
 pub fn remaining(deadline: Instant, limit: Duration) -> Result<Duration> {
     let deadline = active_group().map_or(deadline, |group| deadline.min(group.deadline));
     let budget = deadline.saturating_duration_since(Instant::now());
     if budget.is_zero() {
-        return Err(CiError::Message(
+        return crate::work_outcome::WorkOutcome::before_start(Err(CiError::Message(
             "original operation group deadline expired".into(),
-        ));
+        )));
     }
     Ok(budget.min(limit))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAILED_OWNER_SPAWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn owner_spawn_admission(_lane: usize) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAILED_OWNER_SPAWN.with(|slot| slot.get() == Some(_lane)) {
+        return Err(std::io::Error::other("injected owner spawn failure"));
+    }
+    Ok(())
+}
+
 pub fn observed(command: CommandSpec, directory: &Path, name: &str) -> Result<()> {
-    let result = command.output_quiet()?;
+    command.output_owned().validate_after(|result| {
     let stdout = fs::write(
         directory.join(name).with_extension("stdout.bin"),
         &result.stdout,
@@ -401,6 +841,7 @@ pub fn observed(command: CommandSpec, directory: &Path, name: &str) -> Result<()
     stdout?;
     stderr?;
     Ok(())
+    }).map(|_| ()).into_result()
 }
 
 pub fn auxiliary_tool(root: &Path, name: &str) -> Result<PathBuf> {
@@ -446,7 +887,7 @@ pub fn ensure_auxiliary_tool_until(
         version,
         &toolchain,
         deadline,
-        std::num::NonZeroUsize::new(1).unwrap(),
+        std::num::NonZeroUsize::new(compiler_budget()).expect("positive inherited compiler budget"),
     )
 }
 
@@ -488,7 +929,9 @@ pub fn ensure_one_auxiliary_until(
     validate_auxiliary_directory(&root.join("target/ci-preparation"))?;
     validate_auxiliary_directory(&root.join("target/ci-tools-build").join(name))?;
     let destination = auxiliary_tool(root, name)?;
+    crate::workflow_output::revoke_compilation(tool_ready_fact(name))?;
     if valid_auxiliary_version(root, &destination, version, deadline)? {
+        crate::workflow_output::compilation_complete(tool_ready_fact(name))?;
         return Ok(destination);
     }
     let staging_parent = root.join("target/ci-preparation");
@@ -497,7 +940,8 @@ pub fn ensure_one_auxiliary_until(
         .prefix(name)
         .tempdir_in(staging_parent)?;
     let family = crate::download_cache::DownloadFamily::for_purpose(name);
-    let before = crate::download_cache::context_until(root, family, deadline);
+    let before = crate::download_cache::context_until(root, family, deadline)?;
+    crate::workflow_output::revoke_compilation(tool_build_fact(name))?;
     observed(
         rustup_cargo(
             root,
@@ -514,16 +958,23 @@ pub fn ensure_one_auxiliary_until(
         staging.path(),
         name,
     )?;
+    crate::workflow_output::compilation_complete(tool_build_fact(name))?;
     let staged = staging
         .path()
         .join("bin")
         .join(destination.file_name().expect("tool filename"));
     if !valid_auxiliary_version(root, &staged, version, deadline)? {
-        return Err(CiError::Message(
-            "staged auxiliary version differs from selected pin".into(),
-        ));
+        return crate::work_outcome::WorkOutcome::from_result(Ok(()))
+            .postcondition(Err(CiError::Message(
+                "staged auxiliary version differs from selected pin".into(),
+            )))
+            .map(|_| destination)
+            .into_result();
     }
-    promote_auxiliary(&staged, &destination)?;
+    crate::work_outcome::WorkOutcome::from_result(Ok(()))
+        .validate_after(|_| promote_auxiliary(&staged, &destination))
+        .into_result()?;
+    crate::workflow_output::compilation_complete(tool_ready_fact(name))?;
     if crate::download_cache::packaged_lock_present(root, name, version).unwrap_or_else(|error| {
         eprintln!("tool download lock inspection unavailable: {error}");
         false
@@ -531,10 +982,28 @@ pub fn ensure_one_auxiliary_until(
         crate::download_cache::record(
             family,
             &before,
-            &crate::download_cache::context_until(root, family, deadline),
+            &crate::download_cache::context_until(root, family, deadline)?,
         );
     }
     Ok(destination)
+}
+
+fn tool_build_fact(name: &str) -> &'static str {
+    match name {
+        "cargo-audit" => "tool-cargo-audit-build-complete",
+        "cargo-deny" => "tool-cargo-deny-build-complete",
+        "cargo-fuzz" => "tool-cargo-fuzz-build-complete",
+        _ => unreachable!("validated auxiliary tool"),
+    }
+}
+
+fn tool_ready_fact(name: &str) -> &'static str {
+    match name {
+        "cargo-audit" => "tool-cargo-audit-ready",
+        "cargo-deny" => "tool-cargo-deny-ready",
+        "cargo-fuzz" => "tool-cargo-fuzz-ready",
+        _ => unreachable!("validated auxiliary tool"),
+    }
 }
 
 fn validate_auxiliary_directory(path: &Path) -> Result<()> {
@@ -784,7 +1253,8 @@ fn prepare_selected_until(
                     version,
                     &toolchains.stable,
                     deadline,
-                    std::num::NonZeroUsize::new(1).unwrap(),
+                    std::num::NonZeroUsize::new(compiler_budget())
+                        .expect("positive inherited compiler budget"),
                 )?;
             }
             Ok(())

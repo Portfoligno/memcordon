@@ -41,7 +41,7 @@ fn suite_index(steps: &[Value]) -> usize {
         .position(|step| {
             step["run"]
                 .as_str()
-                .is_some_and(|run| run.split_whitespace().any(|part| part == "suite"))
+                .is_some_and(|run| run.contains(" ci segment backend-"))
         })
         .unwrap()
 }
@@ -163,7 +163,12 @@ fn actual_driver_build_must_precede_the_native_suite() {
         let suite = suite_index(steps);
         let build = steps
             .iter()
-            .position(|step| step["name"] == "Build ordinary CI driver")
+            .position(|step| {
+                step["run"].as_str().is_some_and(|run| {
+                    run.contains("cargo build --locked --release ")
+                        && run.contains("--target-dir target/ci-driver-cold")
+                })
+            })
             .unwrap();
         steps.swap(build, suite);
         rejected(path, &changed, "suite-before-driver-build");

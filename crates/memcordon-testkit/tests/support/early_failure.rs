@@ -64,7 +64,9 @@ fn observation_precedes_callback_settlement_and_preserves_original_status() {
             ProcessControl {
                 cancelled: None,
                 progress: None,
-                failure: Some(Arc::new(move || {
+                failure: Some(Arc::new(move |notice| {
+                    assert_eq!(notice.cause, NativeFailureCause::ObservedFailureStatus);
+                    assert_eq!(notice.status.and_then(|status| status.code()), Some(23));
                     cancelled.store(true, Ordering::Release);
                     let _ = observed_sender.try_send(());
                 })),

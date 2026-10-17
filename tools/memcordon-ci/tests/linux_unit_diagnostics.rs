@@ -189,6 +189,7 @@ fn partial_and_unavailable_unit_outputs_remain_explicit_without_fake_empty_strea
         stderr: b"partial unit stderr\xfe".to_vec(),
         cleanup: Err("collector reaping unknown".into()),
         observation: Box::new(TimeoutObservation {
+            settlement_complete: false,
             child_id: 42,
             observed_status: None,
             callback_completed: false,

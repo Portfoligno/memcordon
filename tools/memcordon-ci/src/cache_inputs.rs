@@ -24,9 +24,18 @@ pub fn keys(input: &KeyInputs) -> Result<(String, String)> {
             | "tool"
             | "tool-build"
             | "compiled-seed"
+            | "tool-build-seed"
             | "registry-archive-seed"
             | "registry-index-snapshot"
             | "miri-sysroot"
+            | "compiled-transfer"
+            | "compiled-transfer-seed"
+            | "tool-build-transfer"
+            | "tool-build-transfer-seed"
+            | "driver-image"
+            | "driver-build"
+            | "driver-build-seed"
+            | "driver-bootstrap"
     ) {
         return Err(CiError::Message("unknown cache family".into()));
     }
@@ -51,6 +60,13 @@ pub fn local_files(root: &Path, purpose: &str) -> Result<BTreeMap<String, String
     let mut inputs = BTreeMap::new();
     let mut total = 0_u64;
     for record in tracked.split('\0').filter(|record| !record.is_empty()) {
+        if crate::preparation::active_group()
+            .is_some_and(|group| std::time::Instant::now() >= group.deadline())
+        {
+            return Err(CiError::Message(
+                "cache input projection budget exhausted".into(),
+            ));
+        }
         let (metadata, name) = record
             .split_once('\t')
             .ok_or_else(|| CiError::Message("invalid tracked cache input".into()))?;

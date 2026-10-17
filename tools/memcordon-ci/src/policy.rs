@@ -11,6 +11,9 @@ use crate::command;
 use crate::config;
 use crate::{CiError, Result};
 
+#[path = "cache_guard.rs"]
+pub(crate) mod cache_guard;
+
 pub const MAXIMUM_YAML_BYTES: usize = 1_048_576;
 pub const MAXIMUM_YAML_DEPTH: usize = 64;
 const UPLOAD_ARTIFACT_ACTION: &str = "./.github/actions/upload-artifact";
@@ -587,9 +590,11 @@ const NATIVE_MATRIX: [(&str, &str); 6] = [
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
-const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
-const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 120;
-const DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES: u64 = 120;
+// Work deadlines remain unchanged; these outer envelopes reserve bounded cache
+// import/copy/transfer/cleanup time in addition to the established cold work.
+const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 100;
+const DEEP_CI_STRESS_TIMEOUT_MINUTES: u64 = 211;
+const DEEP_CI_COMBINED_STRESS_TIMEOUT_MINUTES: u64 = 218;
 fn check_runner_matrix(
     jobs: &Mapping,
     job_name: &str,
@@ -688,7 +693,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             "quarter-three",
             "quarter-four",
         ],
-        60,
+        DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES,
     )?;
     let miri = mapping(
         jobs.get(key("miri"))
@@ -704,7 +709,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             "quarter-three",
             "quarter-four",
         ],
-        75,
+        113,
     )?;
     let planner = mapping(
         jobs.get(key("performance-plan"))
@@ -804,7 +809,7 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
                     || step.get(key("uses")).and_then(Value::as_str)
                         == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
                         && step["with"]["key"].as_str()
-                            == Some("${{ steps.compiled.outputs.cache-primary-key }}")
+                            == Some("${{ steps.compiled-context.outputs.product-key }}")
             })
             .collect();
         if caches.len() != 2
@@ -1029,9 +1034,9 @@ fn check_native_cache_role(job: &Mapping, purpose: &str) -> Result<()> {
         || contexts
             .iter()
             .any(|run| !run.contains(&format!("--purpose {purpose} --shard complete"))
-                && !(purpose == "native-debug" && matches!(*run, "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete" | "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save")))
+                && !(purpose == "native-debug" && matches!(*run, "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete" | "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --for-save" | "./target/ci/release/memcordon-ci ci cache-context --purpose native-auxiliary --shard complete --partition auxiliary-profiles")))
     {
-        return Err(failure("native debug/release cache role differs"));
+        return Err(failure(format!("native debug/release cache role differs: purpose={purpose}; expected={expected}; contexts={contexts:?}")));
     }
     Ok(())
 }
@@ -1101,9 +1106,10 @@ fn check_support_loader_diagnostic(steps: &[Value]) -> Result<()> {
         ));
     }
     let guard = "(steps.support_loader_diagnostic.outputs.diagnostic-started != 'true' || steps.support_loader_diagnostic_cleanup.outputs.cache-quiescent == 'true')";
-    for step in steps {
+    for (ordinal, step) in steps.iter().enumerate() {
         if step["uses"].as_str()
             == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+            && ordinal > cleanup
             && !step["if"]
                 .as_str()
                 .is_some_and(|condition| condition.contains(guard))
@@ -1135,6 +1141,8 @@ fn ordinary_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a [Value]> {
             .is_some_and(|uses| uses.starts_with("actions/cache/"))
             || scalar(step, "run").is_some_and(|run| {
                 run.contains(" ci download-cache-context ")
+                    || run.ends_with(" ci bootstrap-cache-context")
+                    || run.contains(" ci seed-context ")
                     || (run.contains(" ci cache-context ")
                         && step.get(key("timeout-minutes")).and_then(Value::as_u64) == Some(2))
             }))
@@ -1280,12 +1288,17 @@ fn check_compilation_checkpoint(
     let snapshots: Vec<_> = between
         .iter()
         .filter(|step| {
-            step["run"]
-                .as_str()
-                .is_some_and(|run| run.contains(" ci cache-snapshot --kind compiled "))
-                && step["if"].as_str().is_some_and(|guard| {
-                    guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
-                })
+            step["run"].as_str().is_some_and(|run| {
+                run.contains(" ci cache-snapshot --kind compiled ")
+                    && compile.strip_prefix("fuzz-compile-").is_none_or(|shard| {
+                        run.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .windows(2)
+                            .any(|pair| pair == ["--shard", shard])
+                    })
+            }) && step["if"].as_str().is_some_and(|guard| {
+                guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+            })
         })
         .collect();
     if snapshots.len() != 1
@@ -1307,7 +1320,8 @@ fn check_compilation_checkpoint(
             .is_some_and(|run| run.contains(" ci cleanup-cache-snapshot --kind compiled "))
             && step["if"].as_str().is_some_and(|guard| {
                 guard.contains("always()")
-                    && guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+                    && (guard.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'"))
+                        || guard.contains(&format!("steps.{snapshot}.outcome == 'failure'")))
             })
     }) {
         return Err(failure(
@@ -1369,6 +1383,7 @@ fn check_extended_cache(
             .ok_or_else(|| failure("seed context command differs"))?;
         if ![
             "--kind compiled ",
+            "--kind tool-build ",
             "--kind registry-archives",
             "--kind registry-index",
         ]
@@ -1421,7 +1436,9 @@ fn check_extended_cache(
                     .as_deref()
                     == Some(cleanup)
                     && candidate["if"].as_str().is_some_and(|guard| {
-                        guard.contains("always()") && guard.contains("quiescent == 'true'")
+                        guard.contains("always()")
+                            && (guard.contains("quiescent == 'true'")
+                                || guard.contains(&format!("steps.{context}.outcome == 'failure'")))
                     })
             }) {
                 return Err(failure(
@@ -1535,6 +1552,484 @@ fn check_extended_cache(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn cache_writer(step: &Value) -> bool {
+    let run = step["run"].as_str().unwrap_or_default();
+    run.contains(" cargo build ")
+        || [
+            " suite ",
+            " ci fetch-downloads ",
+            " ci prepare ",
+            " ci prepare-miri-",
+            " ci prepare-restored-cache ",
+            " ci import-cache-snapshot ",
+            " release build-target ",
+            " release working-windows-prepare",
+            " release installed-consumers ",
+            " release working-windows-consumer ",
+            " release packages ",
+        ]
+        .iter()
+        .any(|part| run.contains(part))
+}
+
+fn cache_guard(source: &str) -> Result<cache_guard::Expr> {
+    cache_guard::parse(source).map_err(|error| failure(format!("unsupported cache guard: {error}")))
+}
+
+fn require_cache_guard(guard: &cache_guard::Expr, required: &str) -> Result<()> {
+    if !guard.requires(&cache_guard(required)?) {
+        return Err(failure(format!("cache guard must require {required}")));
+    }
+    Ok(())
+}
+
+/// Validate retention against actual declared steps, before the separate suite
+/// coverage pass folds normal and collect-all execution into one logical recipe.
+fn check_cache_save_guards(steps: &[Value]) -> Result<()> {
+    for snapshot in steps.iter().filter(|step| {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains(" ci cache-snapshot --kind "))
+    }) {
+        let id = snapshot["id"]
+            .as_str()
+            .ok_or_else(|| failure("partial snapshot requires explicit id"))?;
+        let key = format!("${{{{ steps.{id}.outputs.snapshot-key }}}}");
+        let path = format!("${{{{ steps.{id}.outputs.snapshot-path }}}}");
+        if !steps.iter().any(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+                && step["with"]["key"].as_str() == Some(key.as_str())
+                && step["with"]["path"].as_str() == Some(path.as_str())
+        }) {
+            return Err(failure(format!(
+                "partial snapshot {id} requires its exact content-keyed save"
+            )));
+        }
+    }
+    if steps
+        .iter()
+        .any(|step| step["id"].as_str() == Some("workspace-fetch"))
+    {
+        for kind in ["registry-archives", "registry-index"] {
+            let snapshots = steps
+                .iter()
+                .filter(|step| {
+                    step["run"].as_str().is_some_and(|run| {
+                        run.ends_with(&format!(" ci cache-snapshot --kind {kind}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            if snapshots.len() != 1 {
+                return Err(failure(format!(
+                    "workspace fetch requires one partial {kind} snapshot"
+                )));
+            }
+            let id = snapshots[0]["id"].as_str().unwrap_or_default();
+            let selected_key = format!("${{{{ steps.{id}.outputs.snapshot-key }}}}");
+            if !steps.iter().any(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+                    && step["with"]["key"].as_str() == Some(selected_key.as_str())
+            }) {
+                return Err(failure(format!(
+                    "workspace fetch requires partial {kind} snapshot save"
+                )));
+            }
+        }
+    }
+    let mut declared = BTreeMap::new();
+    for (ordinal, step) in steps.iter().enumerate() {
+        if let Some(id) = step["id"].as_str()
+            && declared.insert(id, ordinal).is_some()
+        {
+            return Err(failure(format!("duplicate workflow step id {id}")));
+        }
+    }
+    let find = |id: &str| -> Result<(usize, &Value)> {
+        let ordinal = *declared
+            .get(id)
+            .ok_or_else(|| failure(format!("cache references unknown step {id}")))?;
+        Ok((ordinal, &steps[ordinal]))
+    };
+    for (ordinal, step) in steps.iter().enumerate() {
+        let run = step["run"].as_str().unwrap_or_default();
+        let save = step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.starts_with("actions/cache/save@"));
+        let snapshot = run.contains(" ci cache-snapshot ");
+        let recheck = step["id"]
+            .as_str()
+            .is_some_and(|id| id.contains("save-context"));
+        let seed_consumer =
+            run.contains(" ci seed-context ") || run.contains(" ci import-cache-snapshot ");
+        if seed_consumer {
+            ordinary_driver_before_suite(steps, ordinal)?;
+            if let Some(condition) = step["if"].as_str() {
+                for reference in cache_guard(condition)?.references() {
+                    if let Some(id) = reference
+                        .strip_prefix("steps.")
+                        .and_then(|tail| tail.split('.').next())
+                        && find(id)?.0 >= ordinal
+                    {
+                        return Err(failure(format!("seed consumer references later step {id}")));
+                    }
+                }
+            }
+            if run.contains(" ci import-cache-snapshot --kind compiled ") {
+                let argument = |command: &str, flag: &str| {
+                    command
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .find(|pair| pair[0] == flag)
+                        .map(|pair| pair[1].to_owned())
+                };
+                if steps.iter().enumerate().any(|(index, candidate)| {
+                    candidate["run"].as_str().is_some_and(|candidate| {
+                        candidate.contains(" ci prepare-restored-cache ")
+                            && ["--purpose", "--shard", "--partition"]
+                                .into_iter()
+                                .all(|flag| argument(candidate, flag) == argument(run, flag))
+                    }) && index >= ordinal
+                }) {
+                    return Err(failure(
+                        "compiled seed import must follow complete-entry sanitation",
+                    ));
+                }
+            }
+        }
+        if !save && !snapshot && !recheck {
+            continue;
+        }
+        let guard = cache_guard(step["if"].as_str().unwrap_or_default())?;
+        require_cache_guard(&guard, "always()")?;
+        if guard.contains_status("success") {
+            return Err(failure(
+                "cache retention must not depend on aggregate success()",
+            ));
+        }
+        for reference in guard.references() {
+            if let Some(tail) = reference.strip_prefix("steps.") {
+                let id = tail.split('.').next().expect("reference id");
+                if find(id)?.0 >= ordinal {
+                    return Err(failure(format!(
+                        "cache producer {id} must precede retention"
+                    )));
+                }
+            }
+        }
+        if save || snapshot {
+            require_cache_guard(
+                &guard,
+                "github.event_name == 'push' || github.event_name == 'workflow_dispatch'",
+            )?;
+        }
+        let key = step["with"]["key"].as_str().unwrap_or_default();
+        // A closed immutable copy is independent of later live-root owners.
+        if save
+            && (cache_output_reference(key, "snapshot-key").is_some()
+                || cache_output_reference(key, "sysroot-key").is_some())
+        {
+            continue;
+        }
+        // Source-only workspace acquisition has an explicit earlier boundary;
+        // otherwise all declared writers preceding this live read participate.
+        for owner in steps
+            .iter()
+            .take(ordinal)
+            .filter(|owner| cache_writer(owner))
+        {
+            let id = owner["id"]
+                .as_str()
+                .ok_or_else(|| failure("cache writer lacks an explicit step id"))?;
+            let owner_run = owner["run"].as_str().unwrap_or_default();
+            let required = if owner_run.contains(" cargo build ") {
+                format!("steps.{id}.outcome == 'skipped' || steps.{id}.outcome == 'success'")
+            } else {
+                format!(
+                    "steps.{id}.outcome == 'skipped' || steps.{id}.outputs.cache-quiescent == 'true'"
+                )
+            };
+            let fragment = cache_guard(&required)?;
+            // Requiring success from a specific finished bootstrap build is a
+            // stronger, valid form of that owner's nonstarted-or-settled gate.
+            if owner_run.contains(" cargo build ")
+                && guard.requires(&cache_guard(&format!("steps.{id}.outcome == 'success'"))?)
+            {
+                continue;
+            }
+            // A complete early fetch needs positive settlement, not a skipped arm.
+            if guard.requires(&cache_guard(&format!(
+                "steps.{id}.outputs.cache-quiescent == 'true'"
+            ))?) {
+                continue;
+            }
+            if !guard.requires(&fragment) {
+                return Err(failure(format!(
+                    "live cache read must cover skipped/settled writer {id}"
+                )));
+            }
+            for (outcome, settled, permitted) in [
+                ("skipped", "", true),
+                ("failure", "true", true),
+                ("failure", "false", false),
+                ("cancelled", "", false),
+                ("", "", false),
+            ] {
+                if owner_run.contains(" cargo build ") {
+                    break;
+                }
+                let actual = guard.evaluate(
+                    &|field| {
+                        if field == format!("steps.{id}.outcome") {
+                            return outcome.to_owned();
+                        }
+                        if field == format!("steps.{id}.outputs.cache-quiescent") {
+                            return settled.to_owned();
+                        }
+                        if field == "github.event_name" {
+                            "push"
+                        } else if field == "matrix.shard" {
+                            "quarter-one"
+                        } else if field == "matrix.producer-job" {
+                            ""
+                        } else if field.ends_with(".outcome") {
+                            "success"
+                        } else if field.ends_with(".cache-hit") {
+                            ""
+                        } else if field.ends_with("-key") || field.ends_with("-compatibility") {
+                            "same-key"
+                        } else if field.ends_with("-paths") || field.ends_with("-path") {
+                            "target/owned"
+                        } else {
+                            "true"
+                        }
+                        .to_owned()
+                    },
+                    &|status| status == "always",
+                );
+                // Positive cases can have additional recipe requirements. Every
+                // unresolved scenario must remain false in the actual guard.
+                if !permitted && actual {
+                    return Err(failure("cache guard admits an unresolved writer scenario"));
+                }
+            }
+        }
+        if !save {
+            continue;
+        }
+        let Some((context, field)) = ["product-key", "tool-build-key", "tool-key", "source-key"]
+            .into_iter()
+            .find_map(|field| cache_output_reference(key, field).map(|context| (context, field)))
+        else {
+            continue;
+        };
+        require_cache_guard(&guard, &format!("steps.{context}.outputs.{field} != ''"))?;
+        let paths = match field {
+            "product-key" => "product-paths",
+            "tool-build-key" => "tool-build-path",
+            "tool-key" => "tool-path",
+            "source-key" => "source-paths",
+            _ => unreachable!(),
+        };
+        require_cache_guard(&guard, &format!("steps.{context}.outputs.{paths} != ''"))?;
+        let (context_ordinal, selected) = find(context)?;
+        if context_ordinal >= ordinal {
+            return Err(failure("initial cache context must precede save"));
+        }
+        let initial_command = selected["run"]
+            .as_str()
+            .and_then(ordinary_command)
+            .ok_or_else(|| failure("selected cache context command absent"))?;
+        let restores = steps
+            .iter()
+            .take(ordinal)
+            .filter(|candidate| {
+                candidate["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
+                    && candidate["with"]["key"].as_str() == Some(key)
+            })
+            .collect::<Vec<_>>();
+        if restores.len() != 1 {
+            return Err(failure(
+                "completed cache requires one restore of its selected identity",
+            ));
+        }
+        let restored = restores[0]["id"]
+            .as_str()
+            .ok_or_else(|| failure("complete restore id absent"))?;
+        require_cache_guard(
+            &guard,
+            &format!(
+                "!(steps.{restored}.outcome == 'success' && steps.{restored}.outputs.cache-hit == 'true')"
+            ),
+        )?;
+        if field == "source-key" {
+            if !initial_command.contains(" ci download-cache-context --family ") {
+                return Err(failure(
+                    "source cache identity must use source-only family context",
+                ));
+            }
+            continue;
+        }
+        if field != "tool-key" {
+            require_cache_guard(
+                &guard,
+                &format!("steps.{context}.outputs.compiled-cache-usable == 'true'"),
+            )?;
+        }
+        let probes = steps
+            .iter()
+            .take(ordinal)
+            .filter(|candidate| {
+                candidate["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("save-context"))
+                    && candidate["run"]
+                        .as_str()
+                        .and_then(ordinary_command)
+                        .is_some_and(|run| {
+                            run.strip_suffix(" --for-save") == Some(initial_command.as_str())
+                        })
+            })
+            .collect::<Vec<_>>();
+        if probes.len() != 1 {
+            return Err(failure(
+                "completed cache requires one matching current save context",
+            ));
+        }
+        let probe = probes[0]["id"].as_str().expect("matched context id");
+        require_cache_guard(&guard, &format!("steps.{probe}.outcome == 'success'"))?;
+        require_cache_guard(
+            &guard,
+            &format!("steps.{probe}.outputs.{field} == steps.{context}.outputs.{field}"),
+        )?;
+        if field != "tool-key" {
+            require_cache_guard(
+                &guard,
+                &format!("steps.{probe}.outputs.payload-ready == 'true'"),
+            )?;
+        }
+        let tool = initial_command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|pair| pair[0] == "--purpose")
+            .map(|pair| pair[1].to_owned());
+        let fact = match field {
+            "tool-key" => format!("tool-{}-ready", tool.as_deref().unwrap_or_default()),
+            "tool-build-key" => format!(
+                "tool-{}-build-complete",
+                tool.as_deref().unwrap_or_default()
+            ),
+            _ if initial_command.contains("--purpose private ") => {
+                "compiled-recipe-complete".to_owned()
+            }
+            _ if initial_command.contains("--partition native-tests") => {
+                "compiled-native-complete".to_owned()
+            }
+            _ if initial_command.contains("--partition product") => {
+                "compiled-product-complete".to_owned()
+            }
+            _ => "compiled-recipe-complete".to_owned(),
+        };
+        let shard = initial_command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|pair| pair[0] == "--shard")
+            .map(|pair| pair[1].to_owned())
+            .unwrap_or_default();
+        let producers = steps
+            .iter()
+            .take(ordinal)
+            .filter(|owner| {
+                let run = owner["run"].as_str().unwrap_or_default();
+                if fact.starts_with("tool-") {
+                    return run.contains(" suite supply-chain")
+                        || run.contains(" ci prepare --profile fuzz");
+                }
+                if fact == "compiled-native-complete" {
+                    return run.contains(" suite native-compile")
+                        || run.contains(" release build-target ")
+                        || run.contains(" release working-windows-prepare");
+                }
+                if fact == "compiled-product-complete" {
+                    return run.contains(" release build-target ")
+                        || run.contains(" release working-windows-prepare");
+                }
+                if tool.as_deref() == Some("miri") {
+                    return run.contains(&format!(" suite miri-{shard} "))
+                        || run.ends_with(&format!(" suite miri-{shard}"));
+                }
+                if tool.as_deref() == Some("fuzz") {
+                    return run.contains(&format!(" suite fuzz-execute-{shard} "))
+                        || run.ends_with(&format!(" suite fuzz-execute-{shard}"));
+                }
+                run.contains(" suite ")
+                    && !run.contains(" suite fuzz-compile-")
+                    && !run.contains(" suite native-compile")
+                    || run.contains("--bin memcordon-release-rehearsal")
+            })
+            .filter_map(|owner| {
+                owner["id"].as_str().map(|id| {
+                    if owner["run"]
+                        .as_str()
+                        .is_some_and(|run| run.contains(" cargo build "))
+                    {
+                        format!("steps.{id}.outcome == 'success'")
+                    } else {
+                        format!("steps.{id}.outputs.{fact} == 'true'")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if producers.is_empty() {
+            return Err(failure(
+                "completed cache has no actual compilation producer",
+            ));
+        }
+        require_cache_guard(&guard, &producers.join(" || "))?;
+        if tool.as_deref() == Some("fuzz") {
+            for owner in steps.iter().take(ordinal).filter(|owner| {
+                owner["run"].as_str().is_some_and(|run| {
+                    run.contains(" suite fuzz-compile-") || run.contains(" suite fuzz-execute-")
+                })
+            }) {
+                let id = owner["id"].as_str().expect("validated fuzz writer id");
+                require_cache_guard(
+                    &guard,
+                    &format!(
+                        "steps.{id}.outcome == 'skipped' || steps.{id}.outputs.compiled-recipe-complete == 'true'"
+                    ),
+                )?;
+            }
+        }
+        if fact == "compiled-native-complete" {
+            for owner in steps.iter().take(ordinal).filter(|owner| {
+                owner["run"].as_str().is_some_and(|run| {
+                    run.contains(" suite native-execute")
+                        || run.contains(" release build-target ")
+                        || run.contains(" release working-windows-prepare")
+                })
+            }) {
+                let id = owner["id"].as_str().expect("validated writer id");
+                require_cache_guard(
+                    &guard,
+                    &format!(
+                        "steps.{id}.outcome == 'skipped' || steps.{id}.outputs.compiled-native-complete == 'true'"
+                    ),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
@@ -1680,7 +2175,18 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
             }
         } else {
             let id = cache_output_reference(selected, "cache-primary-key")
-                .ok_or_else(|| failure("cache save must use originally requested exact key"))?;
+                .or_else(|| {
+                    restores
+                        .iter()
+                        .find_map(|(id, (_, restore)): (&String, &(usize, &Value))| {
+                            (restore["with"]["key"].as_str() == Some(selected)
+                                && restore["with"]["path"].as_str() == Some(path))
+                            .then_some(id.as_str())
+                        })
+                })
+                .ok_or_else(|| {
+                    failure("cache save must use its originally selected exact context key")
+                })?;
             saves
                 .entry(id.to_owned())
                 .or_default()
@@ -1688,23 +2194,25 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
             let condition = step["if"].as_str().unwrap_or_default();
             if (path.contains(".outputs.product-paths")
                 || path.contains(".outputs.tool-build-path"))
-                && !condition.contains("success()")
+                && !(condition.contains("-complete == 'true'")
+                    || condition.contains("steps.helper-build.outcome == 'success'"))
             {
                 return Err(failure(
                     "complete compiled caches require actual successful compilation; failed settled output belongs only to snapshot seeds",
                 ));
             }
             if paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"] {
-                if !condition.contains(
-                    "steps.workspace-download-context.outputs.bootstrap-home-matches == 'true'",
-                ) {
+                if !condition
+                    .contains("steps.bootstrap-home.outputs.bootstrap-home-matches == 'true'")
+                {
                     return Err(failure(
                         "bootstrap seed save requires actual home association",
                     ));
                 }
-                let mut contexts = steps.iter().enumerate().filter(|(_, candidate)| {
-                    candidate["id"].as_str() == Some("workspace-download-context")
-                });
+                let mut contexts = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| candidate["id"].as_str() == Some("bootstrap-home"));
                 let (context_ordinal, context) = contexts.next().ok_or_else(|| {
                     failure("bootstrap seed save requires workspace home context")
                 })?;
@@ -1714,9 +2222,7 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                         .as_str()
                         .and_then(ordinary_command)
                         .as_deref()
-                        != Some(
-                            "./target/ci/release/memcordon-ci ci download-cache-context --family workspace",
-                        )
+                        != Some("./target/ci/release/memcordon-ci ci bootstrap-cache-context")
                 {
                     return Err(failure(
                         "bootstrap seed save requires one preceding workspace home context",
@@ -1726,7 +2232,10 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
             if !condition.contains("always()")
                 || !condition.contains("github.event_name == 'push'")
                 || !condition.contains("workflow_dispatch")
-                || !condition.contains("cache-primary-key != ''")
+                || !(condition.contains("cache-primary-key != ''")
+                    || ["source-key", "product-key", "tool-key", "tool-build-key"]
+                        .iter()
+                        .any(|field| condition.contains(&format!("{field} != ''"))))
                 || (!condition.contains("cache-quiescent == 'true'")
                     && !condition.contains("outcome == 'success'")
                     && !(paths == ["~/.cargo/registry/cache", "~/.cargo/git/db"]
@@ -1778,19 +2287,19 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                             "fuzz-downloads-key",
                             " ci prepare --profile fuzz",
                         )
-                    } else if command.contains("--purpose cargo-audit ") {
+                    } else if command.contains("--family tool-cargo-audit") {
                         (
                             "download-cargo-audit-populated",
                             "download-cargo-audit-key",
                             " suite supply-chain",
                         )
-                    } else if command.contains("--purpose cargo-deny ") {
+                    } else if command.contains("--family tool-cargo-deny") {
                         (
                             "download-cargo-deny-populated",
                             "download-cargo-deny-key",
                             " suite supply-chain",
                         )
-                    } else if command.contains("--purpose cargo-fuzz ") {
+                    } else if command.contains("--family tool-cargo-fuzz") {
                         (
                             "download-cargo-fuzz-populated",
                             "download-cargo-fuzz-key",
@@ -1832,7 +2341,8 @@ fn check_cache_lifecycle(steps: &[Value]) -> Result<()> {
                 if !producers.iter().any(|owner| condition.contains(&format!("steps.{owner}.outputs.{population} == 'true'")) && condition.contains(&format!("steps.{save_context}.outputs.source-key == steps.{owner}.outputs.{population_key}")) && condition.contains(&format!("steps.{owner}.outputs.cache-quiescent == 'true'")))
                     || !condition.contains(&format!("steps.{save_context}.outputs.source-key == steps.{context}.outputs.source-key"))
                     || !condition.contains(&format!("steps.{save_context}.outcome == 'success'"))
-                    || !condition.contains(&format!("steps.{id}.outputs.cache-hit != 'true'"))
+                    || !(condition.contains(&format!("steps.{id}.outputs.cache-hit != 'true'"))
+                        || cache_guard(condition)?.requires(&cache_guard(&format!("!(steps.{id}.outcome == 'success' && steps.{id}.outputs.cache-hit == 'true')"))?))
                     || (condition.contains("steps.deps.outputs.cache-hit")
                         || condition.contains("steps.supply-deps.outputs.cache-hit"))
                 {
@@ -2267,11 +2777,20 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
         {
             return Err(failure("Mac phase cache identities must be separate"));
         }
-        for step in steps.iter().filter(|step| {
+        for (ordinal, step) in steps.iter().enumerate().filter(|(_, step)| {
             step.get(key("uses"))
                 .and_then(Value::as_str)
                 .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
         }) {
+            if ordinal < operations[0].0
+                || step["with"]["key"].as_str().is_some_and(|selected| {
+                    cache_output_reference(selected, "snapshot-key").is_some()
+                })
+            {
+                // Earlier acquisition and a closed immutable copy have their
+                // own actual producer, independent of this later native phase.
+                continue;
+            }
             if !step
                 .get(key("if"))
                 .and_then(Value::as_str)
@@ -2499,7 +3018,7 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
             name,
         )?;
         if scalar(job, "runs-on") != Some(runner)
-            || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+            || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(173)
             || scalar(job, "needs") != Some("macos-performance-plan")
             || scalar(job, "if")
                 != Some("needs.macos-performance-plan.outputs.standalone-common == 'true'")
@@ -2543,6 +3062,11 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
     Ok(())
 }
 pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
+    check_cache_save_guards(
+        job["steps"]
+            .as_sequence()
+            .ok_or_else(|| failure("fuzz steps absent"))?,
+    )?;
     let mut workflow = Mapping::new();
     let mut jobs = Mapping::new();
     jobs.insert(key("fuzz"), Value::Mapping(job.clone()));
@@ -2560,7 +3084,7 @@ pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
             "quarter-three",
             "quarter-four",
         ],
-        60,
+        DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES,
     )
 }
 
@@ -3150,7 +3674,7 @@ fn check_readiness_candidate_steps(
     name: &str,
     native_name: &str,
 ) -> Result<()> {
-    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)
+    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(241)
         || job
             .get(key("outputs"))
             .and_then(|outputs| outputs.get("artifact-id"))
@@ -3507,19 +4031,27 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
             .is_none_or(|minutes| {
                 minutes == 0
                     || minutes
-                        > if name.starts_with("native-")
-                            || name.starts_with("candidate-")
-                            || name.starts_with("public-")
-                        {
+                        > if name.starts_with("native-") {
+                            301
+                        } else if name.starts_with("candidate-") {
+                            241
+                        } else if name.starts_with("installed-macos-") {
+                            151
+                        } else if name.starts_with("public-") {
                             180
-                        } else if matches!(name, "source-checks" | "msrv") {
-                            105
                         } else {
-                            90
+                            match name {
+                                "source-checks" | "msrv" | "miri" => 196,
+                                "supply-chain" => 135,
+                                "packages" => 121,
+                                "rehearsal-tool" => 143,
+                                "fuzz" => 93,
+                                _ => 90,
+                            }
                         }
             })
         {
-            return Err(failure("release operation deadline missing or excessive"));
+            return Err(failure("release outer job envelope missing or excessive"));
         }
     }
     let mut required = vec![
@@ -3700,10 +4232,22 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
                 }
                 ordinary_driver_before_suite(steps, operations[0].0)?;
             }
-            for step in steps.iter().filter(|step| {
+            for (ordinal, step) in steps.iter().enumerate().filter(|(_, step)| {
                 step.get(key("uses")).and_then(Value::as_str)
                     == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
             }) {
+                if steps
+                    .iter()
+                    .position(|candidate| candidate["id"].as_str() == Some("native"))
+                    .is_some_and(|owner| ordinal < owner)
+                    || step["with"]["key"].as_str().is_some_and(|selected| {
+                        cache_output_reference(selected, "snapshot-key").is_some()
+                    })
+                {
+                    // Acquisition saved before installed consumers and immutable
+                    // copies use their own producer, not later channel cleanup.
+                    continue;
+                }
                 let condition = step
                     .get(key("if"))
                     .and_then(Value::as_str)
@@ -4084,7 +4628,14 @@ fn validate_workflow_bytes_into(
     }
     let document = parse_yaml(bytes)?;
     let workflow = mapping(&document, "workflow")?;
-    let normalized = normalize_failure_branches(workflow)?;
+    let projection = crate::workflow_definitions::policy_projection(
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        &document,
+    )?;
+    let normalized = normalize_failure_branches(projection.as_ref().unwrap_or(workflow))?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {
         return Err(failure(format!(
             "workflow-level shell/env is forbidden: {relative:?}"
@@ -4178,10 +4729,18 @@ fn validate_workflow_bytes_into(
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
             continue;
         };
-        let logical_steps = normalized["jobs"][job_name]["steps"]
-            .as_sequence()
-            .ok_or_else(|| failure("normalized steps absent"))?;
-        check_cache_lifecycle(logical_steps)?;
+        if let Some(logical_steps) = normalized["jobs"][job_name]["steps"].as_sequence() {
+            // Guard expressions refer to both original failure-mode branches;
+            // lifecycle validation alone uses their normalized logical owner.
+            let guard_steps = projection
+                .as_ref()
+                .and_then(|document| document["jobs"][job_name]["steps"].as_sequence())
+                .unwrap_or(steps);
+            check_cache_save_guards(guard_steps)?;
+            check_cache_lifecycle(logical_steps)?;
+        } else if projection.is_none() {
+            return Err(failure("normalized steps absent"));
+        }
         for step_value in steps {
             let step = mapping(step_value, "step")?;
             if step.contains_key(key("shell")) {
@@ -4223,6 +4782,7 @@ fn validate_workflow_bytes_into(
                     .allowed_run_commands
                     .iter()
                     .any(|allowed| allowed == run)
+                    && !(projection.is_some() && crate::workflow_definitions::known_run(run))
                 {
                     return Err(failure(format!("workflow run is not allowlisted: {run:?}")));
                 }
@@ -4305,8 +4865,14 @@ fn validate_workflow_bytes_into(
                     }
                 }
                 if uses.starts_with("actions/cache/save@") {
+                    if projection.is_some()
+                        && crate::workflow_definitions::validate_ready_save(step)?
+                    {
+                        continue;
+                    }
                     let condition = scalar(step, "if").unwrap_or_default();
-                    let cache_hit = condition.contains("outputs.cache-hit != 'true'");
+                    let cache_hit = condition.contains("outputs.cache-hit != 'true'")
+                        || condition.contains("outputs.cache-hit == 'true'");
                     let with = mapping(
                         step.get(key("with"))
                             .ok_or_else(|| failure("cache save action needs with"))?,
@@ -4314,6 +4880,9 @@ fn validate_workflow_bytes_into(
                     )?;
                     let primary_key = scalar(with, "key").is_some_and(|value| {
                         value.contains("outputs.cache-primary-key")
+                            || ["source-key", "product-key", "tool-key", "tool-build-key"]
+                                .iter()
+                                .any(|output| cache_output_reference(value, output).is_some())
                             || cache_output_reference(value, "snapshot-key").is_some()
                             || cache_output_reference(value, "sysroot-key").is_some()
                     });
@@ -4506,7 +5075,26 @@ fn normalize_failure_branches(workflow: &Mapping) -> Result<Mapping> {
         }
         *steps = result;
         for step in steps {
-            rewrite(step, &owners)?;
+            let retention = step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache/"))
+                || step["run"].as_str().is_some_and(|run| {
+                    [
+                        " ci cache-context ",
+                        " ci download-cache-context ",
+                        " ci cache-snapshot ",
+                        " ci cleanup-cache-snapshot ",
+                        " ci seed-context ",
+                        " ci import-cache-snapshot ",
+                    ]
+                    .iter()
+                    .any(|part| run.contains(part))
+                });
+            // Cache guards are validated against the real two declared owners,
+            // before mode branches are collapsed for suite-coverage checks.
+            if !retention {
+                rewrite(step, &owners)?;
+            }
         }
     }
     Ok(normalized)
@@ -4833,10 +5421,10 @@ fn check_preparation_transport(workflow: &Mapping, jobs: &Mapping) -> Result<()>
             }
         }
         if name.starts_with("native-")
-            && job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(180)
+            && job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(301)
         {
             return Err(failure(
-                "native serial phase budgets require the 180 minute planning envelope",
+                "native serial phases and bounded cache finalization require the 301 minute planning envelope",
             ));
         }
         if name.starts_with("installed-") {

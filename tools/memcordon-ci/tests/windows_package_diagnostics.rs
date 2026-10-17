@@ -144,6 +144,7 @@ fn timeout_snapshots_remain_incomplete_without_fabricated_native_exit() {
         stderr: b"partial package error\xfe".to_vec(),
         cleanup: Err("native cleanup remains unconfirmed".to_owned()),
         observation: Box::new(TimeoutObservation {
+            settlement_complete: false,
             child_id: 42,
             observed_status: None,
             callback_completed: false,

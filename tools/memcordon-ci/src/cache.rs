@@ -76,6 +76,7 @@ pub fn emit_consumer_downloads(channel: &str, profile: ConsumerProfile) -> Resul
 fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> Result<String> {
     let output = CommandSpec::new(PathBuf::from(program.into()), root, Duration::from_secs(30))
         .args(args.iter().copied())
+        .bootstrap_environment()
         .output_quiet()?;
     if !output.status.success() {
         return Err(CiError::Message("native cache version query failed".into()));
@@ -103,6 +104,61 @@ fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
             .collect(),
     )
 }
+
+fn tool_compiler_jobs(root: &Path, purpose: &str, shard: &str) -> Result<usize> {
+    let workers = crate::preparation::compiler_budget();
+    let parallel = match shard {
+        "complete" => return Ok(workers),
+        "supply-pair-v1" => true,
+        "preparation-pair-v1" => {
+            crate::performance_plan::PerformancePlan::read(root)?
+                .preparation
+                .selected
+                == crate::performance_plan::Layout::Parallel
+        }
+        _ => {
+            return Err(CiError::Message(
+                "unsupported tool allocation recipe".into(),
+            ));
+        }
+    };
+    Ok(tool_jobs_for_scope(
+        workers,
+        parallel,
+        crate::preparation::active_group().is_some_and(|group| group.inside_parallel_lane()),
+        purpose,
+        shard,
+    ))
+}
+
+fn tool_jobs_for_scope(
+    workers: usize,
+    parallel: bool,
+    nested: bool,
+    purpose: &str,
+    shard: &str,
+) -> usize {
+    if shard == "complete" {
+        return workers;
+    }
+    let allocation = crate::preparation::allocate_pair(
+        std::num::NonZeroUsize::new(workers).expect("positive inherited compiler budget"),
+        parallel,
+        nested,
+        crate::preparation::PairClass::Balanced,
+    );
+    // Preparation's existing source owner gets floor(root/2); its auxiliary
+    // owner gets the remainder, equal to Balanced.first (ceil), not its ordinal.
+    if shard == "preparation-pair-v1" || purpose == "cargo-audit" {
+        allocation.first.get()
+    } else {
+        allocation.second.get()
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/private/cache_allocation.rs"]
+mod cache_allocation_tests;
 
 /// Remove only selection differences absent from the actual compilation recipe.
 pub fn partition_compatibility(
@@ -158,6 +214,24 @@ pub fn context_partition(
     external: &[PathBuf],
     partition: Option<crate::cache_restore::CompiledPartition>,
 ) -> Result<CacheContext> {
+    let mode = crate::preparation::active_group().map_or(
+        crate::failure_mode::FailureMode::StopAfterFailure,
+        |group| group.mode(),
+    );
+    crate::preparation::with_operation(
+        mode,
+        std::time::Instant::now() + Duration::from_secs(240),
+        || context_partition_inner(root, purpose, shard, external, partition),
+    )
+}
+
+fn context_partition_inner(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    external: &[PathBuf],
+    partition: Option<crate::cache_restore::CompiledPartition>,
+) -> Result<CacheContext> {
     if let Some(partition) = partition {
         crate::cache_restore::partition_layout(purpose, shard, Some(partition))?;
     }
@@ -172,9 +246,7 @@ pub fn context_partition(
     }
     match collect_context(root, purpose, shard, external, partition) {
         Ok(context) => Ok(context),
-        Err(
-            error @ (CiError::Process(_) | CiError::Cancelled(_) | CiError::LaneFailures { .. }),
-        ) => Err(error),
+        Err(error) if crate::work_outcome::has_unresolved_owner(&error) => Err(error),
         Err(error) => {
             eprintln!("compiled cache projection unavailable: {error}");
             let unavailable = OptionalCache::Unavailable {
@@ -186,7 +258,7 @@ pub fn context_partition(
                     crate::download_cache::context(
                         root,
                         crate::download_cache::DownloadFamily::for_purpose(purpose),
-                    ),
+                    )?,
                 ),
                 ("product".into(), unavailable.clone()),
                 ("consumer".into(), unavailable),
@@ -285,6 +357,11 @@ fn collect_context(
                 .ok_or_else(|| CiError::Message("submodule object absent".into()))?;
             let actual = Git::new(&root.join(path))
                 .and_then(|submodule| submodule.text(["rev-parse", "HEAD"]));
+            if let Err(error) = &actual
+                && crate::work_outcome::has_unresolved_owner(error)
+            {
+                return actual.map(|_| unreachable!());
+            }
             if actual.as_deref().ok() != Some(selected) {
                 local_usable = false;
                 diagnostics
@@ -320,6 +397,7 @@ fn collect_context(
             Ok(value) => {
                 inputs.insert(name.into(), value);
             }
+            Err(error) if crate::work_outcome::has_unresolved_owner(&error) => return Err(error),
             Err(error) => {
                 usable = false;
                 diagnostics
@@ -331,8 +409,97 @@ fn collect_context(
     }
     inputs.insert("target".into(), distribution::native_target()?.into());
     inputs.insert("purpose".into(), purpose.into());
+    if purpose == "private"
+        && matches!(
+            partition,
+            None | Some(crate::cache_restore::CompiledPartition::PrivateNativeTests)
+        )
+    {
+        inputs.insert(
+            "private-compiler-jobs".into(),
+            crate::preparation::compiler_budget().to_string(),
+        );
+    }
+    if matches!(
+        purpose,
+        "native-release" | "native-readiness" | "windows-working" | "private"
+    ) && partition != Some(crate::cache_restore::CompiledPartition::PrivateNativeTests)
+    {
+        // Exactly the allocator used by release::target::compile_native_pair.
+        let allocation = crate::preparation::allocate_pair(
+            std::num::NonZeroUsize::new(crate::preparation::compiler_budget())
+                .expect("positive budget"),
+            true,
+            crate::preparation::active_group().is_some_and(|group| group.inside_parallel_lane()),
+            crate::preparation::PairClass::ProductAndNative,
+        );
+        if partition != Some(crate::cache_restore::CompiledPartition::NativeTests) {
+            inputs.insert(
+                "product-compiler-jobs".into(),
+                allocation.first.get().to_string(),
+            );
+        }
+        if partition != Some(crate::cache_restore::CompiledPartition::Product) {
+            inputs.insert(
+                "native-compiler-jobs".into(),
+                allocation.second.get().to_string(),
+            );
+        }
+    } else if purpose == "native-debug" {
+        inputs.insert(
+            "native-compiler-jobs".into(),
+            crate::preparation::compiler_budget().to_string(),
+        );
+    }
+    if purpose.starts_with("quality-compiler-") || purpose.starts_with("quality-documentation-") {
+        let workers = crate::preparation::compiler_budget();
+        let jobs = if purpose.contains("-local-") {
+            let allocation = crate::preparation::allocate_pair(
+                std::num::NonZeroUsize::new(workers).expect("positive budget"),
+                crate::performance_plan::PerformancePlan::read(root)?
+                    .quality
+                    .selected
+                    == crate::performance_plan::Layout::Parallel,
+                crate::preparation::active_group()
+                    .is_some_and(|group| group.inside_parallel_lane()),
+                crate::preparation::PairClass::Balanced,
+            );
+            if purpose.starts_with("quality-compiler-") {
+                allocation.second.get()
+            } else {
+                allocation.first.get()
+            }
+        } else {
+            workers
+        };
+        inputs.insert("quality-compiler-jobs".into(), jobs.to_string());
+        inputs.insert(
+            "quality-leaf-recipe".into(),
+            if purpose.starts_with("quality-compiler-") {
+                "check-clippy-workspace-all-targets-all-features-locked-deny-warnings-v1"
+            } else {
+                "rustdoc-public-package-libraries-all-features-locked-deny-warnings-v1"
+            }
+            .into(),
+        );
+    }
     inputs.insert("toolchain".into(), selected_toolchain.clone());
     inputs.insert("shard".into(), shard.into());
+    if purpose == "ci-driver-build" {
+        inputs.insert("profile".into(), "release".into());
+        inputs.insert(
+            "driver-recipe".into(),
+            serde_json::to_string(&(
+                "memcordon-ci",
+                "memcordon-ci",
+                "release",
+                distribution::native_target()?,
+                "target/ci-driver-build",
+                Vec::<String>::new(),
+                "bootstrap-abi-v1",
+            ))?,
+        );
+    }
     if partition != Some(crate::cache_restore::CompiledPartition::NativeTests)
         && matches!(
             purpose,
@@ -514,6 +681,7 @@ fn collect_context(
             Ok(value) => {
                 inputs.insert("cargo-fuzz".into(), value);
             }
+            Err(error) if crate::work_outcome::has_unresolved_owner(&error) => return Err(error),
             Err(_) => usable = false,
         }
     }
@@ -526,6 +694,7 @@ fn collect_context(
             Ok(value) => {
                 inputs.insert("miri".into(), value);
             }
+            Err(error) if crate::work_outcome::has_unresolved_owner(&error) => return Err(error),
             Err(_) => usable = false,
         }
     }
@@ -539,6 +708,9 @@ fn collect_context(
                 match query(root, program, &args) {
                     Ok(value) => {
                         inputs.insert(name.into(), value);
+                    }
+                    Err(error) if crate::work_outcome::has_unresolved_owner(&error) => {
+                        return Err(error);
                     }
                     Err(_) => {
                         usable = false;
@@ -558,6 +730,9 @@ fn collect_context(
                     Ok(value) => {
                         inputs.insert(name.into(), value);
                     }
+                    Err(error) if crate::work_outcome::has_unresolved_owner(&error) => {
+                        return Err(error);
+                    }
                     Err(_) => {
                         usable = false;
                         diagnostics
@@ -574,6 +749,9 @@ fn collect_context(
                 std::time::Instant::now() + Duration::from_secs(30),
             ) {
                 Ok(identity) => inputs.extend(identity),
+                Err(error) if crate::work_outcome::has_unresolved_owner(&error) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     usable = false;
                     diagnostics
@@ -634,6 +812,12 @@ fn collect_context(
             ),
         ] {
             let entry = if usable {
+                if family == "tool-build" {
+                    compatibility.insert(
+                        "tool-compiler-jobs".into(),
+                        tool_compiler_jobs(root, purpose, shard)?.to_string(),
+                    );
+                }
                 compatibility.insert("tool-package".into(), purpose.into());
                 compatibility.insert(
                     "tool-build-root".into(),
@@ -691,13 +875,17 @@ fn collect_context(
         crate::download_cache::context(
             root,
             crate::download_cache::DownloadFamily::for_purpose(purpose),
-        ),
+        )?,
     );
-    if let (Ok(configuration), Some(selected_reader), Ok(stable_reader)) = (
-        &configurations,
-        inputs.get("cargo"),
-        query(root, "rustup", &["run", &pins.stable, "cargo", "-V"]),
-    ) {
+    let stable_reader = query(root, "rustup", &["run", &pins.stable, "cargo", "-V"]);
+    if let Err(error) = &stable_reader
+        && crate::work_outcome::has_unresolved_owner(error)
+    {
+        return stable_reader.map(|_| unreachable!());
+    }
+    if let (Ok(configuration), Some(selected_reader), Ok(stable_reader)) =
+        (&configurations, inputs.get("cargo"), stable_reader)
+    {
         let readers = BTreeMap::from([
             ("driver-reader".into(), stable_reader),
             ("selected-reader".into(), selected_reader.clone()),
@@ -721,6 +909,11 @@ fn collect_context(
         );
     }
     let local = crate::cache_inputs::local_files(root, purpose);
+    if let Err(error) = &local
+        && crate::work_outcome::has_unresolved_owner(error)
+    {
+        return local.map(|_| unreachable!());
+    }
     usable &= local_usable;
     if local.is_err() {
         usable = false;
@@ -862,7 +1055,25 @@ pub fn emit_partition(
     outputs.push((
         "payload-ready",
         (for_save
-            && crate::cache_restore::partition_payload_ready(root, purpose, shard, partition)?)
+            && if matches!(purpose, "cargo-audit" | "cargo-deny" | "cargo-fuzz") {
+                let layout = crate::cache_restore::tool_build_layout(purpose, shard)?;
+                let target = crate::cache_restore::safe_root(root, &layout.directories[0])?;
+                let locks = crate::cache_restore::settled_locks(std::slice::from_ref(&target))?;
+                let ready = crate::cache_restore::cargo_marker_present(&target)?
+                    && walkdir::WalkDir::new(&target)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .any(|entry| {
+                            entry.file_type().is_file()
+                                && entry.file_name() != "CACHEDIR.TAG"
+                                && entry.file_name() != ".cargo-lock"
+                        });
+                drop(locks);
+                ready
+            } else {
+                crate::cache_restore::partition_payload_ready(root, purpose, shard, partition)?
+            })
         .to_string(),
     ));
     if context.usable {

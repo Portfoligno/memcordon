@@ -36,6 +36,7 @@ pub struct CommandSpec {
     isolated_cargo_home: Option<PathBuf>,
     miri_sysroot: Option<PathBuf>,
     clear_environment: bool,
+    bootstrap_environment: bool,
     output_limit: usize,
     defer_group_failure: bool,
     peer_stop_policy: Option<PeerStopPolicy>,
@@ -60,7 +61,7 @@ pub enum CiPhase {
 }
 
 impl CiPhase {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::SourceCheck => "source-check",
             Self::Package => "package",
@@ -111,6 +112,7 @@ impl CommandSpec {
             isolated_cargo_home: None,
             miri_sysroot: None,
             clear_environment: false,
+            bootstrap_environment: false,
             output_limit: 16 * 1024 * 1024,
             defer_group_failure: false,
             peer_stop_policy: None,
@@ -225,6 +227,20 @@ impl CommandSpec {
         if self.clear_environment {
             command.env_clear();
         }
+        if self.bootstrap_environment {
+            for (name, _) in std::env::vars_os() {
+                let text = name.to_string_lossy().to_ascii_uppercase();
+                if ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+                    .iter()
+                    .any(|part| text.contains(part))
+                    || text.ends_with("_PROXY")
+                    || text == "PROXY"
+                    || matches!(text.as_str(), "GITHUB_OUTPUT" | "GITHUB_STEP_SUMMARY")
+                {
+                    command.env_remove(name);
+                }
+            }
+        }
         if let Some(root) = &self.miri_sysroot {
             command.env("MIRI_SYSROOT", root);
         }
@@ -269,8 +285,13 @@ impl CommandSpec {
         self
     }
 
+    pub fn bootstrap_environment(mut self) -> Self {
+        self.bootstrap_environment = true;
+        self
+    }
+
     pub fn run(&self) -> Result<Vec<u8>> {
-        let mut command = self.materialize()?;
+        let mut command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let output = self.observe_with_progress(&mut command, true)?;
         if output.status.success() {
             Ok(output.stdout)
@@ -344,13 +365,15 @@ impl CommandSpec {
                             CiError::Message("Cargo jobs must be a positive typed count".into())
                         })?;
                     arguments[index] = OsString::from("--jobs");
-                    arguments.insert(
-                        index + 1,
-                        count.min(group.compiler_jobs()).to_string().into(),
-                    );
-                    selected = true;
+                    arguments.insert(index + 1, count.to_string().into());
                 }
                 if arguments[index] == "--jobs" || arguments[index] == "-j" {
+                    if selected {
+                        return Err(CiError::Message(
+                            "conflicting duplicate Cargo jobs arguments".into(),
+                        ));
+                    }
+                    arguments[index] = OsString::from("--jobs");
                     let jobs = arguments
                         .get_mut(index + 1)
                         .ok_or_else(|| CiError::Message("Cargo job argument is missing".into()))?;
@@ -361,7 +384,12 @@ impl CommandSpec {
                         .ok_or_else(|| {
                             CiError::Message("Cargo jobs must be a positive typed count".into())
                         })?;
-                    *jobs = count.min(group.compiler_jobs()).to_string().into();
+                    if count > group.compiler_jobs() {
+                        return Err(CiError::Message(
+                            "explicit Cargo jobs exceeds inherited compiler budget".into(),
+                        ));
+                    }
+                    *jobs = count.to_string().into();
                     selected = true;
                     index += 1;
                 }
@@ -396,7 +424,7 @@ impl CommandSpec {
     }
 
     pub fn output(&self) -> Result<ObservedOutput> {
-        let mut command = self.materialize()?;
+        let mut command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         eprintln!("ci subprocess program: {:?}", command.get_program());
         for argument in command.get_args() {
             eprintln!("ci subprocess argument: {argument:?}");
@@ -409,8 +437,33 @@ impl CommandSpec {
     /// Materialization, credential removal, and the deadline remain identical
     /// to `output`; only invocation diagnostics are suppressed.
     pub fn output_quiet(&self) -> Result<ObservedOutput> {
-        let mut command = self.materialize()?;
-        self.observe(&mut command)
+        self.output_owned().into_result()
+    }
+
+    /// The native observation is retained before any semantic error formatting.
+    pub fn output_owned(&self) -> crate::work_outcome::WorkOutcome<ObservedOutput> {
+        use crate::work_outcome::{WorkOutcome, WriterSettlement};
+        match self.materialize() {
+            Ok(mut command) => WorkOutcome::from_result(self.observe(&mut command)),
+            Err(error) => WorkOutcome::observed(Err(error), WriterSettlement::NotStarted),
+        }
+    }
+
+    pub fn run_owned(&self) -> crate::work_outcome::WorkOutcome<Vec<u8>> {
+        self.output_owned()
+            .validate_after(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(CiError::SettledCommandFailure(format!(
+                        "subprocess failed with {}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        bounded_excerpt(&output.stdout),
+                        bounded_excerpt(&output.stderr)
+                    )))
+                }
+            })
+            .map(|output| output.stdout)
     }
 
     /// Bound both capture workers before they allocate subprocess output.
@@ -447,8 +500,8 @@ impl CommandSpec {
         observe_creation: impl FnOnce(&std::process::Child) -> Result<()>,
         hold_exec: bool,
     ) -> Result<ObservedOutput> {
-        let command = self.materialize()?;
-        let budget = self.available_budget()?;
+        let command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
+        let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
         let deadline = self
             .operation_deadline
             .unwrap_or(Instant::now() + budget)
@@ -489,13 +542,15 @@ impl CommandSpec {
             },
             |_| Ok(()),
         );
-        match (output, observation_error) {
+        let writers = crate::work_outcome::native_settlement(&output);
+        let result = match (output, observation_error) {
             (Ok(output), None) => Ok(output),
             (Ok(_), Some(error)) => Err(error),
             (Err(error), original) => Err(CiError::Message(format!(
                 "native creation observation={original:?}; native settlement={error}"
             ))),
-        }
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
     }
 
     /// Supply an already retained finite input without blocking a pipe before
@@ -551,13 +606,15 @@ impl CommandSpec {
                 Ok(())
             },
         );
-        match (output, observation_error) {
+        let writers = crate::work_outcome::native_settlement(&output);
+        let result = match (output, observation_error) {
             (Ok(output), None) => Ok(output),
             (Ok(_), Some(error)) => Err(error),
             (Err(error), original) => Err(CiError::Message(format!(
                 "native creation observation={original:?}; native settlement={error}"
             ))),
-        }
+        };
+        crate::work_outcome::WorkOutcome::observed(result, writers).into_result()
     }
 
     fn observe(&self, command: &mut Command) -> Result<ObservedOutput> {
@@ -573,7 +630,7 @@ impl CommandSpec {
         if group.as_ref().is_some_and(|group| !group.may_start()) {
             return Err(CiError::NotStartedAfterFailure);
         }
-        let budget = self.available_budget()?;
+        let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
         let started = Instant::now();
         let diagnostic_directory = if self.phase.is_some() {
             let directory = self.current_dir.join("target/ci/reports/execution");
@@ -729,7 +786,7 @@ impl CommandSpec {
         } else {
             None
         };
-        let result =
+        let (result, logger_settled) =
             std::thread::scope(|scope| {
                 let lane = match std::thread::current().name() {
                     Some("ci-source-lane") => "first",
@@ -834,11 +891,16 @@ impl CommandSpec {
                     None
                 } else {
                     group.clone().map(|group| {
-                        std::sync::Arc::new(move || group.request_after_failure())
-                            as std::sync::Arc<dyn Fn() + Send + Sync>
+                        let operation = self.phase.map_or("command", CiPhase::name);
+                        std::sync::Arc::new(move |notice| {
+                            group.request_command_failure_notice(operation, notice)
+                        })
+                            as std::sync::Arc<
+                                dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
+                            >
                     })
                 };
-                let result = memcordon_testkit::run_with_deadline_notified_output_limit(
+                let result = memcordon_testkit::run_with_deadline_failure_notice_output_limit(
                     command,
                     budget,
                     self.output_limit,
@@ -849,12 +911,12 @@ impl CommandSpec {
                 done.store(true, std::sync::atomic::Ordering::Release);
                 // Incomplete reader settlement cannot keep the logger waiting for
                 // a sender forever. The native result remains authoritative.
-                logger.join().expect("bounded progress logger panicked");
+                let logger_settled = logger.join().is_ok();
                 let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
                 if omitted != 0 {
                     eprintln!("[ci child] omitted {omitted} progress chunks");
                 }
-                result
+                (result, logger_settled)
             });
         if !self.defer_group_failure
             && (result.as_ref().is_err()
@@ -862,6 +924,9 @@ impl CommandSpec {
             && let Some(group) = &group
         {
             group.request_after_failure();
+        }
+        if !logger_settled && let Some(group) = &group {
+            group.close_admission();
         }
         if let (Err(error), Some(group)) = (&result, &group) {
             use memcordon_testkit::ProcessTestError;
@@ -902,7 +967,20 @@ impl CommandSpec {
         if let Err(error) = report(state, budget, Some(&result)) {
             eprintln!("diagnostic retention incomplete: {error}");
         }
-        result.map_err(|error| match error {
+        finish_native_observation(result, logger_settled).into_result()
+    }
+}
+
+fn finish_native_observation(
+    result: std::result::Result<ObservedOutput, memcordon_testkit::ProcessTestError>,
+    logger_settled: bool,
+) -> crate::work_outcome::WorkOutcome<ObservedOutput> {
+    let writers = if logger_settled {
+        crate::work_outcome::native_settlement(&result)
+    } else {
+        crate::work_outcome::WriterSettlement::Unknown
+    };
+    let result = result.map_err(|error| match error {
             memcordon_testkit::ProcessTestError::Spawn(error) => CiError::CommandSpawnFailure(error),
             memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, cleanup, termination } => CiError::Message(format!("subprocess output exceeds byte limit; cleanup={cleanup:?}; termination={termination:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr))),
             memcordon_testkit::ProcessTestError::Timeout { deadline, stdout, stderr, cleanup, observation } => CiError::Message(format!("subprocess exceeded {deadline:?}; cleanup={cleanup:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr))),
@@ -912,9 +990,17 @@ impl CommandSpec {
                 if settled { CiError::SettledCancellation(details) } else { CiError::Cancelled(details) }
             },
             error => CiError::Message(bounded_excerpt(error.to_string().as_bytes())),
-        })
-    }
+        });
+    crate::work_outcome::WorkOutcome::observed(result, writers).postcondition(if logger_settled {
+        Ok(())
+    } else {
+        Err(CiError::Message("bounded progress logger panicked".into()))
+    })
 }
+
+#[cfg(test)]
+#[path = "../tests/private/native_observation.rs"]
+mod native_observation_tests;
 
 pub fn bounded_excerpt(bytes: &[u8]) -> String {
     excerpt(bytes).0

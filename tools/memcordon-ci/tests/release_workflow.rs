@@ -197,15 +197,16 @@ fn public_readiness_owners_cannot_drop_cleanup_or_rewrite_original_publication_d
     let steps = skipped["jobs"]["public-windows-x64-native"]["steps"]
         .as_sequence_mut()
         .unwrap();
-    let cleanup = steps
-        .iter_mut()
-        .find(|step| {
-            step["run"]
-                .as_str()
-                .is_some_and(|run| run.contains("consumer-readiness cleanup "))
-        })
-        .unwrap();
-    cleanup["if"] = Value::String("success()".into());
+    let cleanup = unique_step(steps, "required public Windows cleanup", |step| {
+        step["id"].as_str() == Some("readiness-cleanup")
+    });
+    assert_eq!(
+        steps[cleanup]["run"].as_str(),
+        Some(
+            "./target/ci-driver-cold/release/consumer-readiness.exe cleanup --github-context --driver ./target/ci-runtime/current/memcordon-ci.exe --identity .release/readiness-identity.json --destination .release/readiness-cell"
+        )
+    );
+    steps[cleanup]["if"] = Value::String("success()".into());
     assert!(check(&skipped).is_err());
     let mut fresh_candidate = workflow.clone();
     fresh_candidate["jobs"]["public-linux-x64-native"]["needs"]
@@ -225,9 +226,7 @@ fn release_quality_installs_required_components_before_running_the_suite() {
     check(&workflow).unwrap();
     let quality = unique_step(steps, "quality compilation", |step| {
         step["run"].as_str()
-            == Some(
-                "./.release/tool/memcordon-ci suite quality-compile --failure-mode stop-after-failure",
-            )
+            == Some("./.release/tool/memcordon-ci ci segment release-quality-compiler")
     });
     assert!(steps[..quality].iter().any(|step| {
         step["run"].as_str()
@@ -305,18 +304,22 @@ fn release_graph_retains_six_native_consumers_and_isolated_publisher() {
     cancel["jobs"]["publish"]["concurrency"]["cancel-in-progress"] = Value::Bool(true);
     assert!(check(&cancel).is_err());
     let mut skip = baseline.clone();
-    for step in skip["jobs"]["candidate-linux-x64-native"]["steps"]
+    let steps = skip["jobs"]["candidate-linux-x64-native"]["steps"]
         .as_sequence_mut()
-        .unwrap()
-    {
-        if step["run"].as_str()
-            == Some(
-                "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci/release/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell",
-            )
-        {
-            step["continue-on-error"] = Value::Bool(true);
-        }
-    }
+        .unwrap();
+    let readiness = unique_step(steps, "selected required readiness", |step| {
+        step["id"] == "readiness"
+    });
+    assert_eq!(
+        steps[readiness]["run"],
+        "./target/ci/release/consumer-readiness acquire --github-context --driver ./target/ci-runtime/current/memcordon-ci --identity .release/readiness-identity.json --destination .release/readiness-cell"
+    );
+    assert!(steps[readiness]["continue-on-error"].is_null());
+    steps[readiness]["continue-on-error"] = Value::Bool(true);
+    assert_ne!(
+        skip, baseline,
+        "readiness mutation must change the actual required owner"
+    );
     assert!(check(&skip).is_err());
 }
 
@@ -329,8 +332,10 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         "select",
         "packages",
         "source-checks",
+        "source-docs",
         "msrv",
-        "supply-chain",
+        "supply-chain-audit",
+        "supply-chain-deny",
         "assemble-payload",
         "rehearse",
         "miri",
@@ -371,11 +376,13 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         match case {
             "serialproducer" => {
                 changed["jobs"]["native-linux-x64"]["needs"] =
-                    serde_yaml::from_str("[select, packages]").unwrap()
+                    serde_yaml::from_str("[select, readiness-tools-linux-x64, packages]").unwrap()
             }
             "wrongtarget" => {
-                changed["jobs"]["candidate-linux-x64-native"]["needs"] =
-                    serde_yaml::from_str("[select, packages, native-linux-arm64]").unwrap()
+                changed["jobs"]["candidate-linux-x64-native"]["needs"] = serde_yaml::from_str(
+                    "[select, packages, readiness-tools-linux-x64, native-linux-arm64]",
+                )
+                .unwrap()
             }
             "partialshards" => {
                 changed["jobs"]["miri"]["strategy"]["matrix"]["shard"]
@@ -412,23 +419,60 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
             .map(|(index, _)| index)
             .collect();
         assert!(!saves.is_empty(), "{job} cache owner must be exercised");
+        let selected = unique_step(steps, "selected installed channel", |step| {
+            step["id"].as_str() == Some(channel)
+        });
+        assert!(steps[selected]["continue-on-error"].is_null());
         for index in saves {
-            let guard = format!(
-                "(steps.{channel}.conclusion == 'skipped' || steps.{channel}.outputs.cache-quiescent == 'true')"
-            );
-            let original = steps[index]["if"].as_str().unwrap();
             assert!(
-                original.contains(&guard),
-                "{job} selected owner guard absent"
+                index < selected,
+                "{job} must retain its independent early transfers before installed execution"
+            );
+            let reference = steps[index]["with"]["key"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("${{ steps.")
+                .and_then(|value| value.strip_suffix("-key }}"))
+                .unwrap();
+            let (owner, slot) = reference.split_once(".outputs.").unwrap();
+            assert_eq!(
+                steps[index]["with"]["path"],
+                format!("${{{{ steps.{owner}.outputs.{slot}-path }}}}")
+            );
+            let producer = unique_step(steps, "actual Rust retention owner", |step| {
+                step["id"].as_str() == Some(owner)
+            });
+            assert!(producer < index);
+            let guard = format!("steps.{owner}.outputs.{slot}-save == 'true'");
+            let original = steps[index]["if"].as_str().unwrap();
+            let ready = format!("always() && {guard}");
+            let expected = if slot.ends_with("partial") {
+                ready
+            } else {
+                format!("{ready} && steps.{owner}-{slot}-probe.outputs.cache-hit != 'true'")
+            };
+            assert_eq!(
+                original, expected,
+                "{job} must use exactly its validated transfer owner/class"
+            );
+            assert!(
+                !original.contains(&format!("steps.{channel}.")),
+                "later independent installed work cannot gate the earlier transfer"
             );
             let mut changed = baseline.clone();
             changed["jobs"][job]["steps"][index]["if"] = original.replace(&guard, "true").into();
             assert_ne!(changed, baseline);
             assert!(
                 check(&changed).is_err(),
-                "{job} accepted unsettled selected owner"
+                "{job} accepted a transfer without its actual Rust readiness decision"
             );
         }
+        let mut optional = baseline.clone();
+        optional["jobs"][job]["steps"][selected]["continue-on-error"] = true.into();
+        assert!(
+            check(&optional).is_err(),
+            "{job} selected installed work must still fail normally"
+        );
     }
 }
 
@@ -540,7 +584,7 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
                     .as_sequence_mut()
                     .unwrap();
                 let restore = unique_step(steps, "package download cache", |step| {
-                    step["id"] == "deps"
+                    step["id"] == "workspace-fetch-request-source-restore"
                         && step["uses"]
                             .as_str()
                             .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))

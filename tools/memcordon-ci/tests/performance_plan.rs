@@ -147,10 +147,12 @@ fn checked_in_safe_groups_are_parallel_without_fabricated_speedup_measurements()
     assert_eq!(plan.stress_cells(Layout::Parallel).unwrap().len(), 5);
     assert_eq!(plan.preparation.selected, Layout::Parallel);
     assert_eq!(plan.quality.selected, Layout::Parallel);
-    assert_eq!(plan.macos_release.selected, Layout::Serial);
+    assert_eq!(plan.macos_release.selected, Layout::Parallel);
     assert!(plan.preparation.experiment.is_none() && plan.quality.experiment.is_none());
     plan.preparation.validate_layout().unwrap();
     plan.quality.validate_layout().unwrap();
+    assert!(plan.macos_release.experiment.is_none());
+    plan.macos_release.validate_layout().unwrap();
     assert!(
         Selection {
             selected: Layout::Parallel,

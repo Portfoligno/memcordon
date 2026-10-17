@@ -2,7 +2,7 @@ format = "memcordon.performance-selection"
 revision = 1
 
 [macos_release]
-selected = "serial"
+selected = "parallel"
 [preparation]
 selected = "parallel"
 [quality]

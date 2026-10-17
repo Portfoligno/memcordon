@@ -73,7 +73,10 @@ fn ordinary_workflows_do_not_restore_retired_self_hosted_runner_exceptions() {
         let mut document: Value =
             serde_yaml::from_slice(include_bytes!("../../../../.github/workflows/ci.yml"))
                 .expect("actual ordinary workflow parses");
-        let job: Value = serde_yaml::from_str(&format!("runs-on: {runner}\nsteps: []\n")).unwrap();
+        let job: Value = serde_yaml::from_str(&format!(
+            "runs-on: {runner}\ntimeout-minutes: 30\nsteps: []\n"
+        ))
+        .unwrap();
         document["jobs"][job_name] = job;
         let bytes = serde_yaml::to_string(&document).unwrap();
         let error = validate_workflow_bytes(

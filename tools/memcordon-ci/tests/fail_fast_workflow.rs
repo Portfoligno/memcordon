@@ -63,10 +63,58 @@ fn validate(value: &Value) -> Result<(), String> {
         ancestors(name, &graph, &mut BTreeSet::new())?;
     }
     let select_only = BTreeSet::from(["select".to_owned()]);
-    for name in ["source-checks", "msrv", "supply-chain", "rehearsal-tool"] {
+    for name in [
+        "source-checks",
+        "source-docs",
+        "msrv",
+        "supply-chain-audit",
+        "supply-chain-deny",
+        "rehearsal-tool",
+        "fuzz-setup",
+    ] {
         if graph.get(name) != Some(&select_only) {
             return Err(format!("{name} must be independent after select"));
         }
+    }
+    if graph.contains_key("supply-chain") {
+        return Err("combined security must not duplicate required leaves".into());
+    }
+    for host in [
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64",
+        "windows-x64",
+        "windows-arm64",
+    ] {
+        let preparation = format!("readiness-tools-{host}");
+        let native = format!("native-{host}");
+        if graph.get(&preparation) != Some(&select_only)
+            || graph.get(&native)
+                != Some(&BTreeSet::from(["select".to_owned(), preparation.clone()]))
+        {
+            return Err(format!(
+                "{native} must require its selected-source helper preparation"
+            ));
+        }
+        for (name, parents) in &graph {
+            if (name.starts_with(&format!("candidate-{host}-"))
+                || name.starts_with(&format!("installed-{host}-")))
+                && (!parents.contains(&native) || !parents.contains(&preparation))
+            {
+                return Err(format!(
+                    "{name} must require native success and the same-host preparation"
+                ));
+            }
+        }
+    }
+    if graph.get("fuzz")
+        != Some(&BTreeSet::from([
+            "select".to_owned(),
+            "fuzz-setup".to_owned(),
+        ]))
+    {
+        return Err("fuzz must require actual selected-source setup".into());
     }
     let early = [
         "select",
@@ -94,10 +142,19 @@ fn validate(value: &Value) -> Result<(), String> {
     let final_ancestors = ancestors("assemble", &graph, &mut BTreeSet::new())?;
     for required in [
         "source-checks",
+        "source-docs",
         "msrv",
-        "supply-chain",
+        "supply-chain-audit",
+        "supply-chain-deny",
         "miri",
         "fuzz",
+        "fuzz-setup",
+        "readiness-tools-linux-x64",
+        "readiness-tools-linux-arm64",
+        "readiness-tools-macos-x64",
+        "readiness-tools-macos-arm64",
+        "readiness-tools-windows-x64",
+        "readiness-tools-windows-arm64",
         "rehearse",
         "assemble-payload",
         "candidate-linux-x64-native",
@@ -126,6 +183,28 @@ fn validate(value: &Value) -> Result<(), String> {
             return Err(format!("{job} bypasses prerequisite success"));
         }
     }
+    for name in graph.keys().filter(|name| {
+        name.starts_with("readiness-tools-")
+            || name.starts_with("native-")
+            || name.starts_with("candidate-")
+            || name.starts_with("installed-")
+            || matches!(
+                name.as_str(),
+                "source-checks"
+                    | "source-docs"
+                    | "supply-chain-audit"
+                    | "supply-chain-deny"
+                    | "fuzz-setup"
+            )
+    }) {
+        let condition = jobs[name.as_str()]["if"].as_str().unwrap_or_default();
+        if ["always()", "failure()", "cancelled()", "!= 'failure'"]
+            .iter()
+            .any(|token| condition.contains(token))
+        {
+            return Err(format!("{name} bypasses required preparation success"));
+        }
+    }
     for (writer, rehearsal) in [
         ("publish", "rehearse"),
         ("recovery-publish", "recovery-rehearse"),
@@ -140,8 +219,11 @@ fn validate(value: &Value) -> Result<(), String> {
         if writer == "recovery-publish"
             && [
                 "source-checks",
+                "source-docs",
                 "msrv",
-                "supply-chain",
+                "supply-chain-audit",
+                "supply-chain-deny",
+                "fuzz-setup",
                 "assemble-payload",
                 "assemble",
             ]
@@ -189,10 +271,19 @@ fn every_required_final_dependency_is_individually_enforced() {
     let value = workflow();
     for parent in [
         "source-checks",
+        "source-docs",
         "msrv",
-        "supply-chain",
+        "supply-chain-audit",
+        "supply-chain-deny",
         "miri",
         "fuzz",
+        "fuzz-setup",
+        "readiness-tools-linux-x64",
+        "readiness-tools-linux-arm64",
+        "readiness-tools-macos-x64",
+        "readiness-tools-macos-arm64",
+        "readiness-tools-windows-x64",
+        "readiness-tools-windows-arm64",
         "rehearse",
         "assemble-payload",
         "native-linux-x64",

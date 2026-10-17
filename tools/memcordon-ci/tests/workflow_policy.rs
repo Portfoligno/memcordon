@@ -142,9 +142,9 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
         )
         .expect_err("a changed fuzz shard deadline must fail");
         assert!(
-            error
-                .to_string()
-                .contains("deep CI fuzz timeout differs from workload deadline"),
+            error.to_string().contains(&format!(
+                "job budget {timeout_minutes} does not cover emitted branch"
+            )),
             "unexpected workflow policy error: {error}"
         );
     }
@@ -173,9 +173,9 @@ fn deep_ci_miri_job_bound_includes_audit_and_cleanup_headroom() {
         )
         .expect_err("a changed Miri job bound must fail");
         assert!(
-            error
-                .to_string()
-                .contains("deep shard runner or execution bounds differ"),
+            error.to_string().contains(&format!(
+                "job budget {timeout_minutes} does not cover emitted branch"
+            )),
             "unexpected workflow policy error: {error}"
         );
     }
@@ -216,9 +216,9 @@ fn deep_ci_stress_job_bound_covers_cold_packages_lifecycle_and_audit() {
         )
         .expect_err("a changed stress job bound must fail");
         assert!(
-            error
-                .to_string()
-                .contains("deep CI stress timeout does not cover the complete cold workload"),
+            error.to_string().contains(&format!(
+                "job budget {timeout_minutes} does not cover emitted branch"
+            )),
             "unexpected workflow policy error: {error}"
         );
     }
@@ -265,6 +265,13 @@ fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
     let exact = std::fs::read_to_string(root.join(relative))
         .expect("workflow fixture should be readable")
         .replace("\r\n", "\n");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(relative),
+        exact.as_bytes(),
+        &repository_policy,
+    )
+    .expect("the exact workflow with its fuzz lockfile guard should pass");
     let invalid = exact.replacen(" && hashFiles('fuzz/Cargo.lock') != ''", "", 1);
     assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
     let error = policy::validate_workflow_bytes(
@@ -277,7 +284,7 @@ fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
     assert!(
         error
             .to_string()
-            .contains("fuzz manifest must include its lockfile"),
+            .contains("new workflow phase differs from its Rust step adapters"),
         "unexpected policy error: {error}"
     );
 }
@@ -431,7 +438,7 @@ fn action_input_boolean_value_selection_is_rejected() {
     assert!(
         error
             .to_string()
-            .contains("workflow action input may not select values with Boolean operators"),
+            .contains("workflow differs from its Rust step adapters"),
         "unexpected policy error: {error}"
     );
 }
@@ -441,8 +448,8 @@ fn named_github_environments_are_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/ci.yml").replace("\r\n", "\n");
     let invalid = exact.replacen(
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n",
-        "    runs-on: ubuntu-24.04\n    environment: release\n    timeout-minutes: 30\n",
+        "    runs-on: ubuntu-24.04\n",
+        "    runs-on: ubuntu-24.04\n    environment: release\n",
         1,
     );
     assert_ne!(invalid, exact, "environment fixture mutation must apply");
@@ -712,17 +719,40 @@ fn every_workflow_upload_uses_the_bounded_action() {
         include_str!("../../../.github/workflows/backend-certification.yml"),
     ];
     let local = "uses: ./.github/actions/upload-artifact";
-    let direct = "uses: actions/upload-artifact@";
-    let count: usize = workflows
-        .iter()
-        .map(|workflow| {
-            assert!(
-                !workflow.contains(direct),
-                "workflow bypasses the bounded artifact upload action"
-            );
-            workflow.matches(local).count()
-        })
-        .sum();
+    let mut count = 0;
+    for workflow in workflows {
+        let document: Value = serde_yaml::from_str(workflow).unwrap();
+        for (job_name, job) in document["jobs"].as_mapping().unwrap() {
+            for step in job["steps"].as_sequence().unwrap() {
+                let uses = step["uses"].as_str().unwrap_or("");
+                if uses.starts_with("actions/upload-artifact@") {
+                    assert_eq!(
+                        uses,
+                        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+                    );
+                    match job_name.as_str() {
+                        Some("fuzz-setup") => {
+                            assert_eq!(step["id"], "fuzz-setup-upload");
+                            assert_eq!(step["timeout-minutes"].as_u64(), Some(5));
+                        }
+                        Some("private-linux-prepare-x64" | "private-linux-prepare-arm64") => {
+                            assert_eq!(step["id"], "private-prepared-upload");
+                            assert_eq!(step["timeout-minutes"].as_u64(), Some(6));
+                            assert_eq!(step["with"]["path"], "target/ci/private-prepared.tar");
+                            assert_eq!(
+                                job["outputs"]["artifact-id"],
+                                "${{ steps.private-prepared-upload.outputs.artifact-id }}"
+                            );
+                        }
+                        _ => panic!("unreviewed direct immutable producer: {job_name:?}"),
+                    }
+                    assert_eq!(step["with"]["if-no-files-found"], "error");
+                    assert!(step["continue-on-error"].is_null());
+                }
+            }
+        }
+        count += workflow.matches(local).count();
+    }
     assert!(
         count >= 4,
         "ordinary workflow artifact upload coverage regressed"

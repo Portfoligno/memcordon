@@ -21,20 +21,22 @@ pub struct Tag {
 
 impl Git {
     pub fn new(root: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        let configuration = tempfile::Builder::new()
-            .prefix("memcordon-git-")
-            .tempdir_in("/tmp")?;
-        #[cfg(not(unix))]
-        let configuration = tempfile::Builder::new()
-            .prefix("memcordon-git-")
-            .tempdir()?;
-        std::fs::write(configuration.path().join("config"), b"")?;
-        std::fs::create_dir(configuration.path().join("hooks"))?;
-        Ok(Self {
-            root: root.into(),
-            configuration,
-        })
+        crate::work_outcome::WorkOutcome::before_start((|| {
+            #[cfg(unix)]
+            let configuration = tempfile::Builder::new()
+                .prefix("memcordon-git-")
+                .tempdir_in("/tmp")?;
+            #[cfg(not(unix))]
+            let configuration = tempfile::Builder::new()
+                .prefix("memcordon-git-")
+                .tempdir()?;
+            std::fs::write(configuration.path().join("config"), b"")?;
+            std::fs::create_dir(configuration.path().join("hooks"))?;
+            Ok(Self {
+                root: root.into(),
+                configuration,
+            })
+        })())
     }
 
     pub fn command(&self, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Command {
@@ -123,64 +125,106 @@ impl Git {
     }
 
     pub fn text(&self, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<String> {
+        let budget = if let Some(group) = crate::preparation::active_group() {
+            if !group.may_start() {
+                return Err(CiError::NotStartedAfterFailure);
+            }
+            crate::command::remaining_budget(
+                Duration::from_secs(120),
+                group
+                    .deadline()
+                    .saturating_duration_since(std::time::Instant::now()),
+                Duration::from_secs(10),
+            )?
+        } else {
+            Duration::from_secs(120)
+        };
         let mut command = self.command(arguments);
-        let output = memcordon_testkit::run_with_deadline_output_limit(
-            &mut command,
-            Duration::from_secs(120),
-            1024 * 1024,
-        )?;
-        if !output.status.success() {
-            return Err(CiError::Message(
-                "Git operation failed; no ref mutation retried".into(),
-            ));
-        }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|_| CiError::Message("Git returned non-UTF-8 protocol data".into()))?;
-        Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+        let output =
+            memcordon_testkit::run_with_deadline_output_limit(&mut command, budget, 1024 * 1024);
+        let writers = crate::work_outcome::native_settlement(&output);
+        crate::work_outcome::WorkOutcome::observed(output.map_err(CiError::Process), writers)
+            .map_validated(|output| {
+                if !output.status.success() {
+                    return Err(CiError::Message(
+                        "Git operation failed; no ref mutation retried".into(),
+                    ));
+                }
+                let text = String::from_utf8(output.stdout)
+                    .map_err(|_| CiError::Message("Git returned non-UTF-8 protocol data".into()))?;
+                Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+            })
+            .into_result()
     }
 
     pub fn require_clean(&self) -> Result<()> {
-        if !self
-            .text(["status", "--porcelain=v1", "--untracked-files=no"])?
-            .is_empty()
-        {
-            return Err(CiError::Message("tracked checkout/index is dirty".into()));
-        }
-        Ok(())
+        crate::work_outcome::WorkOutcome::from_result(self.text([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ]))
+        .validate_after(|text| {
+            if !text.is_empty() {
+                return Err(CiError::Message("tracked checkout/index is dirty".into()));
+            }
+            Ok(())
+        })
+        .map(|_| ())
+        .into_result()
     }
 
     pub fn tags(&self) -> Result<Vec<(String, String)>> {
-        let bytes = self.text([
+        crate::work_outcome::WorkOutcome::from_result(self.text([
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
             "refs/tags/",
-        ])?;
-        bytes
-            .lines()
-            .map(|line| {
-                let (reference, object) = line
-                    .split_once('\t')
-                    .ok_or_else(|| CiError::Message("invalid Git ref inventory".into()))?;
-                super::source::validate_oid(object)?;
-                if !reference.starts_with("refs/tags/") {
-                    return Err(CiError::Message("invalid full tag ref".into()));
-                }
-                Ok((reference.into(), object.into()))
-            })
-            .collect()
+        ]))
+        .map_validated(|bytes| {
+            bytes
+                .lines()
+                .map(|line| {
+                    let (reference, object) = line
+                        .split_once('\t')
+                        .ok_or_else(|| CiError::Message("invalid Git ref inventory".into()))?;
+                    super::source::validate_oid(object)?;
+                    if !reference.starts_with("refs/tags/") {
+                        return Err(CiError::Message("invalid full tag ref".into()));
+                    }
+                    Ok((reference.into(), object.into()))
+                })
+                .collect()
+        })
+        .into_result()
     }
 
     pub fn tag(&self, full_ref: &str) -> Result<Tag> {
-        let (reference, object) = self
-            .tags()?
-            .into_iter()
-            .find(|(reference, _)| reference == full_ref)
-            .ok_or_else(|| CiError::Message("requested tag does not exist".into()))?;
-        let commit = self.text(["rev-list", "--max-count=1", reference.as_str(), "--"])?;
-        super::source::validate_oid(&commit)?;
-        if self.text(["cat-file", "-t", commit.as_str()])? != "commit" {
-            return Err(CiError::Message("tag does not select a commit".into()));
-        }
+        let (reference, object) = crate::work_outcome::WorkOutcome::from_result(self.tags())
+            .map_validated(|tags| {
+                tags.into_iter()
+                    .find(|(reference, _)| reference == full_ref)
+                    .ok_or_else(|| CiError::Message("requested tag does not exist".into()))
+            })
+            .into_result()?;
+        let commit = crate::work_outcome::WorkOutcome::from_result(self.text([
+            "rev-list",
+            "--max-count=1",
+            reference.as_str(),
+            "--",
+        ]))
+        .validate_after(|commit| super::source::validate_oid(commit))
+        .into_result()?;
+        crate::work_outcome::WorkOutcome::from_result(self.text([
+            "cat-file",
+            "-t",
+            commit.as_str(),
+        ]))
+        .validate_after(|kind| {
+            if kind != "commit" {
+                return Err(CiError::Message("tag does not select a commit".into()));
+            }
+            Ok(())
+        })
+        .into_result()?;
         Ok(Tag {
             full_ref: reference,
             object,

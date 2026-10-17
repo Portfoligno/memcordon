@@ -356,7 +356,11 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         .unwrap()
         .iter_mut()
         .find(|step| {
-            step["with"]["key"] == "${{ steps.compiled-quarter-one.outputs.cache-primary-key }}"
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+                && step["with"]["key"]
+                    == "${{ steps.compiled-context-quarter-one.outputs.product-key }}"
         })
         .unwrap()["with"]["path"] = "target/ci/reports".into();
     assert_ne!(&job, baseline);
@@ -426,7 +430,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         source_roles.insert(
             "cache-cargo-fuzz-downloads",
             (
-                "cache-cargo-fuzz",
+                "cache-cargo-fuzz-download-context",
                 memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz,
             ),
         );
@@ -545,6 +549,44 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         require(seen.insert(id))?;
         let key = step["with"]["key"].as_str().ok_or("restore key absent")?;
         let path = step["with"]["path"].as_str().ok_or("restore path absent")?;
+        if id.ends_with("-partial-restore") || id.ends_with("-partial-probe") {
+            let output = if id.ends_with("-partial-restore") {
+                "seed-lookup-key"
+            } else {
+                "snapshot-key"
+            };
+            let context = projected(key, output).ok_or("partial context projection absent")?;
+            let producer = steps[..ordinal]
+                .iter()
+                .find(|candidate| candidate["id"].as_str() == Some(&context))
+                .ok_or("partial producer absent")?;
+            let command = producer["run"]
+                .as_str()
+                .ok_or("partial producer command absent")?;
+            require(
+                command.contains("--kind compiled ")
+                    || command.contains("--kind tool-build --purpose cargo-fuzz --shard complete"),
+            )?;
+            require(
+                path == reference(
+                    &context,
+                    if output == "snapshot-key" {
+                        "snapshot-path"
+                    } else {
+                        "seed-import-path"
+                    },
+                ),
+            )?;
+            if output == "snapshot-key" {
+                require(step["with"]["lookup-only"].as_bool() == Some(true))?;
+            } else {
+                require(
+                    step["with"]["restore-keys"].as_str()
+                        == Some(&reference(&context, "seed-restore-prefix")),
+                )?;
+            }
+            continue;
+        }
         let extended = match id {
             "archive-seed-restore" => Some((
                 "archive-seed-context",
@@ -638,7 +680,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
             let command = if source_family
                 == memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz
             {
-                "./target/ci/release/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete".to_owned()
+                "./target/ci/release/memcordon-ci ci download-cache-context --family tool-cargo-fuzz".to_owned()
             } else {
                 format!(
                     "./target/ci/release/memcordon-ci ci download-cache-context --family {}",
@@ -710,7 +752,8 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
                 save["uses"]
                     .as_str()
                     .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-                    && save["with"]["key"].as_str() == Some(&reference(id, "cache-primary-key"))
+                    && (save["with"]["key"].as_str() == Some(&reference(id, "cache-primary-key"))
+                        || save["with"]["key"].as_str() == Some(key))
             })
             .collect();
         require(if source_role.is_some() {

@@ -37,6 +37,7 @@ fn timeout_distinguishes_an_exited_child_from_a_pending_callback() {
     assert!(cleanup.is_ok(), "{cleanup:?}");
     assert!(observation.observed_status.unwrap().success());
     assert!(!observation.callback_completed);
+    assert!(!observation.settlement_complete);
     assert!(observation.child_id > 0);
     assert!(observation.spawn_returned <= observation.boundary_admitted);
     assert!(observation.boundary_admitted <= observation.timeout_observed);
@@ -59,6 +60,7 @@ fn timeout_does_not_report_the_cleanup_exit_as_an_observed_exit() {
     assert!(cleanup.is_ok(), "{cleanup:?}");
     assert!(observation.observed_status.is_none());
     assert!(observation.callback_completed);
+    assert!(observation.settlement_complete);
 }
 
 #[test]

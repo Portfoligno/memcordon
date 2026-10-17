@@ -119,6 +119,7 @@ fn build_context(root: &Path, family: DownloadFamily, deadline: Instant) -> Resu
         }
     }
     let reader = rustup_cargo(&cwd, &toolchain, ["-V"], Duration::from_secs(30))
+        .bootstrap_environment()
         .bounded_until(deadline)
         .defer_group_failure()
         .output_quiet()?;
@@ -194,24 +195,36 @@ fn build_context(root: &Path, family: DownloadFamily, deadline: Instant) -> Resu
     })
 }
 
-pub fn context(root: &Path, family: DownloadFamily) -> OptionalCache {
+pub fn context(root: &Path, family: DownloadFamily) -> Result<OptionalCache> {
     context_until(root, family, Instant::now() + Duration::from_secs(30))
 }
 
-pub fn context_until(root: &Path, family: DownloadFamily, deadline: Instant) -> OptionalCache {
-    match build_context(root, family, deadline) {
-        Ok(entry) => OptionalCache::Available { entry },
+pub fn context_until(
+    root: &Path,
+    family: DownloadFamily,
+    deadline: Instant,
+) -> Result<OptionalCache> {
+    optional_context_result(family, build_context(root, family, deadline))
+}
+
+pub(crate) fn optional_context_result(
+    family: DownloadFamily,
+    result: Result<CacheEntry>,
+) -> Result<OptionalCache> {
+    match result {
+        Ok(entry) => Ok(OptionalCache::Available { entry }),
+        Err(error) if crate::work_outcome::has_unresolved_owner(&error) => Err(error),
         Err(error) => {
             eprintln!("download family {} unavailable: {error}", family.name());
-            OptionalCache::Unavailable {
+            Ok(OptionalCache::Unavailable {
                 reason: "unmodeled acquisition inputs or Cargo home".into(),
-            }
+            })
         }
     }
 }
 
 pub fn emit(root: &Path, family: DownloadFamily) -> Result<()> {
-    let entry = context(root, family);
+    let entry = context(root, family)?;
     let available = match &entry {
         OptionalCache::Available { entry } => Some(entry),
         _ => None,
@@ -329,6 +342,14 @@ pub fn flush() -> Result<()> {
     crate::workflow_output::write(&outputs)
 }
 
+pub fn populated_key(family: DownloadFamily) -> Option<String> {
+    POPULATED
+        .lock()
+        .expect("population mutex poisoned")
+        .get(&family)
+        .cloned()
+}
+
 pub fn fetch_until(
     root: &Path,
     family: DownloadFamily,
@@ -340,7 +361,7 @@ pub fn fetch_until(
             "tool downloads require actual installation".into(),
         ));
     }
-    let before = context_until(root, family, deadline);
+    let before = context_until(root, family, deadline)?;
     let (cwd, toolchain) = selected(root, family)?;
     let command = rustup_cargo(
         &cwd,
@@ -362,6 +383,6 @@ pub fn fetch_until(
     } else {
         command.run()?;
     }
-    record(family, &before, &context_until(root, family, deadline));
+    record(family, &before, &context_until(root, family, deadline)?);
     Ok(())
 }

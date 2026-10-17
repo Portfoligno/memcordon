@@ -102,12 +102,24 @@ fn nested_cargo_arguments_cannot_exceed_the_parent_lane_allocation() {
             complete_lanes(
                 Layout::Parallel,
                 || {
-                    for jobs in [
-                        vec!["--jobs", "99"],
-                        vec!["--jobs=99"],
-                        vec!["-j99"],
-                        vec![],
-                    ] {
+                    for jobs in [vec!["--jobs", "99"], vec!["--jobs=99"], vec!["-j99"]] {
+                        let command = memcordon_ci::command::rustup_cargo(
+                            std::path::Path::new("."),
+                            "stable",
+                            ["check"],
+                            Duration::from_secs(20),
+                        )
+                        .args(jobs)
+                        .materialize();
+                        assert!(
+                            command
+                                .unwrap_err()
+                                .to_string()
+                                .contains("exceeds inherited compiler budget")
+                        );
+                    }
+                    for jobs in [vec![], vec!["--jobs", "1"], vec!["-j1"]] {
+                        let explicit = !jobs.is_empty();
                         let command = memcordon_ci::command::rustup_cargo(
                             std::path::Path::new("."),
                             "stable",
@@ -123,7 +135,7 @@ fn nested_cargo_arguments_cannot_exceed_the_parent_lane_allocation() {
                             .unwrap();
                         assert_eq!(
                             arguments[position + 1],
-                            std::ffi::OsStr::new(&inherited.to_string())
+                            std::ffi::OsStr::new(&if explicit { 1 } else { inherited }.to_string())
                         );
                     }
                     let fuzz = CommandSpec::toolchain_program(
@@ -186,10 +198,21 @@ fn later_collect_all_pair_selects_its_own_first_observed_failure() {
                 },
             )
             .unwrap_err();
-            let CiError::LaneFailures { primary, .. } = error else {
+            let CiError::OwnedWork {
+                source, writers, ..
+            } = error
+            else {
+                panic!("joined failure must retain writer ownership");
+            };
+            assert_eq!(
+                writers,
+                memcordon_ci::work_outcome::WriterSettlement::Unknown
+            );
+            let CiError::LaneFailures { primary, secondary } = *source else {
                 panic!("both required errors retained");
             };
             assert!(primary.to_string().contains("first observed second lane"));
+            assert!(secondary.to_string().contains("slower first lane"));
             Ok(())
         },
     )
@@ -348,7 +371,17 @@ fn second_failure_remains_primary_after_admitted_first_owner_settles() {
     .unwrap_err();
     // The sole real failure has an exact primary cause; collect-all above
     // separately retains both real errors without scheduler-order assumptions.
-    assert!(matches!(error, CiError::Message(cause) if cause == "fast second failure"));
+    let CiError::OwnedWork {
+        source, writers, ..
+    } = error
+    else {
+        panic!("failed lane must retain writer ownership");
+    };
+    assert_eq!(
+        writers,
+        memcordon_ci::work_outcome::WriterSettlement::Unknown
+    );
+    assert!(matches!(*source, CiError::Message(cause) if cause == "fast second failure"));
     assert!(settled.load(std::sync::atomic::Ordering::SeqCst));
 }
 

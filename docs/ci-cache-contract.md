@@ -17,6 +17,31 @@ Population outputs belong to the current process and remain separate from writer
 settlement. A source save rechecks its acquisition identity and retains its
 original requested key, exact-hit exclusion and trusted-event guards.
 
+Retention is independent of the job's aggregate success. Bootstrap seeds save
+after the driver build and its home-only check; complete workspace downloads
+save after the locked fetch. Release compilation retention precedes readiness
+and uploads. Required tests, cleanup, rehearsal and publication still fail on
+their actual errors. A save-action conclusion proves an attempt, not durable
+storage: a later real restore is required to establish service retention.
+
+Completed compilation entries require the selected producer's completion fact.
+A later assertion failure preserves that fact only if no subsequent compilation
+mutated the same scope. A failed or incomplete compiler recipe uses a content-keyed
+partial seed. Every started writer must settle; only a declared skipped step
+counts as never started. Empty outputs and cancellation never prove settlement.
+The native owner reports settlement before semantic error formatting, retaining
+timeout, output-cap, callback, reader and logger failures independently. Population,
+settlement and completion outputs are attempted separately without replacing the
+first work failure. Miri setup readiness remains distinct from writer settlement.
+
+Revision 7 extends partial snapshots to the finite existing default compilation
+layouts, Miri target outputs, and each pinned tool's build root. It excludes Miri
+sysroots and installed tool images. Earlier unchanged explicit partition snapshots
+retain their revision 6 namespace. Imports validate the selected index, every
+member and Cargo markers before ordinary work; restored bytes never skip that
+work. Tool download contexts use the source-only family API independently of
+compiler/SDK probing, while binary and build caches retain native identities.
+
 Auxiliary compilation transports `target/debug`, `target/release` and the genuine
 `target/CACHEDIR.TAG`, using layout revision 5 for both exact and compatible
 identities. Only the two profile directories may be discarded. Before native
@@ -75,3 +100,43 @@ target/toolchain tuples, never restored readiness files or environment switches.
 The corresponding ignored native regressions document their explicit commands.
 Existing readiness/public/capture workflow consumers remain ephemeral; the
 current workflow inventory contains no eligible ordinary consumer caller.
+# Rust workflow authoring and cache transport
+
+The source of the four checked-in workflow adapters is
+`tools/memcordon-ci/src/workflow_definitions/`. Run
+`memcordon-ci ci workflows --write` after editing; `--check` compares exact UTF-8
+LF output. Fixed literal native invocations include explicit Windows executable
+names. GitHub retains scheduling, event and credential boundaries, pinned action
+transport and actual dependency results.
+
+`ci cache-requests <recipe>`, `ci segment <recipe>` and
+`ci cleanup-transfers <recipe>` select finite source-controlled recipes. Requests
+contain cache identities and bounded paths. Settlement and compilation facts
+come from current native owners; they cannot be restored from a request or
+manifest. Save actions consume only the corresponding producer's validated
+`*-save`, `*-key` and `*-path` outputs and use explicit `always()` guards.
+Completed and partial compiler transfers stay distinct, with a new envelope
+namespace and safe inbox validation before any live-root import. Unsafe paths or
+unresolved ownership remain failures. Optional malformed cache data can be
+discarded for a clean build.
+
+Acquisition and compilation checkpoints remain before later test, readiness and
+required upload failures. Finalizers attempt independent outputs before returning
+the primary work error. Compiler/execution segments do not duplicate the earlier
+source-family checkpoint; tool preparation retains its own actual source family.
+Execution after a compile checkpoint does not reimport an older compilation
+inbox over newly compiled work.
+
+The driver has separate cold/build/runtime/inbox/transfer roots. Its executable
+cache rollout is disabled by default in `ci/driver-bootstrap.toml` until each
+native host has passed real cold/warm acceptance. Cold source compilation remains
+the fallback; a failed first cold compilation cannot fabricate native settlement
+or a ready image. Executable cache data is ordinary trusted-scope cache material,
+not authentication or source approval. Credential-bearing publishers and actual
+rehearsal do not execute cached bootstrap/current images.
+
+Portable structural and mutation tests do not demonstrate hosted cache storage,
+Windows rename/share behavior, Linux/macOS cold/warm native operation, or measured
+transfer/build performance. Those outcomes require their actual native/service
+acceptance. Report cache eligibility, an attempted transfer and verified later
+retrieval separately.

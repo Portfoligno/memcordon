@@ -39,20 +39,21 @@ fn rehearsal_helper_rejects_missing_assembly_and_candidate_output() {
         .as_mapping_mut()
         .unwrap()
         .remove(Value::String("assemble".into()));
-    let error = validate(RELEASE, &missing_job).unwrap_err();
-    assert!(error.to_string().contains("assembly absent"), "{error}");
+    assert!(missing_job["jobs"]["assemble"].is_null());
+    assert!(
+        validate(RELEASE, &missing_job).is_err(),
+        "missing required assembly must be rejected before any legacy projection"
+    );
 
     let mut missing_output = fixture(RELEASE);
     missing_output["jobs"]["assemble"]["outputs"]
         .as_mapping_mut()
         .unwrap()
         .remove(Value::String("candidate-artifact-id".into()));
-    let error = validate(RELEASE, &missing_output).unwrap_err();
+    assert!(missing_output["jobs"]["assemble"]["outputs"]["candidate-artifact-id"].is_null());
     assert!(
-        error
-            .to_string()
-            .contains("assembly must expose the existing candidate artifact ID"),
-        "{error}"
+        validate(RELEASE, &missing_output).is_err(),
+        "missing candidate artifact route must be rejected"
     );
 }
 
@@ -82,17 +83,16 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         assert!(validate(RELEASE, &changed).is_err(), "changed {field}");
     }
     for (job, suite) in [
-        ("source-checks", "quality-compile"),
+        ("source-checks", "release-quality-compiler"),
+        ("source-docs", "quality-documentation"),
         ("msrv", "msrv"),
-        ("supply-chain", "supply-chain"),
+        ("supply-chain-audit", "supply-audit-prepare"),
+        ("supply-chain-audit", "supply-audit-check"),
+        ("supply-chain-deny", "supply-deny-prepare"),
+        ("supply-chain-deny", "supply-deny-check"),
     ] {
         let mut changed = exact.clone();
-        let command = [
-            "./.release/tool/memcordon-ci suite",
-            suite,
-            "--failure-mode stop-after-failure",
-        ]
-        .join(" ");
+        let command = ["./.release/tool/memcordon-ci ci segment", suite].join(" ");
         let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
         let index = steps
             .iter()
@@ -126,7 +126,11 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         );
         let mut changed = exact.clone();
         let steps = changed["jobs"][family]["steps"].as_sequence_mut().unwrap();
-        steps.retain(|step| step["id"].as_str() != Some("quarter-two"));
+        steps.retain(|step| {
+            !step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains(" ci segment ") && run.contains("quarter-two"))
+        });
         assert!(
             validate(RELEASE, &changed).is_err(),
             "removed {family} quarter-two execution"
@@ -189,7 +193,8 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
                 "release-suite" => steps
                     .iter_mut()
                     .find(|step| {
-                        step["run"] == "./target/ci/release/memcordon-ci suite native-execute"
+                        step["run"]
+                            == "./target/ci-runtime/current/memcordon-ci ci segment native-execute"
                     })
                     .unwrap(),
                 "head-checkout" => steps
@@ -202,7 +207,11 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
                     .unwrap(),
                 "generic-cache" => steps
                     .iter_mut()
-                    .find(|step| step["id"] == "compiled-context")
+                    .find(|step| {
+                        step["run"]
+                            .as_str()
+                            .is_some_and(|run| run.contains(" ci cache-requests native-compile"))
+                    })
                     .unwrap(),
                 _ => unreachable!(),
             };
@@ -314,7 +323,7 @@ fn release_native_cache_and_phase_retention_cannot_fall_back_to_old_wrapper() {
             .as_sequence_mut()
             .unwrap();
         match mutation {
-            "generic-cache" => steps.iter_mut().find(|step| step["id"] == "cache").unwrap()["run"] = Value::String("./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete".into()),
+            "generic-cache" => steps.iter_mut().find(|step| step["run"].as_str().is_some_and(|run|run.ends_with(" ci cache-requests release-readiness"))).expect("actual native readiness cache producer")["run"] = Value::String("./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete".into()),
             "ignore-owner-failure" => steps.iter_mut().find(|step| step["id"] == "build").unwrap()["continue-on-error"] = Value::Bool(true),
             _ => {
                 let diagnostic = steps.iter_mut().find(|step| step["name"] == "Retain bounded preparation diagnostics").unwrap();
@@ -331,8 +340,14 @@ fn actual_release_native_owner_still_executes_optimized_tests_and_complete_backe
     let source = include_str!("../src/release/target.rs");
     assert!(source.contains("crate::native_test_plan::commands_with_failure(true, failure_mode)"));
     assert!(source.contains(".bounded_until(operation_deadline)"));
-    assert!(source.contains("crate::preparation::complete_lanes_with_allocation("));
-    assert!(source.contains("for phase in phases"));
+    assert!(source.contains("crate::preparation::complete_owned_pair("));
+    assert!(
+        source
+            .contains("compile_native_pair(root, selected, distribution, prepared).into_result()?")
+    );
+    assert!(source.contains(
+        "for phase in crate::native_test_plan::commands_with_failure(true, failure_mode)"
+    ));
     for backend in [
         "backend-linux-cgroup",
         "backend-windows-job",
@@ -360,7 +375,7 @@ fn actual_release_native_owner_still_executes_optimized_tests_and_complete_backe
 fn optional_private_linux_preserves_installed_channels_and_extra_native_cases() {
     let source = include_str!("../src/release/linux_installed_consumer.rs");
     let working = source
-        .split_once("pub fn run_working(")
+        .split_once("fn working_distribution(")
         .unwrap()
         .1
         .split_once("fn compile_native_cases(")
@@ -379,6 +394,9 @@ fn optional_private_linux_preserves_installed_channels_and_extra_native_cases() 
         "target::build_selected(root, &source, &distribution, &target_directory)?",
         "super::installed_consumer::run(",
         "run_native_observer_cases(root, &destination.join(\"native-observer\"))?",
+        "prepare_working(root, destination)?",
+        "run_prepared(root, destination, destination)",
+        "bundle.source != source || bundle.distribution != distribution",
     ] {
         assert!(
             working.contains(required),

@@ -9,10 +9,12 @@ pub mod cache_restore;
 pub mod cache_snapshot;
 pub mod caller_observation;
 pub mod capability;
+pub mod ci_operation_time;
 pub mod command;
 pub mod config;
 pub mod consumer_readiness_ledger;
 pub mod download_cache;
+pub mod driver_cache;
 pub mod failure_mode;
 pub mod fuzz_targets;
 pub mod line_evidence;
@@ -25,6 +27,7 @@ pub mod native_results;
 pub mod native_test_plan;
 pub mod policy;
 pub mod preparation;
+pub mod preparation_tools;
 pub mod public_install_capture;
 pub mod public_reads;
 pub mod rehearsal_support;
@@ -35,6 +38,7 @@ pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 pub mod sealed_selector;
+pub mod segment_cache;
 pub mod standard_contract;
 pub mod standard_runner;
 pub mod stress;
@@ -65,6 +69,9 @@ pub mod windows_readiness_native_tests;
 pub mod windows_readiness_refusals;
 #[cfg(windows)]
 mod windows_receipt_identity;
+#[doc(hidden)]
+pub mod work_outcome;
+pub mod workflow_definitions;
 pub mod workflow_output;
 pub mod workflow_scope;
 
@@ -72,6 +79,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CiError {
+    #[error("{0}")]
+    CacheSafety(Box<CiError>),
+    #[error("{source}")]
+    OwnedWork {
+        source: Box<CiError>,
+        writers: work_outcome::WriterSettlement,
+        facts: work_outcome::CompilationFacts,
+    },
     #[error("{0}")]
     Message(String),
     #[error("subprocess cancelled by peer: {0}")]

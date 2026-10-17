@@ -70,3 +70,30 @@ PR/merge-group checks and skipped duplicate jobs. Their settings are a maintaine
 operation and are not changed by workflow edits. Confirm the enabled Release
 candidate path and representative event outcomes before relying on suppression;
 see RELEASING.md for migration, measurement and rollback guidance.
+
+Required-status consumers must represent compiler/Clippy and documentation
+separately: ordinary CI uses `quality` and `quality-docs`; Release uses
+`source-checks` and `source-docs`. Each workflow replaces combined security with
+`supply-chain-audit` and `supply-chain-deny`. Both security checks remain required
+where the former combined job was required. Release assembly requires every
+actual leaf; a skipped check or retained cache is not completed validation.
+The exact display labels and event mapping are listed in RELEASING.md. Workflow
+edits do not change protected-branch settings or inspect administrative state.
+
+First-failure notices precede bounded owner retirement and optional retention.
+They distinguish detection from final step completion; actual failures remain
+nonzero. Stop-after-failure still governs work inside an operation, while
+cache-producing matrices retain independent peer runners with `fail-fast: false`.
+Complete compiler output and settled partial work have independent immutable
+transfer slots. A failed save cannot suppress another eligible slot, and an
+action conclusion is not proof of stored bytes or later reuse.
+
+The native compile checkpoint and subsequent execution share the original
+140/155-minute operation/cleanup intervals across Actions boundaries. Job-local
+source/target/job/boot timing inputs cannot be cached or renewed on resume.
+The standalone macOS native and acceptance callbacks run on separate selected
+runners; the shared-host Release callback remains sequential. Existing Miri
+quarters, stress iterations, runtime scenarios and rehearsal requirements stay
+required. Native ownership/timing acceptance and cache-service round trips must
+be reported only when actually executed; portable or source-level results do
+not establish cross-platform support or a measured speedup.

@@ -4,6 +4,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[test]
+fn nested_reads_stay_on_the_callback_thread_and_keep_the_original_cutoff() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let values = map_public_reads_ordered(
+        &[0, 1, 2, 3],
+        NonZeroUsize::new(4).unwrap(),
+        deadline,
+        |_, value, cutoff| {
+            let owner = std::thread::current().id();
+            map_public_reads_ordered(
+                &[0, 1, 2, 3],
+                NonZeroUsize::new(4).unwrap(),
+                cutoff + Duration::from_secs(300),
+                |_, inner, inherited| {
+                    assert_eq!(owner, std::thread::current().id());
+                    assert_eq!(deadline, inherited);
+                    Ok(value + inner)
+                },
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(values[3], [3, 4, 5, 6]);
+}
+
+#[test]
 fn preserves_input_order_and_caps_workers_even_when_requested_limit_is_larger() {
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
@@ -28,7 +53,7 @@ fn preserves_input_order_and_caps_workers_even_when_requested_limit_is_larger() 
 }
 
 #[test]
-fn joins_all_workers_and_returns_first_input_order_failure_including_panics() {
+fn joins_all_workers_and_returns_first_input_order_failure() {
     let completed = AtomicUsize::new(0);
     let error = map_public_reads_ordered(
         &[0, 1, 2, 3, 4],
@@ -38,7 +63,7 @@ fn joins_all_workers_and_returns_first_input_order_failure_including_panics() {
             completed.fetch_add(1, Ordering::SeqCst);
             match input {
                 0 => Err(CiError::Message("first".into())),
-                1 => panic!("worker panic"),
+                1 => Err(CiError::Message("second".into())),
                 _ => Ok(()),
             }
         },
@@ -46,6 +71,59 @@ fn joins_all_workers_and_returns_first_input_order_failure_including_panics() {
     .unwrap_err();
     assert_eq!(error.to_string(), "first");
     assert_eq!(completed.load(Ordering::SeqCst), 5);
+}
+
+#[test]
+fn a_panicked_callback_closes_even_collect_all_read_admission() {
+    let completed = AtomicUsize::new(0);
+    let error = map_public_reads_ordered(
+        &[0, 1, 2],
+        NonZeroUsize::new(1).unwrap(),
+        Instant::now() + Duration::from_secs(10),
+        |_, _, _| -> memcordon_ci::Result<()> {
+            completed.fetch_add(1, Ordering::SeqCst);
+            panic!("unknown callback ownership")
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("panicked"));
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn nested_stop_retains_the_actual_failure_and_collect_all_retains_secondaries() {
+    use memcordon_ci::{failure_mode::FailureMode, public_reads::map_public_reads_with_failure};
+    for mode in [FailureMode::StopAfterFailure, FailureMode::CollectAll] {
+        let error = map_public_reads_with_failure(
+            &[0],
+            NonZeroUsize::new(1).unwrap(),
+            Instant::now() + Duration::from_secs(10),
+            mode,
+            |_, _, cutoff| {
+                map_public_reads_with_failure(
+                    &[0, 1],
+                    NonZeroUsize::new(4).unwrap(),
+                    cutoff,
+                    mode,
+                    |ordinal, _, _| {
+                        Err::<(), _>(CiError::Message(
+                            if ordinal == 0 {
+                                "actual nested failure"
+                            } else {
+                                "nested secondary"
+                            }
+                            .into(),
+                        ))
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("actual nested failure"));
+        if mode == FailureMode::CollectAll {
+            assert!(error.to_string().contains("nested secondary"));
+        }
+    }
 }
 
 #[test]

@@ -13,6 +13,13 @@ use crate::{CiError, Result, Suite, policy};
 const CARGO_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
+/// Only synchronous postconditions of already returned owners belong here.
+fn settled_validation<T>(validation: impl FnOnce() -> Result<T>) -> Result<T> {
+    memcordon_ci::work_outcome::WorkOutcome::from_result(Ok(()))
+        .map_validated(|_| validation())
+        .into_result()
+}
+
 #[cfg(test)]
 #[path = "../tests/private/suite_failure_loops.rs"]
 mod suite_failure_loops;
@@ -126,19 +133,43 @@ fn quality_compile_until(
     mode: crate::failure_mode::FailureMode,
     deadline: Instant,
 ) -> Result<()> {
+    quality_compile_selected(root, stable, mode, deadline, None)
+}
+
+fn quality_compile_selected(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+    deadline: Instant,
+    documentation: Option<bool>,
+) -> Result<()> {
+    quality_compile_owned(root, stable, mode, deadline, documentation)?.into_result()
+}
+
+fn quality_compile_owned(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+    deadline: Instant,
+    documentation: Option<bool>,
+) -> Result<crate::preparation::PairOutcome<(), ()>> {
     let layout = crate::performance_plan::PerformancePlan::read(root)?
         .quality
         .selected;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4);
-    let layout = if workers == 1 {
+    let workers = crate::preparation::compiler_budget();
+    let layout = if workers == 1 || documentation.is_some() {
         crate::performance_plan::Layout::Serial
     } else {
         layout
     };
-    let compiler_jobs = (workers / 2).max(1).to_string();
-    let doc_jobs = (workers - workers / 2).max(1).to_string();
+    let allocation = crate::preparation::allocate_pair(
+        std::num::NonZeroUsize::new(workers).expect("positive budget"),
+        layout == crate::performance_plan::Layout::Parallel,
+        crate::preparation::active_group().is_some_and(|group| group.inside_parallel_lane()),
+        crate::preparation::PairClass::Balanced,
+    );
+    let compiler_jobs = allocation.second.get().to_string();
+    let doc_jobs = allocation.first.get().to_string();
     let reports = root.join("target/ci/reports/quality");
     fs::create_dir_all(&reports)?;
     let reports = tempfile::Builder::new()
@@ -150,90 +181,168 @@ fn quality_compile_until(
     fs::create_dir(&first)?;
     fs::create_dir(&second)?;
     let packages = config::policy(root)?.workspace.publish_packages;
-    crate::preparation::complete_lanes_with_allocation(
+    Ok(crate::preparation::complete_owned_pair(
         layout,
-        mode,
-        [(workers - workers / 2).max(1), (workers / 2).max(1)],
+        [allocation.first.get(), allocation.second.get()],
         || {
-            let mut failures = None;
-            for package in packages {
-                let outcome = crate::preparation::observed(
-                    rustup_cargo(
-                        root,
-                        stable,
-                        [
-                            "rustdoc",
-                            "--jobs",
-                            &doc_jobs,
-                            "--target-dir",
-                            "target/ci/quality-doc",
-                            "--package",
+            owned_compilation(
+                "compiled-documentation-complete",
+                documentation != Some(false),
+                || {
+                    let mut failures = None;
+                    for package in packages {
+                        let outcome = crate::preparation::observed(
+                            rustup_cargo(
+                                root,
+                                stable,
+                                [
+                                    "rustdoc",
+                                    "--jobs",
+                                    &doc_jobs,
+                                    "--target-dir",
+                                    "target/ci/quality-doc",
+                                    "--package",
+                                    &package,
+                                    "--lib",
+                                    "--all-features",
+                                    "--locked",
+                                    "--",
+                                    "-D",
+                                    "warnings",
+                                ],
+                                crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                            )
+                            .bounded_until(deadline),
+                            &first,
                             &package,
-                            "--lib",
-                            "--all-features",
-                            "--locked",
-                            "--",
-                            "-D",
-                            "warnings",
-                        ],
-                        crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                    )
-                    .bounded_until(deadline),
-                    &first,
-                    &package,
-                );
-                retain_failure(&mut failures, outcome, mode)?;
-            }
-            failures.map_or(Ok(()), Err)
+                        );
+                        retain_failure(&mut failures, outcome, mode)?;
+                    }
+                    failures.map_or(Ok(()), Err)
+                },
+            )
         },
         || {
-            crate::preparation::observed(
-                rustup_cargo(
-                    root,
-                    stable,
-                    [
+            owned_compilation(
+                "compiled-compiler-complete",
+                documentation != Some(true),
+                || {
+                    crate::preparation::observed(
+                        rustup_cargo(
+                            root,
+                            stable,
+                            [
+                                "check",
+                                "--jobs",
+                                &compiler_jobs,
+                                "--target-dir",
+                                "target/ci/quality",
+                                "--workspace",
+                                "--all-targets",
+                                "--all-features",
+                                "--locked",
+                            ],
+                            crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                        )
+                        .bounded_until(deadline),
+                        &second,
                         "check",
-                        "--jobs",
-                        &compiler_jobs,
-                        "--target-dir",
-                        "target/ci/quality",
-                        "--workspace",
-                        "--all-targets",
-                        "--all-features",
-                        "--locked",
-                    ],
-                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                )
-                .bounded_until(deadline),
-                &second,
-                "check",
-            )?;
-            crate::preparation::observed(
-                rustup_cargo(
-                    root,
-                    stable,
-                    [
+                    )?;
+                    crate::preparation::observed(
+                        rustup_cargo(
+                            root,
+                            stable,
+                            [
+                                "clippy",
+                                "--jobs",
+                                &compiler_jobs,
+                                "--target-dir",
+                                "target/ci/quality",
+                                "--workspace",
+                                "--all-targets",
+                                "--all-features",
+                                "--locked",
+                                "--",
+                                "-D",
+                                "warnings",
+                            ],
+                            crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
+                        )
+                        .bounded_until(deadline),
+                        &second,
                         "clippy",
-                        "--jobs",
-                        &compiler_jobs,
-                        "--target-dir",
-                        "target/ci/quality",
-                        "--workspace",
-                        "--all-targets",
-                        "--all-features",
-                        "--locked",
-                        "--",
-                        "-D",
-                        "warnings",
-                    ],
-                    crate::preparation::remaining(deadline, CARGO_DEADLINE)?,
-                )
-                .bounded_until(deadline),
-                &second,
-                "clippy",
-            )?;
-            Ok(())
+                    )?;
+                    Ok(())
+                },
+            )
         },
+    ))
+}
+
+fn owned_compilation(
+    fact: &'static str,
+    enabled: bool,
+    operation: impl FnOnce() -> Result<()>,
+) -> memcordon_ci::work_outcome::WorkOutcome<()> {
+    if !enabled {
+        return memcordon_ci::work_outcome::WorkOutcome::not_started(());
+    }
+    let outcome = memcordon_ci::work_outcome::WorkOutcome::not_started(())
+        .postcondition(memcordon_ci::workflow_output::revoke_compilation(fact))
+        .then_owned(|()| memcordon_ci::work_outcome::WorkOutcome::from_result(operation()));
+    if outcome.is_ok() {
+        outcome.postcondition(memcordon_ci::workflow_output::compilation_complete(fact))
+    } else {
+        outcome
+    }
+}
+
+pub(crate) fn quality_pair(
+    root: &Path,
+    mode: crate::failure_mode::FailureMode,
+    prechecks: bool,
+) -> Result<crate::preparation::PairOutcome<(), ()>> {
+    let stable = config::toolchains(root)?.stable;
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    crate::preparation::with_operation(mode, deadline, || {
+        if prechecks {
+            for args in [
+                vec!["fmt", "--all", "--", "--check"],
+                vec!["metadata", "--locked", "--format-version", "1"],
+            ] {
+                rustup_cargo(root, &stable, args, CARGO_DEADLINE)
+                    .bounded_until(deadline)
+                    .run()?;
+            }
+        }
+        quality_compile_owned(root, &stable, mode, deadline, None)
+    })
+}
+
+fn quality_leaf(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+    suite: Suite,
+) -> Result<()> {
+    memcordon_ci::workflow_output::revoke_compilation("compiled-recipe-complete")?;
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    if matches!(suite, Suite::QualityCompiler) {
+        for args in [
+            vec!["fmt", "--all", "--", "--check"],
+            vec!["metadata", "--locked", "--format-version", "1"],
+        ] {
+            rustup_cargo(root, stable, args, CARGO_DEADLINE)
+                .bounded_until(deadline)
+                .run()?;
+        }
+    }
+    quality_compile_selected(
+        root,
+        stable,
+        mode,
+        deadline,
+        Some(matches!(suite, Suite::QualityDocumentation)),
     )
 }
 
@@ -322,7 +431,9 @@ fn native(
     mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
     for command in memcordon_ci::native_test_plan::commands_with_failure(release_mode, mode) {
+        memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
         cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+        memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
     }
     Ok(())
 }
@@ -337,7 +448,10 @@ fn native_phase(
         .into_iter()
         .nth(if compile { 0 } else { 1 })
         .expect("native compile/execute plan");
-    cargo_with_deadline(root, stable, "test", command.arguments, command.deadline).map(|_| ())
+    memcordon_ci::workflow_output::revoke_compilation("compiled-native-complete")?;
+    cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
+    memcordon_ci::workflow_output::compilation_complete("compiled-native-complete")?;
+    Ok(())
 }
 
 fn install_tool(root: &Path, stable: &str, name: &str, version: &str) -> Result<()> {
@@ -363,15 +477,33 @@ fn install_tool_until(
         version,
         stable,
         deadline,
-        std::num::NonZeroUsize::new(1).unwrap(),
+        std::num::NonZeroUsize::new(crate::preparation::compiler_budget())
+            .expect("positive budget"),
     )?;
     Ok(())
 }
 
 fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMode) -> Result<()> {
+    supply_pair_with_stable(root, stable, mode)?.into_result()
+}
+
+pub(crate) fn supply_pair(
+    root: &Path,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<crate::preparation::PairOutcome<(), ()>> {
+    crate::preparation::with_operation(mode, Instant::now() + Duration::from_secs(60 * 60), || {
+        supply_pair_with_stable(root, &config::toolchains(root)?.stable, mode)
+    })
+}
+
+fn supply_pair_with_stable(
+    root: &Path,
+    stable: &str,
+    mode: crate::failure_mode::FailureMode,
+) -> Result<crate::preparation::PairOutcome<(), ()>> {
     let deadline = Instant::now() + Duration::from_secs(60 * 60);
     let lockfile = root.join("Cargo.lock");
-    let lock_before = fs::read(&lockfile)?;
+    let lock_before = supply_input_bytes(&lockfile, 16 * 1024 * 1024)?;
     let tools = config::tools(root)?;
     // Toolchain mutation finishes before either Cargo/tool lane starts.
     CommandSpec::new("rustup", root, Duration::from_secs(900))
@@ -388,46 +520,53 @@ fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMod
         .expect("deny command")
         .bounded_until(deadline);
     assert!(commands.next().is_none(), "exact supply command inventory");
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |count| count.get())
-        .clamp(1, 4);
+    let workers = crate::preparation::compiler_budget();
     let layout = if workers == 1 {
         crate::performance_plan::Layout::Serial
     } else {
         crate::performance_plan::Layout::Parallel
     };
-    let audit_jobs = std::num::NonZeroUsize::new(workers.div_ceil(2)).unwrap();
-    let deny_jobs = std::num::NonZeroUsize::new((workers / 2).max(1)).unwrap();
-    let checks = crate::preparation::with_operation(mode, deadline, || {
-        crate::preparation::complete_lanes_with_allocation(
+    let allocation = crate::preparation::allocate_pair(
+        std::num::NonZeroUsize::new(workers).expect("positive budget"),
+        layout == crate::performance_plan::Layout::Parallel,
+        crate::preparation::active_group().is_some_and(|group| group.inside_parallel_lane()),
+        crate::preparation::PairClass::Balanced,
+    );
+    let audit_jobs = allocation.first;
+    let deny_jobs = allocation.second;
+    let mut checks = crate::preparation::with_operation(mode, deadline, || {
+        Ok(crate::preparation::complete_owned_pair(
             layout,
-            mode,
             [audit_jobs.get(), deny_jobs.get()],
             || {
-                crate::preparation::ensure_one_auxiliary_until(
-                    root,
-                    "cargo-audit",
-                    &tools.cargo_audit,
-                    stable,
-                    deadline,
-                    audit_jobs,
-                )?;
-                audit.run().map(|_| ())
+                memcordon_ci::work_outcome::WorkOutcome::from_result((|| {
+                    crate::preparation::ensure_one_auxiliary_until(
+                        root,
+                        "cargo-audit",
+                        &tools.cargo_audit,
+                        stable,
+                        deadline,
+                        audit_jobs,
+                    )?;
+                    audit.run().map(|_| ())
+                })())
             },
             || {
-                crate::preparation::ensure_one_auxiliary_until(
-                    root,
-                    "cargo-deny",
-                    &tools.cargo_deny,
-                    stable,
-                    deadline,
-                    deny_jobs,
-                )?;
-                deny.run().map(|_| ())
+                memcordon_ci::work_outcome::WorkOutcome::from_result((|| {
+                    crate::preparation::ensure_one_auxiliary_until(
+                        root,
+                        "cargo-deny",
+                        &tools.cargo_deny,
+                        stable,
+                        deadline,
+                        deny_jobs,
+                    )?;
+                    deny.run().map(|_| ())
+                })())
             },
-        )
-    });
-    let lock_check = fs::read(lockfile).map_err(CiError::from).and_then(|after| {
+        ))
+    })?;
+    let lock_check = supply_input_bytes(&lockfile, 16 * 1024 * 1024).and_then(|after| {
         if after == lock_before {
             Ok(())
         } else {
@@ -436,14 +575,123 @@ fn supply_chain(root: &Path, stable: &str, mode: crate::failure_mode::FailureMod
             ))
         }
     });
-    match (checks, lock_check) {
-        (Err(primary), Err(secondary)) => Err(CiError::LaneFailures {
-            primary: Box::new(primary),
-            secondary: Box::new(secondary),
-        }),
-        (Err(error), _) | (_, Err(error)) => Err(error),
-        _ => Ok(()),
+    checks.first = checks.first.postcondition(lock_check);
+    Ok(checks)
+}
+
+/// The handoff contains the original lock bytes only; it cannot attest work.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupplyLockInput {
+    checkout: PathBuf,
+    commit: Vec<u8>,
+    lock: Vec<u8>,
+}
+
+fn supply_input_bytes(path: &Path, bound: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > bound {
+        return Err(CiError::Message(
+            "supply input has unsafe kind or exceeds bound".into(),
+        ));
     }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(bound + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > bound {
+        return Err(CiError::Message("supply input grew beyond bound".into()));
+    }
+    Ok(bytes)
+}
+
+fn supply_leaf(root: &Path, stable: &str, suite: Suite) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60 * 60);
+    let audit = matches!(suite, Suite::SupplyAuditPrepare | Suite::SupplyAuditCheck);
+    let prepare = matches!(suite, Suite::SupplyAuditPrepare | Suite::SupplyDenyPrepare);
+    let name = if audit { "cargo-audit" } else { "cargo-deny" };
+    let relative = Path::new("target/ci-session/supply").join(name);
+    let handoff = memcordon_ci::ci_operation_time::record_path(root, &relative)?;
+    let lock = memcordon_ci::ci_operation_time::record_path(root, Path::new("Cargo.lock"))?;
+    let checkout = root.canonicalize()?;
+    let commit = git(root, ["rev-parse", "HEAD"])?;
+    let before = if prepare {
+        use std::io::Write;
+        let bytes = supply_input_bytes(&lock, 16 * 1024 * 1024)?;
+        let record = SupplyLockInput {
+            checkout: checkout.clone(),
+            commit: commit.clone(),
+            lock: bytes.clone(),
+        };
+        fs::create_dir_all(handoff.parent().expect("fixed parent"))?;
+        let path = memcordon_ci::ci_operation_time::record_path(root, &relative)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all()?;
+        bytes
+    } else {
+        let record: SupplyLockInput =
+            serde_json::from_slice(&supply_input_bytes(&handoff, 64 * 1024 * 1024)?)?;
+        if record.checkout != checkout
+            || record.commit != commit
+            || record.lock.len() > 16 * 1024 * 1024
+        {
+            return Err(CiError::Message(
+                "supply lock input belongs to different source".into(),
+            ));
+        }
+        record.lock
+    };
+    let operation = (|| {
+        if supply_input_bytes(&lock, 16 * 1024 * 1024)? != before {
+            return Err(CiError::Message("supply lock input changed".into()));
+        }
+        if prepare {
+            CommandSpec::new("rustup", root, Duration::from_secs(900))
+                .args(["toolchain", "install", stable, "--profile", "minimal"])
+                .bounded_until(deadline)
+                .run()?;
+            let tools = config::tools(root)?;
+            crate::preparation::ensure_one_auxiliary_until(
+                root,
+                name,
+                if audit {
+                    &tools.cargo_audit
+                } else {
+                    &tools.cargo_deny
+                },
+                stable,
+                deadline,
+                std::num::NonZeroUsize::new(crate::preparation::compiler_budget())
+                    .expect("positive budget"),
+            )?;
+            Ok(())
+        } else {
+            supply_chain_commands(root, stable)
+                .into_iter()
+                .nth(usize::from(!audit))
+                .expect("fixed supply command")
+                .bounded_until(deadline)
+                .run()
+                .map(|_| ())
+        }
+    })();
+    let invariant = supply_input_bytes(&lock, 16 * 1024 * 1024).and_then(|after| {
+        if after == before {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "supply-chain operations changed Cargo.lock".into(),
+            ))
+        }
+    });
+    memcordon_ci::work_outcome::WorkOutcome::from_result(operation)
+        .postcondition(invariant)
+        .into_result()
 }
 
 fn miri(
@@ -471,12 +719,14 @@ fn miri(
         "metadata",
         ["--format-version", "1", "--no-deps", "--locked"],
     )?;
-    let targets = match shard {
-        Some(shard) => {
-            memcordon_ci::miri_targets::plan_partition(&metadata, "memcordon-core", shard)?
-        }
-        None => memcordon_ci::miri_targets::plan(&metadata, "memcordon-core")?,
-    };
+    let targets = memcordon_ci::work_outcome::WorkOutcome::from_result(Ok(metadata.as_slice()))
+        .map_validated(|metadata| match shard {
+            Some(shard) => {
+                memcordon_ci::miri_targets::plan_partition(metadata, "memcordon-core", shard)
+            }
+            None => memcordon_ci::miri_targets::plan(metadata, "memcordon-core"),
+        })
+        .into_result()?;
     let name = match shard.map(|s| (s.index(), s.count())) {
         Some((0, 2)) => "first.json",
         Some((1, 2)) => "second.json",
@@ -511,7 +761,9 @@ fn miri(
                 let all = cargo(root, nightly, "miri", &list)?;
                 list.push(OsString::from("--ignored"));
                 let ignored = cargo(root, nightly, "miri", &list)?;
-                let batches = memcordon_ci::miri_targets::report_batches(&all, &ignored)?;
+                let batches = settled_validation(|| {
+                    memcordon_ci::miri_targets::report_batches(&all, &ignored)
+                })?;
                 write_plan(
                     root,
                     "miri",
@@ -630,7 +882,13 @@ fn fuzz_phase(
     if let Some(error) = failures.take() {
         return Err(error);
     }
+    if compile {
+        memcordon_ci::workflow_output::compilation_complete("compiled-recipe-complete")?;
+    }
     if execute {
+        // `cargo fuzz run` may compile again. A failed later writer must not
+        // retain a completion claim from the earlier build recipe.
+        memcordon_ci::workflow_output::revoke_compilation("compiled-recipe-complete")?;
         for target in &targets {
             let outcome = CommandSpec::toolchain_program(
                 "rustup",
@@ -660,12 +918,14 @@ fn fuzz_phase(
 }
 
 fn write_plan(root: &Path, family: &str, name: &str, value: &serde_json::Value) -> Result<()> {
-    let directory = root.join("target/ci/reports").join(family);
-    fs::create_dir_all(&directory)?;
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    fs::write(directory.join(name), bytes)?;
-    Ok(())
+    settled_validation(|| {
+        let directory = root.join("target/ci/reports").join(family);
+        fs::create_dir_all(&directory)?;
+        let mut bytes = serde_json::to_vec_pretty(value)?;
+        bytes.push(b'\n');
+        fs::write(directory.join(name), bytes)?;
+        Ok(())
+    })
 }
 
 fn shard(index: usize, count: usize) -> memcordon_ci::target_shard::ShardSpec {
@@ -741,7 +1001,9 @@ fn run_hard_scenario(
         OsString::from("1"),
     ]);
     let output = certification_cargo(root, rustup, stable, "test", arguments, deadline)?;
-    capability::require_exact_standard_test_success(&output, scenario.exact_name)
+    settled_validation(|| {
+        capability::require_exact_standard_test_success(&output, scenario.exact_name)
+    })
 }
 
 fn backend_suite(root: &Path, rustup: &Path, stable: &str, backend: &str) -> Result<()> {
@@ -755,10 +1017,12 @@ fn backend_suite(root: &Path, rustup: &Path, stable: &str, backend: &str) -> Res
     }
     let started = std::time::Instant::now();
     let remaining = || {
-        CERTIFICATION_DEADLINE
-            .checked_sub(started.elapsed())
-            .filter(|time| !time.is_zero())
-            .ok_or_else(|| CiError::Message("native backend suite deadline exhausted".into()))
+        settled_validation(|| {
+            CERTIFICATION_DEADLINE
+                .checked_sub(started.elapsed())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| CiError::Message("native backend suite deadline exhausted".into()))
+        })
     };
     let probe = certification_cargo(
         root,
@@ -779,8 +1043,11 @@ fn backend_suite(root: &Path, rustup: &Path, stable: &str, backend: &str) -> Res
         ],
         remaining()?.min(CARGO_DEADLINE),
     )?;
-    capability::require_certified_standard_backend(&serde_json::from_slice(&probe)?, backend)?;
-    let scenarios = memcordon_ci::standard_contract::hard_backend_scenarios(backend)?;
+    settled_validation(|| {
+        capability::require_certified_standard_backend(&serde_json::from_slice(&probe)?, backend)
+    })?;
+    let scenarios =
+        settled_validation(|| memcordon_ci::standard_contract::hard_backend_scenarios(backend))?;
     if scenarios.is_empty() {
         return Err(CiError::Message(
             "native backend suite has no scenarios".into(),
@@ -997,9 +1264,12 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             )?;
             admission.push(serde_json::json!({"package": package, "target": "macos_admission", "scenario": scenario, "executed": 1, "passed": 1}));
         }
-        let mut admission_bytes = serde_json::to_vec_pretty(&admission)?;
-        admission_bytes.push(b'\n');
-        fs::write(evidence.join("admission-inventory.json"), admission_bytes)?;
+        settled_validation(|| {
+            let mut admission_bytes = serde_json::to_vec_pretty(&admission)?;
+            admission_bytes.push(b'\n');
+            fs::write(evidence.join("admission-inventory.json"), admission_bytes)?;
+            Ok(())
+        })?;
         let mut mutations = Vec::new();
         for (package, target, scenario) in
             crate::native_acceptance_catalogue::MACOS_MUTATION_SCENARIOS
@@ -1015,11 +1285,14 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
             )?;
             mutations.push(serde_json::json!({"package": package, "target": target, "scenario": scenario, "executed": 1, "passed": 1}));
         }
-        let mut inventory = serde_json::to_vec_pretty(
-            &serde_json::json!({"schema_version": 1, "native_scenarios": crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS, "writer_barrier_scenarios": 3, "mutations": mutations}),
-        )?;
-        inventory.push(b'\n');
-        fs::write(evidence.join("native-inventory.json"), inventory)?;
+        settled_validation(|| {
+            let mut inventory = serde_json::to_vec_pretty(
+                &serde_json::json!({"schema_version": 1, "native_scenarios": crate::native_acceptance_catalogue::MACOS_REMEDIATION_SCENARIOS, "writer_barrier_scenarios": 3, "mutations": mutations}),
+            )?;
+            inventory.push(b'\n');
+            fs::write(evidence.join("native-inventory.json"), inventory)?;
+            Ok(())
+        })?;
         cargo(
             root,
             stable,
@@ -1068,21 +1341,26 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         .run()?;
         Ok(())
     })();
-    if let Err(error) = &result {
-        let mut bytes = serde_json::to_vec_pretty(
-            &serde_json::json!({"schema_version": 1, "passed": false, "error": error.to_string()}),
-        )?;
-        bytes.push(b'\n');
-        fs::write(evidence.join("suite-final.json"), &bytes)?;
-        if !evidence.join("final.json").exists() {
-            let mut aggregate = serde_json::to_vec_pretty(
-                &serde_json::json!({"schema_version": 2, "passed": false, "error": error.to_string()}),
+    let diagnostic = (|| -> Result<()> {
+        if let Err(error) = &result {
+            let mut bytes = serde_json::to_vec_pretty(
+                &serde_json::json!({"schema_version": 1, "passed": false, "error": error.to_string()}),
             )?;
-            aggregate.push(b'\n');
-            fs::write(evidence.join("final.json"), aggregate)?;
+            bytes.push(b'\n');
+            fs::write(evidence.join("suite-final.json"), &bytes)?;
+            if !evidence.join("final.json").exists() {
+                let mut aggregate = serde_json::to_vec_pretty(
+                    &serde_json::json!({"schema_version": 2, "passed": false, "error": error.to_string()}),
+                )?;
+                aggregate.push(b'\n');
+                fs::write(evidence.join("final.json"), aggregate)?;
+            }
         }
-    }
-    result
+        Ok(())
+    })();
+    memcordon_ci::work_outcome::WorkOutcome::from_result(result)
+        .postcondition(diagnostic)
+        .into_result()
 }
 
 pub fn release_macos_native(root: &Path, stable: &str) -> Result<()> {
@@ -1264,45 +1542,52 @@ pub fn release_macos_acceptance(root: &Path, stable: &str) -> Result<()> {
 }
 
 fn write_macos_report(root: &Path, filename: &str, scenarios: Vec<&str>) -> Result<()> {
-    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
-        .map_err(|error| CiError::Message(error.to_string()))?
-        .trim()
-        .to_owned();
-    let report = memcordon_ci::native_results::NativeTestReport {
-        schema_version: 1,
-        backend: "macos-watchdog".into(),
-        tests_run: scenarios.len(),
-        tests_skipped: 0,
-        tests: scenarios
-            .into_iter()
-            .map(|name| memcordon_ci::native_results::NativeTestResult {
-                name: name.into(),
-                result: memcordon_ci::native_results::NativeTestOutcome::Passed,
+    let commit =
+        memcordon_ci::work_outcome::WorkOutcome::from_result(git(root, ["rev-parse", "HEAD"]))
+            .map_validated(|bytes| {
+                Ok(String::from_utf8(bytes)
+                    .map_err(|error| CiError::Message(error.to_string()))?
+                    .trim()
+                    .to_owned())
             })
-            .collect(),
-        source_commit: commit,
-    };
-    let reports = root.join("target").join("ci").join("reports");
-    fs::create_dir_all(&reports)?;
-    let mut bytes = if let Some(phase) = match filename {
-        "release-macos-native.json" => Some("native"),
-        "release-macos-acceptance.json" => Some("acceptance"),
-        _ => None,
-    } {
-        serde_json::to_vec_pretty(&memcordon_ci::macos_performance::MacosPhaseReport {
-            format: "memcordon.macos-executed-phase".into(),
-            revision: 1,
-            host_os: std::env::consts::OS.into(),
-            host_arch: std::env::consts::ARCH.into(),
-            phase: phase.into(),
-            native: report,
-        })?
-    } else {
-        serde_json::to_vec_pretty(&report)?
-    };
-    bytes.push(b'\n');
-    fs::write(reports.join(filename), bytes)?;
-    Ok(())
+            .into_result()?;
+    settled_validation(|| {
+        let report = memcordon_ci::native_results::NativeTestReport {
+            schema_version: 1,
+            backend: "macos-watchdog".into(),
+            tests_run: scenarios.len(),
+            tests_skipped: 0,
+            tests: scenarios
+                .into_iter()
+                .map(|name| memcordon_ci::native_results::NativeTestResult {
+                    name: name.into(),
+                    result: memcordon_ci::native_results::NativeTestOutcome::Passed,
+                })
+                .collect(),
+            source_commit: commit,
+        };
+        let reports = root.join("target").join("ci").join("reports");
+        fs::create_dir_all(&reports)?;
+        let mut bytes = if let Some(phase) = match filename {
+            "release-macos-native.json" => Some("native"),
+            "release-macos-acceptance.json" => Some("acceptance"),
+            _ => None,
+        } {
+            serde_json::to_vec_pretty(&memcordon_ci::macos_performance::MacosPhaseReport {
+                format: "memcordon.macos-executed-phase".into(),
+                revision: 1,
+                host_os: std::env::consts::OS.into(),
+                host_arch: std::env::consts::ARCH.into(),
+                phase: phase.into(),
+                native: report,
+            })?
+        } else {
+            serde_json::to_vec_pretty(&report)?
+        };
+        bytes.push(b'\n');
+        fs::write(reports.join(filename), bytes)?;
+        Ok(())
+    })
 }
 
 /// Complete sequential compatibility form. Optional job splitting changes
@@ -1316,11 +1601,13 @@ pub fn release_macos(root: &Path, stable: &str) -> Result<()> {
     memcordon_ci::macos_performance::clear_local_phases(root)?;
     release_macos_native(root, stable)?;
     release_macos_acceptance(root, stable)?;
-    memcordon_ci::macos_performance::validate_local_completed(
-        root,
-        &commit,
-        std::env::consts::ARCH,
-    )?;
+    settled_validation(|| {
+        memcordon_ci::macos_performance::validate_local_completed(
+            root,
+            &commit,
+            std::env::consts::ARCH,
+        )
+    })?;
     write_macos_report(
         root,
         "backend-macos-watchdog.json",
@@ -1333,6 +1620,32 @@ pub(crate) struct SuiteOptions {
 }
 
 pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
+    let result = run_result(root, suite, options);
+    if result.is_ok()
+        && !matches!(
+            suite,
+            Suite::Policy
+                | Suite::SupplyChain
+                | Suite::SupplyAuditPrepare
+                | Suite::SupplyAuditCheck
+                | Suite::SupplyDenyPrepare
+                | Suite::SupplyDenyCheck
+                | Suite::NativeCompile
+                | Suite::NativeExecute
+                | Suite::WorkspaceFetch
+                | Suite::FuzzFetch
+                | Suite::PrepareTools
+                | Suite::PrepareFuzz
+                | Suite::PrepareMiriComponents
+                | Suite::MiriSetup
+        )
+    {
+        memcordon_ci::workflow_output::compilation_complete("compiled-recipe-complete")?;
+    }
+    result
+}
+
+fn run_result(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
     if matches!(
         suite,
         Suite::Policy
@@ -1341,6 +1654,8 @@ pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
             | Suite::StressLifecycle
             | Suite::BackendLinuxCgroup
             | Suite::BackendLinuxPrivate
+            | Suite::BackendLinuxPrivatePrepare
+            | Suite::BackendLinuxPrivateRuntime
             | Suite::BackendWindowsJob
             | Suite::BackendWindowsSealed
             | Suite::BackendMacosWatchdog
@@ -1352,7 +1667,15 @@ pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
     }
     let deadline = Instant::now()
         + Duration::from_secs(
-            if matches!(suite, Suite::Msrv | Suite::Quality | Suite::QualityCompile) {
+            if matches!(
+                suite,
+                Suite::Msrv
+                    | Suite::Quality
+                    | Suite::QualityCompile
+                    | Suite::QualityCompiler
+                    | Suite::ReleaseQualityCompiler
+                    | Suite::QualityDocumentation
+            ) {
                 90 * 60
             } else {
                 60 * 60
@@ -1372,6 +1695,13 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
                 | Suite::NativeExecute
                 | Suite::Quality
                 | Suite::QualityCompile
+                | Suite::QualityCompiler
+                | Suite::ReleaseQualityCompiler
+                | Suite::QualityDocumentation
+                | Suite::SupplyAuditPrepare
+                | Suite::SupplyAuditCheck
+                | Suite::SupplyDenyPrepare
+                | Suite::SupplyDenyCheck
                 | Suite::SupplyChain
                 | Suite::Msrv
                 | Suite::Miri
@@ -1434,9 +1764,26 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         );
     }
     match suite {
+        Suite::WorkspaceFetch
+        | Suite::FuzzFetch
+        | Suite::PrepareTools
+        | Suite::PrepareFuzz
+        | Suite::PrepareMiriComponents
+        | Suite::MiriSetup
+        | Suite::ReleaseBuild
+        | Suite::ReleaseCompile
+        | Suite::ReleaseValidatePackage
+        | Suite::WorkingWindowsPrepare
+        | Suite::RehearsalToolBuild
+        | Suite::ReleaseReadiness => {
+            crate::ci_segments::operation(root, suite, options.failure_mode)
+        }
         Suite::Policy => policy::run(root),
         Suite::Quality => quality(root, &toolchains.stable, options.failure_mode),
         Suite::QualityCompile => quality_compile(root, &toolchains.stable, options.failure_mode),
+        Suite::QualityCompiler | Suite::ReleaseQualityCompiler | Suite::QualityDocumentation => {
+            quality_leaf(root, &toolchains.stable, options.failure_mode, suite)
+        }
         Suite::Msrv => msrv(root, &toolchains.msrv, options.failure_mode),
         Suite::Native => native(root, &toolchains.stable, false, options.failure_mode),
         Suite::NativeCompile => native_phase(root, &toolchains.stable, options.failure_mode, true),
@@ -1454,6 +1801,10 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         | Suite::FuzzExecuteQuarterThree
         | Suite::FuzzExecuteQuarterFour => unreachable!("phased fuzz handled above"),
         Suite::SupplyChain => supply_chain(root, &toolchains.stable, options.failure_mode),
+        Suite::SupplyAuditPrepare
+        | Suite::SupplyAuditCheck
+        | Suite::SupplyDenyPrepare
+        | Suite::SupplyDenyCheck => supply_leaf(root, &toolchains.stable, suite),
         Suite::Miri => miri(
             root,
             &toolchains.miri,
@@ -1569,6 +1920,19 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
             root,
             &root.join("target/ci/private-installed"),
         ),
+        Suite::BackendLinuxPrivatePrepare => {
+            memcordon_ci::release::linux_installed_consumer::prepare_working(
+                root,
+                &root.join("target/ci/private-prepared"),
+            )
+        }
+        Suite::BackendLinuxPrivateRuntime => {
+            memcordon_ci::release::linux_installed_consumer::run_prepared(
+                root,
+                &root.join("target/ci/private-prepared"),
+                &root.join("target/ci/private-installed"),
+            )
+        }
         Suite::BackendWindowsSealed => {
             memcordon_ci::release::windows_installed_consumer::run_working(
                 root,

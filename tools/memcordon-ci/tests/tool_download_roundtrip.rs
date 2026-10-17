@@ -297,7 +297,7 @@ fn actual_install_child() {
     let root = std::env::current_dir().unwrap();
     let stable = memcordon_ci::config::toolchains(&root).unwrap().stable;
     let family = DownloadFamily::ToolCargoAudit;
-    let before = download_cache::context(&root, family);
+    let before = download_cache::context(&root, family).unwrap();
     memcordon_ci::preparation::ensure_one_auxiliary_until(
         &root,
         "cargo-audit",
@@ -321,6 +321,10 @@ fn actual_install_child() {
             .any(|part| part == "0.0.1")
     );
     assert!(download_cache::packaged_lock_present(&root, "cargo-audit", "0.0.1").unwrap());
-    download_cache::record(family, &before, &download_cache::context(&root, family));
+    download_cache::record(
+        family,
+        &before,
+        &download_cache::context(&root, family).unwrap(),
+    );
     memcordon_ci::workflow_output::quiescent(Ok(())).unwrap();
 }

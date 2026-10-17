@@ -75,8 +75,9 @@ Linux/Windows candidate and public readiness coverage remains required.
 Native Cargo execution stops scheduling test executables after a failure by
 default. Local `suite native --failure-mode collect-all` retains diagnostic
 execution and still returns failure. Applicable suite and target commands expose
-the same typed failure choice. Automated Miri/fuzz matrices stop peer shards;
-manual matrices retain all shards only when `collect-all` is selected. Deep CI
+the same typed failure choice. Cache-producing matrices use `fail-fast: false`
+so an unrelated failed shard does not cancel another runner's retention. This
+does not change local stop-after-failure into collect-all. Deep CI
 manual runs default to `collect-all`; CI and Release default to
 `stop-after-failure`. Native and publication jobs retain their own
 cleanup and original deadlines. Publication's shared concurrency group never
@@ -86,7 +87,9 @@ Independent compiler lanes use separate target directories and share a maximum
 of four Cargo workers, falling back to serial work on one CPU. Rehearsal accepts
 `--jobs 1` or `--jobs 2` (default two); each case owns its listener, store and
 ordered fault/recovery sequence. Failure stops new admissions and active owners
-settle before reporting. Stress packages and lifecycle use separate jobs; cold
+settle before the final result. A bounded first-failure notice is reported before
+peer settlement and cache copies; it does not claim that cleanup finished.
+Stress packages and lifecycle use separate jobs; cold
 lifecycle compilation precedes its existing 35-minute seeded execution allowance.
 
 Cache V4 separates downloaded source data, Cargo index metadata, installed tools,
@@ -281,19 +284,131 @@ claiming an observed reduction. Rollback restores affected standalone conditions
 and policy expectations while retaining local macOS assertions and cache role
 separation.
 
-Performance forms remain serial or combined by default. `ci/performance.toml` can
-select a bounded stress split as an explicit scheduling choice. Both selected
-phases retain their full coverage and budgets; optional comparative measurements
-must be honest when supplied. Other performance forms retain their existing
-measurement requirements. CI debug-native and Release optimized-native caches use
+`ci/performance.toml` selects the existing bounded preparation, quality and stress
+overlap, and the standalone macOS split as source-controlled scheduling choices.
+Selected phases retain full coverage and budgets; optional comparative
+measurements must be honest when supplied. CI debug-native and Release optimized-native caches use
 separate `native-debug` and `native-release` purposes, with actual native argument
 recipes and selected product inputs in their identities. Unknown cache inputs
 disable compiled reuse and allow an ordinary build; the first CI driver build may
 be cold. Reports, installed state and prepared package bytes are not build caches.
 
-Combined stress keeps its 120-minute envelope. Native release production admits
-30, 25, 15 and 60-minute sequential child ceilings inside a 180-minute planning
-envelope, with one original operation deadline. Product deadlines remain strict.
+Combined stress keeps its existing work envelope. Native Release production
+keeps the product's 30-minute cap, native compile caps of 25 minutes (other),
+40 (macOS) or 60 (Windows), native execution's 15-minute cap and the backend's
+60-minute cap, all clipped to one original operation deadline. Compiler work
+overlaps only where the inherited allocation permits; a one-worker host runs
+serially. Generated job ceilings include actual cache/action overhead separately.
 Preparation jobs retain bounded execution/deadline/installed diagnostics with
 best-effort uploads. Missing final evidence remains incomplete; a retained report
 does not change a failed or cancelled workflow outcome.
+
+The four workflow files are generated from
+`tools/memcordon-ci/src/workflow_definitions/`. Edit those Rust definitions and
+their finite command/action adapters, then run `memcordon-ci ci workflows --write`.
+CI runs `ci workflows --check`; it never rewrites its checkout to hide drift.
+Keep events, native matrices, permissions, artifact pairing, rehearsal and
+tag/recovery publication prerequisites in the platform graph.
+
+Compiler/Clippy, documentation, audit and deny are separate required leaves.
+They start from the same actual source selection, without dependencies on one
+another. The ordinary CI leaves keep their existing non-push event selection;
+Release preparation leaves each need only `select`. The combined local quality
+and supply-chain commands remain available and call the shared implementations.
+
+| Workflow | Job keys | Actual check labels |
+| --- | --- | --- |
+| CI | `quality`, `quality-docs` | `quality / check and Clippy`, `quality / documentation` |
+| CI | `supply-chain-audit`, `supply-chain-deny` | `Supply chain / audit`, `Supply chain / deny` |
+| Release | `source-checks`, `source-docs` | `Source check and Clippy`, `Source documentation` |
+| Release | `supply-chain-audit`, `supply-chain-deny` | `Supply chain / audit`, `Supply chain / deny` |
+
+Map every actual required check consumer to both new leaves. The former quality
+label alone no longer includes documentation, and the former combined security
+label does not stand for audit and deny. Assembly requires all Release leaves;
+failed, canceled or skipped required work cannot be replaced by a cached result.
+Repository settings were not inspected or changed by this source migration.
+
+Native Release compilation retains the existing product/native overlap, then
+offers each eligible compiler partition before native execution, backend checks
+and packaging. The later required phase validates selected source and actual
+product bytes; restoring compiler data never proves that a test passed. A local
+same-job boot-relative handoff and the original wall deadline jointly preserve
+the original 140-minute work and 155-minute cleanup intervals across cache
+actions. Missing or mismatched handoffs fail resume instead of granting new time.
+The complete local build command remains a composition of the same phases.
+
+Job ceilings are computed from reviewed finite step branches, including driver
+bootstrap, acquisition, immutable transfers and five minutes of setup/teardown
+slack. Shared operation time is counted once; sequential Actions time remains
+additional. Generation rejects missing bounds, arithmetic overflow or a plan
+beyond the runner limit. These ceilings are planning limits, not measurements.
+Previously implicit production estimates are now explicit Actions run-step
+guards: macOS deadline 75 minutes, standalone macOS phases 120, Linux private
+195, working Windows preparation 150 and each working Windows installed channel
+135. These are newly enforced outer
+workflow limits, not preexisting Rust operation clocks. Individual child
+timeouts, test scenarios and iterations remain unchanged; the guards do not
+guarantee that every sequential child can consume its maximum allowance.
+Linux private certification separates actual package/native payload production
+from installed-channel and observer execution. Each architecture has its own
+required producer and immutable artifact id. The producer retains the complete
+original native operation on one host; its 190-minute Actions guard is a new
+planning limit. Runtime retains its 195-minute guard and performs the unchanged
+workspace fetch, installed cases and observer cases. Transferred native and
+Cargo payloads must match the current working source and distribution; the
+fresh driver additionally has a source, host and same-run byte manifest. Native
+clock and completion records are excluded from this transfer.
+The standalone macOS layout selects the existing native/acceptance split on
+separate runners. Its combined local/Release callback stays sequential; no
+fabricated speedup samples authorize either layout.
+
+Finite `ci segment` operations retain eligible source and compiler work before
+returning the original failure. Completed compilation transfers and partial
+seeds have distinct namespaces and validated inboxes. Neither a restored image
+nor a transfer manifest means that the current tests, native readiness or
+rehearsal passed. Optional cache context/transfer time is bounded separately from
+the original production deadlines; unavailable cache reuse takes the source path.
+
+`ci/driver-bootstrap.toml` deliberately starts with no enabled executable-cache
+hosts. Current-source cold builds and adoption remain available. Enable a host
+only after real cold/warm native acceptance, full input/image validation and a
+review of its selected job budget. No cross-platform bootstrap support or warm
+performance improvement is claimed by portable tests. A failed first cold build
+has no Rust supervisor to retain a safe partial driver target. Publication and
+rehearsal continue to use their selected immutable prepared artifacts; the
+publication-tool producer actually compiles current source.
+
+Portable ordering/allocation tests and a linked timer test establish only their
+executed scope. Native Linux/macOS/Windows cancellation, reader retirement and
+clock handoff acceptance, representative event execution, and a controlled
+cache-service save/verified later restore require their actual environments.
+No hosted acceptance, cache persistence or performance improvement follows from
+the generated graph or an action's successful conclusion alone.
+
+Release also requires the six `readiness-tools-{host}` preparation phases for
+`linux-x64`, `linux-arm64`, `macos-x64`, `macos-arm64`, `windows-x64` and
+`windows-arm64`. These phases compile the existing readiness helper and its
+current-source driver on the selected native host. Native and installed jobs
+consume their exact same-run immutable artifact IDs; candidate and installed
+jobs still require their native test producer to succeed. These artifacts
+contain only selected program bytes and their checked identity, never native
+operation clocks or prepared test results. The original native work clock
+starts on the native runner and remains there through required retirement.
+This preparation boundary does not enable executable cache reuse on any host.
+
+Release fuzz now requires the actual `fuzz-setup` producer (`Release fuzz setup`)
+before each unchanged quarter compiles and executes. A setup failure makes the
+selected shard fail its required admission step. The setup artifact binds the
+selected checkout, toolchain, native host and exact workflow run and attempt;
+it carries the current program and pinned fuzz tool, never a passed-test claim.
+
+Standalone Linux private checks use `private-linux-prepare-x64` and
+`private-linux-prepare-arm64`, followed by the corresponding required runtime
+jobs `private-linux` and `private-linux-arm64`. Preparation runs the original
+native compilation and validation on one host, then transfers byte-validated
+native/Cargo payloads and the current program. Runtime verifies its own source,
+distribution and exact immutable artifact before the installed and observer
+cases. Native clock records stay in preparation. Maintainers must include the
+new preparation statuses wherever the corresponding runtime checks are required;
+these workflow edits do not modify protected-branch settings.

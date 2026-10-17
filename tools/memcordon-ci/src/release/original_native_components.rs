@@ -541,6 +541,7 @@ fn select_with_diagnostic_deadline(
             "original native component cutoff exhausted or clock regressed".into(),
         ));
     }
+    let original_operation = diagnostic.is_none();
     if let Some(operation) = diagnostic {
         if args.cleanup {
             operation.remaining_cleanup_at(instant, now)?;
@@ -560,16 +561,28 @@ fn select_with_diagnostic_deadline(
         deadline.work_deadline_unix_millis = operation.work_deadline_unix_millis;
         deadline.cleanup_deadline_unix_millis = operation.cleanup_deadline_unix_millis;
     }
-    let work = instant
+    let mut work = instant
         .checked_add(Duration::from_millis(
             deadline.work_deadline_unix_millis.saturating_sub(now),
         ))
         .ok_or_else(|| CiError::Message("native work cutoff overflow".into()))?;
-    let cleanup = instant
+    let mut cleanup = instant
         .checked_add(Duration::from_millis(
             deadline.cleanup_deadline_unix_millis - now,
         ))
         .ok_or_else(|| CiError::Message("native cleanup cutoff overflow".into()))?;
+    if original_operation {
+        // Same live operation: cache/action time counts, and missing timing
+        // inputs cannot silently mint another readiness interval.
+        cleanup = cleanup.min(native_component_harness::resume_original_deadline(
+            root, &identity, target, true,
+        )?);
+        if !args.cleanup {
+            work = work.min(native_component_harness::resume_original_deadline(
+                root, &identity, target, false,
+            )?);
+        }
+    }
     let mut records = vec![
         identity_record,
         roles_record,

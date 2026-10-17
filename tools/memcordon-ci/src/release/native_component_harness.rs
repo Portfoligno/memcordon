@@ -58,6 +58,55 @@ pub fn original_deadline(
     selected: &source::BuildSourceIdentity,
     target: &str,
 ) -> Result<Instant> {
+    resume_original_deadline(root, selected, target, false)
+}
+
+/// Start once, in the original compiler owner. Resume never creates either record.
+pub fn begin_original_deadline(
+    root: &Path,
+    selected: &source::BuildSourceIdentity,
+    target: &str,
+) -> Result<Instant> {
+    let now = unix_millis()?;
+    let record = OriginalNativeDeadline {
+        format: "memcordon.consumer-readiness.original-native-deadline".into(),
+        revision: 1,
+        source: selected.clone(),
+        native_target: target.into(),
+        started_unix_millis: now,
+        work_deadline_unix_millis: now
+            .checked_add(140 * 60 * 1000)
+            .ok_or_else(|| CiError::Message("native work deadline overflow".into()))?,
+        cleanup_deadline_unix_millis: now
+            .checked_add(155 * 60 * 1000)
+            .ok_or_else(|| CiError::Message("native cleanup deadline overflow".into()))?,
+    };
+    let path = crate::ci_operation_time::record_path(
+        root,
+        Path::new(".release/native-operation-deadline.json"),
+    )?;
+    fs::create_dir_all(path.parent().expect("fixed native record parent"))?;
+    publish_native_record(&path, &serde_json::to_vec(&record)?)?;
+    crate::ci_operation_time::begin(root, selected, target, now)?;
+    resume_original_deadline(root, selected, target, false)
+}
+
+fn unix_millis() -> Result<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| CiError::Message(error.to_string()))?
+            .as_millis(),
+    )
+    .map_err(|error| CiError::Message(error.to_string()))
+}
+
+pub fn resume_original_deadline(
+    root: &Path,
+    selected: &source::BuildSourceIdentity,
+    target: &str,
+    cleanup: bool,
+) -> Result<Instant> {
     let now = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -65,26 +114,11 @@ pub fn original_deadline(
             .as_millis(),
     )
     .map_err(|error| CiError::Message(error.to_string()))?;
-    let path = root.join(".release/native-operation-deadline.json");
-    let record = if path.exists() {
-        source::read_json::<OriginalNativeDeadline>(&path)?
-    } else {
-        let record = OriginalNativeDeadline {
-            format: "memcordon.consumer-readiness.original-native-deadline".into(),
-            revision: 1,
-            source: selected.clone(),
-            native_target: target.to_owned(),
-            started_unix_millis: now,
-            work_deadline_unix_millis: now
-                .checked_add(140 * 60 * 1000)
-                .ok_or_else(|| CiError::Message("native work deadline overflow".into()))?,
-            cleanup_deadline_unix_millis: now
-                .checked_add(155 * 60 * 1000)
-                .ok_or_else(|| CiError::Message("native cleanup deadline overflow".into()))?,
-        };
-        publish_native_record(&path, &serde_json::to_vec(&record)?)?;
-        record
-    };
+    let path = crate::ci_operation_time::record_path(
+        root,
+        Path::new(".release/native-operation-deadline.json"),
+    )?;
+    let record = source::read_json::<OriginalNativeDeadline>(&path)?;
     if record.format != "memcordon.consumer-readiness.original-native-deadline"
         || record.revision != 1
         || record.native_target != target
@@ -97,18 +131,24 @@ pub fn original_deadline(
             .cleanup_deadline_unix_millis
             .checked_sub(record.started_unix_millis)
             != Some(155 * 60 * 1000)
-        || now < record.started_unix_millis
-        || now >= record.work_deadline_unix_millis
     {
         return Err(CiError::Message(
             "original native source/deadline differs or is exhausted".into(),
         ));
     }
-    Instant::now()
-        .checked_add(Duration::from_millis(
-            record.work_deadline_unix_millis - now,
-        ))
-        .ok_or_else(|| CiError::Message("retained native operation deadline overflow".into()))
+    crate::ci_operation_time::resume(
+        root,
+        selected,
+        target,
+        record.started_unix_millis,
+        if cleanup {
+            record.cleanup_deadline_unix_millis
+        } else {
+            record.work_deadline_unix_millis
+        },
+        now,
+        cleanup,
+    )
 }
 
 /// Retain both distinct measured native roles in the original native producer.
@@ -122,60 +162,71 @@ pub fn build_original_roles(
     deadline: Instant,
 ) -> Result<()> {
     selected.recheck(root)?;
-    fs::create_dir(destination)?;
-    #[cfg(any(target_os = "linux", windows))]
-    retain_original_host(root, selected, target, destination, deadline)?;
-    let features = if target.ends_with("-unknown-linux-gnu") {
-        "private-tcp,test-support"
-    } else if target.ends_with("-pc-windows-msvc") {
-        "windows-sealed-runtime,test-support"
-    } else {
-        return Err(CiError::Message(
-            "native component roles require a supported readiness target".into(),
-        ));
-    };
-    let operational = build(
-        root,
-        target,
-        "memcordon",
-        "sealed_agent",
-        Some(features),
-        &destination.join("operational"),
-        deadline,
-    )?;
-    let parser = build(
-        root,
-        target,
-        "memcordon-readiness-verifier",
-        "contract",
-        None,
-        &destination.join("parser"),
-        deadline,
-    )?;
-    #[cfg(windows)]
-    build_windows_actor(root, selected, target, &destination.join("actor"), deadline)?;
-    selected.recheck(root)?;
-    publish_native_record(
-        &destination.join("measured-harnesses.json"),
-        &serde_json::to_vec(&serde_json::json!({
-        "format":"memcordon.consumer-readiness.native-harnesses","revision":1,
-        "source":selected,"native_target":target,
-        "roles":[
-            {"role":"operational","package":"memcordon","test":"sealed_agent","features":features,
-                "executable":operational.executable,"sha256":operational.sha256,
-                "compiler_output":operational.compiler_output,"compiler_errors":operational.compiler_errors},
-            {"role":"parser","package":"memcordon-readiness-verifier","test":"contract","features":null,
-                "executable":parser.executable,"sha256":parser.sha256,
-                "compiler_output":parser.compiler_output,"compiler_errors":parser.compiler_errors}
-        ]}))?,
-    )?;
-    retain_acquisition_origin(root, selected, target, destination)?;
-    if Instant::now() >= deadline {
-        return Err(CiError::Message(
-            "original native component build exceeded its operation deadline".into(),
-        ));
-    }
-    Ok(())
+    let mut assembly = crate::work_outcome::WorkSequence::after_settled();
+    let result = (|| {
+        fs::create_dir(destination)?;
+        #[cfg(any(target_os = "linux", windows))]
+        assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            retain_original_host(root, selected, target, destination, deadline),
+        ))?;
+        let features = if target.ends_with("-unknown-linux-gnu") {
+            "private-tcp,test-support"
+        } else if target.ends_with("-pc-windows-msvc") {
+            "windows-sealed-runtime,test-support"
+        } else {
+            return Err(CiError::Message(
+                "native component roles require a supported readiness target".into(),
+            ));
+        };
+        let operational =
+            assembly.observe(crate::work_outcome::WorkOutcome::from_result(build(
+                root,
+                target,
+                "memcordon",
+                "sealed_agent",
+                Some(features),
+                &destination.join("operational"),
+                deadline,
+            )))?;
+        let parser = assembly.observe(crate::work_outcome::WorkOutcome::from_result(build(
+            root,
+            target,
+            "memcordon-readiness-verifier",
+            "contract",
+            None,
+            &destination.join("parser"),
+            deadline,
+        )))?;
+        #[cfg(windows)]
+        assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            build_windows_actor(root, selected, target, &destination.join("actor"), deadline),
+        ))?;
+        assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            selected.recheck(root),
+        ))?;
+        publish_native_record(
+            &destination.join("measured-harnesses.json"),
+            &serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.consumer-readiness.native-harnesses","revision":1,
+            "source":selected,"native_target":target,
+            "roles":[
+                {"role":"operational","package":"memcordon","test":"sealed_agent","features":features,
+                    "executable":operational.executable,"sha256":operational.sha256,
+                    "compiler_output":operational.compiler_output,"compiler_errors":operational.compiler_errors},
+                {"role":"parser","package":"memcordon-readiness-verifier","test":"contract","features":null,
+                    "executable":parser.executable,"sha256":parser.sha256,
+                    "compiler_output":parser.compiler_output,"compiler_errors":parser.compiler_errors}
+            ]}))?,
+        )?;
+        retain_acquisition_origin(root, selected, target, destination)?;
+        if Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "original native component build exceeded its operation deadline".into(),
+            ));
+        }
+        Ok(())
+    })();
+    assembly.finish(result)
 }
 
 fn retain_acquisition_origin(
@@ -363,85 +414,93 @@ fn build_windows_actor(
     for (name, _) in &names {
         command = command.arg("--bin").arg(name);
     }
-    let output = command.output_quiet()?;
-    for (name, bytes) in [
-        ("cargo-output.jsonl", output.stdout.as_slice()),
-        ("cargo-stderr.bin", output.stderr.as_slice()),
-    ] {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination.join(name))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    source::write_json(
-        &destination.join("cargo-status.json"),
-        &serde_json::json!({"status":output.status.code(),"target":target,"features":["test-support","windows-sealed-runtime"]}),
-    )?;
-    if !output.status.success() {
-        return Err(CiError::Message(
-            "actual internal actor compilation failed; original compiler observations retained"
-                .into(),
-        ));
-    }
-    let mut emitted = std::collections::BTreeMap::new();
-    for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
-        if let cargo_metadata::Message::CompilerArtifact(artifact) =
-            message.map_err(|error| CiError::Message(error.to_string()))?
-        {
-            if names.iter().any(|(name, _)| *name == artifact.target.name) && !artifact.profile.test
+    let output = command.output_owned();
+    let mut assembly = crate::work_outcome::WorkSequence::after_settled();
+    let output = assembly.observe(output)?;
+    let result = (|| {
+        for (name, bytes) in [
+            ("cargo-output.jsonl", output.stdout.as_slice()),
+            ("cargo-stderr.bin", output.stderr.as_slice()),
+        ] {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        source::write_json(
+            &destination.join("cargo-status.json"),
+            &serde_json::json!({"status":output.status.code(),"target":target,"features":["test-support","windows-sealed-runtime"]}),
+        )?;
+        if !output.status.success() {
+            return Err(CiError::Message(
+                "actual internal actor compilation failed; original compiler observations retained"
+                    .into(),
+            ));
+        }
+        let mut emitted = std::collections::BTreeMap::new();
+        for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
+            if let cargo_metadata::Message::CompilerArtifact(artifact) =
+                message.map_err(|error| CiError::Message(error.to_string()))?
             {
-                if let Some(path) = artifact.executable {
-                    if emitted
-                        .insert(artifact.target.name, path.into_std_path_buf())
-                        .is_some()
-                    {
-                        return Err(CiError::Message(
-                            "duplicate actual internal actor executable".into(),
-                        ));
+                if names.iter().any(|(name, _)| *name == artifact.target.name)
+                    && !artifact.profile.test
+                {
+                    if let Some(path) = artifact.executable {
+                        if emitted
+                            .insert(artifact.target.name, path.into_std_path_buf())
+                            .is_some()
+                        {
+                            return Err(CiError::Message(
+                                "duplicate actual internal actor executable".into(),
+                            ));
+                        }
                     }
                 }
             }
         }
-    }
-    let mut components = Vec::new();
-    let mut held = Vec::new();
-    for (name, role) in names {
-        let actual = emitted.remove(name).ok_or_else(|| {
-            CiError::Message("actual Cargo output omitted internal actor component".into())
-        })?;
-        if !actual.starts_with(&build_root) {
-            return Err(CiError::Message(
-                "internal actor executable escaped native build root".into(),
-            ));
+        let mut components = Vec::new();
+        let mut held = Vec::new();
+        for (name, role) in names {
+            let actual = emitted.remove(name).ok_or_else(|| {
+                CiError::Message("actual Cargo output omitted internal actor component".into())
+            })?;
+            if !actual.starts_with(&build_root) {
+                return Err(CiError::Message(
+                    "internal actor executable escaped native build root".into(),
+                ));
+            }
+            let bytes = artifacts::read_file(&actual)?;
+            super::target::validate_executable(&bytes, target)?;
+            let filename = format!("{name}.exe");
+            let checksum = artifacts::checksum(&bytes);
+            held.push(crate::windows_readiness_adapter::copy_compiler_artifact(
+                &actual,
+                &build_root,
+                &destination.join(&filename),
+                &checksum,
+            )?);
+            components.push(super::target::runtime_component(role, filename, &bytes));
         }
-        let bytes = artifacts::read_file(&actual)?;
-        super::target::validate_executable(&bytes, target)?;
-        let filename = format!("{name}.exe");
-        let checksum = artifacts::checksum(&bytes);
-        held.push(crate::windows_readiness_adapter::copy_compiler_artifact(
-            &actual,
-            &build_root,
-            &destination.join(&filename),
-            &checksum,
-        )?);
-        components.push(super::target::runtime_component(role, filename, &bytes));
-    }
-    selected.recheck(root)?;
-    let runtime = RuntimeManifest::windows(
-        selected.version().to_string(),
-        selected.commit().to_owned(),
-        target.to_owned(),
-        components,
-    )
-    .map_err(CiError::Message)?;
-    source::write_json(&destination.join("runtime-manifest.json"), &runtime)?;
-    source::write_json(
-        &destination.join("internal-actor-build.json"),
-        &serde_json::json!({"format":"memcordon.consumer-readiness.internal-actor-build","revision":1,"source":selected,"native_target":target,"features":["test-support","windows-sealed-runtime"],"runtime_manifest":runtime}),
-    )?;
-    Ok(())
+        assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            selected.recheck(root),
+        ))?;
+        let runtime = RuntimeManifest::windows(
+            selected.version().to_string(),
+            selected.commit().to_owned(),
+            target.to_owned(),
+            components,
+        )
+        .map_err(CiError::Message)?;
+        source::write_json(&destination.join("runtime-manifest.json"), &runtime)?;
+        source::write_json(
+            &destination.join("internal-actor-build.json"),
+            &serde_json::json!({"format":"memcordon.consumer-readiness.internal-actor-build","revision":1,"source":selected,"native_target":target,"features":["test-support","windows-sealed-runtime"],"runtime_manifest":runtime}),
+        )?;
+        Ok(())
+    })();
+    assembly.finish(result)
 }
 
 /// Build exactly one native harness and retain its actual Cargo association.
@@ -505,7 +564,7 @@ pub fn build(
     if let Some(features) = features {
         command = command.args(["--features", features]);
     }
-    let output = command.output_quiet()?;
+    command.output_owned().map_validated(|output| {
     let compiler_output = destination.join("cargo-output.jsonl");
     let compiler_errors = destination.join("cargo-stderr.bin");
     for (path, bytes) in [
@@ -594,4 +653,5 @@ pub fn build(
         #[cfg(windows)]
         _custody: custody,
     })
+    }).into_result()
 }

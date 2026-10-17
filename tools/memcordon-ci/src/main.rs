@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod ci_segments;
 mod suites;
 
 use std::path::{Path, PathBuf};
@@ -61,6 +62,38 @@ enum TopLevel {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    Workflows {
+        #[arg(long, conflicts_with = "write", required_unless_present = "write")]
+        check: bool,
+        #[arg(long, conflicts_with = "check", required_unless_present = "check")]
+        write: bool,
+    },
+    DriverBootstrap,
+    DriverImageProbe,
+    DriverCleanup,
+    DriverContext,
+    DriverSelect,
+    DriverBuild,
+    DriverAdoptCold,
+    PreparationTools {
+        #[arg(value_enum)]
+        operation: memcordon_ci::preparation_tools::Operation,
+        #[arg(long, value_enum)]
+        kind: memcordon_ci::preparation_tools::Kind,
+    },
+    Segment {
+        #[arg(value_enum)]
+        recipe: Suite,
+    },
+    CacheRequests {
+        #[arg(value_enum)]
+        recipe: Suite,
+    },
+    CleanupTransfers {
+        #[arg(value_enum)]
+        recipe: Suite,
+    },
+    BootstrapCacheContext,
     DownloadCacheContext {
         #[arg(long, value_enum)]
         family: memcordon_ci::download_cache::DownloadFamily,
@@ -161,14 +194,33 @@ enum CiCommand {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Suite {
+    WorkspaceFetch,
+    FuzzFetch,
+    PrepareTools,
+    PrepareFuzz,
+    PrepareMiriComponents,
+    MiriSetup,
+    ReleaseBuild,
+    ReleaseCompile,
+    ReleaseValidatePackage,
+    ReleaseReadiness,
+    WorkingWindowsPrepare,
+    RehearsalToolBuild,
     Policy,
     Quality,
     QualityCompile,
+    QualityCompiler,
+    ReleaseQualityCompiler,
+    QualityDocumentation,
     Msrv,
     Native,
     NativeCompile,
     NativeExecute,
     SupplyChain,
+    SupplyAuditPrepare,
+    SupplyAuditCheck,
+    SupplyDenyPrepare,
+    SupplyDenyCheck,
     Miri,
     MiriFirst,
     MiriSecond,
@@ -200,6 +252,8 @@ enum Suite {
     StressLifecycle,
     BackendLinuxCgroup,
     BackendLinuxPrivate,
+    BackendLinuxPrivatePrepare,
+    BackendLinuxPrivateRuntime,
     BackendWindowsJob,
     BackendWindowsSealed,
     BackendMacosWatchdog,
@@ -235,19 +289,51 @@ fn run() -> Result<()> {
         }) => current,
         _ => workspace_root(&current)?,
     };
-    let result = match cli.command {
+    let result = (|| match cli.command {
         #[cfg(target_os = "windows")]
         Some(TopLevel::ConsumerReadinessLoaderDiagnostic(arguments)) => {
-            memcordon_ci::release::original_native_components::loader_diagnostic::run(
-                &root, &arguments,
-            )
+            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                memcordon_ci::release::original_native_components::loader_diagnostic::run(
+                    &root, &arguments,
+                ),
+            );
+            if arguments.cleanup {
+                operation.into_result()
+            } else {
+                let mut cleanup = arguments;
+                cleanup.cleanup = true;
+                let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                    memcordon_ci::release::original_native_components::loader_diagnostic::run(
+                        &root, &cleanup,
+                    ),
+                );
+                memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
+            }
         }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         Some(TopLevel::ConsumerReadinessNativeComponents(arguments)) => {
-            memcordon_ci::release::original_native_components::run(&root, &arguments)
+            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                memcordon_ci::release::original_native_components::run(&root, &arguments),
+            );
+            if arguments.cleanup {
+                operation.into_result()
+            } else {
+                let mut cleanup = arguments;
+                cleanup.cleanup = true;
+                let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                    memcordon_ci::release::original_native_components::run(&root, &cleanup),
+                );
+                memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
+            }
         }
         Some(TopLevel::ConsumerReadinessCell(arguments)) => {
-            memcordon_ci::release::consumer_readiness_cell::execute(&root, &arguments)
+            let operation = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                memcordon_ci::release::consumer_readiness_cell::execute(&root, &arguments),
+            );
+            let cleanup = memcordon_ci::work_outcome::WorkOutcome::from_result(
+                memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments),
+            );
+            memcordon_ci::work_outcome::join_completed(operation, cleanup).into_result()
         }
         #[cfg(target_os = "linux")]
         Some(TopLevel::ConsumerReadinessMalformedIngress(arguments)) => {
@@ -257,6 +343,26 @@ fn run() -> Result<()> {
             memcordon_ci::release::consumer_readiness_cell::cleanup(&root, &arguments)
         }
         Some(TopLevel::Ci { command }) => match command {
+            CiCommand::Workflows { check: _, write } => {
+                memcordon_ci::workflow_definitions::run(&root, write)
+            }
+            CiCommand::DriverBootstrap => memcordon_ci::driver_cache::bootstrap(&root),
+            CiCommand::DriverImageProbe => memcordon_ci::driver_cache::image_probe(&root),
+            CiCommand::DriverCleanup => memcordon_ci::driver_cache::cleanup(&root),
+            CiCommand::DriverContext => memcordon_ci::driver_cache::context(&root),
+            CiCommand::DriverSelect => memcordon_ci::driver_cache::select(&root),
+            CiCommand::DriverBuild => memcordon_ci::driver_cache::build(&root),
+            CiCommand::DriverAdoptCold => memcordon_ci::driver_cache::adopt_cold(&root),
+            CiCommand::PreparationTools { operation, kind } => {
+                memcordon_ci::preparation_tools::run(&root, operation, kind)
+            }
+            CiCommand::Segment { recipe } => ci_segments::run(&root, recipe),
+            CiCommand::CacheRequests { recipe } => ci_segments::requests(&root, recipe),
+            CiCommand::CleanupTransfers { recipe } => ci_segments::cleanup(&root, recipe),
+            CiCommand::BootstrapCacheContext => memcordon_ci::workflow_output::write(&[(
+                "bootstrap-home-matches",
+                memcordon_ci::download_cache::bootstrap_home_matches(&root).to_string(),
+            )]),
             CiCommand::DownloadCacheContext { family } => {
                 memcordon_ci::download_cache::emit(&root, family)
             }
@@ -332,7 +438,50 @@ fn run() -> Result<()> {
                 memcordon_ci::macos_performance::aggregate(&root, &input, &destination)
             }
         },
-        Some(TopLevel::Release { command }) => memcordon_ci::release::run(&root, command),
+        Some(TopLevel::Release { mut command }) => {
+            if matches!(
+                &command,
+                memcordon_ci::release::ReleaseCommand::CompileTarget { .. }
+                    | memcordon_ci::release::ReleaseCommand::ValidatePackage { .. }
+            ) {
+                ci_segments::native::run(&root, command)
+            } else if let memcordon_ci::release::ReleaseCommand::BuildTarget {
+                consumer_readiness,
+                failure_mode,
+                ..
+            } = &mut command
+            {
+                if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
+                    *failure_mode = ci_segments::event_mode()?;
+                }
+                let recipe = if *consumer_readiness {
+                    Suite::ReleaseReadiness
+                } else {
+                    Suite::ReleaseBuild
+                };
+                let session = memcordon_ci::segment_cache::Session::begin_selected(
+                    &root,
+                    ci_segments::scopes(recipe),
+                    ci_segments::family(recipe),
+                    false,
+                )?;
+                session.execute(&root, || memcordon_ci::release::run(&root, command))
+            } else if matches!(
+                &command,
+                memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
+            ) {
+                let recipe = Suite::WorkingWindowsPrepare;
+                let session = memcordon_ci::segment_cache::Session::begin_selected(
+                    &root,
+                    ci_segments::scopes(recipe),
+                    ci_segments::family(recipe),
+                    false,
+                )?;
+                session.execute(&root, || memcordon_ci::release::run(&root, command))
+            } else {
+                memcordon_ci::release::run(&root, command)
+            }
+        }
         Some(TopLevel::ExternalConsumer { input, destination }) => {
             let assessment = memcordon_ci::external_consumer::run_file(&input, &destination)?;
             if assessment.passed() {
@@ -354,8 +503,10 @@ fn run() -> Result<()> {
         None => Err(CiError::Message(
             "exactly one CI command is required".to_owned(),
         )),
-    };
-    memcordon_ci::workflow_output::quiescent(result)
+    })();
+    memcordon_ci::workflow_output::finalize(memcordon_ci::work_outcome::WorkOutcome::from_result(
+        result,
+    ))
 }
 
 fn main() {

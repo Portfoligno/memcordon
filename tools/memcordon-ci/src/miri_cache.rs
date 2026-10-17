@@ -10,6 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn ready_in_invocation() -> bool {
+    READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn managed_root(root: &Path) -> Result<Option<PathBuf>> {
     if !native_setup_validated(
         crate::release::distribution::native_target()?,
@@ -87,6 +93,18 @@ pub fn native_setup_validated(target: &str, nightly: &str) -> bool {
 }
 
 pub fn components(root: &Path, deadline: Instant) -> Result<()> {
+    components_only(root, deadline)?;
+    crate::download_cache::fetch_until(
+        root,
+        crate::download_cache::DownloadFamily::Workspace,
+        deadline,
+        None,
+    )
+}
+
+/// The workflow segment has a preceding required source-acquisition checkpoint.
+/// The local compatibility command above continues to own its original fetch.
+pub fn components_only(root: &Path, deadline: Instant) -> Result<()> {
     let pins = crate::config::toolchains(root)?;
     CommandSpec::new("rustup", root, Duration::from_secs(900))
         .args([
@@ -101,13 +119,8 @@ pub fn components(root: &Path, deadline: Instant) -> Result<()> {
             "rust-src",
         ])
         .bounded_until(deadline)
-        .run()?;
-    crate::download_cache::fetch_until(
-        root,
-        crate::download_cache::DownloadFamily::Workspace,
-        deadline,
-        None,
-    )
+        .run()
+        .map(|_| ())
 }
 
 pub fn context(root: &Path) -> Result<()> {
@@ -246,6 +259,7 @@ pub fn identity(root: &Path) -> Result<(String, PathBuf)> {
 }
 
 pub fn ensure(root: &Path, nightly: &str, deadline: Instant) -> Result<Option<PathBuf>> {
+    READY.store(false, std::sync::atomic::Ordering::Release);
     let path = managed_root(root)?;
     let command = rustup_cargo(root, nightly, ["miri", "setup"], Duration::from_secs(900))
         .bounded_until(deadline);
@@ -254,15 +268,17 @@ pub fn ensure(root: &Path, nightly: &str, deadline: Instant) -> Result<Option<Pa
     } else {
         command
     };
-    let result = command.run();
-    if result.is_ok() {
-        crate::workflow_output::write(&[
-            ("miri-sysroot-ready", path.is_some().to_string()),
-            ("miri-sysroot-quiescent", "true".into()),
-        ])?;
-    }
-    result?;
-    Ok(path)
+    let outcome = command.run_owned();
+    let ready = outcome.is_ok() && path.is_some();
+    READY.store(ready, std::sync::atomic::Ordering::Release);
+    let settled = outcome.writers().permits_reading();
+    outcome
+        .postcondition(crate::workflow_output::write(&[
+            ("miri-sysroot-ready", ready.to_string()),
+            ("miri-sysroot-quiescent", settled.to_string()),
+        ]))
+        .map(|_| path)
+        .into_result()
 }
 
 pub fn prepare(root: &Path) -> Result<()> {

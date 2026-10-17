@@ -115,6 +115,43 @@ pub fn layout(purpose: &str, shard: &str) -> Result<CacheLayout> {
     })
 }
 
+/// Pinned registry tools have no workspace-local packages to clean. Their
+/// finite target root still requires the same path, marker and lock checks.
+pub fn tool_build_layout(purpose: &str, shard: &str) -> Result<CacheLayout> {
+    if !matches!(shard, "complete" | "supply-pair-v1" | "preparation-pair-v1")
+        || !matches!(purpose, "cargo-audit" | "cargo-deny" | "cargo-fuzz")
+    {
+        return Err(CiError::Message("unsupported tool-build selection".into()));
+    }
+    if shard == "supply-pair-v1" && purpose == "cargo-fuzz" {
+        return Err(CiError::Message("supply pair has no fuzz tool".into()));
+    }
+    let target = Path::new("target/ci-tools-build").join(purpose);
+    Ok(CacheLayout {
+        directories: vec![target.clone()],
+        cargo_targets: vec![target],
+        required_files: Vec::new(),
+        revision: 7,
+    })
+}
+
+pub fn prepare_tool_build(
+    root: &Path,
+    purpose: &str,
+    shard: &str,
+    mode: RestoreMode,
+) -> Result<()> {
+    let layout = tool_build_layout(purpose, shard)?;
+    let target = safe_root(root, &layout.directories[0])?;
+    let marker = !target.try_exists()? || cargo_marker_present(&target)?;
+    let locks = settled_locks(std::slice::from_ref(&target))?;
+    drop(locks);
+    if (matches!(mode, RestoreMode::Discard) || !marker) && target.try_exists()? {
+        std::fs::remove_dir_all(&target)?;
+    }
+    Ok(())
+}
+
 pub fn payload_ready(root: &Path, purpose: &str, shard: &str) -> Result<bool> {
     partition_payload_ready(root, purpose, shard, None)
 }
@@ -155,7 +192,12 @@ pub fn partition_payload_ready(
 
 pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
     let paths: &[&str] = match (purpose, shard) {
+        ("ci-driver-build", "complete") => &["target/ci-driver-build"],
         ("quality", "complete") => &["target/ci/quality", "target/ci/quality-doc"],
+        ("quality-compiler-v1" | "quality-compiler-local-v1", "complete") => &["target/ci/quality"],
+        ("quality-documentation-v1" | "quality-documentation-local-v1", "complete") => {
+            &["target/ci/quality-doc"]
+        }
         ("msrv", "complete") => &["target/ci/msrv"],
         ("native-debug", "complete") => &["target/ci/native"],
         ("native-auxiliary", "complete") => &["target/debug", "target/release"],

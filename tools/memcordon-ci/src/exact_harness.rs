@@ -132,20 +132,27 @@ impl ExactHarnessRunner {
             )
             .run()?;
             if cfg!(target_os = "macos") && package == "memcordon" {
-                let image = resolve_binary(&output, "memcordon")?;
-                let probe = CommandSpec::new(image, root, Duration::from_secs(30))
+                let image = crate::work_outcome::WorkOutcome::from_result(Ok(output.as_slice()))
+                    .map_validated(|output| resolve_binary(output, "memcordon"))
+                    .into_result()?;
+                CommandSpec::new(image, root, Duration::from_secs(30))
                     .args(["doctor", "--json"])
-                    .run()?;
-                require_selected_watchdog(&probe)?;
+                    .run_owned()
+                    .validate_after(|probe| require_selected_watchdog(probe))
+                    .into_result()?;
             }
-            let executable = resolve_executable(&output, target)?;
+            let executable = crate::work_outcome::WorkOutcome::from_result(Ok(output.as_slice()))
+                .map_validated(|output| resolve_executable(output, target))
+                .into_result()?;
             let listing = CommandSpec::new(&executable, root, Duration::from_secs(30))
                 .args(["--list", "--format", "terse"])
                 .run()?;
             entry.insert((executable, listing));
         }
         let (executable, listing) = &self.compiled[&key];
-        require_listed_exactly_once(listing, selected)?;
+        crate::work_outcome::WorkOutcome::from_result(Ok(()))
+            .validate_after(|_| require_listed_exactly_once(listing, selected))
+            .into_result()?;
         Ok(executable.clone())
     }
 
@@ -204,6 +211,12 @@ impl ExactHarnessRunner {
         if selected.starts_with("required_") {
             execution = execution.arg("--ignored");
         }
-        capability::require_exact_standard_test_success(&execution.run()?, selected)
+        execution
+            .run_owned()
+            .validate_after(|output| {
+                capability::require_exact_standard_test_success(output, selected)
+            })
+            .map(|_| ())
+            .into_result()
     }
 }

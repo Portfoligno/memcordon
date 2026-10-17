@@ -89,6 +89,7 @@ fn partial_timeout_and_unavailable_observation_remain_distinct() {
         stderr: b"partial native error\xfe".to_vec(),
         cleanup: Err("cleanup unconfirmed".into()),
         observation: Box::new(TimeoutObservation {
+            settlement_complete: false,
             child_id: 42,
             observed_status: None,
             callback_completed: false,

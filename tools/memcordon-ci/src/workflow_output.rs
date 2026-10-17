@@ -1,6 +1,26 @@
 //! Standard GitHub output records are data, never command text.
 use crate::{CiError, Result};
 use std::io::Write;
+use std::sync::Mutex;
+
+// Finite compiler observations only; this does not observe child ownership.
+static COMPILATION: Mutex<std::collections::BTreeSet<&'static str>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+pub fn compiled_in_invocation(fact: &str) -> bool {
+    COMPILATION
+        .lock()
+        .expect("compilation facts poisoned")
+        .contains(fact)
+}
+
+pub fn revoke_compilation(fact: &'static str) -> Result<()> {
+    COMPILATION
+        .lock()
+        .expect("compilation facts poisoned")
+        .remove(fact);
+    write(&[(fact, "false".into())])
+}
 
 pub fn write(values: &[(&str, String)]) -> Result<()> {
     let path = std::env::var_os("GITHUB_OUTPUT");
@@ -48,40 +68,79 @@ pub fn write_to(path: Option<&std::path::Path>, values: &[(&str, String)]) -> Re
         let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
         // Serialize before appending: formatted writes can split a record into
         // key/value fragments that concurrent append handles interleave.
-        file.write_all(records.as_bytes())?;
-        file.flush()?;
+        append_records(&mut file, records.as_bytes())?;
     }
     Ok(())
 }
 
+fn append_records(writer: &mut impl Write, records: &[u8]) -> Result<()> {
+    writer.write_all(records)?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub fn quiescent(result: Result<()>) -> Result<()> {
-    if let Err(error) = crate::download_cache::flush() {
-        if result.is_ok() {
-            return Err(error);
+    finalize(crate::work_outcome::WorkOutcome::from_result(result))
+}
+
+pub fn finalize(outcome: crate::work_outcome::WorkOutcome<()>) -> Result<()> {
+    finalize_with(outcome, crate::download_cache::flush, write)
+}
+
+fn finalize_with(
+    outcome: crate::work_outcome::WorkOutcome<()>,
+    population: impl FnOnce() -> Result<()>,
+    mut emit: impl FnMut(&[(&str, String)]) -> Result<()>,
+) -> Result<()> {
+    let (mut result, writers, facts) = outcome.into_parts();
+    // Each group is attempted even if a preceding append failed. Preserve work's
+    // original failure; output errors are secondary and never imply population.
+    for emission in [
+        population(),
+        emit(&[("cache-quiescent", writers.permits_reading().to_string())]),
+        emit(&facts.outputs()),
+    ] {
+        if let Err(error) = emission {
+            eprintln!("workflow fact emission failed: {error}");
+            result = match result {
+                Ok(()) => Err(error),
+                Err(primary) => Err(CiError::LaneFailures {
+                    primary: Box::new(primary),
+                    secondary: Box::new(error),
+                }),
+            };
         }
-        eprintln!("download population output collection failed: {error}");
-    }
-    fn settled(error: &CiError) -> bool {
-        match error {
-            CiError::SettledCommandFailure(_)
-            | CiError::SettledCancellation(_)
-            | CiError::NotStartedAfterFailure => true,
-            CiError::LaneFailures { primary, secondary } => settled(primary) && settled(secondary),
-            _ => false,
-        }
-    }
-    // A real failed exit can retain useful compilation outputs after its sole
-    // owner and readers settle. Unknown native cleanup remains ineligible.
-    let observation = if result.as_ref().map_or_else(settled, |_| true) {
-        "true"
-    } else {
-        "false"
-    };
-    if let Err(error) = write(&[("cache-quiescent", observation.into())]) {
-        if result.is_ok() {
-            return Err(error);
-        }
-        eprintln!("workflow output collection failed: {error}");
     }
     result
 }
+
+/// Establish a genuine completed compilation boundary before later read-only
+/// checks. Callers must revoke the fact before another writer to the same scope.
+pub fn compilation_complete(fact: &'static str) -> Result<()> {
+    assert!(matches!(
+        fact,
+        "compiled-native-complete"
+            | "compiled-product-complete"
+            | "compiled-recipe-complete"
+            | "compiled-documentation-complete"
+            | "compiled-compiler-complete"
+            | "tool-cargo-audit-build-complete"
+            | "tool-cargo-deny-build-complete"
+            | "tool-cargo-fuzz-build-complete"
+            | "tool-cargo-audit-ready"
+            | "tool-cargo-deny-ready"
+            | "tool-cargo-fuzz-ready"
+    ));
+    COMPILATION
+        .lock()
+        .expect("compilation facts poisoned")
+        .insert(fact);
+    crate::work_outcome::WorkOutcome::from_result(Ok(()))
+        .fact(fact)
+        .postcondition(write(&[(fact, "true".into())]))
+        .into_result()
+}
+
+#[cfg(test)]
+#[path = "../tests/private/workflow_finalization.rs"]
+mod tests;

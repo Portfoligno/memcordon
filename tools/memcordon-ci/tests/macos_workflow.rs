@@ -1,13 +1,13 @@
 use serde_yaml::Value;
 
-const OWNER_SETTLED: &str = "steps.native.outputs.cache-quiescent == 'true'";
+const OWNER_SETTLED: &str = "steps.native.outputs.compiled-complete-save == 'true'";
 
 fn compiled_save(selected: &Value) -> Result<usize, &'static str> {
     let steps = selected["steps"].as_sequence().ok_or("steps absent")?;
     let restores: Vec<_> = steps
         .iter()
         .enumerate()
-        .filter(|(_, step)| step["id"] == "compiled")
+        .filter(|(_, step)| step["id"] == "native-request-compiled-complete-restore")
         .collect();
     if restores.len() != 1 {
         return Err("exactly one compiled restore is required");
@@ -16,9 +16,10 @@ fn compiled_save(selected: &Value) -> Result<usize, &'static str> {
     if !restore["uses"]
         .as_str()
         .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
-        || restore["with"]["key"] != "${{ steps.context.outputs.product-key }}"
-        || restore["with"]["path"] != "${{ steps.context.outputs.product-paths }}"
-        || restore["with"]["restore-keys"] != "${{ steps.context.outputs.product-restore-prefix }}"
+        || restore["with"]["key"] != "${{ steps.native-request.outputs.compiled-complete-key }}"
+        || restore["with"]["path"] != "${{ steps.native-request.outputs.compiled-complete-inbox }}"
+        || restore["with"]["restore-keys"]
+            != "${{ steps.native-request.outputs.compiled-complete-prefix }}"
     {
         return Err("compiled restore must use its selected context");
     }
@@ -29,7 +30,7 @@ fn compiled_save(selected: &Value) -> Result<usize, &'static str> {
             step["uses"]
                 .as_str()
                 .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-                && step["with"]["key"] == "${{ steps.compiled.outputs.cache-primary-key }}"
+                && step["with"]["key"] == "${{ steps.native.outputs.compiled-complete-key }}"
         })
         .collect();
     if saves.len() != 1 {
@@ -37,10 +38,12 @@ fn compiled_save(selected: &Value) -> Result<usize, &'static str> {
     }
     let (save_index, save) = saves[0];
     if save_index <= restore_index
-        || save["with"]["path"] != restore["with"]["path"]
+        || save["with"]["path"] != "${{ steps.native.outputs.compiled-complete-path }}"
         || !save["if"]
             .as_str()
-            .is_some_and(|condition| condition.split(" && ").any(|term| term == OWNER_SETTLED))
+            .is_some_and(|condition| {
+                condition == "always() && steps.native.outputs.compiled-complete-save == 'true' && steps.native-compiled-complete-probe.outputs.cache-hit != 'true'"
+            })
     {
         return Err("compiled save must retain selected paths and settled owner");
     }
@@ -94,16 +97,46 @@ fn selected_macos_forms_require_both_architectures_and_actual_phase_collection()
         assert_eq!(
             steps
                 .iter()
-                .filter(|step| step["run"]
-                    .as_str()
-                    .is_some_and(|run| run.split_whitespace().last() == Some(suite)))
+                .filter(|step| step["run"].as_str()
+                    == Some(&format!(
+                        "./target/ci-runtime/current/memcordon-ci ci segment {suite}"
+                    )))
                 .count(),
             1
         );
-        assert_eq!(steps.iter().filter(|step| {
-            step["id"] == "context"
-                && step["run"].as_str() == Some(&format!("./target/ci/release/memcordon-ci ci cache-context --purpose macos --shard {phase}"))
-        }).count(), 1);
+        let work = steps
+            .iter()
+            .find(|step| {
+                step["run"].as_str()
+                    == Some(&format!(
+                        "./target/ci-runtime/current/memcordon-ci ci segment {suite}"
+                    ))
+            })
+            .unwrap();
+        assert_ne!(work["continue-on-error"].as_bool(), Some(true));
+        assert_eq!(work["if"].as_str(), Some("runner.os != 'Windows'"));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step["run"].as_str()
+                    == Some(&format!(
+                        "./target/ci-runtime/current/memcordon-ci ci cleanup-transfers {suite}"
+                    )))
+                .count(),
+            1
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| {
+                    step["run"].as_str()
+                        == Some(&format!(
+                            "./target/ci-runtime/current/memcordon-ci ci cache-requests {suite}"
+                        ))
+                })
+                .count(),
+            1
+        );
         let roots = memcordon_ci::cache_restore::roots("macos", phase).unwrap();
         let expected: &[&str] = if phase == "acceptance" {
             &["target/ci/backend-macos"]
@@ -156,10 +189,8 @@ fn selected_macos_forms_require_both_architectures_and_actual_phase_collection()
     );
     assert_eq!(assessment["needs"].as_sequence().unwrap().len(), 4);
     assert!(
-        assessment["steps"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .any(|step| step["run"] == "./target/ci/release/memcordon-ci ci aggregate-macos")
+        assessment["steps"].as_sequence().unwrap().iter().any(
+            |step| step["run"] == "./target/ci-runtime/current/memcordon-ci ci aggregate-macos"
+        )
     );
 }

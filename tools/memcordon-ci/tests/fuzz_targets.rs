@@ -215,24 +215,31 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             Some("fuzz-download-save-context" | "cache-cargo-fuzz-save-context")
         );
         let optional_refresh_or_seed = step["id"].as_str().is_some_and(|id| {
-            id == "workspace-downloads"
-                || id == "archive-seed-restore"
-                || id == "index-snapshot-restore"
-                || id.ends_with("-seed")
-                || (id.ends_with("save-context") && !source_refresh)
+            !source_refresh
+                && (id == "workspace-downloads"
+                    || id == "archive-seed-restore"
+                    || id == "index-snapshot-restore"
+                    || id.ends_with("-seed"))
+                && !steps.iter().enumerate().any(|(other, candidate)| {
+                    other != index
+                        && serde_yaml::to_string(candidate)
+                            .unwrap()
+                            .contains(&format!("steps.{id}."))
+                })
         });
-        let optional_source_save = matches!(
-            step["name"].as_str(),
-            Some(
-                "Save complete fuzz downloads"
-                    | "Save cargo-fuzz downloads"
-                    | "Save observed registry-archives"
-                    | "Save observed registry-index"
-            )
-        );
+        let optional_source_save = step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+            && step["with"]["key"]
+                .as_str()
+                .is_some_and(|key| key.contains(".outputs.source-key"))
+            || matches!(
+                step["name"].as_str(),
+                Some("Save complete fuzz downloads" | "Save cargo-fuzz downloads")
+            );
         if optional_refresh_or_seed || optional_source_save {
-            // Missing seeds/saves leave required population intact. Compiled
-            // refreshes may be absent; paired source saves require their refresh.
+            // Optional transfers may disappear when no declared guard consumes
+            // their outputs. A dangling step reference is always rejected.
             assert_ne!(&job, baseline);
             validate(&job).unwrap();
         } else {
@@ -250,6 +257,8 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             .insert("continue-on-error".into(), true.into());
         let run = step["run"].as_str().unwrap();
         let advisory_context = run.contains(" ci download-cache-context ")
+            || run.ends_with(" ci bootstrap-cache-context")
+            || run.contains(" ci seed-context ")
             || (run.contains(" ci cache-context ") && step["timeout-minutes"].as_u64() == Some(2));
         if advisory_context {
             // A missing cache context disables caching, while the required
