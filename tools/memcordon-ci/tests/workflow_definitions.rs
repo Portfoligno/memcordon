@@ -46,6 +46,27 @@ fn rendered_bytes_match_all_checked_in_workflows() {
 }
 
 #[test]
+fn compact_action_aliases_preserve_complete_workflow_data_and_consumer_guards() {
+    for file in workflow_definitions::FILES {
+        let rendered = workflow_definitions::render(file).unwrap();
+        assert!(rendered.len() <= 500 * 1024, "{file} exceeds size budget");
+        assert!(rendered.contains("uses: &action_"));
+        assert!(rendered.contains("uses: *action_"));
+        let parsed: Value = serde_yaml::from_str(&rendered).unwrap();
+        assert_eq!(parsed, workflow_definitions::definition(file).unwrap());
+        if file == "release.yml" {
+            for (name, job) in parsed["jobs"].as_mapping().unwrap() {
+                if name.as_str().unwrap().starts_with("installed-macos-") {
+                    for row in job["strategy"]["matrix"]["include"].as_sequence().unwrap() {
+                        assert_eq!(row["producer-job"].as_str(), Some(""));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn budgets_use_maximum_branch_and_reject_platform_overflow() {
     use workflow_definitions::budget::JobBudget;
     assert_eq!(

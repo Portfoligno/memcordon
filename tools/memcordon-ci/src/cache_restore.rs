@@ -314,10 +314,20 @@ pub(crate) fn safe_root(repository: &Path, relative: &Path) -> Result<PathBuf> {
 
 pub(crate) fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
     let mut locks = Vec::new();
+    // Archive members can include both profile directories and their parent
+    // Cargo marker. Scan the union once; relocking a descendant via another
+    // file descriptor would conflict with our own exclusive lock.
+    let mut roots = std::collections::BTreeSet::new();
     for target in targets {
-        if !target.try_exists()? {
-            continue;
+        if target.try_exists()? {
+            roots.insert(target.canonicalize()?);
         }
+    }
+    for target in roots.iter().filter(|target| {
+        !roots
+            .iter()
+            .any(|other| other != *target && target.starts_with(other))
+    }) {
         for entry in walkdir::WalkDir::new(target).follow_links(false) {
             let entry = entry.map_err(|error| CiError::Message(error.to_string()))?;
             if entry.file_name() != ".cargo-lock" {
@@ -330,17 +340,29 @@ pub(crate) fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
                 use std::os::windows::fs::OpenOptionsExt;
                 options.share_mode(0);
             }
-            let file = options.open(entry.path())?;
+            let file = options.open(entry.path()).map_err(|error| {
+                CiError::Message(format!(
+                    "cannot open Cargo settlement lock {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
             #[cfg(unix)]
             rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .map_err(|_| {
-                    CiError::Message("restored cache has an active Cargo writer".into())
+                .map_err(|error| {
+                    CiError::Message(format!(
+                        "restored cache has an active Cargo writer at {}: {error}",
+                        entry.path().display()
+                    ))
                 })?;
             locks.push(file);
         }
     }
     Ok(locks)
 }
+
+#[cfg(test)]
+#[path = "../tests/private/cache_restore_locks.rs"]
+mod locks_tests;
 
 pub(crate) fn cargo_marker_present(target: &Path) -> Result<bool> {
     use std::io::Read;

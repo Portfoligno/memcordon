@@ -575,11 +575,17 @@ fn select_with_diagnostic_deadline(
         // Same live operation: cache/action time counts, and missing timing
         // inputs cannot silently mint another readiness interval.
         cleanup = cleanup.min(native_component_harness::resume_original_deadline(
-            root, &identity, target, true,
+            root,
+            &roles.source,
+            target,
+            true,
         )?);
         if !args.cleanup {
             work = work.min(native_component_harness::resume_original_deadline(
-                root, &identity, target, false,
+                root,
+                &roles.source,
+                target,
+                false,
             )?);
         }
     }

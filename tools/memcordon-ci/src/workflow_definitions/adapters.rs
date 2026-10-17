@@ -882,6 +882,21 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     }
     if name == "release.yml" {
         super::host_preparation::apply(workflow)?;
+        // Installed macOS consumers use the consumer branch of the shared
+        // readiness steps, whose producer guard requires an explicit empty key.
+        for (job_name, job) in workflow["jobs"].as_mapping_mut().expect("source jobs") {
+            if job_name
+                .as_str()
+                .is_some_and(|name| name.starts_with("installed-macos-"))
+            {
+                for row in job["strategy"]["matrix"]["include"]
+                    .as_sequence_mut()
+                    .expect("installed macOS matrix")
+                {
+                    set(row, "producer-job", text(""));
+                }
+            }
+        }
     }
     if name == "backend-certification.yml" {
         super::backend_private::apply(workflow)?;
