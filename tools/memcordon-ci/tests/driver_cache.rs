@@ -1,4 +1,9 @@
-use std::{fs, path::Path, process::Command, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 fn fixture() -> tempfile::TempDir {
     let fixture = tempfile::tempdir().unwrap();
@@ -37,6 +42,33 @@ fn executable() -> &'static str {
     }
 }
 
+fn cold_image(root: &Path) -> PathBuf {
+    let cold = root.join("target/ci-driver-cold/release");
+    fs::create_dir_all(&cold).unwrap();
+    let binary = cold.join(executable());
+    fs::copy(env!("CARGO_BIN_EXE_memcordon-ci"), &binary).unwrap();
+    // Native debug tests still exercise the real driver, but its unrelated
+    // Linux debug sections are not part of the bounded release image fixture.
+    // Strip only the disposable copy, never Cargo's original executable.
+    #[cfg(target_os = "linux")]
+    {
+        let mut strip = Command::new("strip");
+        strip.arg("--strip-debug").arg(&binary);
+        let output = memcordon_testkit::run_with_deadline_output_limit(
+            &mut strip,
+            Duration::from_secs(30),
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    binary
+}
+
 fn invoke(
     root: &Path,
     binary: &Path,
@@ -69,10 +101,7 @@ fn invoke(
 fn real_cold_image_is_adopted_as_bootstrap_then_activated_without_old_job_logic() {
     let fixture = fixture();
     let root = fixture.path();
-    let cold = root.join("target/ci-driver-cold/release");
-    fs::create_dir_all(&cold).unwrap();
-    let binary = cold.join(executable());
-    fs::copy(env!("CARGO_BIN_EXE_memcordon-ci"), &binary).unwrap();
+    let binary = cold_image(root);
     let (output, outputs) = invoke(root, &binary, "driver-adopt-cold", "push");
     assert!(
         output.status.success(),
@@ -114,10 +143,7 @@ fn real_cold_image_is_adopted_as_bootstrap_then_activated_without_old_job_logic(
 fn cold_adoption_never_uses_untrusted_events_to_publish_an_executable() {
     let fixture = fixture();
     let root = fixture.path();
-    let cold = root.join("target/ci-driver-cold/release");
-    fs::create_dir_all(&cold).unwrap();
-    let binary = cold.join(executable());
-    fs::copy(env!("CARGO_BIN_EXE_memcordon-ci"), &binary).unwrap();
+    let binary = cold_image(root);
     let (output, outputs) = invoke(root, &binary, "driver-adopt-cold", "pull_request");
     assert!(
         output.status.success(),

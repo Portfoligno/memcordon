@@ -65,10 +65,15 @@ pub fn compilation_retention(
 }
 
 pub fn write_event() -> bool {
-    matches!(
-        std::env::var("GITHUB_EVENT_NAME").as_deref(),
-        Ok("push" | "workflow_dispatch")
-    ) && std::env::var("GITHUB_REF").is_ok_and(|reference| reference.starts_with("refs/heads/"))
+    write_event_for(
+        std::env::var("GITHUB_EVENT_NAME").ok().as_deref(),
+        std::env::var("GITHUB_REF").ok().as_deref(),
+    )
+}
+
+pub fn write_event_for(event: Option<&str>, reference: Option<&str>) -> bool {
+    matches!(event, Some("push" | "workflow_dispatch"))
+        && reference.is_some_and(|reference| reference.starts_with("refs/heads/"))
 }
 
 fn unsafe_cache(error: &CiError) -> bool {
