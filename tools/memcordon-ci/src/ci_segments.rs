@@ -417,7 +417,8 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
             let entry = before
                 .as_ref()
                 .ok()
-                .zip(after.as_ref().ok())
+                .and_then(Option::as_ref)
+                .zip(after.as_ref().ok().and_then(Option::as_ref))
                 .filter(|(a, b)| a == b)
                 .filter(|_| {
                     memcordon_ci::segment_cache::write_event()
@@ -465,7 +466,7 @@ fn requests_inner(root: &Path, suite: Suite) -> Result<()> {
     let request = memcordon_ci::segment_cache::requests(root, &scopes(suite), family(suite));
     if matches!(suite, Suite::MiriSetup) {
         let context = memcordon_ci::miri_cache::identity(root);
-        let entry = context.as_ref().ok();
+        let entry = context.as_ref().ok().and_then(Option::as_ref);
         let emission = memcordon_ci::workflow_output::write(&[
             (
                 "sysroot-key",

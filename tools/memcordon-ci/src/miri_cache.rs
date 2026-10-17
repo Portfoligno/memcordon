@@ -126,12 +126,14 @@ pub fn components_only(root: &Path, deadline: Instant) -> Result<()> {
 pub fn context(root: &Path) -> Result<()> {
     let result = identity(root);
     match result {
-        Ok((key, path)) => crate::workflow_output::write(&[
+        Ok(Some((key, path))) => crate::workflow_output::write(&[
             ("sysroot-key", key),
             ("sysroot-path", path.display().to_string()),
         ]),
-        Err(error) => {
-            eprintln!("Miri sysroot cache unavailable: {error}");
+        unavailable => {
+            if let Err(error) = unavailable {
+                eprintln!("Miri sysroot cache unavailable: {error}");
+            }
             crate::workflow_output::write(&[
                 ("sysroot-key", String::new()),
                 ("sysroot-path", String::new()),
@@ -140,9 +142,12 @@ pub fn context(root: &Path) -> Result<()> {
     }
 }
 
-pub fn identity(root: &Path) -> Result<(String, PathBuf)> {
-    let path = managed_root(root)?
-        .ok_or_else(|| CiError::Message("unmodeled Miri setup overrides".into()))?;
+pub fn identity(root: &Path) -> Result<Option<(String, PathBuf)>> {
+    // Unsupported native setups and override-bearing inputs disable managed
+    // sysroot reuse; they do not prevent the required uncached native setup.
+    let Some(path) = managed_root(root)? else {
+        return Ok(None);
+    };
     let pins = crate::config::toolchains(root)?;
     let mut facts = crate::cache_inputs::cargo_configs(root)?;
     let home = crate::download_cache::cargo_home(root)?.canonicalize()?;
@@ -255,7 +260,7 @@ pub fn identity(root: &Path) -> Result<(String, PathBuf)> {
         compatibility: facts,
         content: BTreeMap::new(),
     })?;
-    Ok((key, path))
+    Ok(Some((key, path)))
 }
 
 pub fn ensure(root: &Path, nightly: &str, deadline: Instant) -> Result<Option<PathBuf>> {
