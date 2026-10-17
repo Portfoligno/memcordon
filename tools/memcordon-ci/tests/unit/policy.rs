@@ -60,6 +60,31 @@ fn repository_root() -> PathBuf {
 }
 
 #[test]
+fn authored_workflow_tokens_require_only_trusted_publishing_bindings() {
+    let path = Path::new("tools/memcordon-ci/src/workflow_definitions/release.rs");
+    let source = include_str!("../../src/workflow_definitions/release.rs");
+    validate_legacy_registry_token_source(path, source).unwrap();
+    let secret = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
+    for changed in [
+        source.replace("${{ steps.registry-auth.outputs.token }}", &secret),
+        source.replace("${{ steps.registry-auth.outputs.token }}", "untrusted"),
+        [
+            source,
+            r#"fn token() { std::env::var("CARGO_REGISTRY_TOKEN"); }"#,
+        ]
+        .join("\n"),
+        [
+            source,
+            r#"fn token(command: &mut Command) { command.env("CARGO_REGISTRY_TOKEN", "secret"); }"#,
+        ]
+        .join("\n"),
+    ] {
+        assert!(validate_legacy_registry_token_source(path, &changed).is_err());
+    }
+    assert!(validate_legacy_registry_token_source(Path::new("tools/other.rs"), source).is_err());
+}
+
+#[test]
 fn ordinary_workflows_do_not_restore_retired_self_hosted_runner_exceptions() {
     let root = repository_root();
     let policy = config::policy(&root).unwrap();

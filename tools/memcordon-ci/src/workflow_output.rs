@@ -7,6 +7,43 @@ use std::sync::Mutex;
 static COMPILATION: Mutex<std::collections::BTreeSet<&'static str>> =
     Mutex::new(std::collections::BTreeSet::new());
 
+/// Actions cache inputs are glob patterns, not native filesystem paths. Keep
+/// canonical paths internally, but remove Windows verbatim namespace syntax
+/// when presenting an ordinary drive or UNC path to an action.
+pub fn action_path(path: &std::path::Path) -> Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| CiError::Message("action path is not UTF-8".into()))?;
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        let mut components = unc.split('\\');
+        if !components.next().is_some_and(|value| !value.is_empty())
+            || !components.next().is_some_and(|value| !value.is_empty())
+        {
+            return Err(CiError::Message(
+                "action UNC path lacks server or share".into(),
+            ));
+        }
+        return Ok(["//", &unc.replace('\\', "/")].concat());
+    }
+    if let Some(drive) = value.strip_prefix(r"\\?\") {
+        if matches!(drive.as_bytes(), [letter, b':', b'\\', ..] if letter.is_ascii_alphabetic()) {
+            return Ok(drive.replace('\\', "/"));
+        }
+        return Err(CiError::Message(
+            "unsupported Windows namespace in action path".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+pub fn action_paths(paths: &[std::path::PathBuf]) -> Result<String> {
+    paths
+        .iter()
+        .map(|path| action_path(path))
+        .collect::<Result<Vec<_>>>()
+        .map(|paths| paths.join("\n"))
+}
+
 pub fn compiled_in_invocation(fact: &str) -> bool {
     COMPILATION
         .lock()

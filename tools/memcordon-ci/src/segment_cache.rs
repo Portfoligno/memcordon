@@ -115,9 +115,14 @@ fn emit(mut values: Vec<(String, String)>) -> Result<()> {
 }
 
 pub fn transfer_outputs(slot: &str, transfer: Option<cache_snapshot::Transfer>) -> Result<()> {
-    let (ready, key, path) = transfer.map_or((false, String::new(), String::new()), |value| {
-        (true, value.key, value.path.display().to_string())
-    });
+    let (ready, key, path) = match transfer {
+        Some(value) => (
+            true,
+            value.key,
+            crate::workflow_output::action_path(&value.path)?,
+        ),
+        None => (false, String::new(), String::new()),
+    };
     emit(vec![
         (format!("{slot}-save"), ready.to_string()),
         (format!("{slot}-key"), key),
@@ -150,7 +155,10 @@ fn request_outputs(slot: &str, request: Result<cache_snapshot::TransferRequest>)
         ),
         (
             format!("{slot}-inbox"),
-            request.map_or_else(String::new, |value| value.path.display().to_string()),
+            request
+                .map(|value| crate::workflow_output::action_path(&value.path))
+                .transpose()?
+                .unwrap_or_default(),
         ),
     ])
 }
@@ -240,14 +248,10 @@ fn direct_request(slot: &str, entry: Option<&CacheEntry>) -> Result<()> {
         ),
         (
             format!("{slot}-path"),
-            entry.map_or_else(String::new, |entry| {
-                entry
-                    .paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
+            entry
+                .map(|entry| crate::workflow_output::action_paths(&entry.paths))
+                .transpose()?
+                .unwrap_or_default(),
         ),
     ])
 }
@@ -366,13 +370,10 @@ impl SourceSession {
                 ),
                 (
                     format!("{}-complete-path", self.slot),
-                    complete.map_or_else(String::new, |e| {
-                        e.paths
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }),
+                    complete
+                        .map(|entry| crate::workflow_output::action_paths(&entry.paths))
+                        .transpose()?
+                        .unwrap_or_default(),
                 ),
             ])
         })();
@@ -760,13 +761,10 @@ impl<'a> Session<'a> {
                     ),
                     (
                         format!("{slot}-image-path"),
-                        entry.map_or_else(String::new, |e| {
-                            e.paths
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }),
+                        entry
+                            .map(|entry| crate::workflow_output::action_paths(&entry.paths))
+                            .transpose()?
+                            .unwrap_or_default(),
                     ),
                 ])
             })();

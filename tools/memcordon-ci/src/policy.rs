@@ -6418,6 +6418,50 @@ fn removal_only_legacy_token(source: &str) -> bool {
     reviewed != 0 && reviewed == source.matches("CARGO_REGISTRY_TOKEN").count()
 }
 
+fn trusted_workflow_definition_token(source: &str) -> bool {
+    fn text_literal(expression: &syn::Expr) -> Option<String> {
+        let syn::Expr::Call(call) = expression else {
+            return None;
+        };
+        let syn::Expr::Path(function) = call.func.as_ref() else {
+            return None;
+        };
+        if !function.path.is_ident("text") || call.args.len() != 1 {
+            return None;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) = call.args.first()?
+        else {
+            return None;
+        };
+        Some(value.value())
+    }
+    struct Bindings(usize);
+    impl<'ast> Visit<'ast> for Bindings {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "insert"
+                && call.args.len() == 2
+                && text_literal(&call.args[0]).as_deref() == Some("CARGO_REGISTRY_TOKEN")
+                && text_literal(&call.args[1]).as_deref()
+                    == Some("${{ steps.registry-auth.outputs.token }}")
+            {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let Ok(syntax) = syn::parse_file(source) else {
+        return false;
+    };
+    let mut bindings = Bindings(0);
+    bindings.visit_file(&syntax);
+    // Other reads, writes, literals and interfaces remain prohibited even in
+    // the authoritative workflow source. Emitted auth flow is checked below.
+    bindings.0 != 0 && bindings.0 == source.matches("CARGO_REGISTRY_TOKEN").count()
+}
+
 pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> Result<()> {
     let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
     if source.contains(legacy_secret_source.as_str()) {
@@ -6443,6 +6487,8 @@ pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> R
     .iter()
     .any(|path| relative == Path::new(path));
     if established
+        || relative == Path::new("tools/memcordon-ci/src/workflow_definitions/release.rs")
+            && trusted_workflow_definition_token(source)
         || relative == Path::new("tools/memcordon-ci/src/rehearsal_support/coordinator.rs")
             && removal_only_legacy_token(source)
     {

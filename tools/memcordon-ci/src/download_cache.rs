@@ -242,14 +242,10 @@ pub fn emit(root: &Path, family: DownloadFamily) -> Result<()> {
         ),
         (
             "source-paths",
-            available.map_or_else(String::new, |entry| {
-                entry
-                    .paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
+            available
+                .map(|entry| crate::workflow_output::action_paths(&entry.paths))
+                .transpose()?
+                .unwrap_or_default(),
         ),
         (
             "bootstrap-home-matches",

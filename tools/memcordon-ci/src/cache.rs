@@ -1115,14 +1115,10 @@ pub fn emit_partition(
         ));
         outputs.push((
             paths_output,
-            entry.map_or_else(String::new, |entry| {
-                entry
-                    .paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
+            entry
+                .map(|entry| crate::workflow_output::action_paths(&entry.paths))
+                .transpose()?
+                .unwrap_or_default(),
         ));
     }
     for (name, key_output, path_output) in [
@@ -1134,12 +1130,7 @@ pub fn emit_partition(
             outputs.push((key_output, entry.exact_key.clone()));
             outputs.push((
                 path_output,
-                entry
-                    .paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                crate::workflow_output::action_paths(&entry.paths)?,
             ));
         } else {
             outputs.push((key_output, String::new()));
