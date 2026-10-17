@@ -5634,6 +5634,33 @@ fn check_workflow(
     )
 }
 
+fn driver_fixture_environment_slot(key: &str, value: &syn::Expr) -> Option<usize> {
+    match (key, value) {
+        ("GITHUB_EVENT_NAME", syn::Expr::Path(event)) if event.path.is_ident("event") => Some(0),
+        (
+            "GITHUB_REF",
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(reference),
+                ..
+            }),
+        ) if reference.value() == "refs/heads/test" => Some(1),
+        ("GITHUB_OUTPUT", syn::Expr::Reference(output)) if matches!(output.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("outputs")) => {
+            Some(2)
+        }
+        ("CARGO_HOME", syn::Expr::MethodCall(home))
+            if home.method == "join"
+                && home.args.len() == 1
+                && matches!(home.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(directory), .. })) if directory.value() == "cargo-home")
+                && matches!(home.receiver.as_ref(), syn::Expr::MethodCall(unwrap) if unwrap.method == "unwrap" && unwrap.args.is_empty()
+                    && matches!(unwrap.receiver.as_ref(), syn::Expr::MethodCall(canonical) if canonical.method == "canonicalize" && canonical.args.is_empty()
+                        && matches!(canonical.receiver.as_ref(), syn::Expr::Path(root) if root.path.is_ident("root")))) =>
+        {
+            Some(3)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct RustPolicy {
     violations: Vec<String>,
@@ -5650,6 +5677,7 @@ struct RustPolicy {
     cargo_job_budget_mutations: usize,
     managed_miri_sysroot_mutations: usize,
     standard_output_mutations: usize,
+    driver_fixture_mutations: [usize; 4],
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -5723,6 +5751,17 @@ impl<'ast> Visit<'ast> for RustPolicy {
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.subprocess_env_mutations += 1;
+            if expression.method == "env"
+                && expression.args.len() == 2
+                && let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(key),
+                    ..
+                }) = &expression.args[0]
+                && let Some(slot) =
+                    driver_fixture_environment_slot(&key.value(), &expression.args[1])
+            {
+                self.driver_fixture_mutations[slot] += 1;
+            }
             if expression.method == "env"
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "PATH")
             {
@@ -5837,6 +5876,15 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
 }
 
 fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    // The driver fixture must simulate both trusted push and untrusted PR
+    // events, an owned output receipt, and its isolated standard Cargo home.
+    // Every setter has one exact source/value shape; no ambient state changes.
+    if relative == Path::new("tools/memcordon-ci/tests/driver_cache.rs") {
+        return visitor.driver_fixture_mutations == [1; 4]
+            && visitor.subprocess_env_mutations
+                == visitor.driver_fixture_mutations.iter().sum::<usize>()
+            && visitor.cleared_environments == 0;
+    }
     // Only the authored-registry installation fixture forces Cargo offline;
     // other transport fixtures retain the existing home/output-only boundary.
     let offline = if relative == Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs") {
