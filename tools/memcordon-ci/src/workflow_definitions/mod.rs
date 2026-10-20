@@ -134,10 +134,14 @@ pub fn run(root: &Path, write: bool) -> Result<()> {
         let path = root.join(".github/workflows").join(file);
         if write {
             fs::write(path, expected)?;
-        } else if fs::read(path)? != expected.as_bytes() {
-            return Err(CiError::Message(format!(
-                "generated workflow drift: {file}; run memcordon-ci ci workflows --write"
-            )));
+        } else {
+            // Git may check these text files out with CRLF. Ignore only that
+            // newline representation; all other generated content stays exact.
+            if fs::read_to_string(path)?.replace("\r\n", "\n") != expected {
+                return Err(CiError::Message(format!(
+                    "generated workflow drift: {file}; run memcordon-ci ci workflows --write"
+                )));
+            }
         }
     }
     Ok(())
