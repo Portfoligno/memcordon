@@ -1,10 +1,113 @@
 use memcordon_ci::windows_component_failed_recovery::{
-    RecoveryBinding, pending_original_frontend_relay, worker_loss_recovery_authority,
+    RecoveryBinding, guardian_loss_original_authority, pending_original_frontend_relay,
+    worker_loss_recovery_authority,
 };
 use memcordon_core::*;
 
 #[path = "../../../crates/memcordon-core/tests/support/windows_postauthorization.rs"]
 mod support;
+
+#[path = "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/publication_wait.rs"]
+mod publication_wait;
+
+#[test]
+fn publication_wait_classifies_only_actual_timeout_as_busy() {
+    assert_eq!(publication_wait::failure_detail(0, None), None);
+    assert_eq!(publication_wait::failure_detail(128, None), None);
+    let busy =
+        publication_wait::failure_detail(publication_wait::WAIT_TIMEOUT_STATUS, None).unwrap();
+    let failed = publication_wait::failure_detail(u32::MAX, Some(5)).unwrap();
+    assert!(failed.contains("WAIT_FAILED"));
+    assert!(failed.contains("Some(5)"));
+    assert_ne!(failed, busy);
+    let unavailable_error = publication_wait::failure_detail(u32::MAX, None).unwrap();
+    assert!(unavailable_error.contains("native_error=None"));
+    assert_ne!(unavailable_error, busy);
+    let unexpected = publication_wait::failure_detail(17, Some(5)).unwrap();
+    assert!(unexpected.contains("17"));
+    assert_ne!(unexpected, busy);
+}
+
+#[test]
+fn publication_busy_retry_requires_exact_authenticated_original_binding() {
+    let original = held();
+    let provider = &original.association.provider;
+    let binding = RecoveryBinding::from_held(&original, provider).unwrap();
+    let frontend = WindowsProcessIdentityV1 {
+        process_id: 46,
+        creation_time_100ns: 1238,
+    };
+    let busy =
+        publication_wait::failure_detail(publication_wait::WAIT_TIMEOUT_STATUS, None).unwrap();
+    let wrapper = serde_json::json!({"schema_version":1,
+        "provider_request":WindowsProviderRequestV3::RecoverAttempt {
+            schema_version:WINDOWS_PUBLIC_PROTOCOL_VERSION, attempt_id:binding.attempt.clone(),
+            nonce:binding.nonce.clone(),request_sha256:binding.request.clone(),challenge:"original-recovery".into()},
+        "provider_response":WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+            schema_version:WINDOWS_PUBLIC_PROTOCOL_VERSION,attempt_id:binding.attempt.clone(),
+            challenge:"original-recovery".into(),detail:busy},"frontend_delivery":null});
+    assert!(
+        pending_original_frontend_relay(&wrapper, &original, provider, &frontend, Some(1)).unwrap()
+    );
+    for detail in [
+        "attempt publication owner is unavailable".to_owned(),
+        publication_wait::failure_detail(u32::MAX, Some(5)).unwrap(),
+        publication_wait::failure_detail(17, None).unwrap(),
+    ] {
+        let mut changed = wrapper.clone();
+        changed["provider_response"]["detail"] = serde_json::json!(detail);
+        assert!(
+            !pending_original_frontend_relay(&changed, &original, provider, &frontend, Some(1))
+                .unwrap()
+        );
+    }
+    for (pointer, value) in [
+        ("/schema_version", serde_json::json!(2)),
+        ("/provider_request/schema_version", serde_json::json!(0)),
+        ("/provider_response/schema_version", serde_json::json!(0)),
+        (
+            "/provider_request/attempt_id",
+            serde_json::json!("9".repeat(64)),
+        ),
+        ("/provider_request/nonce", serde_json::json!("9".repeat(32))),
+        (
+            "/provider_request/request_sha256",
+            serde_json::json!("9".repeat(64)),
+        ),
+        (
+            "/provider_response/attempt_id",
+            serde_json::json!("9".repeat(64)),
+        ),
+        (
+            "/provider_response/challenge",
+            serde_json::json!("foreign-recovery"),
+        ),
+        (
+            "/frontend_delivery",
+            serde_json::json!({"retired_confirmed":true}),
+        ),
+    ] {
+        let mut changed = wrapper.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !pending_original_frontend_relay(&changed, &original, provider, &frontend, Some(1))
+                .unwrap(),
+            "{pointer}"
+        );
+    }
+    for status in [Some(0), Some(2), None] {
+        assert!(
+            !pending_original_frontend_relay(&wrapper, &original, provider, &frontend, status)
+                .unwrap()
+        );
+    }
+    let mut foreign = provider.clone();
+    foreign.generation = BoundedText::new("foreign-provider").unwrap();
+    assert!(
+        !pending_original_frontend_relay(&wrapper, &original, &foreign, &frontend, Some(1))
+            .unwrap_or(false)
+    );
+}
 
 fn held() -> WindowsGuardianAttemptObservation {
     WindowsGuardianAttemptObservation {
@@ -38,6 +141,208 @@ fn held() -> WindowsGuardianAttemptObservation {
             attempt_id: DiagnosticSha256::from_bytes([2; 32]),
             request_sha256: DiagnosticSha256::from_bytes([3; 32]),
         },
+    }
+}
+
+fn original_guardian_failure() -> (WindowsGuardianAttemptObservation, WindowsProviderResponseV3) {
+    // The shared real receipt fixture already models original CheckGuardian /
+    // GuardianLoss and an Execution MonitorFailed, rather than recovered closure.
+    let mut rejection = support::rejection();
+    rejection.code = "MCSEALED-WINDOWS-JOB-QUERY".into();
+    let receipt = rejection.terminal_receipt().unwrap();
+    let mut original = held();
+    original.association.provider = rejection
+        .provider_failure
+        .as_ref()
+        .unwrap()
+        .provider_binding
+        .clone();
+    original.association.attempt_id =
+        DiagnosticSha256::try_from(BoundedText::new(&receipt.attempt_id).unwrap()).unwrap();
+    original.association.request_sha256 =
+        DiagnosticSha256::try_from(BoundedText::new(&receipt.request_sha256).unwrap()).unwrap();
+    original.live_nonce = Some(receipt.nonce.clone());
+    original.live_target_identity = receipt.process_observation.root_identity.clone();
+    assert!(rejection.is_consistent());
+    let response = WindowsProviderResponseV3::Reject {
+        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        attempt_id: String::from(original.association.attempt_id.clone()),
+        nonce: original.live_nonce.clone().unwrap(),
+        request_sha256: String::from(original.association.request_sha256.clone()),
+        rejection,
+    };
+    (original, response)
+}
+
+#[test]
+fn original_guardian_authority_survives_later_receipt_free_retirement() {
+    let (original, response) = original_guardian_failure();
+    let provider = &original.association.provider;
+    let selected = WindowsSealedFault::GuardianKilledAfterAuthorization;
+    assert!(guardian_loss_original_authority(&response, selected, &original, provider).unwrap());
+    let binding = RecoveryBinding::from_held(&original, provider).unwrap();
+    assert!(
+        !guardian_loss_original_authority(
+            &WindowsProviderResponseV3::TerminalRetiredV2(retired(&binding)),
+            selected,
+            &original,
+            provider,
+        )
+        .unwrap()
+    );
+    assert!(
+        !guardian_loss_original_authority(
+            &response,
+            WindowsSealedFault::AllJobOwnersClosedAfterAuthorization,
+            &original,
+            provider,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn original_guardian_authority_rejects_foreign_held_and_response_bindings() {
+    let (original, response) = original_guardian_failure();
+    let selected = WindowsSealedFault::GuardianKilledAfterAuthorization;
+    for mutate in [
+        |held: &mut WindowsGuardianAttemptObservation| {
+            held.association.provider.generation = BoundedText::new("foreign-provider").unwrap()
+        },
+        |held: &mut WindowsGuardianAttemptObservation| {
+            held.association.attempt_id = DiagnosticSha256::from_bytes([9; 32])
+        },
+        |held: &mut WindowsGuardianAttemptObservation| {
+            held.association.request_sha256 = DiagnosticSha256::from_bytes([9; 32])
+        },
+        |held: &mut WindowsGuardianAttemptObservation| held.live_nonce = Some("9".repeat(32)),
+        |held: &mut WindowsGuardianAttemptObservation| {
+            held.live_target_identity
+                .as_mut()
+                .unwrap()
+                .creation_time_100ns += 1
+        },
+    ] {
+        let mut changed = original.clone();
+        mutate(&mut changed);
+        assert!(
+            !guardian_loss_original_authority(
+                &response,
+                selected,
+                &changed,
+                &original.association.provider
+            )
+            .unwrap_or(false)
+        );
+    }
+    for field in ["attempt_id", "nonce", "request_sha256"] {
+        let mut changed = response.clone();
+        let WindowsProviderResponseV3::Reject {
+            attempt_id,
+            nonce,
+            request_sha256,
+            ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        match field {
+            "attempt_id" => *attempt_id = "9".repeat(64),
+            "nonce" => *nonce = "9".repeat(32),
+            "request_sha256" => *request_sha256 = "9".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            !guardian_loss_original_authority(
+                &changed,
+                selected,
+                &original,
+                &original.association.provider
+            )
+            .unwrap_or(false)
+        );
+    }
+}
+
+#[test]
+fn original_guardian_authority_requires_actual_monitor_failure_cause() {
+    let (original, response) = original_guardian_failure();
+    let selected = WindowsSealedFault::GuardianKilledAfterAuthorization;
+    for mutate in [
+        |rejection: &mut WindowsProviderRejectionV2| {
+            rejection.phase = BoundarySetupPhase::Retirement
+        },
+        |rejection: &mut WindowsProviderRejectionV2| rejection.provider_failure = None,
+        |rejection: &mut WindowsProviderRejectionV2| {
+            rejection
+                .provider_failure
+                .as_mut()
+                .unwrap()
+                .provider_binding
+                .generation = BoundedText::new("foreign-provider").unwrap()
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            rejection.provider_failure.as_mut().unwrap().attempt_id =
+                DiagnosticSha256::from_bytes([9; 32])
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            rejection.provider_failure.as_mut().unwrap().request_sha256 =
+                DiagnosticSha256::from_bytes([9; 32])
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            let OriginalFailureV1::Observed { event } =
+                &mut rejection.provider_failure.as_mut().unwrap().original
+            else {
+                unreachable!()
+            };
+            event.native_code = Some(NativeFailureCodeV1::Win32(5));
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            let OriginalFailureV1::Observed { event } =
+                &mut rejection.provider_failure.as_mut().unwrap().original
+            else {
+                unreachable!()
+            };
+            event.operation = FailureOperationV1::ReadControlFrame;
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            let OriginalFailureV1::Observed { event } =
+                &mut rejection.provider_failure.as_mut().unwrap().original
+            else {
+                unreachable!()
+            };
+            event.observed_phase = AttemptObservationPhaseV1::BeforeAuthorization;
+        },
+        |rejection: &mut WindowsProviderRejectionV2| {
+            let WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } =
+                &mut rejection.disposition
+            else {
+                unreachable!()
+            };
+            let WindowsTerminalPayloadV2::Execution { outcome, .. } = &mut receipt.payload else {
+                unreachable!()
+            };
+            *outcome = RunOutcome::Exited {
+                child: ChildTermination::ExitCode { code: 0 },
+                peak: None,
+                cleanup: outcome.cleanup().clone(),
+            };
+        },
+    ] {
+        let mut changed = response.clone();
+        let WindowsProviderResponseV3::Reject { rejection, .. } = &mut changed else {
+            unreachable!()
+        };
+        mutate(rejection);
+        assert!(
+            !guardian_loss_original_authority(
+                &changed,
+                selected,
+                &original,
+                &original.association.provider
+            )
+            .unwrap_or(false)
+        );
     }
 }
 

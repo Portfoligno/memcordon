@@ -47,10 +47,17 @@ fn exact_non_release_workflows_and_shard_mutations() {
         shards[1] = shards[0].clone();
         assert!(check(".github/workflows/deep-ci.yml", &duplicate).is_err());
         let mut wrong = exact.clone();
-        let steps = wrong["jobs"][family]["steps"].as_sequence_mut().unwrap();
+        let driver_owner = if family == "fuzz" {
+            "fuzz-setup"
+        } else {
+            family
+        };
+        let steps = wrong["jobs"][driver_owner]["steps"]
+            .as_sequence_mut()
+            .unwrap();
         let prepare = steps
             .iter_mut()
-            .find(|step| step["name"].as_str() == Some("Build ordinary CI driver"))
+            .find(|step| step["id"] == "driver-cold-build")
             .unwrap();
         prepare["run"] = Value::String(
             "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-core"
@@ -64,9 +71,12 @@ fn exact_non_release_workflows_and_shard_mutations() {
         let suite = steps
             .iter_mut()
             .find(|step| {
-                step["if"]
-                    .as_str()
-                    .is_some_and(|condition| condition.starts_with("matrix.shard =="))
+                step["id"]
+                    == if family == "miri" {
+                        "miri-quarter-one"
+                    } else {
+                        "fuzz-one"
+                    }
             })
             .unwrap();
         suite["run"] = Value::String("./target/ci/release/memcordon-ci suite native".into());
@@ -91,11 +101,7 @@ fn windows_native_architecture_runner_and_environment_boundaries_are_exact() {
         let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
         let suite = steps
             .iter_mut()
-            .find(|step| {
-                step["run"]
-                    .as_str()
-                    .is_some_and(|run| run.split_whitespace().any(|part| part == "suite"))
-            })
+            .find(|step| step["id"] == "backend-run")
             .unwrap();
         suite["env"] = serde_yaml::from_str("CARGO_TARGET_DIR: target/ci/incorrect").unwrap();
         assert!(check(".github/workflows/backend-certification.yml", &changed).is_err());
@@ -106,16 +112,19 @@ fn windows_native_architecture_runner_and_environment_boundaries_are_exact() {
 fn source_cache_and_duplicate_ordinary_build_controls_cannot_be_weakened() {
     let exact: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/deep-ci.yml")).unwrap();
-    let mut duplicate = exact.clone();
-    let steps = duplicate["jobs"]["fuzz"]["steps"]
-        .as_sequence_mut()
-        .unwrap();
-    let ordinal = steps
-        .iter()
-        .position(|step| step["name"] == "Build ordinary CI driver")
-        .unwrap();
-    steps.insert(ordinal + 1, steps[ordinal].clone());
-    assert!(check(".github/workflows/deep-ci.yml", &duplicate).is_err());
+    for (job, id) in [
+        ("fuzz", "fuzz-current-probe"),
+        ("fuzz-setup", "driver-cold-build"),
+    ] {
+        let mut duplicate = exact.clone();
+        let steps = duplicate["jobs"][job]["steps"].as_sequence_mut().unwrap();
+        let ordinal = steps.iter().position(|step| step["id"] == id).unwrap();
+        steps.insert(ordinal + 1, steps[ordinal].clone());
+        assert!(
+            check(".github/workflows/deep-ci.yml", &duplicate).is_err(),
+            "duplicate {job}/{id}"
+        );
+    }
     for mutation in ["staging", "credentials", "success-only"] {
         let mut changed = exact.clone();
         let steps = changed["jobs"]["fuzz"]["steps"].as_sequence_mut().unwrap();
@@ -228,7 +237,7 @@ fn selected_stress_phases_cannot_serialize_share_roots_or_omit_aggregation() {
                     let id = if other == "conditional-run" {
                         "stress-run"
                     } else {
-                        "compiled"
+                        "stress-run-request-compiled-complete-restore"
                     };
                     let step = steps.iter_mut().find(|step| step["id"] == id).unwrap();
                     if other == "conditional-run" {
@@ -272,11 +281,13 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
     for family in [
         "miri",
         "fuzz",
+        "fuzz-setup",
         "stress",
         "stress-packages",
         "stress-lifecycle",
     ] {
-        finite_cache_paths(&deep["jobs"][family], family).unwrap();
+        finite_cache_paths(&deep["jobs"][family], family)
+            .unwrap_or_else(|error| panic!("{family}: {error}"));
     }
 
     let baseline = &deep["jobs"]["miri"];
@@ -286,11 +297,11 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         ("path", "target/ci/reports"),
         (
             "key",
-            "${{ steps.fuzz-download-context.outputs.source-key }}",
+            "${{ steps.shard-fuzz-fetch-request.outputs.source-key }}",
         ),
         (
             "restore-keys",
-            "${{ steps.workspace-download-context.outputs.product-restore-prefix }}",
+            "${{ steps.workspace-fetch-request.outputs.product-restore-prefix }}",
         ),
     ] {
         let mut job = baseline.clone();
@@ -298,7 +309,7 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
             .as_sequence_mut()
             .unwrap()
             .iter_mut()
-            .find(|step| step["id"] == "workspace-downloads")
+            .find(|step| step["id"] == "workspace-fetch-request-source-restore")
             .unwrap()["with"][field] = replacement.into();
         assert_ne!(&job, baseline);
         assert!(finite_cache_paths(&job, "miri").is_err());
@@ -307,9 +318,20 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
     missing_source_context["steps"]
         .as_sequence_mut()
         .unwrap()
-        .retain(|step| step["id"] != "workspace-download-context");
+        .retain(|step| step["id"] != "workspace-fetch-request");
     assert_ne!(&missing_source_context, baseline);
     assert!(finite_cache_paths(&missing_source_context, "miri").is_err());
+    let mut unknown = baseline.clone();
+    let mut extra = unknown["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == "workspace-fetch-request-source-restore")
+        .unwrap()
+        .clone();
+    extra["id"] = "unowned-source-restore".into();
+    unknown["steps"].as_sequence_mut().unwrap().push(extra);
+    assert!(finite_cache_paths(&unknown, "miri").is_err());
     for replacement in [
         "~/.cargo",
         "~/.cargo/credentials.toml",
@@ -329,19 +351,22 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
         "target/ci/reports",
         "target/ci-build",
         "target/ci/miri-*",
-        "${{ steps.compiled-context-quarter-two.outputs.product-paths }}",
+        "${{ steps.miri-quarter-two-request.outputs.compiled-complete-inbox }}",
     ] {
         let mut job = baseline.clone();
         job["steps"]
             .as_sequence_mut()
             .unwrap()
             .iter_mut()
-            .find(|step| step["id"] == "compiled-quarter-one")
+            .find(|step| step["id"] == "miri-quarter-one-request-compiled-complete-restore")
             .unwrap()["with"]["path"] = replacement.into();
         assert_ne!(&job, baseline);
         assert!(finite_cache_paths(&job, "miri").is_err());
     }
-    for id in ["compiled-quarter-one", "compiled-context-quarter-two"] {
+    for id in [
+        "miri-quarter-one-request-compiled-complete-restore",
+        "miri-quarter-two-request",
+    ] {
         let mut job = baseline.clone();
         job["steps"]
             .as_sequence_mut()
@@ -360,15 +385,21 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
                 .as_str()
                 .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
                 && step["with"]["key"]
-                    == "${{ steps.compiled-context-quarter-one.outputs.product-key }}"
+                    == "${{ steps.miri-quarter-one.outputs.compiled-complete-key }}"
         })
         .unwrap()["with"]["path"] = "target/ci/reports".into();
     assert_ne!(&job, baseline);
     assert!(finite_cache_paths(&job, "miri").is_err());
-    let baseline = &deep["jobs"]["fuzz"];
+    let baseline = &deep["jobs"]["fuzz-setup"];
     for (id, path) in [
-        ("cache-cargo-fuzz-binary", "target/ci-tools/bin"),
-        ("cache-cargo-fuzz-build", "target/ci-tools-build"),
+        (
+            "prepare-fuzz-request-cargo-fuzz-image-restore",
+            "target/ci-tools/bin",
+        ),
+        (
+            "prepare-fuzz-request-cargo-fuzz-complete-restore",
+            "target/ci-tools-build",
+        ),
     ] {
         let mut job = baseline.clone();
         job["steps"]
@@ -378,399 +409,414 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
             .find(|step| step["id"] == id)
             .unwrap()["with"]["path"] = path.into();
         assert_ne!(&job, baseline);
-        assert!(finite_cache_paths(&job, "fuzz").is_err());
+        assert!(finite_cache_paths(&job, "fuzz-setup").is_err());
     }
 }
 
 fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
     #[track_caller]
     fn require(valid: bool) -> Result<(), String> {
-        valid.then_some(()).ok_or_else(|| {
-            format!(
-                "cache role or custody differs at {}",
-                std::panic::Location::caller()
-            )
-        })
+        let caller = std::panic::Location::caller();
+        valid
+            .then_some(())
+            .ok_or_else(|| format!("cache role or custody differs at {caller}"))
     }
-    let steps = job["steps"].as_sequence().ok_or("steps absent")?;
-    let shards: &[&str] = match family {
-        "miri" => &[
-            "quarter-one",
-            "quarter-two",
-            "quarter-three",
-            "quarter-four",
-        ],
-        "fuzz" => &[
-            "quarter-one",
-            "quarter-two",
-            "quarter-three",
-            "quarter-four",
-        ],
-        "stress" | "stress-packages" | "stress-lifecycle" => &["complete"],
-        _ => return Err("unknown family".into()),
-    };
-    let reference =
-        |context: &str, output: &str| format!("${{{{ steps.{context}.outputs.{output} }}}}");
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut source_roles = std::collections::BTreeMap::from([(
-        "workspace-downloads",
-        (
-            "workspace-download-context",
-            memcordon_ci::download_cache::DownloadFamily::Workspace,
-        ),
-    )]);
-    if family == "fuzz" {
-        source_roles.insert(
-            "fuzz-downloads",
-            (
-                "fuzz-download-context",
-                memcordon_ci::download_cache::DownloadFamily::Fuzz,
-            ),
-        );
-        source_roles.insert(
-            "cache-cargo-fuzz-downloads",
-            (
-                "cache-cargo-fuzz-download-context",
-                memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz,
-            ),
-        );
+    fn reference(owner: &str, field: &str) -> String {
+        format!("${{{{ steps.{owner}.outputs.{field} }}}}")
     }
-    let mut roles = std::collections::BTreeMap::new();
-    for shard in shards {
-        let (id, context) = if *shard == "complete" {
-            ("compiled".to_owned(), "compiled-context".to_owned())
+    fn equal<T: std::fmt::Debug + PartialEq>(
+        family: &str,
+        role: &str,
+        field: &str,
+        actual: T,
+        expected: T,
+    ) -> Result<(), String> {
+        if actual == expected {
+            Ok(())
         } else {
-            (
-                format!("compiled-{shard}"),
-                format!("compiled-context-{shard}"),
-            )
-        };
-        let declarations: Vec<_> = steps
-            .iter()
-            .filter(|step| step["id"].as_str() == Some(&context))
-            .collect();
-        require(declarations.len() == 1)?;
-        require(
-            declarations[0]["run"].as_str()
-                == Some(&format!(
-                    "./target/ci/release/memcordon-ci ci cache-context --purpose {family} --shard {shard}{}",
-                    if family == "fuzz" {
-                        " --partition fuzz-targets"
-                    } else {
-                        ""
-                    }
-                )),
-        )?;
-        if *shard != "complete" {
-            require(declarations[0]["if"].as_str() == Some(&format!("matrix.shard == '{shard}'")))?;
+            Err(format!(
+                "{family}/{role} {field}: expected {expected:?}, actual {actual:?}"
+            ))
         }
-        let roots =
-            memcordon_ci::cache_restore::roots(family, shard).map_err(|error| error.to_string())?;
-        roles.insert(
-            id,
-            (
-                reference(&context, "product-key"),
-                reference(&context, "product-paths"),
-                Some(reference(&context, "product-restore-prefix")),
-                roots,
-            ),
-        );
     }
-    if family == "fuzz" {
-        require(steps.iter().filter(|step| step["id"] == "cache-cargo-fuzz" && step["run"] == "./target/ci/release/memcordon-ci ci cache-context --purpose cargo-fuzz --shard complete").count() == 1)?;
-        for (id, key, path, roots) in [
-            (
-                "cache-cargo-fuzz-binary",
-                "tool-key",
-                "tool-path",
-                vec![
-                    memcordon_ci::preparation::auxiliary_tool(Path::new(""), "cargo-fuzz")
-                        .map_err(|error| error.to_string())?,
-                ],
-            ),
-            (
-                "cache-cargo-fuzz-build",
-                "tool-build-key",
-                "tool-build-path",
-                vec!["target/ci-tools-build/cargo-fuzz".into()],
-            ),
-        ] {
-            roles.insert(
-                id.into(),
-                (
-                    reference("cache-cargo-fuzz", key),
-                    reference("cache-cargo-fuzz", path),
-                    None,
-                    roots,
-                ),
+    fn protected(roots: &[std::path::PathBuf]) -> Result<(), String> {
+        for root in roots {
+            require(!root.as_os_str().is_empty() && !root.to_string_lossy().contains('*'))?;
+            for excluded in [
+                ".release/prepared",
+                "target/ci/reports",
+                "target/ci/deadline-evidence",
+                "target/ci-consumers/capture",
+                "target/ci-build/package-staging",
+                "~/.cargo/credentials.toml",
+                "~/.cargo/config.toml",
+            ] {
+                require(!Path::new(excluded).starts_with(root))?;
+            }
+        }
+        Ok(())
+    }
+    // Independent catalog: request/save roles are derived from native operation
+    // names, never accepted from the YAML's key/path strings or renderer output.
+    fn slots(recipe: &str, request: bool) -> Result<Vec<String>, String> {
+        let source = if request { "source" } else { "source-complete" };
+        let mut result: Vec<String> = match recipe {
+            "workspace-fetch" | "fuzz-fetch" | "miri-setup" | "prepare-fuzz" => {
+                [source, "archives-partial", "index-partial"]
+                    .map(str::to_owned)
+                    .into()
+            }
+            "driver-context" if request => ["image", "compiled-complete", "compiled-partial"]
+                .map(str::to_owned)
+                .into(),
+            "driver-build" if !request => [
+                "bootstrap",
+                "image",
+                "compiled-complete",
+                "compiled-partial",
+                "source-complete",
+                "archives-partial",
+                "index-partial",
+            ]
+            .map(str::to_owned)
+            .into(),
+            "driver-adopt-cold" if !request => [
+                "bootstrap",
+                "source-complete",
+                "archives-partial",
+                "index-partial",
+            ]
+            .map(str::to_owned)
+            .into(),
+            "prepare-miri-components" => Vec::new(),
+            value
+                if value.starts_with("miri-quarter-")
+                    || value.starts_with("fuzz-compile-quarter-")
+                    || value.starts_with("fuzz-execute-quarter-")
+                    || matches!(value, "stress" | "stress-packages" | "stress-lifecycle") =>
+            {
+                ["compiled-complete", "compiled-partial"]
+                    .map(str::to_owned)
+                    .into()
+            }
+            _ => return Err(format!("unknown finite recipe {recipe}")),
+        };
+        if recipe == "miri-setup" {
+            result.push("sysroot".into());
+        }
+        if recipe == "prepare-fuzz" {
+            result.extend(
+                if request {
+                    [
+                        "cargo-fuzz-image",
+                        "cargo-fuzz-source",
+                        "cargo-fuzz-complete",
+                        "cargo-fuzz-partial",
+                    ]
+                } else {
+                    [
+                        "cargo-fuzz-image",
+                        "cargo-fuzz-source-complete",
+                        "cargo-fuzz-complete",
+                        "cargo-fuzz-partial",
+                    ]
+                }
+                .map(str::to_owned),
             );
         }
+        // Execution consumes the compiler's owned targets, never a second inbox.
+        if request && recipe.starts_with("fuzz-execute-") {
+            return Err("execution cache reimport".into());
+        }
+        Ok(result)
+    }
+    let steps = job["steps"].as_sequence().ok_or("steps absent")?;
+    // id -> (save, key, path, prefix, guard, lookup-only, producer ordinal).
+    let mut expected =
+        BTreeMap::<String, (bool, String, String, Option<String>, String, bool, usize)>::new();
+    let mut recipes = BTreeSet::new();
+    for (ordinal, step) in steps.iter().enumerate() {
+        let Some(run) = step["run"].as_str() else {
+            continue;
+        };
+        let operation = run
+            .split_once(" ci cache-requests ")
+            .map(|(_, recipe)| (recipe, true))
+            .or_else(|| {
+                run.split_once(" ci segment ")
+                    .map(|(_, recipe)| (recipe, false))
+            })
+            .or_else(|| {
+                ["driver-context", "driver-build", "driver-adopt-cold"]
+                    .into_iter()
+                    .find(|recipe| run.ends_with(&format!(" ci {recipe}")))
+                    .map(|recipe| (recipe, recipe == "driver-context"))
+            });
+        let Some((recipe, request)) = operation else {
+            continue;
+        };
+        let role_slots = slots(recipe, request)?;
+        if role_slots.is_empty() {
+            continue;
+        }
+        let owner = step["id"].as_str().ok_or("finite owner id absent")?;
+        require(!owner.is_empty())?;
+        recipes.insert(recipe.to_owned());
+        if let Some(quarter) = recipe.strip_prefix("miri-quarter-") {
+            let shard = format!("quarter-{quarter}");
+            let roots =
+                memcordon_ci::cache_restore::roots("miri", &shard).map_err(|e| e.to_string())?;
+            require(roots == vec![Path::new("target/ci").join(format!("miri-{shard}"))])?;
+            protected(&roots)?;
+            for other in ["one", "two", "three", "four"]
+                .into_iter()
+                .filter(|other| *other != quarter)
+            {
+                require(
+                    !Path::new("target/ci")
+                        .join(format!("miri-quarter-{other}"))
+                        .starts_with(&roots[0]),
+                )?;
+            }
+        } else if let Some(quarter) = recipe
+            .strip_prefix("fuzz-compile-quarter-")
+            .or_else(|| recipe.strip_prefix("fuzz-execute-quarter-"))
+        {
+            let roots = memcordon_ci::cache_restore::roots("fuzz", &format!("quarter-{quarter}"))
+                .map_err(|e| e.to_string())?;
+            require(roots == vec![std::path::PathBuf::from("fuzz/target")])?;
+            protected(&roots)?;
+        } else if matches!(recipe, "stress" | "stress-packages" | "stress-lifecycle") {
+            let roots = memcordon_ci::cache_restore::roots(recipe, "complete")
+                .map_err(|e| e.to_string())?;
+            require(roots == vec![Path::new("target/ci").join(recipe)])?;
+            protected(&roots)?;
+        }
+        if recipe == "prepare-fuzz" {
+            let layout = memcordon_ci::cache_restore::tool_build_layout("cargo-fuzz", "complete")
+                .map_err(|e| e.to_string())?;
+            require(
+                layout.directories
+                    == vec![std::path::PathBuf::from("target/ci-tools-build/cargo-fuzz")],
+            )?;
+            protected(&layout.directories)?;
+            let image = memcordon_ci::preparation::auxiliary_tool(Path::new(""), "cargo-fuzz")
+                .map_err(|e| e.to_string())?;
+            require(image.parent() == Some(Path::new("target/ci-tools/bin")))?;
+            protected(&[image])?;
+        }
+        for slot in role_slots {
+            let key = reference(owner, &format!("{slot}-key"));
+            let ready = format!(
+                "steps.{owner}.outputs.{slot}-{}",
+                if request { "restore" } else { "save" }
+            );
+            if request {
+                let direct = matches!(
+                    slot.as_str(),
+                    "source" | "sysroot" | "cargo-fuzz-image" | "cargo-fuzz-source"
+                );
+                let path = reference(
+                    owner,
+                    &format!("{slot}-{}", if direct { "path" } else { "inbox" }),
+                );
+                let mut guard = format!("{ready} == 'true'");
+                if recipe == "driver-context" && slot.starts_with("compiled-") {
+                    let selection = match owner {
+                        "driver-context" => "driver-selection",
+                        "driver-context-windows" => "driver-selection-windows",
+                        _ => return Err("driver context name".into()),
+                    };
+                    guard =
+                        format!("steps.{selection}.outputs.build-required == 'true' && {guard}");
+                }
+                require(
+                    expected
+                        .insert(
+                            format!("{owner}-{slot}-restore"),
+                            (
+                                false,
+                                key,
+                                path,
+                                Some(reference(owner, &format!("{slot}-prefix"))),
+                                guard,
+                                false,
+                                ordinal,
+                            ),
+                        )
+                        .is_none(),
+                )?;
+            } else {
+                let path = reference(owner, &format!("{slot}-path"));
+                let guard = format!("always() && {ready} == 'true'");
+                let partial = slot.ends_with("partial");
+                if !partial {
+                    require(
+                        expected
+                            .insert(
+                                format!("{owner}-{slot}-probe"),
+                                (
+                                    false,
+                                    key.clone(),
+                                    path.clone(),
+                                    None,
+                                    guard.clone(),
+                                    true,
+                                    ordinal,
+                                ),
+                            )
+                            .is_none(),
+                    )?;
+                }
+                let save_guard = if partial {
+                    guard
+                } else {
+                    format!("{guard} && steps.{owner}-{slot}-probe.outputs.cache-hit != 'true'")
+                };
+                require(
+                    expected
+                        .insert(
+                            format!("{owner}-{slot}-save"),
+                            (true, key, path, None, save_guard, false, ordinal),
+                        )
+                        .is_none(),
+                )?;
+            }
+        }
+    }
+    for recipe in match family {
+        "miri" => vec![
+            "workspace-fetch",
+            "miri-setup",
+            "miri-quarter-one",
+            "miri-quarter-two",
+            "miri-quarter-three",
+            "miri-quarter-four",
+        ],
+        "fuzz" => vec![
+            "workspace-fetch",
+            "fuzz-fetch",
+            "fuzz-compile-quarter-one",
+            "fuzz-compile-quarter-two",
+            "fuzz-compile-quarter-three",
+            "fuzz-compile-quarter-four",
+            "fuzz-execute-quarter-one",
+            "fuzz-execute-quarter-two",
+            "fuzz-execute-quarter-three",
+            "fuzz-execute-quarter-four",
+        ],
+        "fuzz-setup" => vec!["workspace-fetch", "prepare-fuzz"],
+        "stress" | "stress-packages" | "stress-lifecycle" => vec!["workspace-fetch", family],
+        _ => return Err("unknown family".into()),
+    } {
+        if !recipes.contains(recipe) {
+            return Err(format!(
+                "{family}: required recipe {recipe} absent from {recipes:?}"
+            ));
+        }
+    }
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let home = memcordon_ci::download_cache::cargo_home(&repository).map_err(|e| e.to_string())?;
+    for root in [home.join("registry/cache"), home.join("git/db")] {
+        require(root.is_absolute() && !root.to_string_lossy().contains('*'))?;
+        require(
+            !home.join("credentials.toml").starts_with(&root)
+                && !home.join("config.toml").starts_with(&root),
+        )?;
+        require(!repository.join("target/ci/reports").starts_with(&root))?;
     }
     let mut downloads = 0;
-    let mut saves = 0;
-    let mut paired_saves = 0;
-    let mut seen = std::collections::BTreeSet::new();
-    let projected = |key: &str, output: &str| {
-        key.strip_prefix("${{ steps.")
-            .and_then(|tail| tail.strip_suffix(" }}"))
-            .and_then(|inner| inner.split_once(".outputs."))
-            .filter(|(_, selected)| *selected == output)
-            .map(|(context, _)| context.to_owned())
-    };
+    let mut bootstraps = 0;
+    let mut seen = BTreeSet::new();
     for (ordinal, step) in steps.iter().enumerate() {
         let Some(uses) = step["uses"].as_str() else {
             continue;
         };
-        if uses.starts_with("actions/cache/save@") {
-            let selected = step["with"]["key"].as_str().ok_or("save key absent")?;
-            if let Some(context) =
-                projected(selected, "snapshot-key").or_else(|| projected(selected, "sysroot-key"))
-            {
-                let output = if selected.contains("sysroot-key") {
-                    "sysroot-path"
-                } else {
-                    "snapshot-path"
-                };
-                require(step["with"]["path"].as_str() == Some(&reference(&context, output)))?;
-                require(
-                    steps[..ordinal]
-                        .iter()
-                        .any(|candidate| candidate["id"].as_str() == Some(&context)),
-                )?;
-                continue;
-            }
-            saves += 1;
+        let save = uses.starts_with("actions/cache/save@");
+        if !save && !uses.starts_with("actions/cache/restore@") {
             continue;
         }
-        if !uses.starts_with("actions/cache/restore@") {
-            continue;
-        }
-        let id = step["id"].as_str().ok_or("restore id absent")?;
+        let id = step["id"].as_str().ok_or("cache id absent")?;
         require(seen.insert(id))?;
-        let key = step["with"]["key"].as_str().ok_or("restore key absent")?;
-        let path = step["with"]["path"].as_str().ok_or("restore path absent")?;
-        if id.ends_with("-partial-restore") || id.ends_with("-partial-probe") {
-            let output = if id.ends_with("-partial-restore") {
-                "seed-lookup-key"
-            } else {
-                "snapshot-key"
-            };
-            let context = projected(key, output).ok_or("partial context projection absent")?;
-            let producer = steps[..ordinal]
-                .iter()
-                .find(|candidate| candidate["id"].as_str() == Some(&context))
-                .ok_or("partial producer absent")?;
-            let command = producer["run"]
-                .as_str()
-                .ok_or("partial producer command absent")?;
-            require(
-                command.contains("--kind compiled ")
-                    || command.contains("--kind tool-build --purpose cargo-fuzz --shard complete"),
-            )?;
-            require(
-                path == reference(
-                    &context,
-                    if output == "snapshot-key" {
-                        "snapshot-path"
-                    } else {
-                        "seed-import-path"
-                    },
-                ),
-            )?;
-            if output == "snapshot-key" {
-                require(step["with"]["lookup-only"].as_bool() == Some(true))?;
-            } else {
-                require(
-                    step["with"]["restore-keys"].as_str()
-                        == Some(&reference(&context, "seed-restore-prefix")),
-                )?;
-            }
-            continue;
-        }
-        let extended = match id {
-            "archive-seed-restore" => Some((
-                "archive-seed-context",
-                "seed-lookup-key",
-                "seed-import-path",
-                "ci seed-context --kind registry-archives".to_owned(),
-            )),
-            "index-snapshot-restore" => Some((
-                "index-snapshot-context",
-                "seed-lookup-key",
-                "seed-import-path",
-                "ci seed-context --kind registry-index".to_owned(),
-            )),
-            "miri-sysroot-cache" if family == "miri" => Some((
-                "miri-sysroot-context",
-                "sysroot-key",
-                "sysroot-path",
-                "ci miri-cache-context".to_owned(),
-            )),
-            "archive-seed-probe" => Some((
-                "archive-seed-snapshot",
-                "snapshot-key",
-                "snapshot-path",
-                "ci cache-snapshot --kind registry-archives".to_owned(),
-            )),
-            "index-snapshot-probe" => Some((
-                "index-snapshot-snapshot",
-                "snapshot-key",
-                "snapshot-path",
-                "ci cache-snapshot --kind registry-index".to_owned(),
-            )),
-            _ => None,
-        };
-        let fuzz_seed = if family == "fuzz" {
-            [("one", "quarter-one"), ("two", "quarter-two"), ("three", "quarter-three"), ("four", "quarter-four")].into_iter().find_map(|(label, shard)| {
-                if id == format!("fuzz-{label}-seed") { Some((format!("fuzz-{label}-seed-context"), "seed-lookup-key", "seed-import-path", format!("ci seed-context --kind compiled --purpose fuzz --partition fuzz-targets --shard {shard}"))) }
-                else if id == format!("fuzz-{label}-probe") { Some((format!("fuzz-{label}-snapshot"), "snapshot-key", "snapshot-path", format!("ci cache-snapshot --kind compiled --purpose fuzz --partition fuzz-targets --shard {shard} --stage build"))) }
-                else { None }
-            })
-        } else {
-            None
-        };
-        if let Some((context, selected_key, selected_path, command)) = extended
-            .map(|(context, key, path, command)| (context.to_owned(), key, path, command))
-            .or(fuzz_seed)
-        {
-            require(
-                key == reference(&context, selected_key)
-                    && path == reference(&context, selected_path),
-            )?;
-            require(steps[..ordinal].iter().any(|candidate| {
-                candidate["id"].as_str() == Some(&context)
-                    && candidate["run"].as_str()
-                        == Some(&format!("./target/ci/release/memcordon-ci {command}"))
-            }))?;
-            if selected_key == "snapshot-key" {
-                require(step["with"]["lookup-only"].as_bool() == Some(true))?;
-            }
-            if selected_key == "seed-lookup-key" {
-                require(
-                    step["with"]["restore-keys"].as_str()
-                        == Some(&reference(&context, "seed-restore-prefix")),
-                )?;
-            }
-            continue;
-        }
-        let source_role = source_roles.remove(id);
-        if key.starts_with("mc-download-bootstrap-v5-${{ runner.os }}-") {
+        let key = step["with"]["key"].as_str().ok_or("cache key absent")?;
+        let path = step["with"]["path"].as_str().ok_or("cache path absent")?;
+        if key.starts_with("mc-download-bootstrap-v5-") {
             downloads += 1;
             require(
-                path.lines().collect::<Vec<_>>() == ["~/.cargo/registry/cache", "~/.cargo/git/db"],
+                !save
+                    && path.lines().collect::<Vec<_>>()
+                        == ["~/.cargo/registry/cache", "~/.cargo/git/db"],
             )?;
             require(
-                key == "mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}"
-                    && step["if"].as_str().is_some_and(|condition| {
-                        condition.contains("hashFiles('Cargo.lock') != ''")
-                    }),
+                key == "mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}",
             )?;
-            if family == "fuzz" {
-                require(step["if"].as_str().is_some_and(|condition| {
-                    condition.contains("hashFiles('fuzz/Cargo.lock') != ''")
-                }))?;
+            let guard = step["if"].as_str().ok_or("download guard absent")?;
+            require(guard.contains("hashFiles('Cargo.lock') != ''"))?;
+            if family.starts_with("fuzz") {
+                require(guard.contains("hashFiles('fuzz/Cargo.lock') != ''"))?;
             }
-        } else if let Some((context, source_family)) = source_role {
-            require(key == reference(context, "source-key"))?;
-            require(path == reference(context, "source-paths"))?;
-            require(
-                step["with"]["restore-keys"].as_str()
-                    == Some(&reference(context, "source-restore-prefix")),
-            )?;
-            let command = if source_family
-                == memcordon_ci::download_cache::DownloadFamily::ToolCargoFuzz
-            {
-                "./target/ci/release/memcordon-ci ci download-cache-context --family tool-cargo-fuzz".to_owned()
-            } else {
-                format!(
-                    "./target/ci/release/memcordon-ci ci download-cache-context --family {}",
-                    source_family.name()
-                )
-            };
-            require(
-                steps[..ordinal]
-                    .iter()
-                    .filter(|candidate| {
-                        candidate["id"] == context && candidate["run"].as_str() == Some(&command)
-                    })
-                    .count()
-                    == 1,
-            )?;
-            let cwd = if source_family == memcordon_ci::download_cache::DownloadFamily::Fuzz {
-                repository.join("fuzz")
-            } else {
-                repository.clone()
-            };
-            let home = memcordon_ci::download_cache::cargo_home(&cwd)
-                .map_err(|error| error.to_string())?;
-            for root in [home.join("registry/cache"), home.join("git/db")] {
-                require(root.is_absolute())?;
-                require(!root.to_string_lossy().contains('*'))?;
-                require(!home.join("credentials.toml").starts_with(&root))?;
-                require(!home.join("config.toml").starts_with(&root))?;
-                require(!repository.join("target/ci/reports").starts_with(&root))?;
-            }
-        } else {
-            let (expected_key, expected_path, prefix, roots) =
-                roles.remove(id).ok_or("unknown restore role")?;
-            require(key == expected_key && path == expected_path)?;
-            if let Some(prefix) = prefix {
-                require(step["with"]["restore-keys"].as_str() == Some(&prefix))?;
-                if let Some(shard) = id.strip_prefix("compiled-") {
-                    require(step["if"].as_str().is_some_and(|condition| {
-                        condition.contains(&format!("matrix.shard == '{shard}'"))
-                    }))?;
-                }
-            }
-            for root in roots {
-                require(!root.to_string_lossy().contains('*'))?;
-                for excluded in [
-                    ".release/prepared",
-                    "target/ci/reports",
-                    "target/ci/deadline-evidence",
-                    "target/ci-consumers/capture",
-                    "target/ci-build/package-staging",
-                    "~/.cargo/credentials.toml",
-                    "~/.cargo/config.toml",
-                ] {
-                    require(!Path::new(excluded).starts_with(&root))?;
-                }
-                if family == "miri" {
-                    for other in shards
-                        .iter()
-                        .filter(|shard| id != format!("compiled-{shard}"))
-                    {
-                        require(!Path::new(&format!("target/ci/miri-{other}")).starts_with(&root))?;
-                    }
-                }
-            }
+            continue;
         }
-        let paired: Vec<_> = steps
-            .iter()
-            .enumerate()
-            .filter(|(_, save)| {
-                save["uses"]
-                    .as_str()
-                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-                    && (save["with"]["key"].as_str() == Some(&reference(id, "cache-primary-key"))
-                        || save["with"]["key"].as_str() == Some(key))
-            })
-            .collect();
-        require(if source_role.is_some() {
-            paired.len() <= 1
-        } else {
-            paired.len() == 1
-        })?;
-        for (save_ordinal, save) in &paired {
-            require(*save_ordinal > ordinal && save["with"]["path"].as_str() == Some(path))?;
+        if key.starts_with("mc-ci-bootstrap-v1-") {
+            bootstraps += 1;
+            require(
+                id == "driver-bootstrap-cache"
+                    || (family.starts_with("stress") && id == "driver-bootstrap-cache-windows"),
+            )?;
+            require(!save && path == "target/ci-bootstrap-in")?;
+            require(
+                key == "mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup",
+            )?;
+            require(
+                step["with"]["restore-keys"]
+                    == "mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-",
+            )?;
+            continue;
         }
-        paired_saves += paired.len();
+        let (expected_save, expected_key, expected_path, prefix, guard, probe, owner) = expected
+            .remove(id)
+            .ok_or_else(|| format!("unknown cache role {id}"))?;
+        equal(family, id, "owner precedes cache", owner < ordinal, true)?;
+        equal(family, id, "save action", save, expected_save)?;
+        equal(family, id, "key", key, expected_key.as_str())?;
+        equal(family, id, "path", path, expected_path.as_str())?;
+        equal(family, id, "if", step["if"].as_str(), Some(guard.as_str()))?;
+        equal(
+            family,
+            id,
+            "lookup-only",
+            step["with"]["lookup-only"].as_bool().unwrap_or(false),
+            probe,
+        )?;
+        equal(
+            family,
+            id,
+            "restore-keys",
+            step["with"]["restore-keys"].as_str(),
+            prefix.as_deref(),
+        )?;
+        equal(
+            family,
+            id,
+            "continue-on-error",
+            step["continue-on-error"].as_bool(),
+            Some(true),
+        )?;
     }
+    require(downloads == usize::from(family != "fuzz"))?;
     require(
-        downloads == 1 && roles.is_empty() && source_roles.is_empty() && saves == paired_saves,
+        bootstraps
+            == if family == "fuzz" {
+                0
+            } else if family.starts_with("stress") {
+                2
+            } else {
+                1
+            },
     )?;
-    // The finite catalog checks custody; production policy checks every declared
-    // save's current population, owner settlement and recomputed recipe identity.
+    require(expected.is_empty())?;
+    // Additional integration validation, after independent role and root checks.
     let mut workflow: Value =
         serde_yaml::from_str(include_str!("../../../.github/workflows/deep-ci.yml")).unwrap();
     workflow["jobs"][family] = job.clone();

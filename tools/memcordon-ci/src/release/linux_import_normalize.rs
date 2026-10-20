@@ -3,7 +3,9 @@
 use super::linux_isolation_cases::ImportRefusalReport;
 use super::linux_mixed_installed::{read_policy_observation_file, retain};
 use crate::{CiError, Result, consumer_readiness_ledger::SourceIdentity};
-use memcordon_readiness_verifier::{Artifact, CaseKey, LinuxIsolationImportEvidence};
+use memcordon_readiness_verifier::{
+    Artifact, CaseKey, LinuxIsolationImportEvidence, LinuxIsolationImportOutcome,
+};
 use std::{collections::BTreeMap, path::Path};
 
 impl ImportRefusalReport {
@@ -60,6 +62,13 @@ impl ImportRefusalReport {
             .join(&key.scenario);
         std::fs::create_dir_all(artifact_root.join(&prefix))?;
         std::fs::create_dir_all(artifact_root.join(&prefix).join("definition-retirement"))?;
+        if key.scenario == "input-socket" {
+            std::fs::create_dir_all(
+                artifact_root
+                    .join(&prefix)
+                    .join("installed-image-inspection"),
+            )?;
+        }
         let mut persist = |name: &str, bytes: &[u8]| -> Result<String> {
             let relative = prefix
                 .join(name)
@@ -112,6 +121,31 @@ impl ImportRefusalReport {
             Some(leaf("socket-replaced-original.bin")?)
         } else {
             None
+        };
+        let outcome = if key.scenario == "input-socket" {
+            let source_after = leaf("isolation-import-source-after.json")?;
+            let mut inspected = |name: &str| {
+                capture(
+                    Path::new("installed-image-inspection")
+                        .join(name)
+                        .to_str()
+                        .ok_or_else(|| {
+                            CiError::Message("importer inspection path nonUTF8".into())
+                        })?,
+                    &directory.join("installed-image-inspection").join(name),
+                )
+            };
+            LinuxIsolationImportOutcome::Excluded {
+                invocation: inspected("invocation.json")?,
+                native_creation: inspected("native-creation.json")?,
+                native_process: inspected("native-process.json")?,
+                exit: inspected("exit.json")?,
+                stdout: inspected("stdout.json")?,
+                stderr: inspected("stderr.bin")?,
+                source_after,
+            }
+        } else {
+            LinuxIsolationImportOutcome::Refused
         };
         let mut retired = |name: &str| {
             capture(
@@ -176,8 +210,8 @@ impl ImportRefusalReport {
         let original_lease = original_path(original_lease)?;
         let acquisition = original_path(acquisition)?;
         let evidence = LinuxIsolationImportEvidence {
-            format: "memcordon.consumer-readiness.linux-isolation-import-refusal".into(),
-            revision: 1,
+            format: "memcordon.consumer-readiness.linux-isolation-import".into(),
+            revision: 2,
             key: key.clone(),
             run_id: identity.run_id.clone(),
             source_commit: identity.source_commit.clone(),
@@ -216,6 +250,7 @@ impl ImportRefusalReport {
             retirement_stdout,
             retirement_stderr,
             replaced_original,
+            outcome,
         };
         let relative = prefix
             .join("case-evidence.json")

@@ -108,38 +108,9 @@ const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 const TOKEN_GROUP_ENABLED: u32 = 0x0000_0004;
 const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
-fn observed_terminal_delivery(
-    attempt_id: &str,
-    nonce: &str,
-    request_sha256: &str,
-    authority: &[u8],
-    retired: &[u8],
-) -> Result<memcordon_core::WindowsTerminalDeliveryEvidenceV1, Error> {
-    if authority.is_empty()
-        || authority.len() > memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
-        || retired.is_empty()
-        || retired.len() > memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
-    {
-        return Err(transport_error(
-            "terminal response exceeds its native frame bound".to_owned(),
-        ));
-    }
-    let delivery = memcordon_core::WindowsTerminalDeliveryEvidenceV1 {
-        schema_version: 1,
-        attempt_id: attempt_id.to_owned(),
-        nonce: nonce.to_owned(),
-        request_sha256: request_sha256.to_owned(),
-        authority_sha256: digest_bytes(authority),
-        retired_sha256: digest_bytes(retired),
-        retired_confirmed: true,
-    };
-    if !delivery.is_consistent() {
-        return Err(transport_error(
-            "terminal delivery binding is invalid".to_owned(),
-        ));
-    }
-    Ok(delivery)
-}
+#[path = "windows_rejection_retirement.rs"]
+mod rejection_retirement;
+use rejection_retirement::{RejectionContext, complete_rejection_ack, observed_terminal_delivery};
 
 pub fn workload_discovery() -> Result<memcordon_core::workload_discovery::WorkloadDiscovery, String>
 {
@@ -665,7 +636,9 @@ pub fn run(
     write_frame(pipe.raw(), &provider_request).map_err(transport_error)?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-launch-written");
-    let prepared = read_frame::<WindowsProviderResponseV3>(pipe.raw()).map_err(transport_error)?;
+    let (prepared, prepared_raw) =
+        read_frame_with_raw_detailed::<WindowsProviderResponseV3>(pipe.raw())
+            .map_err(|error| transport_error(error.to_string()))?;
     #[cfg(feature = "test-support")]
     crate::windows_stack_diagnostics::phase("sealed-prepared-read");
     let (attempt_id, streams, relay_retired_event_handle) = match prepared {
@@ -693,12 +666,41 @@ pub fn run(
             && returned_nonce == nonce
             && returned_digest == request_sha256 =>
         {
-            return Err(bound_rejection_error(
+            let early_response = WindowsProviderResponseV3::Reject {
+                schema_version,
+                attempt_id: attempt_id.clone(),
+                nonce: returned_nonce,
+                request_sha256: returned_digest,
+                rejection: rejection.clone(),
+            };
+            let primary = bound_rejection_error(
                 rejection,
                 policy.workload_contract(),
                 &provider_binding,
                 &attempt_id,
                 &request_sha256,
+            );
+            return Err(complete_rejection_ack(
+                primary,
+                &early_response,
+                &prepared_raw,
+                &RejectionContext {
+                    attempt_id: &attempt_id,
+                    nonce: &nonce,
+                    request_sha256: &request_sha256,
+                    provider: &provider_binding,
+                },
+                |digest| {
+                    acknowledge_terminal_retirement(
+                        pipe.raw(),
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        digest,
+                        &provider_binding,
+                    )
+                    .map_err(Box::new)
+                },
             ));
         }
         _ => {
@@ -1006,7 +1008,8 @@ pub fn run(
                         &request_sha256,
                         &response_raw,
                         &retired_raw,
-                    )?;
+                    )
+                    .map_err(|error| *error)?;
                     break (receipt, delivery);
                 }
                 WindowsProviderResponseV3::Reject {
@@ -1029,55 +1032,48 @@ pub fn run(
                     relay_phase
                         .advance(WindowsRelayEventV1::Reject)
                         .map_err(|error| transport_error(error.to_owned()))?;
-                    let terminal_ack_required = rejection.terminal_ack_required();
                     let observed_terminal = rejection.terminal_receipt().cloned();
-                    let mut primary = bound_rejection_error(
+                    let rejection_response = WindowsProviderResponseV3::Reject {
+                        schema_version,
+                        attempt_id: returned_attempt,
+                        nonce: returned_nonce,
+                        request_sha256: returned_digest,
+                        rejection: rejection.clone(),
+                    };
+                    let primary = bound_rejection_error(
                         rejection,
                         policy.workload_contract(),
                         &provider_binding,
                         &attempt_id,
                         &request_sha256,
                     );
-                    if terminal_ack_required {
-                        match acknowledge_terminal_retirement(
-                            pipe.raw(),
-                            &attempt_id,
-                            &nonce,
-                            &request_sha256,
-                            &response_sha256,
-                            &provider_binding,
-                        ) {
-                            Ok(retired_raw) => {
-                                primary.windows_terminal_delivery =
-                                    Some(observed_terminal_delivery(
-                                        &attempt_id,
-                                        &nonce,
-                                        &request_sha256,
-                                        &response_raw,
-                                        &retired_raw,
-                                    )?);
-                                if let (Some(terminal), Some(delivery)) = (
-                                    observed_terminal.as_ref(),
-                                    primary.windows_terminal_delivery.as_ref(),
-                                ) {
-                                    terminal_observation::retain(
-                                        &provider_binding,
-                                        terminal,
-                                        delivery,
-                                    );
-                                }
-                            }
-                            Err(acknowledgment) => {
-                                if primary.provider_failure.is_none() {
-                                    primary.provider_failure =
-                                        acknowledgment.provider_failure.clone();
-                                }
-                                primary.message = format!(
-                                    "{}; secondary terminal acknowledgment failure: {}",
-                                    primary.message, acknowledgment
-                                );
-                            }
-                        }
+                    let primary = complete_rejection_ack(
+                        primary,
+                        &rejection_response,
+                        &response_raw,
+                        &RejectionContext {
+                            attempt_id: &attempt_id,
+                            nonce: &nonce,
+                            request_sha256: &request_sha256,
+                            provider: &provider_binding,
+                        },
+                        |digest| {
+                            acknowledge_terminal_retirement(
+                                pipe.raw(),
+                                &attempt_id,
+                                &nonce,
+                                &request_sha256,
+                                digest,
+                                &provider_binding,
+                            )
+                            .map_err(Box::new)
+                        },
+                    );
+                    if let (Some(terminal), Some(delivery)) = (
+                        observed_terminal.as_ref(),
+                        primary.windows_terminal_delivery.as_ref(),
+                    ) {
+                        terminal_observation::retain(&provider_binding, terminal, delivery);
                     }
                     return Err(primary);
                 }

@@ -2,6 +2,8 @@
 use crate::{CiError, Result};
 use std::{
     collections::BTreeMap,
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -12,6 +14,25 @@ pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamedResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub length: u64,
+}
+
+/// Artifact transfers must implement a genuine bounded sink, not a buffered fallback.
+pub trait StreamingTransport: Transport {
+    fn request_to(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        deadline: Instant,
+        maximum: u64,
+        destination: &mut dyn Write,
+    ) -> Result<StreamedResponse>;
 }
 
 pub trait Transport: Sync {
@@ -43,6 +64,29 @@ impl Transport for HttpsTransport {
     }
 }
 
+impl StreamingTransport for HttpsTransport {
+    fn request_to(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        deadline: Instant,
+        maximum: u64,
+        destination: &mut dyn Write,
+    ) -> Result<StreamedResponse> {
+        validate_https(url)?;
+        wire_request_to(
+            "GET",
+            url,
+            headers,
+            &[],
+            deadline,
+            maximum,
+            false,
+            destination,
+        )
+    }
+}
+
 /// The fixture caller validates numeric loopback before reaching this shared wire boundary.
 pub(crate) fn wire_request(
     method: &str,
@@ -53,6 +97,38 @@ pub(crate) fn wire_request(
     maximum: u64,
     disable_proxy: bool,
 ) -> Result<Response> {
+    let mut bytes = Vec::new();
+    let response = wire_request_to(
+        method,
+        url,
+        headers,
+        body,
+        deadline,
+        maximum,
+        disable_proxy,
+        &mut bytes,
+    )?;
+    Ok(Response {
+        status: response.status,
+        headers: response.headers,
+        body: bytes,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared wire boundary binds request, deadline, admission, proxy policy and caller-owned sink"
+)]
+pub(crate) fn wire_request_to(
+    method: &str,
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+    maximum: u64,
+    disable_proxy: bool,
+    destination: &mut dyn Write,
+) -> Result<StreamedResponse> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|time| !time.is_zero())
@@ -104,33 +180,53 @@ pub(crate) fn wire_request(
     // The wire bound is inclusive. ureq's LimitReader rejects its next EOF
     // probe once exactly the configured length was read. Probe at most one
     // extra byte ourselves, rejecting overflow before retaining that byte.
-    use std::io::Read;
-    let mut bytes = Vec::new();
+    let length = copy_bounded_body(
+        &mut response.body_mut().as_reader(),
+        destination,
+        maximum,
+        deadline,
+    )?;
+    Ok(StreamedResponse {
+        status,
+        headers: observed,
+        length,
+    })
+}
+
+fn copy_bounded_body(
+    reader: &mut dyn Read,
+    destination: &mut dyn Write,
+    maximum: u64,
+    deadline: Instant,
+) -> Result<u64> {
+    let mut length = 0u64;
     let mut chunk = [0_u8; 64 * 1024];
-    let mut reader = response.body_mut().as_reader();
     loop {
-        let remaining = maximum.saturating_sub(bytes.len() as u64);
+        if Instant::now() >= deadline {
+            return Err(CiError::Message("HTTPS operation deadline expired".into()));
+        }
+        let remaining = maximum.saturating_sub(length);
         let admission = usize::try_from(remaining.saturating_add(1))
             .unwrap_or(usize::MAX)
             .min(chunk.len());
         let count = reader.read(&mut chunk[..admission]).map_err(|_| {
-            CiError::Message("HTTPS body exceeds bound or could not be read".into())
+            CiError::Message(format!("HTTPS body read failed after {length} bytes"))
         })?;
         if count == 0 {
             break;
         }
         if count as u64 > remaining {
-            return Err(CiError::Message(
-                "HTTPS body exceeds bound or could not be read".into(),
-            ));
+            return Err(CiError::Message(format!(
+                "HTTPS body exceeds bound: limit={maximum}; observed-at-least={}",
+                length + count as u64
+            )));
         }
-        bytes.extend_from_slice(&chunk[..count]);
+        destination
+            .write_all(&chunk[..count])
+            .map_err(|_| CiError::Message("HTTPS body retention failed".into()))?;
+        length += count as u64;
     }
-    Ok(Response {
-        status,
-        headers: observed,
-        body: bytes,
-    })
+    Ok(length)
 }
 
 pub fn validate_https(url: &Url) -> Result<()> {
@@ -157,6 +253,9 @@ impl ReadBudget {
             deadline,
             throttle: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
     fn wait(&self) -> Result<()> {
         loop {
@@ -209,6 +308,39 @@ impl ReadBudget {
             }
             let delay = retry_hint(&response).unwrap_or(Duration::from_secs(1 << attempt));
             self.delay(delay)?;
+        }
+        Err(CiError::Message("HTTP throttle retry limit reached".into()))
+    }
+
+    fn read_to(
+        &self,
+        transport: &impl StreamingTransport,
+        url: &Url,
+        headers: &[(String, String)],
+        maximum: u64,
+        destination: &mut File,
+    ) -> Result<StreamedResponse> {
+        for attempt in 0..4 {
+            self.wait()?;
+            destination.set_len(0)?;
+            destination.seek(SeekFrom::Start(0))?;
+            let response =
+                transport.request_to(url, headers, self.deadline, maximum, destination)?;
+            if response.status != 429
+                && !(response.status == 403
+                    && response
+                        .headers
+                        .get("x-ratelimit-remaining")
+                        .is_some_and(|remaining| remaining == "0"))
+            {
+                return Ok(response);
+            }
+            let hint = Response {
+                status: response.status,
+                headers: response.headers,
+                body: Vec::new(),
+            };
+            self.delay(retry_hint(&hint).unwrap_or(Duration::from_secs(1 << attempt)))?;
         }
         Err(CiError::Message("HTTP throttle retry limit reached".into()))
     }
@@ -284,6 +416,54 @@ pub fn download(
     }
     Err(CiError::Message("HTTPS redirect limit exceeded".into()))
 }
+
+/// Stream an artifact into the caller's exclusively owned file under the same redirect and retry budget.
+pub fn download_to_file(
+    transport: &impl StreamingTransport,
+    budget: &ReadBudget,
+    original: &Url,
+    headers: &[(String, String)],
+    maximum: u64,
+    destination: &mut File,
+) -> Result<u64> {
+    let mut url = original.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    for redirect in 0..=5 {
+        validate_https(&url)?;
+        if !visited.insert(url.as_str().to_owned()) {
+            return Err(CiError::Message("HTTPS redirect cycle".into()));
+        }
+        let response = budget.read_to(
+            transport,
+            &url,
+            if redirect == 0 { headers } else { &[] },
+            maximum,
+            destination,
+        )?;
+        match response.status {
+            200 => return Ok(response.length),
+            301 | 302 | 303 | 307 | 308 => {
+                url = url
+                    .join(
+                        response.headers.get("location").ok_or_else(|| {
+                            CiError::Message("HTTPS redirect lacks location".into())
+                        })?,
+                    )
+                    .map_err(|_| CiError::Message("invalid HTTPS redirect".into()))?;
+            }
+            status => {
+                return Err(CiError::Message(format!(
+                    "HTTPS artifact unavailable; status={status}; redirect-index={redirect}"
+                )));
+            }
+        }
+    }
+    Err(CiError::Message("HTTPS redirect limit exceeded".into()))
+}
+
+#[cfg(test)]
+#[path = "../../tests/private/http_streaming.rs"]
+mod streaming_tests;
 
 pub fn json(response: &Response) -> Result<serde_json::Value> {
     memcordon_core::canonical_json::reject_duplicate_json_keys(&response.body)

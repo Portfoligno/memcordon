@@ -747,6 +747,13 @@ impl WindowsAttemptRecordV1 {
             request_sha256: self.request_sha256.clone(),
             process_observation: receipt.process_observation.clone(),
             primary_failure,
+            premature_release: match &receipt.payload {
+                memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure {
+                    witness,
+                    ..
+                } => Some(witness.clone()),
+                _ => None,
+            },
         };
         if self
             .terminal_seed
@@ -812,8 +819,87 @@ impl WindowsAttemptRecordV1 {
             request_sha256: self.request_sha256.clone(),
             process_observation,
             primary_failure,
+            premature_release: None,
         });
         store(self)
+    }
+
+    pub fn begin_premature_release(
+        &mut self,
+        mutant: memcordon_core::WindowsSealedMutant,
+    ) -> Result<(), String> {
+        let disposition = WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { mutant };
+        if disposition.premature_release_mutant().is_none()
+            || self.authorization_unix_millis.is_some()
+            || self.resume_attempted
+            || self.target_released
+            || self.terminal_disposition.is_some()
+            || self.owner_manifest.is_none()
+            || self.workload_checkpoint.is_some()
+            || self.target_identity.is_none()
+        {
+            return Err("premature-release intent conflicts with native attempt".to_owned());
+        }
+        self.transition(WindowsAttemptStateV1::Terminating)?;
+        self.cleanup_state.termination_requested = true;
+        self.terminal_disposition = Some(disposition);
+        self.store()
+    }
+
+    pub fn freeze_premature_release_seed(
+        &mut self,
+        witness: memcordon_core::WindowsPrematureReleaseWitnessV1,
+        process_observation: memcordon_core::WindowsProcessObservationV2,
+        primary_failure: Option<memcordon_core::ProviderFailureDiagnosticV1>,
+    ) -> Result<(), String> {
+        if !witness.is_consistent()
+            || self
+                .terminal_disposition
+                .and_then(|value| value.premature_release_mutant())
+                != Some(witness.mutant)
+            || self.authorization_unix_millis.is_some()
+            || self.resume_attempted
+            || !self.target_released
+            || self.state != WindowsAttemptStateV1::Terminating
+            || self.owner_manifest.is_none()
+            || self.workload_checkpoint.is_some()
+            || self.terminal_seed.is_some()
+            || self.retirement_proof.is_some()
+            || self.terminal_response_json.is_some()
+        {
+            return Err("premature-release seed lacks exact observed native failure".to_owned());
+        }
+        process_observation
+            .validate(&self.attempt_id, &self.nonce, &self.request_sha256)
+            .map_err(str::to_owned)?;
+        self.terminal_seed = Some(memcordon_core::WindowsTerminalSeedV2 {
+            schema_version: 2,
+            attempt_id: self.attempt_id.clone(),
+            nonce: self.nonce.clone(),
+            request_sha256: self.request_sha256.clone(),
+            process_observation,
+            primary_failure,
+            premature_release: Some(witness),
+        });
+        self.store()
+    }
+
+    pub fn complete_premature_release(&mut self) -> Result<(), String> {
+        let disposition = self
+            .terminal_disposition
+            .ok_or("premature-release disposition absent")?;
+        if disposition.premature_release_mutant().is_none()
+            || self
+                .terminal_seed
+                .as_ref()
+                .and_then(|seed| seed.premature_release.as_ref())
+                .is_none()
+        {
+            return Err("premature-release completion lacks frozen native witness".to_owned());
+        }
+        self.prepare_cleanup_completion(disposition)?;
+        self.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::Retiring;
+        self.store()
     }
 
     #[cfg(test)]
@@ -859,7 +945,8 @@ impl WindowsAttemptRecordV1 {
         }
         match self.terminal_disposition {
             None | Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {}
-            Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
+            Some(WindowsAttemptTerminalDispositionV1::Posttarget)
+            | Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. }) => {
                 return Err(
                     "preauthorization abort conflicts with posttarget terminal disposition"
                         .to_owned(),
@@ -894,7 +981,8 @@ impl WindowsAttemptRecordV1 {
         }
         match self.terminal_disposition {
             None | Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {}
-            Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {
+            Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
+            | Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. }) => {
                 return Err(
                     "postauthorization retirement conflicts with preauthorization abort".to_owned(),
                 );
@@ -952,6 +1040,9 @@ impl WindowsAttemptRecordV1 {
             Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
                 self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)
             }
+            Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. }) => Err(
+                "premature-release rejection requires its observed seed and native completion".to_owned(),
+            ),
             None if self.authorization_unix_millis.is_some() || self.resume_attempted => {
                 self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)
             }
@@ -2448,6 +2539,16 @@ impl TerminalAckTombstoneV1 {
             &self.retired.disposition,
             &self.preauthorization_retirement_proof,
         ) {
+            (
+                disposition @ WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure {
+                    ..
+                },
+                None,
+            ) => {
+                disposition.premature_release_mutant().is_some()
+                    && validate_attempt_id(&self.owner_manifest_sha256).is_ok()
+                    && validate_attempt_id(&self.proof_sha256).is_ok()
+            }
             (WindowsAttemptTerminalDispositionV1::Posttarget, None) => {
                 validate_attempt_id(&self.owner_manifest_sha256).is_ok()
             }
@@ -4046,6 +4147,16 @@ pub fn rejection_evidence(
         cleanup_attempted,
         restart_safety,
         disposition: match terminal_receipt {
+            Some(receipt)
+                if matches!(
+                    receipt.payload,
+                    memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure { .. }
+                ) =>
+            {
+                memcordon_core::WindowsProviderRejectionDispositionV2::PrematureReleaseFailure {
+                    receipt,
+                }
+            }
             Some(receipt) => {
                 memcordon_core::WindowsProviderRejectionDispositionV2::PostauthorizationFailure {
                     receipt,

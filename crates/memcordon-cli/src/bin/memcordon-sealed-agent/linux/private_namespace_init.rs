@@ -465,7 +465,13 @@ impl PrivateNamespaceStartupProvider {
                     std::io::Error::last_os_error()
                 ));
             }
-            let (credentials, target_pidfd) = receive_startup_ancillary(&message)?;
+            let (credentials, target_pidfd) =
+                receive_startup_ancillary(&message).map_err(|error| {
+                    format!(
+                        "{error}; received_bytes={count}; message_flags={}; ancillary_bytes={}",
+                        message.msg_flags, message.msg_controllen
+                    )
+                })?;
             if count == 0
                 || count as usize > packet.len()
                 || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0

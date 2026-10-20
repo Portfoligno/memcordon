@@ -1,47 +1,125 @@
-use crate::{Artifact, MAX_ARTIFACT_BYTES, VerificationResult, sha256};
-use std::collections::BTreeMap;
+use crate::{Artifact, MAX_ARTIFACT_BYTES, MAX_PRODUCER_BYTES, ProducerOrigin, VerificationResult};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 #[cfg(windows)]
 use std::fs::OpenOptions;
-use std::io::Read;
-use std::path::{Component, Path};
+use std::io::{Read, Seek};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct Custody {
     bytes: BTreeMap<String, Vec<u8>>,
     hashes: BTreeMap<String, String>,
+    archives: BTreeMap<String, Collected>,
+    root: PathBuf,
 }
 
 impl Custody {
     pub(crate) fn new(root: &Path, artifacts: &[Artifact]) -> VerificationResult<Self> {
+        Self::for_evidence(root, artifacts, &[])
+    }
+    pub(crate) fn for_evidence(
+        root: &Path,
+        artifacts: &[Artifact],
+        origins: &[ProducerOrigin],
+    ) -> VerificationResult<Self> {
+        Self::with_limits(
+            root,
+            artifacts,
+            origins,
+            MAX_ARTIFACT_BYTES,
+            MAX_PRODUCER_BYTES,
+        )
+    }
+    fn with_limits(
+        root: &Path,
+        artifacts: &[Artifact],
+        origins: &[ProducerOrigin],
+        raw_limit: u64,
+        total_limit: u64,
+    ) -> VerificationResult<Self> {
+        let mut archive_names = BTreeSet::new();
+        for origin in origins {
+            validate_path(&origin.bundle_artifact)?;
+            if !archive_names.insert(origin.bundle_artifact.as_str()) {
+                return Err("duplicate producer archive custody role".into());
+            }
+            let mut matches = artifacts
+                .iter()
+                .filter(|artifact| artifact.path == origin.bundle_artifact);
+            let artifact = matches
+                .next()
+                .ok_or("producer archive lacks indexed custody")?;
+            if matches.next().is_some() {
+                return Err("producer archive role digest/index differs".into());
+            }
+            if artifact.sha256 != origin.artifact_sha256 {
+                return Err("actual downloaded producer archive digest differs".into());
+            }
+        }
         let mut bytes = BTreeMap::new();
         let mut hashes = BTreeMap::new();
+        let mut archives = BTreeMap::new();
         let mut total = 0u64;
         for artifact in artifacts {
             validate_path(&artifact.path)?;
-            if bytes.contains_key(&artifact.path) {
+            if hashes.contains_key(&artifact.path) {
                 return Err("duplicate evidence artifact path".into());
             }
-            if artifact.length > MAX_ARTIFACT_BYTES {
+            let archive = archive_names.contains(artifact.path.as_str());
+            if artifact.length > if archive { total_limit } else { raw_limit } {
                 return Err("artifact exceeds per-file bound".into());
             }
             total = total
                 .checked_add(artifact.length)
                 .ok_or("artifact total overflow")?;
-            if total > 4 * 1024 * 1024 * 1024 {
+            if total > total_limit {
                 return Err("artifact total exceeds bounded evidence index".into());
             }
-            let collected = read_confined(root, &artifact.path, artifact.length)?;
-            let hash = sha256(&collected);
-            if collected.len() as u64 != artifact.length || hash != artifact.sha256 {
+            let collected = collect_confined(root, &artifact.path, artifact.length, !archive)?;
+            if collected.length != artifact.length || collected.hash != artifact.sha256 {
                 return Err(format!(
                     "persisted artifact custody differs: {}",
                     artifact.path
                 ));
             }
-            hashes.insert(artifact.path.clone(), hash);
-            bytes.insert(artifact.path.clone(), collected);
+            hashes.insert(artifact.path.clone(), collected.hash.clone());
+            if archive {
+                archives.insert(artifact.path.clone(), collected);
+            } else {
+                bytes.insert(
+                    artifact.path.clone(),
+                    collected.bytes.ok_or("raw artifact buffer absent")?,
+                );
+            }
         }
-        Ok(Self { bytes, hashes })
+        Ok(Self {
+            bytes,
+            hashes,
+            archives,
+            root: root.into(),
+        })
+    }
+    pub(crate) fn archive(&self, path: &str) -> VerificationResult<File> {
+        validate_path(path)?;
+        let held = self
+            .archives
+            .get(path)
+            .ok_or("archive is not a declared producer origin")?;
+        let collected = bounded_collect(
+            held.file.try_clone().map_err(|e| e.to_string())?,
+            held.length,
+            false,
+        )?;
+        if collected != *held {
+            return Err("held producer archive changed after collection".into());
+        }
+        if collect_confined(&self.root, path, held.length, false)? != *held {
+            return Err("named producer archive changed after collection".into());
+        }
+        let mut file = collected.file;
+        file.rewind().map_err(|e| e.to_string())?;
+        Ok(file)
     }
     pub(crate) fn bytes(&self, path: &str) -> VerificationResult<&[u8]> {
         validate_path(path)?;
@@ -58,6 +136,10 @@ impl Custody {
             .ok_or_else(|| format!("artifact digest not bound in evidence index: {path}"))
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/private/archive_custody.rs"]
+mod archive_tests;
 
 pub fn validate_path(path: &str) -> VerificationResult<()> {
     if path.is_empty()
@@ -79,7 +161,29 @@ pub fn validate_path(path: &str) -> VerificationResult<()> {
     Ok(())
 }
 
-fn bounded_read(mut file: File, limit: u64) -> VerificationResult<Vec<u8>> {
+struct Collected {
+    file: File,
+    bytes: Option<Vec<u8>>,
+    hash: String,
+    length: u64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(windows)]
+    identity: (u32, u32, u32),
+}
+
+impl PartialEq for Collected {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(any(unix, windows))]
+        if self.identity != other.identity {
+            return false;
+        }
+        self.length == other.length && self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+
+fn bounded_collect(mut file: File, limit: u64, buffered: bool) -> VerificationResult<Collected> {
+    file.rewind().map_err(|e| e.to_string())?;
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() || before.len() > limit {
         return Err("evidence is not a bounded regular file".into());
@@ -91,15 +195,37 @@ fn bounded_read(mut file: File, limit: u64) -> VerificationResult<Vec<u8>> {
             return Err("hard-linked evidence is not exclusive collected custody".into());
         }
     }
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+    let mut bytes = buffered.then(Vec::new);
+    let mut digest = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let remaining = limit
+            .checked_sub(length)
+            .ok_or("evidence exceeds collection limit")?;
+        let capacity = usize::try_from(remaining.min(buffer.len() as u64 - 1) + 1)
+            .map_err(|e| e.to_string())?;
+        let count = file
+            .read(&mut buffer[..capacity])
+            .map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .ok_or("evidence length overflow")?;
+        if length > limit {
+            return Err("evidence exceeds collection limit".into());
+        }
+        digest.update(&buffer[..count]);
+        if let Some(bytes) = &mut bytes {
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
     let after = file.metadata().map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > limit
+    if length > limit
         || before.len() != after.len()
-        || before.len() != bytes.len() as u64
+        || before.len() != length
         || before.modified().map_err(|e| e.to_string())?
             != after.modified().map_err(|e| e.to_string())?
     {
@@ -116,11 +242,53 @@ fn bounded_read(mut file: File, limit: u64) -> VerificationResult<Vec<u8>> {
             return Err("native evidence identity changed during collection".into());
         }
     }
-    Ok(bytes)
+    #[cfg(windows)]
+    let identity = windows_identity(&file)?;
+    Ok(Collected {
+        file,
+        bytes,
+        hash: hex::encode(digest.finalize()),
+        length,
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt;
+            (before.dev(), before.ino())
+        },
+        #[cfg(windows)]
+        identity,
+    })
+}
+
+#[cfg(windows)]
+fn windows_identity(file: &File) -> VerificationResult<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr()) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let information = unsafe { information.assume_init() };
+    if information.nNumberOfLinks != 1 {
+        return Err("hard-linked Windows evidence lacks exclusive named custody".into());
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
 }
 
 #[cfg(unix)]
-fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<Vec<u8>> {
+fn collect_confined(
+    root: &Path,
+    relative: &str,
+    limit: u64,
+    buffered: bool,
+) -> VerificationResult<Collected> {
     use rustix::fs::{Mode, OFlags, open, openat};
     let mut ancestors = vec![File::from(
         open(
@@ -152,7 +320,11 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
     use std::os::unix::fs::MetadataExt;
     let file = File::from(file);
     let expected = file.metadata().map_err(|e| e.to_string())?;
-    let bytes = bounded_read(file.try_clone().map_err(|e| e.to_string())?, limit)?;
+    let bytes = bounded_collect(
+        file.try_clone().map_err(|e| e.to_string())?,
+        limit,
+        buffered,
+    )?;
     let named = File::from(
         openat(
             parent,
@@ -169,7 +341,7 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
     {
         return Err("persisted named evidence was replaced/unlinked during collection".into());
     }
-    if bounded_read(named, limit)? != bytes {
+    if bounded_collect(named, limit, buffered)? != bytes {
         return Err("persisted named evidence readback differs".into());
     }
     let mut current = File::from(
@@ -209,7 +381,7 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
     );
     let final_identity = final_named.metadata().map_err(|e| e.to_string())?;
     if (expected.dev(), expected.ino()) != (final_identity.dev(), final_identity.ino())
-        || bounded_read(final_named, limit)? != bytes
+        || bounded_collect(final_named, limit, buffered)? != bytes
     {
         return Err("bundle-root named evidence identity/readback differs".into());
     }
@@ -217,7 +389,12 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
 }
 
 #[cfg(windows)]
-fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<Vec<u8>> {
+fn collect_confined(
+    root: &Path,
+    relative: &str,
+    limit: u64,
+    buffered: bool,
+) -> VerificationResult<Collected> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -283,7 +460,11 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
         return Err("reparse evidence is forbidden".into());
     }
     let expected = identity(&file)?;
-    let bytes = bounded_read(file.try_clone().map_err(|e| e.to_string())?, limit)?;
+    let bytes = bounded_collect(
+        file.try_clone().map_err(|e| e.to_string())?,
+        limit,
+        buffered,
+    )?;
     let named = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
@@ -297,7 +478,7 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
             .file_attributes()
             & FILE_ATTRIBUTE_REPARSE_POINT
             != 0
-        || bounded_read(named, limit)? != bytes
+        || bounded_collect(named, limit, buffered)? != bytes
     {
         return Err("Windows named evidence identity/readback differs".into());
     }
@@ -307,8 +488,14 @@ fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_confined(_: &Path, _: &str, _: u64) -> VerificationResult<Vec<u8>> {
+fn collect_confined(_: &Path, _: &str, _: u64, _: bool) -> VerificationResult<Collected> {
     Err("native file custody unavailable on this host".into())
+}
+
+fn read_confined(root: &Path, relative: &str, limit: u64) -> VerificationResult<Vec<u8>> {
+    collect_confined(root, relative, limit, true)?
+        .bytes
+        .ok_or("external evidence buffer absent".into())
 }
 
 pub(crate) fn read_external(path: &Path, limit: u64) -> VerificationResult<Vec<u8>> {

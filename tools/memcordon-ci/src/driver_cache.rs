@@ -860,7 +860,7 @@ fn context_owned(root: &Path) -> Result<()> {
                     } else {
                         "compiled-partial-inbox"
                     },
-                    request.path.display().to_string(),
+                    crate::workflow_output::action_path(&request.path)?,
                 ),
             ])?,
             Err(error)
@@ -1245,32 +1245,34 @@ fn build_owned(
                         crate::cache_snapshot::stage_transfer(root, compiler_selection(), complete)
                     }) {
                         Ok(transfer) => {
-                            let output = crate::workflow_output::write(&[
-                                (
-                                    if complete {
-                                        "compiled-complete-key"
-                                    } else {
-                                        "compiled-partial-key"
-                                    },
-                                    transfer.key,
-                                ),
-                                (
-                                    if complete {
-                                        "compiled-complete-path"
-                                    } else {
-                                        "compiled-partial-path"
-                                    },
-                                    transfer.path.display().to_string(),
-                                ),
-                                (
-                                    if complete {
-                                        "compiled-complete-save"
-                                    } else {
-                                        "compiled-partial-save"
-                                    },
-                                    "true".into(),
-                                ),
-                            ]);
+                            let output = (|| {
+                                crate::workflow_output::write(&[
+                                    (
+                                        if complete {
+                                            "compiled-complete-key"
+                                        } else {
+                                            "compiled-partial-key"
+                                        },
+                                        transfer.key,
+                                    ),
+                                    (
+                                        if complete {
+                                            "compiled-complete-path"
+                                        } else {
+                                            "compiled-partial-path"
+                                        },
+                                        crate::workflow_output::action_path(&transfer.path)?,
+                                    ),
+                                    (
+                                        if complete {
+                                            "compiled-complete-save"
+                                        } else {
+                                            "compiled-partial-save"
+                                        },
+                                        "true".into(),
+                                    ),
+                                ])
+                            })();
                             if let Err(error) = output {
                                 eprintln!("driver compiler output emission failed: {error}");
                             }

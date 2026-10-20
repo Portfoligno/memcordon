@@ -936,7 +936,10 @@ pub fn seed_context(
                 prefix
             },
         ),
-        ("seed-import-path", selected.stage.display().to_string()),
+        (
+            "seed-import-path",
+            crate::workflow_output::action_path(&selected.stage)?,
+        ),
         ("input-key", selected.input),
         ("seed-compatibility", selected.compatibility),
     ])
@@ -1363,7 +1366,10 @@ pub fn snapshot(
             crate::workflow_output::write(&[
                 ("snapshot-ready", "true".into()),
                 ("snapshot-key", key),
-                ("snapshot-path", selected.stage.display().to_string()),
+                (
+                    "snapshot-path",
+                    crate::workflow_output::action_path(&selected.stage)?,
+                ),
                 ("input-key", selected.input),
                 ("seed-compatibility", selected.compatibility),
             ])

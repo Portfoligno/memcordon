@@ -1,6 +1,6 @@
 //! Closed platform adapters. These functions author Actions data; they do not
 //! execute a workflow, inspect step outcomes, or interpret executable recipes.
-use super::{invocations::invocation, literal, number, text, translations::translate};
+use super::{LiteralRun, invocations::invocation, literal, number, text, translations::translate};
 use crate::{CiError, Result};
 use serde_yaml::Value;
 use std::collections::BTreeSet;
@@ -877,11 +877,104 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     if name == "deep-ci.yml" {
         split_fuzz(workflow)?;
     }
+    if name == "backend-certification.yml" {
+        for job_name in ["windows-installed-x64", "windows-installed-arm64"] {
+            let steps = workflow["jobs"][job_name]["steps"]
+                .as_sequence_mut()
+                .expect("installed steps");
+            let upload = steps
+                .iter()
+                .position(|step| field(&step["with"], "path") == "target/ci/windows-installed")
+                .ok_or_else(|| CiError::Message("installed diagnostic upload absent".into()))?;
+            for (offset, (id, condition, command)) in [
+                (
+                    "loader-cleanup-native",
+                    "always() && matrix.channel == 'native' && runner.os == 'Windows'",
+                    LiteralRun::InstalledLoaderCleanupNative,
+                ),
+                (
+                    "loader-cleanup-cargo",
+                    "always() && matrix.channel == 'cargo' && runner.os == 'Windows'",
+                    LiteralRun::InstalledLoaderCleanupCargo,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                steps.insert(
+                    upload + offset,
+                    object(&[
+                        ("id", text(id)),
+                        ("if", text(condition)),
+                        ("run", literal(command)),
+                    ]),
+                );
+            }
+        }
+    }
     if name == "release.yml" {
         super::release_fuzz::apply(workflow)?;
     }
     if name == "release.yml" {
         super::host_preparation::apply(workflow)?;
+        // Public Linux producers upload only selected readable copies, never
+        // administrative owners or caller-private native execution directories.
+        for (job_name, job) in workflow["jobs"].as_mapping_mut().expect("source jobs") {
+            if !job_name.as_str().is_some_and(|id| {
+                id.starts_with("candidate-linux-") || id.starts_with("public-linux-")
+            }) {
+                continue;
+            }
+            let mut sealed = false;
+            let mut uploaded = false;
+            for step in job["steps"].as_sequence_mut().expect("producer steps") {
+                let command = field(step, "run");
+                let replacement = if command == LiteralRun::R535.command() {
+                    Some(LiteralRun::LinuxProjectedProducerSeal)
+                } else if command == LiteralRun::R567.command() {
+                    Some(LiteralRun::LinuxProjectedProducerColdSeal)
+                } else {
+                    None
+                };
+                if let Some(command) = replacement {
+                    set(step, "run", literal(command));
+                    sealed = true;
+                }
+                if field(step, "id") == "readiness-upload" {
+                    if field(&step["with"], "path") != ".release/readiness-cell" {
+                        return Err(CiError::Message(
+                            "Linux producer upload root differs".into(),
+                        ));
+                    }
+                    set(
+                        &mut step["with"],
+                        "path",
+                        text(".release/readiness-cell/producer"),
+                    );
+                    uploaded = true;
+                }
+            }
+            if !sealed || !uploaded {
+                return Err(CiError::Message(
+                    "Linux producer projection seal/upload pair absent".into(),
+                ));
+            }
+        }
+        // Installed macOS consumers use the consumer branch of the shared
+        // readiness steps, whose producer guard requires an explicit empty key.
+        for (job_name, job) in workflow["jobs"].as_mapping_mut().expect("source jobs") {
+            if job_name
+                .as_str()
+                .is_some_and(|name| name.starts_with("installed-macos-"))
+            {
+                for row in job["strategy"]["matrix"]["include"]
+                    .as_sequence_mut()
+                    .expect("installed macOS matrix")
+                {
+                    set(row, "producer-job", text(""));
+                }
+            }
+        }
     }
     if name == "backend-certification.yml" {
         super::backend_private::apply(workflow)?;
@@ -1140,9 +1233,39 @@ fn reviewed_step_minutes(step: &Value) -> Option<u64> {
         Some("rehearsal-tool-build") => Some(40),           // actual compiler30 + optional10
         Some("prepare-miri-components") => Some(45),
         Some("msrv") => Some(100), // suites::run_result original90 + optional10
-        Some("native-compile") => Some(35), // actual debug compiler25 + optional10
-        Some("native-execute") => Some(25), // actual execution15 + optional10
-        Some("native") => Some(50), // actual compiler25 + execution15 + optional10
+        Some(recipe @ ("native-compile" | "native-execute" | "native")) => {
+            // The shared POSIX command can run on macOS or other native hosts.
+            // Its ceiling must cover both modeled allocations.
+            // Derive Actions work ceilings from the same finite runtime plan;
+            // cache work retains its separate, unchanged10-minute allocation.
+            use crate::native_test_plan::{NativePlatform, commands_for_platform};
+            let platforms = if command
+                .split_whitespace()
+                .next()
+                .is_some_and(|executable| executable.ends_with(".exe"))
+            {
+                vec![NativePlatform::Windows]
+            } else {
+                vec![NativePlatform::MacOs, NativePlatform::Other]
+            };
+            let work = platforms
+                .into_iter()
+                .map(|platform| {
+                    let plan = commands_for_platform(
+                        false,
+                        crate::failure_mode::FailureMode::StopAfterFailure,
+                        platform,
+                    );
+                    match recipe {
+                        "native-compile" => plan[0].deadline,
+                        "native-execute" => plan[1].deadline,
+                        _ => plan.iter().map(|command| command.deadline).sum(),
+                    }
+                })
+                .max()
+                .expect("native command has at least one supported platform");
+            Some(work.as_secs().div_ceil(60) + 10)
+        }
         Some("miri-setup") => Some(25), // miri_cache::prepare original15 + optional10
         Some("prepare-tools" | "prepare-fuzz") => Some(55), // preparation original45 + optional10
         Some("stress" | "stress-packages" | "stress-lifecycle") => Some(110), // actual original100 + optional10

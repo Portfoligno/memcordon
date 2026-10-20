@@ -1,4 +1,6 @@
 //! Original measured recovery uses production native ownership, never CLI admission.
+#[path = "../../src/bin/original_native_recovery_checkpoint.rs"]
+mod checkpoint;
 #[path = "../../src/bin/original_native_recovery_contract.rs"]
 pub(crate) mod contract;
 
@@ -158,12 +160,7 @@ fn validate_records(
     if matches!(input.context, Context::InterruptedLease { .. }) {
         if let Some(bytes) = records.get("resources_acquired") {
             let acquired = json(bytes)?;
-            if acquired["identity"] != owner["identity"]
-                || acquired["cell"] != owner["cell"]
-                || acquired["lease_id"] != owner["lease_id"]
-            {
-                return Err("original recovery partial acquisition association differs".into());
-            }
+            checkpoint::validate_interrupted_checkpoint(&owner, &acquired)?;
         }
         return Ok(());
     }

@@ -4,6 +4,182 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
+fn console_comparison_leaf_policy_preserves_publication_and_exact_admin_retirement() {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner,
+    };
+    let descriptor = SecurityDescriptor::from_sddl(
+        &crate::windows::security::support_console_comparison_intent_sddl().unwrap(),
+    )
+    .unwrap();
+    let mut owner = ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: all returned pointers borrow the live parsed descriptor.
+    assert_ne!(
+        unsafe { GetSecurityDescriptorOwner(descriptor.raw(), &mut owner, &mut defaulted) },
+        0
+    );
+    assert_eq!(
+        crate::windows::token::sid_string(owner).unwrap(),
+        "S-1-5-18"
+    );
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: outputs are initialized scalar storage.
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(descriptor.raw(), &mut control, &mut revision) },
+        0
+    );
+    assert_ne!(control & 0x1000, 0, "leaf DACL must be protected");
+    let mut present = 0;
+    let mut acl: *mut ACL = ptr::null_mut();
+    // SAFETY: descriptor remains live for all ACL/ACE borrows below.
+    assert_ne!(
+        unsafe {
+            GetSecurityDescriptorDacl(descriptor.raw(), &mut present, &mut acl, &mut defaulted)
+        },
+        0
+    );
+    assert_ne!(present, 0);
+    assert!(!acl.is_null());
+    let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
+    let mut grants = std::collections::BTreeMap::new();
+    // SAFETY: ACL count and each GetAce output refer to the parsed descriptor.
+    for index in 0..unsafe { (*acl).AceCount } {
+        let mut raw = ptr::null_mut();
+        assert_ne!(unsafe { GetAce(acl, u32::from(index), &mut raw) }, 0);
+        // SAFETY: the finite policy contains only ordinary allow/deny ACEs.
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = crate::windows::token::sid_string(ptr::addr_of!(ace.SidStart).cast_mut().cast())
+            .unwrap();
+        assert_eq!(ace.Header.AceFlags, 0, "leaf rights must not propagate");
+        assert!(
+            grants
+                .insert(
+                    sid,
+                    (
+                        ace.Header.AceType,
+                        normalized_access_mask(SecurityObjectKind::File, ace.Mask)
+                    )
+                )
+                .is_none()
+        );
+    }
+    assert_eq!(
+        grants.len(),
+        4,
+        "only owner-rights, SYSTEM, administrator and launcher"
+    );
+    assert_eq!(
+        grants["S-1-3-4"],
+        (1, 0x000c_0000),
+        "owner cannot rewrite policy"
+    );
+    assert_eq!(
+        grants["S-1-5-18"],
+        (
+            0,
+            normalized_access_mask(SecurityObjectKind::File, 0x1000_0000)
+        )
+    );
+    assert_eq!(
+        grants["S-1-5-32-544"],
+        (
+            0,
+            windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES
+                | windows_sys::Win32::Storage::FileSystem::DELETE
+                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE
+        ),
+        "administrative synchronous metadata/read-control/delete only"
+    );
+    assert_eq!(
+        grants[&launcher],
+        (
+            0,
+            normalized_access_mask(SecurityObjectKind::File, 0xc000_0000)
+        ),
+        "launcher retains read/write publication only"
+    );
+    assert_eq!(
+        grants["S-1-5-32-544"].1 & (0x1 | 0x2 | 0x4 | 0x10 | 0x100 | 0x40000 | 0x80000),
+        0
+    );
+    // Native descriptor parsing proves the scoped policy, not a simulated
+    // SYSTEM token, live service AccessCheck, or successful file creation.
+}
+
+#[test]
+fn console_comparison_intent_uses_launcher_writable_state_policy() {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, GetAce, GetSecurityDescriptorDacl,
+    };
+    let root = std::env::temp_dir().join("memcordon-console-intent-policy");
+    let intent = crate::windows::package::support_console_comparison_intent_path(&root);
+    assert_eq!(intent.parent(), Some(root.as_path()));
+    assert_eq!(
+        intent.file_name().unwrap(),
+        "support-console-comparison-intent.json"
+    );
+    let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
+    let mut masks = Vec::new();
+    for policy in [state_sddl().unwrap(), package_state_sddl().unwrap()] {
+        let descriptor = SecurityDescriptor::from_sddl(&policy).unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl: *mut ACL = ptr::null_mut();
+        // SAFETY: the parsed descriptor owns every returned ACL and ACE borrow.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor.raw(), &mut present, &mut acl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!acl.is_null());
+        let mut launcher_mask = None;
+        // SAFETY: acl remains borrowed from the live native descriptor.
+        for index in 0..unsafe { (*acl).AceCount } {
+            let mut raw = ptr::null_mut();
+            // SAFETY: index is bounded by the actual ACL's ACE count.
+            assert_ne!(unsafe { GetAce(acl, u32::from(index), &mut raw) }, 0);
+            // SAFETY: policies above contain ordinary allow/deny ACE layouts.
+            let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid =
+                crate::windows::token::sid_string(ptr::addr_of!(ace.SidStart).cast_mut().cast())
+                    .unwrap();
+            if sid == launcher {
+                assert_eq!(ace.Header.AceType, 0);
+                assert!(
+                    launcher_mask.is_none(),
+                    "launcher policy must have one explicit grant"
+                );
+                launcher_mask = Some(normalized_access_mask(SecurityObjectKind::File, ace.Mask));
+            }
+        }
+        masks.push(launcher_mask.expect("real launcher service SID grant"));
+    }
+    const FILE_ADD_FILE: u32 = 0x2;
+    const FILE_WRITE_DATA: u32 = 0x2;
+    const FILE_APPEND_DATA: u32 = 0x4;
+    const FILE_WRITE_EA: u32 = 0x10;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    assert_ne!(
+        masks[0] & FILE_ADD_FILE,
+        0,
+        "selected parent must permit intent creation"
+    );
+    assert_eq!(
+        masks[1] & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES),
+        0,
+        "protected package policy remains read/execute only for launcher"
+    );
+    // This checks real native policy parsing and path selection, not the
+    // current runner token or a fabricated restricted-service AccessCheck.
+}
+
+#[test]
 fn protected_runtime_descriptor_rejects_unprotected_and_malformed_authority() {
     use memcordon_platform::{
         protected_runtime_descriptor_for_test, runtime_security_descriptor_bounds_for_test,

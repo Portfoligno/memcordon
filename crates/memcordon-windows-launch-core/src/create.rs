@@ -1,7 +1,7 @@
 use crate::{
     CleanupOutcomeV1, HandshakeOutcomeV1, LoaderReadyEvidenceV1, NativeStatusV1,
-    ProductionLoaderPlanV1, WindowsLoaderQualificationFailureV2,
-    WindowsLoaderQualificationOutcomeV2, WindowsLoaderQualificationStageV2,
+    ProductionLoaderPlan, WindowsLoaderQualificationFailureV2, WindowsLoaderQualificationOutcomeV2,
+    WindowsLoaderQualificationStageV2,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -24,12 +24,18 @@ pub struct SuspendedProcessEvidenceV1 {
     pub exact_handle_list_attested: bool,
 }
 
-pub trait SuspendedProcessFactory {
+pub trait SuspendedProcessFactory<const VERSION: u32 = 1> {
     type Process;
 
-    fn desktop_preflight(&self, plan: &ProductionLoaderPlanV1) -> Result<(), ProcessCreateFailure>;
+    fn desktop_preflight(
+        &self,
+        plan: &ProductionLoaderPlan<VERSION>,
+    ) -> Result<(), ProcessCreateFailure>;
 
-    fn create(&self, plan: &ProductionLoaderPlanV1) -> Result<Self::Process, ProcessCreateFailure>;
+    fn create(
+        &self,
+        plan: &ProductionLoaderPlan<VERSION>,
+    ) -> Result<Self::Process, ProcessCreateFailure>;
 
     fn cleanup(&self, process: &mut Self::Process) -> CleanupOutcomeV1;
 }
@@ -45,12 +51,12 @@ pub enum PackageLoaderProbeError {
 /// Production and semantic tests both enter through this function. The
 /// factory is borrowed only for this call, so retry policy cannot be hidden
 /// inside the orchestration boundary.
-pub fn create_package_loader_probe<Factory>(
+pub fn create_package_loader_probe<Factory, const VERSION: u32>(
     factory: &Factory,
-    plan: &ProductionLoaderPlanV1,
+    plan: &ProductionLoaderPlan<VERSION>,
 ) -> Result<Factory::Process, PackageLoaderProbeError>
 where
-    Factory: SuspendedProcessFactory,
+    Factory: SuspendedProcessFactory<VERSION>,
 {
     factory
         .desktop_preflight(plan)
@@ -60,37 +66,37 @@ where
         .map_err(PackageLoaderProbeError::ProcessCreate)
 }
 
-pub trait SuspendedProcessAttestor<Process> {
+pub trait SuspendedProcessAttestor<Process, const VERSION: u32 = 1> {
     fn attest(
         &self,
         process: &Process,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
     ) -> Result<SuspendedProcessEvidenceV1, ProcessCreateFailure>;
 }
 
-pub trait LoaderReadyChannel<Process> {
+pub trait LoaderReadyChannel<Process, const VERSION: u32 = 1> {
     fn resume(
         &self,
         process: &mut Process,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure>;
 
     fn await_ready(
         &self,
         process: &mut Process,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
     ) -> Result<HandshakeOutcomeV1, ProcessCreateFailure>;
 
     fn attest_containment(
         &self,
         process: &Process,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure>;
 
     fn drain_exit(
         &self,
         process: &mut Process,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure>;
 }
 
@@ -111,17 +117,17 @@ impl<Factory, Attestor, Channel> ProductionQualificationDriver<Factory, Attestor
     }
 }
 
-impl<Factory, Attestor, Channel> ProductionQualificationDriver<Factory, Attestor, Channel>
-where
-    Factory: SuspendedProcessFactory,
-    Attestor: SuspendedProcessAttestor<Factory::Process>,
-    Channel: LoaderReadyChannel<Factory::Process>,
-{
-    pub fn qualify(
+impl<Factory, Attestor, Channel> ProductionQualificationDriver<Factory, Attestor, Channel> {
+    pub fn qualify<const VERSION: u32>(
         &self,
-        plan: &ProductionLoaderPlanV1,
+        plan: &ProductionLoaderPlan<VERSION>,
         qualification_id: &str,
-    ) -> WindowsLoaderQualificationOutcomeV2 {
+    ) -> WindowsLoaderQualificationOutcomeV2
+    where
+        Factory: SuspendedProcessFactory<VERSION>,
+        Attestor: SuspendedProcessAttestor<Factory::Process, VERSION>,
+        Channel: LoaderReadyChannel<Factory::Process, VERSION>,
+    {
         let started = Instant::now();
         let mut process = match create_package_loader_probe(&self.factory, plan) {
             Ok(process) => process,
@@ -270,8 +276,8 @@ where
     }
 }
 
-fn map_failure(
-    plan: &ProductionLoaderPlanV1,
+fn map_failure<const VERSION: u32>(
+    plan: &ProductionLoaderPlan<VERSION>,
     qualification_id: &str,
     started: Instant,
     stage: WindowsLoaderQualificationStageV2,
@@ -290,17 +296,17 @@ fn map_failure(
     .with_cleanup(cleanup)
 }
 
-fn failed_after_create<Factory>(
+fn failed_after_create<Factory, const VERSION: u32>(
     factory: &Factory,
     process: &mut Factory::Process,
-    plan: &ProductionLoaderPlanV1,
+    plan: &ProductionLoaderPlan<VERSION>,
     qualification_id: &str,
     started: Instant,
     stage: WindowsLoaderQualificationStageV2,
     failure: ProcessCreateFailure,
 ) -> WindowsLoaderQualificationOutcomeV2
 where
-    Factory: SuspendedProcessFactory,
+    Factory: SuspendedProcessFactory<VERSION>,
 {
     let cleanup = factory.cleanup(process);
     WindowsLoaderQualificationOutcomeV2::Failed(map_failure(

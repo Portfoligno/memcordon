@@ -16,6 +16,30 @@ Job-at-creation requirement, executable, command, environment, current
 directory, desktop, object descriptors, and caller-token identity are validated
 and hashed before process creation.
 
+The shipped LoaderControl helper uses production plan schema 2, whose fixed
+creation policy is consoleless (`DETACHED_PROCESS`). It has an empty inherited
+handle list and attests the selected helper image, token and desktop through
+the authenticated protocol. The plan version and fixed creation flags are
+included in the plan digest. Schema 1 retains its original console policy and
+exact digest interpretation for historical evidence and laboratory inputs.
+
+This helper qualification does not assert that the workload image initialized.
+The workload retains its separate process-group and standard-stream policy and
+must satisfy its own creation, containment, readback, release and retirement
+checks. Holder policy is separate and unchanged. A detached-console
+diagnostic is explicitly not applicable to a schema-2 consoleless baseline; it
+creates no alternative child and supplies no qualification authority.
+
+The separate Probe helper also uses an explicit consoleless creation policy.
+Its typed policy fixes the Probe role, creation flags, atomic Job assignment and
+empty inherited-handle list before native creation. The identical policy enters
+Probe binding schema 4 and its digest; child admission rejects role, schema or
+policy mismatch. Holder bindings remain schema 3 with their original bytes and
+digest domain. Probe still requires its actual token lineage, USER security and
+noninteractive/live binding evidence, admitted AccessCheck, normal child exit
+and empty Job. These are helper attestation claims, not workload initialization
+or diagnostic authority, and workload console/stdIO policy is unchanged.
+
 Debugger, loader-snap, ETW/WPR, Process Monitor, and synthetic token variants
 belong only to the standalone Windows loader laboratory. A diagnostic outcome
 is evidence and cannot replace or fail the production result. The laboratory

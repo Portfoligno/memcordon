@@ -1,4 +1,6 @@
 //! One outer installation lease for the measured predecessor and mixed cases.
+#[path = "linux_cleanup_publication.rs"]
+mod cleanup_publication;
 use super::{
     installed_consumer::{MaterializedPayload, binary_path},
     linux_installed_consumer::{InstalledLeaseExtension, SelectedInstallOperation},
@@ -775,21 +777,90 @@ pub(super) fn recover_installation(
         deadline,
         &owner.artifact_root,
     )?;
-    driver.finalize_owned_resources(workspace, &mixed, &owner.legacy, deadline)?;
+    // Original acquisition evidence stays at `mixed`, including when absent.
+    // Recovery-only publication must not recreate that authority namespace.
+    if Instant::now() >= deadline {
+        return Err(CiError::Message(
+            "original interrupted cleanup cutoff exhausted".into(),
+        ));
+    }
+    let owner_now = owner_file.metadata()?;
+    if !owner_now.is_file()
+        || owner_now.uid() != 0
+        || owner_now.nlink() != 1
+        || owner_now.mode() & 0o022 != 0
+        || (
+            owner_now.dev(),
+            owner_now.ino(),
+            owner_now.len(),
+            owner_now.mtime(),
+            owner_now.mtime_nsec(),
+        ) != (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+        )
+    {
+        return Err(CiError::Message(
+            "original interrupted lease owner changed before publication".into(),
+        ));
+    }
+    let publication = cleanup_publication::HeldPublication::open(output, &owner_file, 0)
+        .map_err(CiError::Message)?;
+    let association = serde_json::to_vec(&serde_json::json!({
+        "format":"memcordon.interrupted-resource-publication","revision":1,
+        "identity":identity,"cell":cell,"lease_id":owner.lease_id,
+        "lease_owner_sha256":super::artifacts::checksum(&owner_bytes),
+        "admin_root":owner.admin_root,"device":owner.device,"inode":owner.inode,
+        "original_mixed_path":mixed,"publication_path":publication.path()
+    }))?;
+    let association_path = publication.path().join("association.json");
+    match fs::symlink_metadata(&association_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::linux_mixed_installed::retain(&association_path, &association)?;
+            std::fs::File::open(publication.path())?.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+            if super::linux_mixed_installed::read_owned_resource(&association_path, 1024 * 1024)?
+                != association
+            {
+                return Err(CiError::Message(
+                    "interrupted publication association differs".into(),
+                ));
+            }
+        }
+    }
+    publication.verify().map_err(CiError::Message)?;
+    let finalization = driver.finalize_owned_resources_with_publication(
+        workspace,
+        &mixed,
+        publication.path(),
+        &owner.legacy,
+        deadline,
+    );
+    let publication_check = publication.verify().map_err(CiError::Message);
+    crate::work_outcome::join_completed(
+        crate::work_outcome::WorkOutcome::from_result(finalization),
+        crate::work_outcome::WorkOutcome::from_result(publication_check),
+    )
+    .into_result()?;
     verify_cleanup_agent_name(&owner.cleanup_agent, &agent, &bytes)?;
     let uninstall = CommandSpec::new(&owner.cleanup_agent, workspace, Duration::from_secs(120))
         .args(["package", "uninstall"])
         .bounded_until(deadline)
         .output_quiet()?;
-    source::write_json(
+    let uninstall_retention = source::write_json(
         &output.join("interrupted-package-uninstall.json"),
         &serde_json::json!({"status":uninstall.status.code(),"stdout":uninstall.stdout,"stderr":uninstall.stderr}),
+    );
+    crate::command::require_successful_retained_output(
+        "interrupted package uninstall failed; administrative owner retained",
+        &uninstall,
+        uninstall_retention,
     )?;
-    if !uninstall.status.success() {
-        return Err(CiError::Message(
-            "interrupted package uninstall failed; administrative owner retained".into(),
-        ));
-    }
     for path in [
         "/usr/libexec/memcordon",
         "/usr/libexec/memcordon-sealed-agent",
@@ -843,8 +914,18 @@ pub(super) fn recover_installation(
                 || !text.lines().any(|line| line == "ActiveState=inactive")
                 || !text.lines().any(|line| line == "MainPID=0")
             {
+                let stdout_end = observed.stdout.len().min(2048);
+                let stderr_end = observed.stderr.len().min(2048);
                 return Err(CiError::Message(format!(
-                    "interrupted cleanup native unit {unit} remains active or uncertain"
+                    "interrupted cleanup native unit {unit} remains active or uncertain; status={:?}; code={:?}; stdout-bytes={}; stderr-bytes={}; stdout-truncated={}; stderr-truncated={}; stdout={:?}; stderr={:?}",
+                    observed.status,
+                    observed.status.code(),
+                    observed.stdout.len(),
+                    observed.stderr.len(),
+                    stdout_end != observed.stdout.len(),
+                    stderr_end != observed.stderr.len(),
+                    String::from_utf8_lossy(&observed.stdout[..stdout_end]),
+                    String::from_utf8_lossy(&observed.stderr[..stderr_end]),
                 )));
             }
             units.push(serde_json::json!({"unit":unit,"status":observed.status.code(),"stdout":observed.stdout,"stderr":observed.stderr}));

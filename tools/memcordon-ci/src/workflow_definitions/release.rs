@@ -9948,7 +9948,7 @@ fn node_797() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -9962,7 +9962,7 @@ fn node_798() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),
@@ -11198,7 +11198,7 @@ fn node_896() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -11212,7 +11212,7 @@ fn node_897() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),
@@ -12446,7 +12446,7 @@ fn node_995() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -12460,7 +12460,7 @@ fn node_996() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),
@@ -13694,7 +13694,7 @@ fn node_1094() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -13708,7 +13708,7 @@ fn node_1095() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),
@@ -14944,7 +14944,7 @@ fn node_1193() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -14958,7 +14958,7 @@ fn node_1194() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),
@@ -16194,7 +16194,7 @@ fn node_1292() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(text("run"), literal(LiteralRun::R527));
     Value::Mapping(values)
@@ -16208,7 +16208,7 @@ fn node_1293() -> Value {
     );
     values.insert(
         text("if"),
-        text("always() && (runner.os == 'Linux' || runner.os == 'Windows')"),
+        text("always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')"),
     );
     values.insert(
         text("uses"),

@@ -9,6 +9,18 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::linux_fixture_memory_budget::FrozenImageMemoryBudget;
+
+#[path = "linux_memory_event_counters.rs"]
+mod memory_event_counters;
+
+#[allow(unsafe_code)] // Query only the native page-size scalar used to size the admitted fixture images.
+fn native_fixture_page_bytes() -> Result<u64> {
+    // SAFETY: sysconf has no pointer arguments and returns the page size or a negative failure.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|_| CiError::Message("native fixture page size unavailable".into()))
+}
+
 pub struct LimitsContext<'a> {
     pub lease_owner_path: &'a Path,
     pub recovery_harness: &'a super::linux_recovery_harness::HeldRecoveryHarness,
@@ -16,6 +28,7 @@ pub struct LimitsContext<'a> {
     pub cell: &'a memcordon_readiness_verifier::ProductKey,
     pub provider: &'a memcordon_core::PublicProviderBindingV1,
     pub contract: &'a memcordon_core::workload_contract_v3::WorkloadContractV3,
+    pub images: &'a super::linux_mixed_installed::MixedImages,
     pub contract_path: &'a Path,
     pub artifact_root: &'a Path,
     pub lease_id: &'a str,
@@ -29,6 +42,7 @@ pub struct LimitsContext<'a> {
 
 #[derive(Default)]
 pub struct LimitsReport {
+    pub fixture_budgets: std::collections::BTreeMap<CaseKey, FrozenFixtureBudget>,
     original_work_deadline: Option<Instant>,
     original_cleanup_deadline: Option<Instant>,
     pub owners: Vec<OwnedMixedRecipe>,
@@ -43,6 +57,19 @@ pub struct LimitsReport {
     memory_files: Vec<std::fs::File>,
     memory_directories: Vec<std::fs::File>,
     memory_intervals: Vec<MemoryEventInterval>,
+    memory_allocators: Vec<MemoryAllocator>,
+}
+
+struct MemoryAllocator {
+    process: crate::linux_consumer_readiness::HeldLinuxProcess,
+    resume_required: bool,
+}
+
+pub struct FrozenFixtureBudget {
+    budget: FrozenImageMemoryBudget,
+    receipt: Vec<u8>,
+    file: std::fs::File,
+    allocator_records: Vec<(String, std::fs::File, Vec<u8>)>,
 }
 
 pub struct MemoryEventInterval {
@@ -53,12 +80,186 @@ pub struct MemoryEventInterval {
     key: CaseKey,
     attempt: String,
     worker_index: usize,
+    budget: FrozenImageMemoryBudget,
+    allocator_index: usize,
 }
 
-fn read_memory_counter_file(file: &std::fs::File, deadline: Instant) -> Result<Vec<u8>> {
+fn retain_allocator_record(
+    report: &mut LimitsReport,
+    context: &LimitsContext<'_>,
+    key: &CaseKey,
+    leaf: &str,
+    value: &serde_json::Value,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
+    remaining(context.work_deadline)?;
+    let directory = context
+        .contract_path
+        .parent()
+        .ok_or_else(|| CiError::Message("allocator original contract parent absent".into()))?;
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)?;
+    let stamp = parent.metadata()?;
+    if !stamp.is_dir() || stamp.uid() != 0 || stamp.nlink() == 0 || stamp.mode() & 0o022 != 0 {
+        return Err(CiError::Message(
+            "allocator intent parent is not owned protected directory".into(),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(leaf))?;
+    report.memory_files.push(file.try_clone()?);
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > 65536 {
+        return Err(CiError::Message(
+            "allocator receipt exceeds finite bound".into(),
+        ));
+    }
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let named = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(leaf))?;
+    let held = file.metadata()?;
+    let current = named.metadata()?;
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.len(),
+        )
+    };
+    if !held.is_file()
+        || held.uid() != 0
+        || held.mode() & 0o7777 != 0o600
+        || held.nlink() != 1
+        || identity(&held) != identity(&current)
+    {
+        return Err(CiError::Message(
+            "allocator intent named custody differs".into(),
+        ));
+    }
+    let mut actual = Vec::new();
+    named
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut actual)?;
+    let named_parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)?;
+    let after = named_parent.metadata()?;
+    if actual != bytes
+        || (stamp.dev(), stamp.ino(), stamp.uid(), stamp.mode())
+            != (after.dev(), after.ino(), after.uid(), after.mode())
+    {
+        return Err(CiError::Message(
+            "allocator intent bytes/parent changed".into(),
+        ));
+    }
+    parent.sync_all()?;
+    report.memory_directories.push(parent);
+    report
+        .fixture_budgets
+        .get_mut(key)
+        .ok_or_else(|| CiError::Message("allocator frozen case budget absent".into()))?
+        .allocator_records
+        .push((leaf.to_owned(), file, bytes));
+    remaining(context.work_deadline)?;
+    Ok(())
+}
+
+fn retain_memory_allocator(
+    report: &mut LimitsReport,
+    observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
+    tree: &serde_json::Value,
+    context: &LimitsContext<'_>,
+) -> Result<usize> {
+    let deadline = context.work_deadline;
+    if deadline >= context.cleanup_deadline
+        || report
+            .original_work_deadline
+            .is_some_and(|original| original != deadline)
+        || report
+            .original_cleanup_deadline
+            .is_some_and(|original| original != context.cleanup_deadline)
+        || observer.observation.provider != *context.provider
+        || observer.observation.admission.request != *context.contract
+    {
+        return Err(CiError::Message(
+            "allocator original owner/request/cutoff differs".into(),
+        ));
+    }
+    report.original_work_deadline = Some(deadline);
+    report.original_cleanup_deadline = Some(context.cleanup_deadline);
+    remaining(deadline)?;
+    let pid = tree["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| CiError::Message("allocator PID absent".into()))?;
+    let birth = tree["birth"]
+        .as_u64()
+        .filter(|birth| *birth > 0)
+        .ok_or_else(|| CiError::Message("allocator birth absent".into()))?;
+    let mut process = observer
+        .target
+        .hold_namespace_member(pid, birth)
+        .map_err(CiError::Message)?;
+    process
+        .verify_parent(&observer.target)
+        .map_err(CiError::Message)?;
+    let mut target = crate::linux_consumer_readiness::HeldLinuxProcess::acquire(
+        observer.target.process_id,
+        observer.target.birth,
+    )
+    .map_err(CiError::Message)?;
+    if process
+        .hold_executable_image(deadline)
+        .map_err(CiError::Message)?["sha256"]
+        != target
+            .hold_executable_image(deadline)
+            .map_err(CiError::Message)?["sha256"]
+    {
+        return Err(CiError::Message(
+            "allocator differs from selected fixture executable".into(),
+        ));
+    }
+    let index = report.memory_allocators.len();
+    report.memory_allocators.push(MemoryAllocator {
+        process,
+        resume_required: true,
+    });
+    observe_stopped_worker(
+        &report.memory_allocators[index].process,
+        deadline,
+        &mut report.memory_files,
+    )?;
+    Ok(index)
+}
+
+pub(super) fn read_memory_counter_file(
+    file: &std::fs::File,
+    counter: &str,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
     use std::os::unix::fs::{FileExt, MetadataExt};
     remaining(deadline)?;
-    let before = file.metadata()?;
+    let before = file.metadata().map_err(|error| {
+        CiError::Message(format!(
+            "native memory counter {counter} metadata-before: {error}"
+        ))
+    })?;
     if !before.is_file() || before.uid() != 0 || before.mode() & 0o022 != 0 {
         return Err(CiError::Message(
             "held native memory counter protection differs".into(),
@@ -68,7 +269,13 @@ fn read_memory_counter_file(file: &std::fs::File, deadline: Instant) -> Result<V
     let mut length = 0;
     loop {
         remaining(deadline)?;
-        let count = file.read_at(&mut bytes[length..], length as u64)?;
+        let count = file
+            .read_at(&mut bytes[length..], length as u64)
+            .map_err(|error| {
+                CiError::Message(format!(
+                    "native memory counter {counter} read-at offset={length}: {error}"
+                ))
+            })?;
         if count == 0 {
             break;
         }
@@ -79,7 +286,11 @@ fn read_memory_counter_file(file: &std::fs::File, deadline: Instant) -> Result<V
             ));
         }
     }
-    let after = file.metadata()?;
+    let after = file.metadata().map_err(|error| {
+        CiError::Message(format!(
+            "native memory counter {counter} metadata-after: {error}"
+        ))
+    })?;
     if (
         before.dev(),
         before.ino(),
@@ -103,42 +314,7 @@ fn read_memory_counter_file(file: &std::fs::File, deadline: Instant) -> Result<V
 }
 
 fn memory_counters(bytes: &[u8]) -> Result<std::collections::BTreeMap<String, u64>> {
-    let text = std::str::from_utf8(bytes).map_err(|error| CiError::Message(error.to_string()))?;
-    let mut result = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let name = fields
-            .next()
-            .ok_or_else(|| CiError::Message("memory counter name absent".into()))?;
-        let value = fields
-            .next()
-            .ok_or_else(|| CiError::Message("memory counter value absent".into()))?;
-        if fields.next().is_some()
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
-            || result.contains_key(name)
-        {
-            return Err(CiError::Message(
-                "native memory counters duplicated/malformed".into(),
-            ));
-        }
-        let parsed = value
-            .parse::<u64>()
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        if parsed.to_string() != value {
-            return Err(CiError::Message(
-                "native memory counter decimal differs".into(),
-            ));
-        }
-        result.insert(name.to_owned(), parsed);
-    }
-    if result.keys().map(String::as_str).collect::<Vec<_>>()
-        != ["high", "low", "max", "oom", "oom_group_kill", "oom_kill"]
-    {
-        return Err(CiError::Message(
-            "native memory event inventory differs".into(),
-        ));
-    }
-    Ok(result)
+    memory_event_counters::parse(bytes).map_err(CiError::Message)
 }
 
 /// Arm actual selected cgroup counters only after the journalled worker is
@@ -147,7 +323,8 @@ pub fn arm_memory_events(
     report: &mut LimitsReport,
     observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
     key: &CaseKey,
-    worker_index: usize,
+    (worker_index, allocator_index): (usize, usize),
+    budget: &FrozenImageMemoryBudget,
     deadline: Instant,
 ) -> Result<usize> {
     use std::io::Read;
@@ -207,6 +384,8 @@ pub fn arm_memory_events(
             .as_str()
             .to_owned(),
         worker_index,
+        budget: budget.clone(),
+        allocator_index,
     });
     let interval = &mut report.memory_intervals[index];
     if rustix::fs::fstatfs(&interval.group)
@@ -219,28 +398,60 @@ pub fn arm_memory_events(
             "memory interval actual selected cgroup is absent/notcgroup2".into(),
         ));
     }
-    interval.before = read_memory_counter_file(&interval.events, deadline)?;
-    if memory_counters(&interval.before)?["oom_kill"] != 0 {
+    let allocator = report
+        .memory_allocators
+        .get(allocator_index)
+        .ok_or_else(|| CiError::Message("memory interval allocator owner absent".into()))?;
+    if !allocator.resume_required {
+        return Err(CiError::Message(
+            "memory allocator release obligation absent".into(),
+        ));
+    }
+    observe_stopped_worker(&allocator.process, deadline, &mut report.memory_files)?;
+    let members = std::fs::File::from(
+        rustix::fs::openat(
+            &interval.group,
+            "cgroup.procs",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?,
+    );
+    let members_bytes = read_memory_counter_file(&members, "cgroup.procs", deadline)?;
+    report.memory_files.push(members);
+    let pids = std::str::from_utf8(&members_bytes)
+        .map_err(|error| CiError::Message(error.to_string()))?
+        .lines()
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    if pids
+        .iter()
+        .filter(|pid| **pid == allocator.process.process_id)
+        .count()
+        != 1
+    {
+        return Err(CiError::Message(
+            "held allocator is not in exact selected memory cgroup".into(),
+        ));
+    }
+    interval.before = read_memory_counter_file(&interval.events, "memory.events", deadline)?;
+    let before = memory_counters(&interval.before)?;
+    if before["oom"] != 0 || before["oom_kill"] != 0 {
         return Err(CiError::Message(
             "memory interval already observed OOM before allocator release".into(),
         ));
     }
-    let maximum = read_memory_counter_file(&interval.maximum, deadline)?;
+    let maximum = read_memory_counter_file(&interval.maximum, "memory.max", deadline)?;
     let limit = std::str::from_utf8(&maximum)
         .map_err(|error| CiError::Message(error.to_string()))?
         .trim()
         .parse::<u64>()
         .map_err(|error| CiError::Message(error.to_string()))?;
-    let expected_limit = if key.family == "L-LIFE-03" {
-        512 * 1024 * 1024
-    } else {
-        128 * 1024 * 1024
-    };
-    if limit != expected_limit {
-        return Err(CiError::Message(
-            "native memory maximum differs from actual selected memory budget".into(),
-        ));
-    }
+    interval
+        .budget
+        .require_maximum(limit)
+        .map_err(CiError::Message)?;
     observe_stopped_worker(
         &report.memory_workers[worker_index],
         deadline,
@@ -300,13 +511,9 @@ pub fn observe_memory_oom(
                 "stopped native memory worker exited during counter interval".into(),
             ));
         }
-        let after_bytes = read_memory_counter_file(&interval.events, deadline)?;
+        let after_bytes = read_memory_counter_file(&interval.events, "memory.events", deadline)?;
         let after = memory_counters(&after_bytes)?;
-        if before.iter().any(|(name, value)| after[name] < *value) {
-            return Err(CiError::Message(
-                "native memory counters moved backwards".into(),
-            ));
-        }
+        memory_event_counters::require_monotonic(&before, &after).map_err(CiError::Message)?;
         if after["oom_kill"] > before["oom_kill"] && after["oom"] > before["oom"] {
             observe_stopped_worker(
                 &report.memory_workers[interval.worker_index],
@@ -396,6 +603,7 @@ impl LimitsReport {
             && self.controller_owners.is_empty()
             && self.memory_workers.is_empty()
             && self.memory_resume_required.is_empty()
+            && self.memory_allocators.is_empty()
     }
 }
 
@@ -406,7 +614,6 @@ pub fn pause_memory_worker(
     observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
     context: &LimitsContext<'_>,
     key: &CaseKey,
-    directory: &Path,
     challenge: &str,
 ) -> Result<serde_json::Value> {
     use std::io::{Read, Write};
@@ -434,10 +641,15 @@ pub fn pause_memory_worker(
     report.original_work_deadline = Some(context.work_deadline);
     report.original_cleanup_deadline = Some(context.cleanup_deadline);
     remaining(context.work_deadline)?;
+    // The frontend capture directory belongs to the unprivileged caller.
+    // Controller intent stays beside the original privileged recipe contract.
+    let intent_directory = context.contract_path.parent().ok_or_else(|| {
+        CiError::Message("memory controller original contract parent absent".into())
+    })?;
     let parent = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)?;
+        .open(intent_directory)?;
     let parent_identity = parent.metadata()?;
     report.memory_directories.push(parent);
     if parent_identity.uid() != 0
@@ -473,7 +685,7 @@ pub fn pause_memory_worker(
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join("memory-worker-stop-intent.json"))?;
+        .open(intent_directory.join("memory-worker-stop-intent.json"))?;
     report.memory_files.push(file);
     let file = report
         .memory_files
@@ -486,7 +698,7 @@ pub fn pause_memory_worker(
     let named = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join("memory-worker-stop-intent.json"))?;
+        .open(intent_directory.join("memory-worker-stop-intent.json"))?;
     let metadata = named.metadata()?;
     if !held.is_file()
         || held.nlink() != 1
@@ -526,7 +738,7 @@ pub fn pause_memory_worker(
     let named_parent = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)?;
+        .open(intent_directory)?;
     let current = named_parent.metadata()?;
     if (
         parent_identity.dev(),
@@ -730,6 +942,72 @@ pub fn run_case(
                 ));
             }
         };
+        // The original init materializes these immutable files into tmpfs
+        // inside the limited cgroup. Preserve each case's workload headroom
+        // while sizing its request for the exact admitted image inventory.
+        let headroom = match (key.family.as_str(), key.scenario.as_str()) {
+            ("C-STATUS", "memory") => Some(128 * 1024 * 1024),
+            ("L-LIFE-03", "memory") => Some(512 * 1024 * 1024),
+            ("C-IO" | "L-MIX-05", "bounded-large-output") | ("L-LIFE-05", "relay-backpressure") => {
+                Some(256 * 1024 * 1024)
+            }
+            _ => None,
+        };
+        let budget = headroom
+            .map(|headroom| {
+                let page_bytes = native_fixture_page_bytes()?;
+                FrozenImageMemoryBudget::for_images(
+                    &context.images.runtime,
+                    &context.images.input,
+                    &context.contract.runtime_image,
+                    &context.contract.input_image,
+                    page_bytes,
+                    headroom,
+                )
+                .map_err(CiError::Message)
+            })
+            .transpose()?;
+        let memory = budget
+            .as_ref()
+            .map_or_else(|| memory.to_owned(), FrozenImageMemoryBudget::token);
+        if let Some(budget) = &budget {
+            use std::io::Write;
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.linux-fixture-memory-budget", "revision":1,
+                "source":context.identity, "cell":context.cell,
+                "lease_id":context.lease_id, "key":key, "budget":budget,
+            }))?;
+            let parent = directory
+                .parent()
+                .ok_or_else(|| CiError::Message("fixture budget parent absent".into()))?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(parent.join("fixture-memory-budget.json"))?;
+            file.write_all(&receipt)?;
+            file.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+            if report
+                .fixture_budgets
+                .insert(
+                    key.clone(),
+                    FrozenFixtureBudget {
+                        budget: budget.clone(),
+                        receipt,
+                        file,
+                        allocator_records: Vec::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(CiError::Message(
+                    "fixture budget already frozen for selected case".into(),
+                ));
+            }
+        }
         let mut arguments = vec![
             std::ffi::OsString::from(mode),
             std::ffi::OsString::from(challenge),
@@ -786,7 +1064,7 @@ pub fn run_case(
                 caller_gid: 65534,
                 target_arguments: &arguments,
                 deadline: std::ffi::OsStr::new(deadline),
-                memory: std::ffi::OsStr::new(memory),
+                memory: std::ffi::OsStr::new(&memory),
             },
             false,
             backpressure.then_some(context.work_deadline),
@@ -873,7 +1151,30 @@ pub fn run_case(
                         if row.operation == "memory-pressure-descendant-held" {
                             let index = report.memory_intervals.len().checked_sub(1)
                                 .ok_or_else(|| CiError::Message("memory allocator lacks armed native interval".into()))?;
-                            observe_memory_oom(report, index, context.work_deadline)?;
+                            let allocator_index = report.memory_intervals[index].allocator_index;
+                            let allocator = &report.memory_allocators[allocator_index];
+                            if !allocator.resume_required {
+                                return Err(CiError::Message("allocator release already consumed".into()));
+                            }
+                            observe_stopped_worker(&allocator.process, context.work_deadline, &mut report.memory_files)?;
+                            let intent = serde_json::json!({"format":"memcordon.linux-memory-allocator-release-intent","revision":1,
+                                "source":context.identity,"cell":context.cell,"lease_id":context.lease_id,"key":key,
+                                "challenge":challenge,"attempt_id":observer.observation.admission.attempt_id,
+                                "allocator":allocator.process.retirement_identity().map_err(CiError::Message)?,"signal":18});
+                            retain_allocator_record(report, context, &key, "memory-allocator-release-intent.json", &intent)?;
+                            remaining(context.work_deadline)?;
+                            let resumed = report.memory_allocators[allocator_index].process.signal_continue().map_err(CiError::Message)?;
+                            if resumed.is_ok() {
+                                report.memory_allocators[allocator_index].resume_required = false;
+                            }
+                            let receipt = serde_json::json!({"format":"memcordon.linux-memory-allocator-release","revision":1,
+                                "intent":intent,"syscall_succeeded":resumed.is_ok(),"native_errno":resumed.err()});
+                            retain_allocator_record(report, context, &key, "memory-allocator-release.json", &receipt)?;
+                            if resumed.is_err() {
+                                return Err(CiError::Message("exact allocator release failed; obligation retained".into()));
+                            }
+                            observe_memory_oom(report, index, context.work_deadline)
+                                .map_err(|error| CiError::Message(format!("memory controller post-release OOM observation: {error}")))?;
                             let worker_index = report.memory_intervals[index].worker_index;
                             let resumed = report.memory_workers[worker_index].signal_continue().map_err(CiError::Message)?;
                             report.controller_actions.push(serde_json::json!({"format":"memcordon.linux-memory-worker-resume","revision":1,
@@ -881,16 +1182,25 @@ pub fn run_case(
                                 "signal":18,"syscall_succeeded":resumed.is_ok(),"native_errno":resumed.err()}));
                             if resumed.is_err() { return Err(CiError::Message("selected memory worker resume failed; original obligation retained".into())); }
                             report.memory_resume_required.remove(&worker_index);
-                            report.persist_controller_actions(directory, context.work_deadline)?;
+                            report.persist_controller_actions(directory, context.work_deadline)
+                                .map_err(|error| CiError::Message(format!("memory controller post-release action persistence: {error}")))?;
                         }
                         return Ok(super::linux_mixed_installed::FixtureBarrierDecision::Continue);
                     }
                     if row.operation == "memory-pressure-descendant-held" {
-                        pause_memory_worker(report, observer, context, &key, directory, challenge)?;
+                        let allocator_index = retain_memory_allocator(report, observer,
+                            row.observation.get("native_tree").ok_or_else(|| CiError::Message("allocator native identity absent".into()))?,
+                            context)?;
+                        pause_memory_worker(report, observer, context, &key, challenge)
+                            .map_err(|error| CiError::Message(format!("memory controller worker pause: {error}")))?;
                         let worker_index = report.memory_workers.len().checked_sub(1)
                             .ok_or_else(|| CiError::Message("memory worker owner absent".into()))?;
-                        arm_memory_events(report, observer, &key, worker_index, context.work_deadline)?;
-                        report.persist_controller_actions(directory, context.work_deadline)?;
+                        arm_memory_events(report, observer, &key, (worker_index, allocator_index),
+                            budget.as_ref().ok_or_else(|| CiError::Message("frozen memory fixture budget absent".into()))?,
+                            context.work_deadline)
+                            .map_err(|error| CiError::Message(format!("memory controller counter arming: {error}")))?;
+                        report.persist_controller_actions(directory, context.work_deadline)
+                            .map_err(|error| CiError::Message(format!("memory controller pre-release action persistence: {error}")))?;
                     }
                     if row.operation == "population-held-until-native-deadline" {
                         report.controller_actions.push(serde_json::from_slice(&std::fs::read(directory.join("native-deadline-population.json"))?)?);
@@ -990,6 +1300,7 @@ pub fn normalize_completed(
     input: &super::linux_mixed_installed::InstalledMixedDriverInput<'_>,
     prefix: &str,
     selected_agent_sha256: &str,
+    frozen: Option<&FrozenFixtureBudget>,
 ) -> Result<()> {
     use memcordon_readiness_verifier::{
         Artifact, BehaviorArtifact, ByteComparison, FixtureBehavior, FixtureInput, NativeArguments,
@@ -1085,12 +1396,87 @@ pub fn normalize_completed(
         return Err(CiError::Message("limit public entrypoint differs".into()));
     }
     let challenge = std::fs::read(input.artifact_root.join(format!("{prefix}/challenge.bin")))?;
-    let budget = match (key.family.as_str(), key.scenario.as_str()) {
-        ("C-STATUS", "deadline") => (Some(30_000), Some(2 * 1024 * 1024 * 1024)),
-        ("C-STATUS", "memory") => (Some(300_000), Some(128 * 1024 * 1024)),
-        ("L-LIFE-03", "memory") => (Some(300_000), Some(512 * 1024 * 1024)),
-        ("L-LIFE-03", _) => (Some(300_000), Some(2 * 1024 * 1024 * 1024)),
-        _ => (Some(30_000), Some(256 * 1024 * 1024)),
+    let memory_token = invocation
+        .memory_token
+        .as_deref()
+        .ok_or_else(|| CiError::Message("actual limit invocation memory token absent".into()))?;
+    if collection.result.invocation.memory_token.as_deref() != Some(memory_token) {
+        return Err(CiError::Message(
+            "retained public and completed invocation memory differ".into(),
+        ));
+    }
+    let memory_bytes = memory_token
+        .strip_prefix('+')
+        .ok_or_else(|| CiError::Message("actual limit memory budget prefix absent".into()))?
+        .parse::<memcordon_core::ByteSize>()
+        .map_err(|error| CiError::Message(error.to_string()))?
+        .bytes();
+    let requires_derived = matches!(
+        (key.family.as_str(), key.scenario.as_str()),
+        ("C-STATUS" | "L-LIFE-03", "memory")
+            | ("C-IO" | "L-MIX-05", "bounded-large-output")
+            | ("L-LIFE-05", "relay-backpressure")
+    );
+    match (requires_derived, frozen) {
+        (true, Some(frozen)) => {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut held = frozen.file.try_clone()?;
+            held.seek(SeekFrom::Start(0))?;
+            let mut receipt = Vec::new();
+            let maximum = u64::try_from(frozen.receipt.len())
+                .map_err(|error| CiError::Message(error.to_string()))?
+                .checked_add(1)
+                .ok_or_else(|| CiError::Message("fixture receipt bound overflow".into()))?;
+            held.take(maximum).read_to_end(&mut receipt)?;
+            if receipt != frozen.receipt {
+                return Err(CiError::Message(
+                    "held fixture budget receipt changed".into(),
+                ));
+            }
+            let reconstructed = FrozenImageMemoryBudget::for_images(
+                &images.runtime,
+                &images.input,
+                &public.contract.runtime_image,
+                &public.contract.input_image,
+                frozen.budget.page_bytes,
+                frozen.budget.headroom_bytes,
+            )
+            .map_err(CiError::Message)?;
+            if serde_json::to_vec(&reconstructed)? != serde_json::to_vec(&frozen.budget)? {
+                return Err(CiError::Message(
+                    "fixture budget differs from original admitted images".into(),
+                ));
+            }
+            frozen
+                .budget
+                .require_invocation_tokens(
+                    invocation.memory_token.as_deref(),
+                    collection.result.invocation.memory_token.as_deref(),
+                )
+                .map_err(CiError::Message)?;
+            persist("fixture-memory-budget.json", &receipt)?;
+            for (leaf, file, original) in &frozen.allocator_records {
+                let mut held = file.try_clone()?;
+                held.seek(SeekFrom::Start(0))?;
+                let mut actual = Vec::new();
+                held.take(65537).read_to_end(&mut actual)?;
+                if actual != *original {
+                    return Err(CiError::Message("held allocator receipt changed".into()));
+                }
+                persist(leaf, &actual)?;
+            }
+        }
+        (false, None) if memory_bytes == 2 * 1024 * 1024 * 1024 => {}
+        _ => {
+            return Err(CiError::Message(
+                "selected fixture memory basis absent or unexpected".into(),
+            ));
+        }
+    }
+    let deadline_millis = if key.family == "L-LIFE-03" || key.scenario == "memory" {
+        300_000
+    } else {
+        30_000
     };
     let fixture_input = FixtureInput {
         format: "memcordon.consumer-readiness.input".into(),
@@ -1100,8 +1486,8 @@ pub fn normalize_completed(
         challenge_sha256: super::artifacts::checksum(&challenge),
         binary: Vec::new(),
         target_argv: NativeArguments::UnixBytes(public_argv.iter().skip(1).cloned().collect()),
-        deadline_millis: budget.0,
-        memory_bytes: budget.1,
+        deadline_millis: Some(deadline_millis),
+        memory_bytes: Some(memory_bytes),
         toolchain_identity: None,
     };
     if !matches!(fixture_input.target_argv, NativeArguments::UnixBytes(_)) {
@@ -1307,7 +1693,8 @@ pub fn finalize_report(report: &mut LimitsReport, deadline: Instant) -> Result<(
         Some(original) => deadline.min(original),
         None if report.owners.is_empty()
             && report.controller_owners.is_empty()
-            && report.memory_workers.is_empty() =>
+            && report.memory_workers.is_empty()
+            && report.memory_allocators.is_empty() =>
         {
             return Ok(());
         }
@@ -1318,6 +1705,29 @@ pub fn finalize_report(report: &mut LimitsReport, deadline: Instant) -> Result<(
         }
     };
     let mut errors = Vec::new();
+    // Allocator obligations are distinct from provider-worker controller rows.
+    // A failed observation still resumes this exact retained child before
+    // mandatory normal owner cleanup; neither operation substitutes for it.
+    for allocator in &mut report.memory_allocators {
+        if !allocator.resume_required {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            errors.push("original allocator resume cutoff exhausted; owner retained".into());
+            continue;
+        }
+        match allocator.process.exited() {
+            Ok(true) => allocator.resume_required = false,
+            Ok(false) => match allocator.process.signal_continue() {
+                Ok(Ok(())) => allocator.resume_required = false,
+                Ok(Err(errno)) => errors.push(format!(
+                    "native allocator cleanup resume failed: errno {errno}"
+                )),
+                Err(error) => errors.push(error),
+            },
+            Err(error) => errors.push(error),
+        }
+    }
     for index in report
         .memory_resume_required
         .iter()
@@ -1444,7 +1854,12 @@ pub fn finalize_report(report: &mut LimitsReport, deadline: Instant) -> Result<(
         report.controller_owners.remove(index);
     }
     let mut workers_retired = true;
-    for worker in &report.memory_workers {
+    for worker in report.memory_workers.iter().chain(
+        report
+            .memory_allocators
+            .iter()
+            .map(|allocator| &allocator.process),
+    ) {
         loop {
             match worker.exited() {
                 Ok(true) => break,
@@ -1464,9 +1879,16 @@ pub fn finalize_report(report: &mut LimitsReport, deadline: Instant) -> Result<(
             }
         }
     }
-    if workers_retired && report.memory_resume_required.is_empty() {
+    if workers_retired
+        && report.memory_resume_required.is_empty()
+        && report
+            .memory_allocators
+            .iter()
+            .all(|allocator| !allocator.resume_required)
+    {
         report.memory_intervals.clear();
         report.memory_workers.clear();
+        report.memory_allocators.clear();
         report.memory_files.clear();
         report.memory_directories.clear();
     }

@@ -75,7 +75,8 @@ fn descriptor() -> Descriptor {
 #[test]
 fn separate_loader_command_selects_only_the_restricted_envelope_route() {
     use memcordon_ci::windows_consumer_readiness::{
-        CaseInput, CaseKey, TokenObservation, support_loader_command,
+        CaseInput, CaseKey, TokenObservation, installed_support_loader_command,
+        support_loader_command,
     };
     let root = std::env::temp_dir().join("support-loader-argv-oracle");
     let mut descriptor = descriptor();
@@ -96,8 +97,13 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
             restricting_sids: vec![vec![2]],
         },
     };
-    let build = |case: &CaseInput| {
-        support_loader_command(
+    let build = |case: &CaseInput, installed: bool| {
+        let builder = if installed {
+            installed_support_loader_command
+        } else {
+            support_loader_command
+        };
+        builder(
             &root.join("measured-cli.exe"),
             &root.join("measured-wrapper.exe"),
             &root,
@@ -107,7 +113,7 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
             &root.join("observation.json"),
         )
     };
-    let command = build(&case).unwrap().materialize().unwrap();
+    let command = build(&case, false).unwrap().materialize().unwrap();
     let args: Vec<_> = command.get_args().map(std::ffi::OsStr::to_owned).collect();
     assert_eq!(command.get_program(), root.join("measured-wrapper.exe"));
     assert!(args.starts_with(&[
@@ -119,6 +125,25 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
         root.join("observation.json").into_os_string()
     ]));
     assert!(!args.iter().any(|arg| arg == "__windows-certification"));
+    let installed = build(&case, true).unwrap().materialize().unwrap();
+    assert_eq!(installed.get_program(), command.get_program());
+    assert_eq!(installed.get_current_dir(), command.get_current_dir());
+    let installed_args: Vec<_> = installed
+        .get_args()
+        .map(std::ffi::OsStr::to_owned)
+        .collect();
+    let mut expected_installed = args.clone();
+    let route = expected_installed
+        .iter_mut()
+        .find(|arg| *arg == "restricted-frontend")
+        .unwrap();
+    *route = "system-restricted-frontend".into();
+    assert_eq!(installed_args, expected_installed);
+    assert!(installed_args.ends_with(&[
+        root.join("measured-wrapper.exe").into_os_string(),
+        "consumer-readiness-windows".into(),
+        case.descriptor_path.clone().into_os_string()
+    ]));
     for field in ["scenario", "restricted", "workload", "arguments"] {
         let original = case.clone();
         match field {
@@ -128,7 +153,12 @@ fn separate_loader_command_selects_only_the_restricted_envelope_route() {
             "arguments" => case.descriptor.arguments.push("foreign".into()),
             _ => unreachable!(),
         }
-        assert!(build(&case).is_err(), "accepted {field}");
+        for installed in [false, true] {
+            assert!(
+                build(&case, installed).is_err(),
+                "accepted {field}, installed={installed}"
+            );
+        }
         case = original;
     }
 }

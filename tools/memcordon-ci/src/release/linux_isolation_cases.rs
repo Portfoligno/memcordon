@@ -1,5 +1,7 @@
 //! Original host file canaries for concrete private-root escape probes.
 #![cfg(target_os = "linux")]
+#[path = "linux_import_socket.rs"]
+mod import_socket;
 use crate::{CiError, Result};
 use std::{
     fs::{File, OpenOptions},
@@ -118,10 +120,18 @@ pub struct ImportRefusalReport {
     pub artifacts: Vec<PathBuf>,
     source: Option<ImportSourceOwner>,
     closure_complete: bool,
+    retirement: Option<ImportDefinitionRetirement>,
     pub definition: Option<(
         memcordon_core::workload_registry_v3::RuntimeImageDefinitionV1,
         PathBuf,
     )>,
+}
+struct ImportDefinitionRetirement {
+    directory: PathBuf,
+    agent_sha256: String,
+    invocation: Vec<u8>,
+    cleanup_deadline: std::time::Instant,
+    completed_digest: Option<String>,
 }
 struct ImportSourceOwner {
     root: File,
@@ -131,8 +141,32 @@ struct ImportSourceOwner {
     socket_parent: Option<File>,
     socket_name: Option<std::ffi::OsString>,
     socket_identity: Option<(u64, u64)>,
+    root_identity: (u64, u64),
+    parent_identity: (u64, u64),
+    listener_identity: Option<(u64, u64, u32)>,
     original: serde_json::Value,
     directory: PathBuf,
+}
+
+fn captured_import_failure(
+    stage: &'static str,
+    path: &Path,
+    cause: impl std::fmt::Display,
+    output: &memcordon_testkit::ObservedOutput,
+) -> CiError {
+    let stdout_end = output.stdout.len().min(2048);
+    let stderr_end = output.stderr.len().min(2048);
+    CiError::Message(format!(
+        "{stage} at {path:?}: {cause}; native-status={:?}; native-code={:?}; stdout-bytes={}; stderr-bytes={}; stdout-truncated={}; stderr-truncated={}; stdout={:?}; stderr={:?}",
+        output.status,
+        output.status.code(),
+        output.stdout.len(),
+        output.stderr.len(),
+        stdout_end != output.stdout.len(),
+        stderr_end != output.stderr.len(),
+        String::from_utf8_lossy(&output.stdout[..stdout_end]),
+        String::from_utf8_lossy(&output.stderr[..stderr_end]),
+    ))
 }
 impl ImportRefusalReport {
     #[expect(
@@ -252,12 +286,8 @@ impl ImportRefusalReport {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(directory)?;
-        let before_inventory =
-            capture_import_source_inventory(&definition, &source, None, &mut self.files)?;
-        super::linux_mixed_installed::retain(
-            &directory.join("isolation-import-original-inventory.json"),
-            &serde_json::to_vec(&before_inventory)?,
-        )?;
+        let root_metadata = root.metadata()?;
+        let parent_metadata = parent.metadata()?;
         self.source = Some(ImportSourceOwner {
             root,
             parent,
@@ -266,9 +296,18 @@ impl ImportRefusalReport {
             socket_parent: None,
             socket_name: None,
             socket_identity: None,
+            root_identity: (root_metadata.dev(), root_metadata.ino()),
+            parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+            listener_identity: None,
             original: serde_json::Value::Null,
             directory: directory.to_owned(),
         });
+        let before_inventory =
+            capture_import_source_inventory(&definition, &source, None, &mut self.files)?;
+        super::linux_mixed_installed::retain(
+            &directory.join("isolation-import-original-inventory.json"),
+            &serde_json::to_vec(&before_inventory)?,
+        )?;
         let owner = self
             .source
             .as_mut()
@@ -332,7 +371,13 @@ impl ImportRefusalReport {
                     }
                 }
             }
-            owner.socket = Some(std::os::unix::net::UnixListener::bind(&path)?);
+            let alias = Path::new("/proc/self/fd").join(parent.as_raw_fd().to_string());
+            owner.socket = Some(import_socket::bind_via_held_alias(&parent, &alias, &name)?);
+            owner.socket_parent = Some(parent);
+            owner.socket_name = Some(name);
+            let listener = rustix::fs::fstat(owner.socket.as_ref().expect("held native listener"))
+                .map_err(|error| CiError::Message(error.to_string()))?;
+            owner.listener_identity = Some((listener.st_dev, listener.st_ino, listener.st_mode));
             let native = std::fs::symlink_metadata(&path)?;
             if native.mode() & libc::S_IFMT != libc::S_IFSOCK
                 || native.uid() != 0
@@ -343,15 +388,6 @@ impl ImportRefusalReport {
                 ));
             }
             owner.socket_identity = Some((native.dev(), native.ino()));
-            owner.socket_parent = Some(parent);
-            owner.socket_name = Some(name);
-            let listener = rustix::fs::fstat(
-                owner
-                    .socket
-                    .as_ref()
-                    .expect("original native socket listener"),
-            )
-            .map_err(|error| CiError::Message(error.to_string()))?;
             serde_json::json!({"kind":scenario,"path":selected,"device":native.dev(),"inode":native.ino(),"uid":native.uid(),"gid":native.gid(),"mode":native.mode(),"nlink":native.nlink(),"baseline_sha256":baseline.as_ref().map(|bytes|super::artifacts::checksum(bytes)),
                 "listener":{"device":listener.st_dev,"inode":listener.st_ino,"mode":listener.st_mode}})
         } else {
@@ -395,6 +431,28 @@ impl ImportRefusalReport {
             512 * 1024 * 1024,
         )?;
         let agent_sha = super::artifacts::checksum(&agent);
+        let retirement = directory.join("definition-retirement");
+        let retirement_argv = [
+            std::ffi::OsString::from("package"),
+            "policy".into(),
+            "image".into(),
+            "retire".into(),
+            "--definition".into(),
+            definition_path.as_os_str().to_owned(),
+            "--json".into(),
+        ];
+        self.retirement = Some(ImportDefinitionRetirement {
+            directory: retirement.clone(),
+            agent_sha256: agent_sha.clone(),
+            invocation: serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.linux-isolation-image-retirement-command","revision":1,"identity":input.identity,"cell":input.cell,
+                "lease_id":input.lease_id,"scenario":scenario,"program":"/usr/libexec/memcordon-sealed-agent","executable_sha256":agent_sha,
+                "argv":retirement_argv.iter().map(|value|value.to_string_lossy()).collect::<Vec<_>>(),"cwd":retirement,"environment_cleared":true,
+                "definition_sha256":super::artifacts::checksum(&definition_bytes),"work_deadline_unix_millis":input.work_deadline_unix_millis,
+                "cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis}))?,
+            cleanup_deadline: input.cleanup_deadline,
+            completed_digest: None,
+        });
         let argv = vec![
             "package".into(),
             "policy".into(),
@@ -440,7 +498,12 @@ impl ImportRefusalReport {
             &directory.join("native-process.json"),
             &mut self.files,
             &mut self.processes,
-        )?;
+        )
+        .map_err(|error| {
+            CiError::Message(format!(
+                "isolation original input import command capture at {directory:?}: {error}"
+            ))
+        })?;
         for (name, bytes) in [
             ("stdout.json", &output.stdout),
             ("stderr.bin", &output.stderr),
@@ -469,52 +532,266 @@ impl ImportRefusalReport {
             ]
             .map(|name| directory.join(name)),
         );
-        let retirement = directory.join("definition-retirement");
-        std::fs::create_dir(&retirement)?;
-        let retirement_argv = vec![
+        let probe_nonce = hex::encode(&probe_bytes[..16]);
+        let census_path = directory.join("isolation-import-native-census.json");
+        super::linux_mixed_installed::persist_policy_refusal_census(
+            account,
+            input.provider,
+            &input.identity,
+            &input.cell,
+            &input.lease_id,
+            scenario,
+            &probe_nonce,
+            &output.stdout,
+            &definition_bytes,
+            &census_path,
+            input.cleanup_deadline,
+        )
+        .map_err(|error| {
+            captured_import_failure(
+                "isolation original import refusal native census",
+                &census_path,
+                error,
+                &output,
+            )
+        })?;
+        let census_bytes =
+            super::linux_mixed_installed::read_owned_resource(&census_path, 32 * 1024 * 1024)
+                .map_err(|error| {
+                    captured_import_failure(
+                        "isolation original import refusal census readback",
+                        &census_path,
+                        error,
+                        &output,
+                    )
+                })?;
+        let census: serde_json::Value = serde_json::from_slice(&census_bytes).map_err(|error| {
+            captured_import_failure(
+                "isolation original import refusal census JSON",
+                &census_path,
+                error,
+                &output,
+            )
+        })?;
+        super::linux_mixed_installed::retain(
+            &directory.join("isolation-import-census.json"),
+            &serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.linux-isolation-import-census","revision":1,"original_probe_nonce":probe_nonce,
+            "definition_sha256":super::artifacts::checksum(&definition_bytes),"stdout_sha256":super::artifacts::checksum(&output.stdout),"native_census":census}))?,
+        )?;
+        self.artifacts
+            .extend([census_path, directory.join("isolation-import-census.json")]);
+        if scenario == "input-socket" {
+            if !output.status.success() {
+                return Err(CiError::Message("undeclared input socket manifest projection import failed; native evidence retained".into()));
+            }
+            let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if receipt["format"] != "memcordon.runtime-image-installation"
+                || receipt["revision"] != 1
+                || receipt["image"]
+                    != serde_json::to_value(definition.reference().map_err(CiError::Message)?)?
+                || receipt["target"] != definition.target
+                || receipt["policy_activated"] != false
+                || receipt["member_count"] != definition.entries.as_slice().len()
+            {
+                return Err(CiError::Message(
+                    "undeclared socket installation receipt differs".into(),
+                ));
+            }
+            self.observe_excluded_image(
+                &context,
+                &definition,
+                &definition_path,
+                &definition_bytes,
+                &source,
+            )?;
+        } else if output.status.success() {
+            return Err(CiError::Message("unsafe actual isolation source unexpectedly imported; native definition intent retained".into()));
+        }
+        Ok((definition, definition_path))
+    }
+
+    fn observe_excluded_image(
+        &mut self,
+        context: &super::linux_readiness_image_cases::ImageCaseContext<'_>,
+        definition: &memcordon_core::workload_registry_v3::RuntimeImageDefinitionV1,
+        definition_path: &Path,
+        definition_bytes: &[u8],
+        source: &Path,
+    ) -> Result<()> {
+        let directory = context.output;
+        let inspection = directory.join("installed-image-inspection");
+        std::fs::create_dir(&inspection)?;
+        std::fs::set_permissions(&inspection, std::fs::Permissions::from_mode(0o700))?;
+        let cutoff = context.work_deadline_unix_millis.to_string();
+        let argv: Vec<std::ffi::OsString> = vec![
             "package".into(),
+            "policy".into(),
+            "image".into(),
+            "inspect".into(),
+            "--definition".into(),
+            definition_path.as_os_str().to_owned(),
+            "--cutoff-unix-millis".into(),
+            cutoff.into(),
+            "--json".into(),
+        ];
+        super::linux_mixed_installed::retain(
+            &inspection.join("invocation.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.linux-isolation-image-inspection-command","revision":1,
+                "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"scenario":"input-socket",
+                "program":"/usr/libexec/memcordon-sealed-agent","executable_sha256":context.expected_agent_sha256,
+                "argv":argv.iter().map(|value|value.to_string_lossy()).collect::<Vec<_>>(),"cwd":inspection,"environment_cleared":true,
+                "definition_sha256":super::artifacts::checksum(definition_bytes),
+                "work_deadline_unix_millis":context.work_deadline_unix_millis,
+                "cleanup_deadline_unix_millis":context.cleanup_deadline_unix_millis
+            }))?,
+        )?;
+        let observed = super::linux_readiness_image_cases::capture_import_command(
+            context,
+            &inspection,
+            argv,
+            &inspection.join("native-creation.json"),
+            &inspection.join("native-process.json"),
+            &mut self.files,
+            &mut self.processes,
+        )?;
+        for (name, bytes) in [
+            ("stdout.json", &observed.stdout),
+            ("stderr.bin", &observed.stderr),
+        ] {
+            super::linux_mixed_installed::retain(&inspection.join(name), bytes)?;
+        }
+        super::linux_mixed_installed::retain(
+            &inspection.join("exit.json"),
+            &serde_json::to_vec(
+                &serde_json::json!({"native_exit":observed.status.code(),"success":observed.status.success()}),
+            )?,
+        )?;
+        self.artifacts.extend(
+            [
+                "invocation.json",
+                "native-creation.json",
+                "native-process.json",
+                "exit.json",
+                "stdout.json",
+                "stderr.bin",
+            ]
+            .map(|name| inspection.join(name)),
+        );
+        if !observed.status.success() {
+            return Err(captured_import_failure(
+                "installed image exclusion census",
+                &inspection,
+                "native inspector did not complete",
+                &observed,
+            ));
+        }
+        let census: memcordon_core::runtime_image_census::RuntimeImageCensusV1 =
+            serde_json::from_slice(&observed.stdout)?;
+        let raw_hash = memcordon_core::DiagnosticSha256::try_from(
+            memcordon_core::BoundedText::new(&super::artifacts::checksum(definition_bytes))
+                .map_err(|error| CiError::Message(error.into()))?,
+        )
+        .map_err(|error| CiError::Message(error.into()))?;
+        census
+            .validate_for_definition(definition, &raw_hash)
+            .map_err(CiError::Message)?;
+        if census.cutoff_unix_millis != context.work_deadline_unix_millis {
+            return Err(CiError::Message(
+                "installed exclusion census renewed original cutoff".into(),
+            ));
+        }
+        let inventory = capture_import_source_inventory(
+            definition,
+            source,
+            Some("owned-source/input-socket"),
+            &mut self.files,
+        )?;
+        let owner = self
+            .source
+            .as_ref()
+            .ok_or_else(|| CiError::Message("exclusion source owner absent".into()))?;
+        let named = rustix::fs::statat(
+            &owner.parent,
+            &owner.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?;
+        let root = owner.root.metadata()?;
+        if (root.dev(), root.ino()) != owner.root_identity
+            || (named.st_dev, named.st_ino) != owner.root_identity
+            || (
+                owner.parent.metadata()?.dev(),
+                owner.parent.metadata()?.ino(),
+            ) != owner.parent_identity
+        {
+            return Err(CiError::Message(
+                "held exclusion source reassociated".into(),
+            ));
+        }
+        let listener = rustix::fs::fstat(
+            owner
+                .socket
+                .as_ref()
+                .ok_or_else(|| CiError::Message("held excluded socket absent".into()))?,
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?;
+        if Some((listener.st_dev, listener.st_ino, listener.st_mode)) != owner.listener_identity {
+            return Err(CiError::Message(
+                "original excluded listener changed".into(),
+            ));
+        }
+        let path = directory.join("isolation-import-source-after.json");
+        super::linux_mixed_installed::retain(
+            &path,
+            &serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.linux-isolation-import-source-after","revision":1,"inventory":inventory,
+                "listener":{"device":listener.st_dev,"inode":listener.st_ino,"mode":listener.st_mode}
+            }))?,
+        )?;
+        self.artifacts.push(path);
+        Ok(())
+    }
+    /// Called only after the outer owner restores its exact nonmixed policy.
+    /// Keep the original per-case native provenance required by normalization.
+    pub fn retire_definition(&mut self, deadline: std::time::Instant) -> Result<Option<String>> {
+        let Some(owner) = self.retirement.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(digest) = &owner.completed_digest {
+            return Ok(Some(digest.clone()));
+        }
+        let (definition, path) = self.definition.as_ref().ok_or_else(|| {
+            CiError::Message("original importer retirement definition absent".into())
+        })?;
+        let reference = definition.reference().map_err(CiError::Message)?;
+        let retirement = &owner.directory;
+        std::fs::create_dir(retirement)?;
+        super::linux_mixed_installed::retain(
+            &retirement.join("invocation.json"),
+            &owner.invocation,
+        )?;
+        let retirement_argv = vec![
+            std::ffi::OsString::from("package"),
             "policy".into(),
             "image".into(),
             "retire".into(),
             "--definition".into(),
-            definition_path.as_os_str().to_owned(),
+            path.as_os_str().to_owned(),
             "--json".into(),
         ];
-        super::linux_mixed_installed::retain(
-            &retirement.join("invocation.json"),
-            &serde_json::to_vec(&serde_json::json!({
-            "format":"memcordon.linux-isolation-image-retirement-command","revision":1,"identity":input.identity,"cell":input.cell,
-            "lease_id":input.lease_id,"scenario":scenario,"program":"/usr/libexec/memcordon-sealed-agent","executable_sha256":agent_sha,
-            "argv":retirement_argv.iter().map(|value:&std::ffi::OsString|value.to_string_lossy()).collect::<Vec<_>>(),"cwd":retirement,"environment_cleared":true,
-            "definition_sha256":super::artifacts::checksum(&definition_bytes),"work_deadline_unix_millis":input.work_deadline_unix_millis,
-            "cleanup_deadline_unix_millis":input.cleanup_deadline_unix_millis}))?,
-        )?;
-        let cleanup_context = super::linux_readiness_image_cases::ImageCaseContext {
-            identity: context.identity,
-            cell: context.cell,
-            lease_id: context.lease_id,
-            activated: context.activated,
-            provider: context.provider,
-            images: context.images,
-            account: context.account,
-            expected_agent_sha256: context.expected_agent_sha256,
-            output: &retirement,
-            artifact_root: context.artifact_root,
-            admin_root: context.admin_root,
-            deadline: context.cleanup_deadline,
-            cleanup_deadline: context.cleanup_deadline,
-            work_deadline_unix_millis: context.work_deadline_unix_millis,
-            cleanup_deadline_unix_millis: context.cleanup_deadline_unix_millis,
-        };
-        let retired = super::linux_readiness_image_cases::capture_import_command(
-            &cleanup_context,
-            &retirement,
-            retirement_argv,
-            &retirement.join("native-creation.json"),
-            &retirement.join("native-process.json"),
-            &mut self.files,
-            &mut self.processes,
-        )?;
+        let retired = super::linux_readiness_image_cases::capture_import_command_for_identity(
+            super::linux_readiness_image_cases::ImportCommandIdentity {
+                expected_agent_sha256: &owner.agent_sha256,
+                deadline: deadline.min(owner.cleanup_deadline),
+            },
+            retirement, retirement_argv,
+            &retirement.join("native-creation.json"), &retirement.join("native-process.json"),
+            &mut self.files, &mut self.processes,
+        ).map_err(|error| CiError::Message(format!(
+            "isolation original definition retirement command capture at {retirement:?}: {error}"
+        )))?;
         for (name, bytes) in [
             ("stdout.json", &retired.stdout),
             ("stderr.bin", &retired.stderr),
@@ -538,49 +815,33 @@ impl ImportRefusalReport {
             ]
             .map(|name| retirement.join(name)),
         );
-        let retirement_receipt: serde_json::Value = serde_json::from_slice(&retired.stdout)?;
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&retired.stdout).map_err(|error| {
+                captured_import_failure(
+                    "isolation original definition retirement stdout JSON",
+                    retirement,
+                    error,
+                    &retired,
+                )
+            })?;
         if !retired.status.success()
-            || retirement_receipt["format"] != "memcordon.runtime-image-retirement"
-            || retirement_receipt["revision"] != 1
-            || retirement_receipt["reference"]
-                != serde_json::to_value(definition.reference().map_err(CiError::Message)?)?
-            || retirement_receipt["storage_absent"] != true
+            || receipt["format"] != "memcordon.runtime-image-retirement"
+            || receipt["revision"] != 1
+            || receipt["reference"] != serde_json::to_value(&reference)?
+            || receipt["storage_absent"] != true
         {
-            return Err(CiError::Message(
-                "isolation original input definition retirement differs; owner retained".into(),
+            return Err(captured_import_failure(
+                "isolation original definition retirement validation",
+                retirement,
+                "original input definition retirement differs; owner retained",
+                &retired,
             ));
         }
-        let probe_nonce = hex::encode(&probe_bytes[..16]);
-        let census_path = directory.join("isolation-import-native-census.json");
-        super::linux_mixed_installed::persist_policy_refusal_census(
-            account,
-            input.provider,
-            &input.identity,
-            &input.cell,
-            &input.lease_id,
-            scenario,
-            &probe_nonce,
-            &output.stdout,
-            &definition_bytes,
-            &census_path,
-            input.cleanup_deadline,
-        )?;
-        let census: serde_json::Value = serde_json::from_slice(
-            &super::linux_mixed_installed::read_owned_resource(&census_path, 32 * 1024 * 1024)?,
-        )?;
-        super::linux_mixed_installed::retain(
-            &directory.join("isolation-import-census.json"),
-            &serde_json::to_vec(&serde_json::json!({
-            "format":"memcordon.linux-isolation-import-census","revision":1,"original_probe_nonce":probe_nonce,
-            "definition_sha256":super::artifacts::checksum(&definition_bytes),"stdout_sha256":super::artifacts::checksum(&output.stdout),"native_census":census}))?,
-        )?;
-        self.artifacts
-            .extend([census_path, directory.join("isolation-import-census.json")]);
-        if output.status.success() {
-            return Err(CiError::Message("unsafe actual isolation source unexpectedly imported; native definition intent retained".into()));
-        }
-        Ok((definition, definition_path))
+        let digest = String::from(reference.digest);
+        owner.completed_digest = Some(digest.clone());
+        Ok(Some(digest))
     }
+
     pub fn finalize(&mut self, deadline: std::time::Instant) -> Result<()> {
         use std::os::fd::AsFd;
         if let Some(owner) = self.source.as_mut() {
@@ -593,11 +854,17 @@ impl ImportRefusalReport {
             .map_err(|error| CiError::Message(error.to_string()))?;
             if root.dev() != named.st_dev
                 || root.ino() != named.st_ino
-                || owner.original["device"] != root.dev()
-                || owner.original["inode"] != root.ino()
+                || owner.root_identity != (root.dev(), root.ino())
             {
                 return Err(CiError::Message(
                     "isolation source original native root changed before cleanup".into(),
+                ));
+            }
+            if owner.socket.is_some()
+                && (owner.socket_identity.is_none() || owner.listener_identity.is_none())
+            {
+                return Err(CiError::Message(
+                    "partial imported socket custody remains unresolved before cleanup".into(),
                 ));
             }
             if let Some((device, inode)) = owner.socket_identity {
@@ -621,9 +888,8 @@ impl ImportRefusalReport {
                 let listener =
                     rustix::fs::fstat(owner.socket.as_ref().expect("held native listener"))
                         .map_err(|error| CiError::Message(error.to_string()))?;
-                if owner.original["mutation"]["listener"]["device"] != listener.st_dev
-                    || owner.original["mutation"]["listener"]["inode"] != listener.st_ino
-                    || owner.original["mutation"]["listener"]["mode"] != listener.st_mode
+                if owner.listener_identity
+                    != Some((listener.st_dev, listener.st_ino, listener.st_mode))
                 {
                     return Err(CiError::Message(
                         "original imported listener descriptor reassociated before close".into(),
@@ -672,11 +938,16 @@ impl ImportRefusalReport {
                     "isolation source original root not retired".into(),
                 ));
             }
-            let destination = owner.directory.join("isolation-import-source-retired.json");
+            let partial = owner.original.is_null();
+            let destination = owner.directory.join(if partial {
+                "isolation-import-partial-allocation-retired.json"
+            } else {
+                "isolation-import-source-retired.json"
+            });
             super::linux_mixed_installed::retain(
                 &destination,
                 &serde_json::to_vec(
-                    &serde_json::json!({"format":"memcordon.linux-isolation-import-source-retired","revision":1,
+                    &serde_json::json!({"format":if partial {"memcordon.linux-isolation-import-partial-allocation-retired"} else {"memcordon.linux-isolation-import-source-retired"},"revision":1,
                 "original":owner.original,"held_nlink":0,"native_errno":libc::ENOENT,"caller_write_revoked_before_cleanup":owner.original["scenario"]=="caller-writable-tree"}),
                 )?,
             )?;
@@ -694,8 +965,7 @@ impl ImportRefusalReport {
             let named = std::fs::symlink_metadata(&owner.directory)?;
             if (parent.dev(), parent.ino(), parent.uid(), parent.mode())
                 != (named.dev(), named.ino(), named.uid(), named.mode())
-                || owner.original["parent"]["device"] != parent.dev()
-                || owner.original["parent"]["inode"] != parent.ino()
+                || owner.parent_identity != (parent.dev(), parent.ino())
             {
                 return Err(CiError::Message(
                     "original source parent changed before native close".into(),
@@ -711,11 +981,16 @@ impl ImportRefusalReport {
             for file in self.files.drain(..) {
                 memcordon_platform::linux_checked_close(file.into())?;
             }
-            let destination = owner.directory.join("isolation-import-source-closed.json");
+            let partial = owner.original.is_null();
+            let destination = owner.directory.join(if partial {
+                "isolation-import-partial-allocation-closed.json"
+            } else {
+                "isolation-import-source-closed.json"
+            });
             super::linux_mixed_installed::retain(
                 &destination,
                 &serde_json::to_vec(&serde_json::json!({
-                "format":"memcordon.linux-isolation-import-source-closed","revision":1,"original":owner.original,
+                "format":if partial {"memcordon.linux-isolation-import-partial-allocation-closed"} else {"memcordon.linux-isolation-import-source-closed"},"revision":1,"original":owner.original,
                 "parent":{"device":parent.dev(),"inode":parent.ino(),"uid":parent.uid(),"mode":parent.mode()},
                 "root_closed":true,"parent_closed":true,"socket_parent_closed":had_socket_parent,"listener_closed":had_socket_parent,
                 "native_file_closes":file_closes,"native_errno":serde_json::Value::Null}))?,

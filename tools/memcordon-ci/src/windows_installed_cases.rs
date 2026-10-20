@@ -570,6 +570,7 @@ impl InstalledWindowsPayload {
         }
         let agent =
             agent.ok_or_else(|| CiError::Message("selected payload lacks sealed agent".into()))?;
+        let output_directory = std::path::absolute(output_directory)?;
         Ok(Self {
             channel,
             source_commit: source.commit().to_owned(),
@@ -1449,13 +1450,14 @@ mod native {
                 )
                 .map_err(|error| error.to_string())?;
             }
-            assessment.positive_suite = crate::windows_consumer_readiness::run_installed_until(
-                config,
-                &config.output_directory.join("windows-readiness-input.json"),
-                &mut assessment.positive_cases,
-                deadlines.work,
-            )
-            .map_err(|error| error.to_string());
+            assessment.positive_suite =
+                crate::windows_consumer_readiness::run_installed_with_deadlines(
+                    config,
+                    &config.output_directory.join("windows-readiness-input.json"),
+                    &mut assessment.positive_cases,
+                    deadlines,
+                )
+                .map_err(|error| error.to_string());
             assessment.positive_suite.clone()?;
             assessment.loss_suite = crate::windows_readiness_faults::run_until(
                 config,

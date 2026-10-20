@@ -567,7 +567,7 @@ fn emit_state(
         (
             "consumer-paths",
             if usable {
-                slot.build.display().to_string()
+                crate::workflow_output::action_path(&slot.build)?
             } else {
                 String::new()
             },

@@ -1,6 +1,7 @@
 //! Internal selection established only after authenticated support dispatch and
 //! exclusive provider settlement. No environment or ordinary launch enables it.
 use std::{
+    cell::Cell,
     cell::RefCell,
     marker::PhantomData,
     rc::Rc,
@@ -14,6 +15,13 @@ pub(super) struct Execution {
     pub work: Instant,
     pub cleanup: Instant,
     pub observation: RefCell<Option<WindowsLoaderDebugObservationV1>>,
+    pub comparison_started: Cell<bool>,
+    pub detached_console: Cell<bool>,
+    pub baseline_plan: RefCell<Option<memcordon_windows_launch_core::ProductionLoaderPlanV1>>,
+    pub comparison: RefCell<Option<memcordon_core::WindowsLoaderConsoleComparisonV1>>,
+    pub variant_observation: RefCell<Option<WindowsLoaderDebugObservationV1>>,
+    pub active_console_plan:
+        RefCell<Option<memcordon_windows_launch_core::SupportDetachedConsolePlanV1>>,
 }
 
 impl Execution {
@@ -41,6 +49,12 @@ impl Execution {
             work,
             cleanup,
             observation: RefCell::new(None),
+            comparison_started: Cell::new(false),
+            detached_console: Cell::new(false),
+            baseline_plan: RefCell::new(None),
+            comparison: RefCell::new(None),
+            variant_observation: RefCell::new(None),
+            active_console_plan: RefCell::new(None),
         }))
     }
 }

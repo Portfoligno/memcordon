@@ -4,6 +4,37 @@ use memcordon_ci::consumer_readiness_ledger::{self as ledger, CellEvidence, Sour
 use memcordon_readiness_verifier::{EvidenceIndex, JobOutcome, ProducerOrigin};
 use std::{fs, path::PathBuf, process::ExitCode};
 
+fn cleanup_failures(
+    status: &memcordon_ci::Result<memcordon_testkit::ObservedOutput>,
+    cell: &Result<CellEvidence, String>,
+) -> Vec<String> {
+    use memcordon_ci::command::bounded_excerpt;
+    let mut failures = Vec::new();
+    if !status.as_ref().is_ok_and(|output| output.status.success()) {
+        failures.push(format!(
+            "explicit cleanup command failed: {}",
+            command_failure(status)
+        ));
+    }
+    match cell {
+        Ok(cell) if cell.cache_quiescent && cell.cleanup_failures.is_empty() => {}
+        Ok(cell) => failures.push(format!(
+            "selected cell is not settled: cache-quiescent={}; cleanup-failures={:?}",
+            cell.cache_quiescent,
+            bounded_excerpt(format!("{:?}", cell.cleanup_failures).as_bytes())
+        )),
+        Err(error) => failures.push(format!(
+            "selected cleanup cell could not be read: {}",
+            bounded_excerpt(error.as_bytes())
+        )),
+    }
+    failures
+}
+
+#[cfg(test)]
+#[path = "../../tests/private/readiness_cleanup_observation.rs"]
+mod cleanup_observation_tests;
+
 fn command_failure(result: &memcordon_ci::Result<memcordon_testkit::ObservedOutput>) -> String {
     use memcordon_ci::command::bounded_excerpt;
     match result {
@@ -52,6 +83,8 @@ enum Operation {
         cell: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        acquisition_root: Option<PathBuf>,
     },
     Identity {
         #[arg(long)]
@@ -238,6 +271,31 @@ fn join_github_identity(path: &std::path::Path, enabled: bool) -> Result<(), Str
     }
     Ok(())
 }
+fn acquisition_failed(root: Option<&std::path::Path>) -> Result<bool, String> {
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    if !std::fs::symlink_metadata(root)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("selected acquisition root is not a real directory".into());
+    }
+    let acquisition = root
+        .join("acquisition-failure.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?;
+    let cleanup = root
+        .join("always-cleanup-failure.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?;
+    Ok(acquisition || cleanup)
+}
+
+#[cfg(test)]
+#[path = "../../tests/private/readiness_seal_projection.rs"]
+mod projection_tests;
+
 fn run(operation: Operation) -> Result<(), String> {
     match operation {
         Operation::SealProducer {
@@ -248,6 +306,7 @@ fn run(operation: Operation) -> Result<(), String> {
             manifest,
             cell,
             output,
+            acquisition_root,
         } => {
             join_github_identity(&identity, github_context)?;
             let (job, run_attempt) = if github_context {
@@ -267,6 +326,11 @@ fn run(operation: Operation) -> Result<(), String> {
             }
             let identity = read::<SourceIdentity>(&identity)?;
             let mut cell = read::<CellEvidence>(&cell)?;
+            if acquisition_failed(acquisition_root.as_deref())? {
+                cell.cache_quiescent = false;
+                cell.cleanup_failures
+                    .push("acquisition wrapper recorded native runner/cleanup failure".into());
+            }
             if cell.format != "memcordon.consumer-readiness.cell"
                 || cell.revision != 1
                 || serde_json::to_value(&cell.identity).map_err(|e| e.to_string())?
@@ -510,7 +574,9 @@ fn run(operation: Operation) -> Result<(), String> {
                 .arg("--operation-deadline-unix-millis")
                 .arg(absolute.to_string())
                 .output();
-            let cell: Result<CellEvidence, String> = read(&destination.join("cell.json"));
+            let cell: Result<CellEvidence, String> = read(
+                &memcordon_ci::release::consumer_readiness_cell::cell_record_path(&destination),
+            );
             let mut failures = Vec::new();
             if !acquisition
                 .as_ref()
@@ -596,22 +662,29 @@ fn run(operation: Operation) -> Result<(), String> {
             .arg("--operation-deadline-unix-millis")
             .arg(absolute.to_string())
             .output();
-            let cell = read::<CellEvidence>(&destination.join("cell.json"));
-            if status.is_ok_and(|observed| observed.status.success())
-                && cell.is_ok_and(|cell| cell.cache_quiescent && cell.cleanup_failures.is_empty())
-            {
+            let cell = read::<CellEvidence>(
+                &memcordon_ci::release::consumer_readiness_cell::cell_record_path(&destination),
+            );
+            let failures = cleanup_failures(&status, &cell);
+            if failures.is_empty() {
                 memcordon_ci::workflow_output::write(&[("cache-quiescent", "true".into())])
                     .map_err(|error| error.to_string())?;
                 Ok(())
             } else {
+                let failure = format!(
+                    "always-run explicit recovery/cleanup failed: {}",
+                    failures.join("; ")
+                );
                 if destination.is_dir() {
                     fs::write(
                         destination.join("always-cleanup-failure.json"),
                         b"{\"cleanup_failed\":true}\n",
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|error| {
+                        format!("{failure}; retaining cleanup failure marker failed: {error}")
+                    })?;
                 }
-                Err("always-run explicit recovery/cleanup failed".into())
+                Err(failure)
             }
         }
         Operation::CaptureJobOutcomes {

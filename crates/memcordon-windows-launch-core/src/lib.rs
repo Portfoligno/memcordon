@@ -18,9 +18,16 @@ mod handshake;
 mod native;
 mod plan;
 mod prepared;
+#[cfg(feature = "test-support")]
+mod support_diagnostic;
 #[cfg(windows)]
 mod token;
 mod token_snapshot;
+
+#[cfg(all(windows, feature = "test-support"))]
+pub use native::create_support_detached_console;
+#[cfg(feature = "test-support")]
+pub use support_diagnostic::SupportDetachedConsolePlanV1;
 
 pub use artifact::{ArtifactRefError, ArtifactRefV1, RedactionClassV1};
 pub use attributes::{ExactHandleListV1, HandleRoleV1};
@@ -42,13 +49,15 @@ pub use handshake::{
 #[cfg(windows)]
 pub use native::{
     NativeCreateErrorV1, NativeKernelObjectKindV1, NativeSecurityDescriptorV1, ProductionJobV1,
-    ProductionNativeCreateRequestV1, SuspendedNativeProcessV1, create_process_as_user_native,
+    ProductionNativeCreateRequest, ProductionNativeCreateRequestV1,
+    ProductionNativeCreateRequestV2, SuspendedNativeProcessV1, create_process_as_user_native,
     create_process_native, create_suspended_in_job, query_process_handle_count,
 };
 pub use plan::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    ProductionLoaderPlanInputV1, ProductionLoaderPlanV1, ProductionPlanError,
-    build_package_loader_plan,
+    ProductionLoaderPlan, ProductionLoaderPlanInputV1, ProductionLoaderPlanV1,
+    ProductionLoaderPlanV2, ProductionPlanError, build_package_loader_plan,
+    build_package_loader_plan_v2,
 };
 pub use prepared::{
     PreparedCurrentDirectoryV1, PreparedLoaderCommandV1, PreparedLoaderEnvironmentV1,

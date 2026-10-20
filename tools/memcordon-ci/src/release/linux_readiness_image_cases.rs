@@ -870,12 +870,49 @@ pub fn capture_import_command(
     file_custody: &mut Vec<File>,
     kernel_custody: &mut Vec<crate::linux_consumer_readiness::HeldLinuxProcess>,
 ) -> Result<memcordon_testkit::ObservedOutput> {
+    capture_import_command_for_identity(
+        ImportCommandIdentity {
+            expected_agent_sha256: context.expected_agent_sha256,
+            deadline: context.deadline,
+        },
+        output,
+        argv,
+        native_creation,
+        native_process,
+        file_custody,
+        kernel_custody,
+    )
+}
+
+pub struct ImportCommandIdentity<'a> {
+    pub expected_agent_sha256: &'a str,
+    pub deadline: Instant,
+}
+
+pub fn capture_import_command_for_identity(
+    context: ImportCommandIdentity<'_>,
+    output: &Path,
+    argv: impl IntoIterator<Item = OsString>,
+    native_creation: &Path,
+    native_process: &Path,
+    file_custody: &mut Vec<File>,
+    kernel_custody: &mut Vec<crate::linux_consumer_readiness::HeldLinuxProcess>,
+) -> Result<memcordon_testkit::ObservedOutput> {
+    let failure = |operation: &'static str, cause: &dyn std::fmt::Display| {
+        CiError::Message(format!(
+            "native image importer {operation}; program=/usr/libexec/memcordon-sealed-agent; output={output:?}: {cause}"
+        ))
+    };
     let mut agent = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/usr/libexec/memcordon-sealed-agent")?;
-    let agent_before = agent.metadata()?;
-    let agent_bytes = read_image_bytes_until(&mut agent, 512 * 1024 * 1024, context.deadline)?;
+        .open("/usr/libexec/memcordon-sealed-agent")
+        .map_err(|error| failure("acquire installed executable", &error))?;
+    let agent_before = agent
+        .metadata()
+        .map_err(|error| failure("read initial held executable metadata", &error))?;
+    let agent_bytes = read_image_bytes_until(&mut agent, 512 * 1024 * 1024, context.deadline)
+        .map_err(|error| failure("read held executable bytes", &error))?;
     if agent_before.uid() != 0
         || agent_before.mode() & 0o022 != 0
         || agent_before.nlink() != 1
@@ -893,27 +930,28 @@ pub fn capture_import_command(
     let captured = CommandSpec::new(
         "/usr/libexec/memcordon-sealed-agent",
         output,
-        remaining(context.deadline)?,
+        remaining(context.deadline).map_err(|error| failure("check original command cutoff", &error))?,
     )
     .bounded_until(context.deadline)
     .args(argv)
     .cleared_environment()
-    .output_quiet_with_creation(|child|{
-        let pid=child.id();let birth=crate::linux_consumer_readiness::process_birth(pid).map_err(CiError::Message)?;
+    .output_quiet_with_exec_observation(|child|{
+        let pid=child.id();let birth=crate::linux_consumer_readiness::process_birth(pid).map_err(|error|failure("read created process birth", &error))?;
         let native_pid=rustix::process::Pid::from_raw(i32::try_from(pid).map_err(|error|CiError::Message(error.to_string()))?)
             .ok_or_else(||CiError::Message("importer native process absent".into()))?;
-        let pidfd=rustix::process::pidfd_open(native_pid,rustix::process::PidfdFlags::empty()).map_err(|error|CiError::Message(error.to_string()))?;
-        let stat=rustix::fs::fstat(&pidfd).map_err(|error|CiError::Message(error.to_string()))?;
-        let mut owner=crate::linux_consumer_readiness::HeldLinuxProcess::acquire(pid,birth).map_err(CiError::Message)?;
-        let image=owner.hold_executable_image(context.deadline).map_err(CiError::Message)?;
+        let pidfd=rustix::process::pidfd_open(native_pid,rustix::process::PidfdFlags::empty()).map_err(|error|failure("open created process pidfd", &error))?;
+        let stat=rustix::fs::fstat(&pidfd).map_err(|error|failure("read created process pidfd metadata", &error))?;
+        let mut owner=crate::linux_consumer_readiness::HeldLinuxProcess::acquire(pid,birth).map_err(|error|failure("acquire created kernel process owner", &error))?;
+        let image=owner.hold_executable_image(context.deadline).map_err(|error|failure("hold created process executable image", &error))?;
         if image["sha256"]!=context.expected_agent_sha256||image["device"]!=agent_before.dev()||image["inode"]!=agent_before.ino()||image["length"]!=agent_before.len(){return Err(CiError::Message("actual kernel importer image differs from held selected agent".into()));}
         retain(native_creation,&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-image-import-creation","revision":1,
             "process_id":pid,"birth":birth,"pidfd_device":stat.st_dev,"pidfd_inode":stat.st_ino,
-            "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json"))?)),"kernel_image":image}))?,file_custody)?;
+            "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json")).map_err(|error|failure("read creation invocation", &error))?)),"kernel_image":image}))?,file_custody)
+            .map_err(|error|failure("publish native creation observation", &error))?;
         child_kernel_owner=Some(owner);
         child_pidfd=Some(pidfd);
         child_identity=Some((pid,birth));Ok(())
-    })?;
+    }).map_err(|error|failure("execute and observe native command", &error))?;
     let (pid, birth) = child_identity
         .ok_or_else(|| CiError::Message("actual importer creation identity absent".into()))?;
     let pidfd = child_pidfd
@@ -930,7 +968,7 @@ pub fn capture_import_command(
             tv_nsec: 0,
         }),
     )
-    .map_err(|error| CiError::Message(error.to_string()))?
+    .map_err(|error| failure("poll retired process pidfd", &error))?
         == 0
         || !wait[0]
             .revents()
@@ -941,21 +979,24 @@ pub fn capture_import_command(
         ));
     }
     let pidfd_revents = wait[0].revents().bits();
-    let pidfd_stat =
-        rustix::fs::fstat(&pidfd).map_err(|error| CiError::Message(error.to_string()))?;
+    let pidfd_stat = rustix::fs::fstat(&pidfd)
+        .map_err(|error| failure("read retired process pidfd metadata", &error))?;
     drop(pidfd);
     if !child_kernel_owner
         .as_ref()
         .ok_or_else(|| CiError::Message("original importer kernel owner absent".into()))?
         .exited()
-        .map_err(CiError::Message)?
+        .map_err(|error| failure("observe held process exit", &error))?
     {
         return Err(CiError::Message(
             "original kernel importer owner remains live after wait".into(),
         ));
     }
-    let agent_after = agent.metadata()?;
-    let agent_named = std::fs::symlink_metadata("/usr/libexec/memcordon-sealed-agent")?;
+    let agent_after = agent
+        .metadata()
+        .map_err(|error| failure("read final held executable metadata", &error))?;
+    let agent_named = std::fs::symlink_metadata("/usr/libexec/memcordon-sealed-agent")
+        .map_err(|error| failure("read final named executable metadata", &error))?;
     if (
         agent_after.dev(),
         agent_after.ino(),
@@ -980,14 +1021,14 @@ pub fn capture_import_command(
         &serde_json::to_vec(
             &serde_json::json!({"format":"memcordon.linux-image-import-process","revision":1,
         "process_id":pid,"birth":birth,"raw_wait_status":captured.status.into_raw(),"native_exit":captured.status.code(),"signal":captured.status.signal(),
-        "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json"))?)),
+        "invocation_sha256":hex(&Sha256::digest(std::fs::read(output.join("invocation.json")).map_err(|error|failure("read final invocation", &error))?)),
         "stdout_sha256":hex(&Sha256::digest(&captured.stdout)),"stderr_sha256":hex(&Sha256::digest(&captured.stderr)),
         "executable_device":agent_before.dev(),"executable_inode":agent_before.ino(),
-        "creation_sha256":hex(&Sha256::digest(std::fs::read(native_creation)?)),
+        "creation_sha256":hex(&Sha256::digest(std::fs::read(native_creation).map_err(|error|failure("read native creation observation", &error))?)),
         "pidfd_device":pidfd_stat.st_dev,"pidfd_inode":pidfd_stat.st_ino,"pidfd_revents":pidfd_revents}),
         )?,
         file_custody,
-    )?;
+    ).map_err(|error|failure("publish native process observation", &error))?;
     file_custody.push(agent);
     kernel_custody.push(
         child_kernel_owner

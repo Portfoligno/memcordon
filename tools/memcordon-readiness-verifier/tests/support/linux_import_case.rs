@@ -165,6 +165,7 @@ pub fn baseline(scenario: &str) -> PersistedCase {
     ));
     case.json("import-census.json",&json!({"format":"memcordon.linux-isolation-import-census","revision":1,"original_probe_nonce":hex::encode([7;16]),"definition_sha256":definition_hash,"stdout_sha256":census["result_sha256"],"native_census":census}));
     let evidence = LinuxIsolationImportEvidence {
+        outcome: memcordon_readiness_verifier::LinuxIsolationImportOutcome::Refused,
         format: "memcordon.consumer-readiness.linux-isolation-import-refusal".into(),
         revision: 1,
         key: case.record.key.clone(),

@@ -8,6 +8,7 @@ use thiserror::Error;
 pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
 pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 const DEBUG_PROCESS: u32 = 0x0000_0001;
 const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
 
@@ -37,8 +38,14 @@ pub fn build_package_loader_plan(
     ProductionLoaderPlanV1::new(input)
 }
 
+pub fn build_package_loader_plan_v2(
+    input: ProductionLoaderPlanInputV1,
+) -> Result<ProductionLoaderPlanV2, ProductionPlanError> {
+    ProductionLoaderPlanV2::new(input)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ProductionLoaderPlanV1 {
+pub struct ProductionLoaderPlan<const VERSION: u32> {
     schema_version: u32,
     executable_path_utf16: Vec<u16>,
     executable_sha256: String,
@@ -61,8 +68,16 @@ pub struct ProductionLoaderPlanV1 {
     launch_plan_sha256: String,
 }
 
+/// Legacy helper policy, retained for exact historical evidence validation.
+pub type ProductionLoaderPlanV1 = ProductionLoaderPlan<1>;
+/// Schema 2 means the consoleless LoaderControl helper policy. The schema and
+/// fixed DETACHED_PROCESS flags are hashed; actual workload policy is separate.
+pub type ProductionLoaderPlanV2 = ProductionLoaderPlan<2>;
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProductionPlanError {
+    #[error("unsupported production loader plan schema")]
+    UnsupportedSchema,
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
     #[error("{field} must be a lowercase SHA-256 digest")]
@@ -73,11 +88,16 @@ pub enum ProductionPlanError {
     NonemptyHandleList,
 }
 
-impl ProductionLoaderPlanV1 {
-    pub const CREATION_FLAGS: u32 =
-        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+impl<const VERSION: u32> ProductionLoaderPlan<VERSION> {
+    pub const CREATION_FLAGS: u32 = CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_UNICODE_ENVIRONMENT
+        | if VERSION == 2 { DETACHED_PROCESS } else { 0 };
 
     pub fn new(input: ProductionLoaderPlanInputV1) -> Result<Self, ProductionPlanError> {
+        if VERSION != 1 && VERSION != 2 {
+            return Err(ProductionPlanError::UnsupportedSchema);
+        }
         if input.executable_path_utf16.is_empty() || input.executable_path_utf16.contains(&0) {
             return Err(ProductionPlanError::Empty {
                 field: "executable_path_utf16",
@@ -159,7 +179,7 @@ impl ProductionLoaderPlanV1 {
         }
 
         let mut plan = Self {
-            schema_version: 1,
+            schema_version: VERSION,
             executable_path_utf16: input.executable_path_utf16,
             executable_sha256: input.executable_sha256,
             command_line_sha256: input.command_line_sha256,
@@ -413,13 +433,13 @@ struct ProductionLoaderPlanWireV1 {
     launch_plan_sha256: String,
 }
 
-impl<'de> Deserialize<'de> for ProductionLoaderPlanV1 {
+impl<'de, const VERSION: u32> Deserialize<'de> for ProductionLoaderPlan<VERSION> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let wire = ProductionLoaderPlanWireV1::deserialize(deserializer)?;
-        if wire.schema_version != 1 {
+        if (VERSION != 1 && VERSION != 2) || wire.schema_version != VERSION {
             return Err(serde::de::Error::custom(
                 "unsupported production plan schema",
             ));

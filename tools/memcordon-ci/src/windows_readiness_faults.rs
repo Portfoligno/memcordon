@@ -83,6 +83,14 @@ pub(crate) fn observe_control_service_status() -> std::io::Result<serde_json::Va
 }
 
 #[cfg(windows)]
+pub(crate) fn observe_launcher_service_status() -> std::io::Result<serde_json::Value> {
+    serde_json::to_value(native::service_status(
+        memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+    )?)
+    .map_err(std::io::Error::other)
+}
+
+#[cfg(windows)]
 mod native {
     use super::*;
     use crate::command::CommandSpec;
@@ -363,17 +371,18 @@ mod native {
         Ok(status)
     }
 
-    #[allow(unsafe_code)] // Query-only SCM status; replacement process authority is separately held and measured.
     pub(super) fn control_service_status() -> io::Result<ControlServiceObservation> {
+        service_status(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)
+    }
+
+    #[allow(unsafe_code)] // Query-only SCM status; replacement process authority is separately held and measured.
+    pub(super) fn service_status(service_name: &str) -> io::Result<ControlServiceObservation> {
         use windows_sys::Win32::System::Services::{
             CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
             SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS,
             SERVICE_STATUS_PROCESS,
         };
-        let name: Vec<_> = memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
+        let name: Vec<_> = service_name.encode_utf16().chain(Some(0)).collect();
         let manager =
             unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
         if manager.is_null() {
@@ -405,7 +414,7 @@ mod native {
             return Err(error);
         }
         Ok(ControlServiceObservation {
-            name: memcordon_core::WINDOWS_CONTROL_SERVICE_NAME.into(),
+            name: service_name.into(),
             process_id: status.dwProcessId,
             current_state: status.dwCurrentState,
         })

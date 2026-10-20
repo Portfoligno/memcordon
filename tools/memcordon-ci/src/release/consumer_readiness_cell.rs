@@ -36,6 +36,77 @@ struct CellOwner {
     cleanup_failures: Vec<String>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
+enum CellOperation {
+    Execute,
+    Cleanup,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn toolchain_environment(
+    path: std::ffi::OsString,
+    rustup_home: PathBuf,
+) -> [std::ffi::OsString; 2] {
+    let mut native_path = std::ffi::OsString::from("PATH=");
+    native_path.push(path);
+    let mut rustup_environment = std::ffi::OsString::from("RUSTUP_HOME=");
+    rustup_environment.push(rustup_home);
+    [native_path, rustup_environment]
+}
+
+#[cfg(target_os = "linux")]
+fn selected_toolchain_environment() -> Result<[std::ffi::OsString; 2]> {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| CiError::Message("native toolchain PATH absent".into()))?;
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .ok_or_else(|| CiError::Message("native Rust toolchain home absent".into()))?;
+    Ok(toolchain_environment(path, rustup_home))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn privileged_cell_command(
+    root: &Path,
+    arguments: &CellArguments,
+    operation: CellOperation,
+    toolchain: [std::ffi::OsString; 2],
+    executable: &Path,
+    deadline: Instant,
+) -> Result<crate::command::CommandSpec> {
+    let (command, minutes) = match operation {
+        CellOperation::Execute => ("consumer-readiness-cell", 150),
+        CellOperation::Cleanup => ("consumer-readiness-cleanup", 15),
+    };
+    let [native_path, rustup_environment] = toolchain;
+    Ok(
+        crate::command::CommandSpec::new("sudo", root, Duration::from_secs(minutes * 60))
+            .arg("-n")
+            .arg("--")
+            .arg("/usr/bin/env")
+            .arg(native_path)
+            .arg(rustup_environment)
+            .arg(executable)
+            .arg(command)
+            .arg("--target")
+            .arg(&arguments.target)
+            .arg("--channel")
+            .arg(&arguments.channel)
+            .arg("--identity")
+            .arg(std::path::absolute(&arguments.identity)?)
+            .arg("--destination")
+            .arg(std::path::absolute(&arguments.destination)?)
+            .arg("--operation-deadline-unix-millis")
+            .arg(arguments.operation_deadline_unix_millis.to_string())
+            .bounded_until(deadline),
+    )
+}
+
+#[cfg(test)]
+#[path = "../../tests/private/readiness_cell_privilege.rs"]
+mod privilege_tests;
+
 fn remaining(arguments: &CellArguments) -> Result<Instant> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -124,38 +195,16 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
     let (identity, key, bundle) = select(root, arguments)?;
     #[cfg(target_os = "linux")]
     if !rustix::process::geteuid().is_root() {
-        let mut native_path = std::ffi::OsString::from("PATH=");
-        native_path.push(
-            std::env::var_os("PATH")
-                .ok_or_else(|| CiError::Message("native toolchain PATH absent".into()))?,
-        );
-        let rustup_home = std::env::var_os("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
-            .ok_or_else(|| CiError::Message("native Rust toolchain home absent".into()))?;
-        let mut rustup_environment = std::ffi::OsString::from("RUSTUP_HOME=");
-        rustup_environment.push(rustup_home);
-        return crate::command::CommandSpec::new("sudo", root, Duration::from_secs(150 * 60))
-            .arg("-n")
-            .arg("--")
-            .arg("/usr/bin/env")
-            .arg(native_path)
-            .arg(rustup_environment)
-            .arg(std::env::current_exe()?)
-            .arg("consumer-readiness-cell")
-            .arg("--target")
-            .arg(&arguments.target)
-            .arg("--channel")
-            .arg(&arguments.channel)
-            .arg("--identity")
-            .arg(std::path::absolute(&arguments.identity)?)
-            .arg("--destination")
-            .arg(std::path::absolute(&arguments.destination)?)
-            .arg("--operation-deadline-unix-millis")
-            .arg(arguments.operation_deadline_unix_millis.to_string())
-            .bounded_until(cleanup_deadline)
-            .run()
-            .map(|_| ());
+        return privileged_cell_command(
+            root,
+            arguments,
+            CellOperation::Execute,
+            selected_toolchain_environment()?,
+            &std::env::current_exe()?,
+            cleanup_deadline,
+        )?
+        .run()
+        .map(|_| ());
     }
     fs::create_dir_all(&arguments.destination)?;
     let artifact_root = std::path::absolute(&arguments.destination)?;
@@ -554,12 +603,54 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
     }
     super::source::write_json(&owner_path, &owner)?;
     super::source::write_json(&arguments.destination.join("cell.json"), &cell)?;
+    #[cfg(target_os = "linux")]
+    {
+        let projection =
+            public_projection::publish(&arguments.destination, &cell, cleanup_deadline);
+        crate::work_outcome::join_completed(
+            crate::work_outcome::WorkOutcome::from_result(result),
+            crate::work_outcome::WorkOutcome::from_result(projection),
+        )
+        .into_result()
+    }
+    #[cfg(not(target_os = "linux"))]
     result
 }
+
+/// The Linux administrative tree stays private; clients consume its projection.
+pub fn cell_record_path(destination: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        destination.join("producer/cell.json")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        destination.join("cell.json")
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[path = "readiness_public_projection.rs"]
+mod public_projection;
 
 pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
     let deadline = remaining(arguments)?;
     let (identity, key, _) = select(root, arguments)?;
+    // The cell owner is created by the privileged execution path and remains
+    // root-private. Enter the existing cleanup boundary before reading it.
+    #[cfg(target_os = "linux")]
+    if !rustix::process::geteuid().is_root() {
+        return privileged_cell_command(
+            root,
+            arguments,
+            CellOperation::Cleanup,
+            selected_toolchain_environment()?,
+            &std::env::current_exe()?,
+            deadline,
+        )?
+        .run()
+        .map(|_| ());
+    }
     let path = arguments
         .destination
         .join(&key.target)
@@ -583,33 +674,35 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        if !rustix::process::geteuid().is_root() {
-            return crate::command::CommandSpec::new("sudo", root, Duration::from_secs(15 * 60))
-                .arg("-n")
-                .arg("--")
-                .arg(std::env::current_exe()?)
-                .arg("consumer-readiness-cleanup")
-                .arg("--target")
-                .arg(&arguments.target)
-                .arg("--channel")
-                .arg(&arguments.channel)
-                .arg("--identity")
-                .arg(std::path::absolute(&arguments.identity)?)
-                .arg("--destination")
-                .arg(std::path::absolute(&arguments.destination)?)
-                .arg("--operation-deadline-unix-millis")
-                .arg(arguments.operation_deadline_unix_millis.to_string())
-                .bounded_until(deadline)
-                .run()
-                .map(|_| ());
-        }
-        super::linux_readiness_lease::recover_installation(
+        let recovered = super::linux_readiness_lease::recover_installation(
             root,
             &path.parent().expect("cell owner parent").join("lifetime"),
             &identity,
             &key,
             deadline,
-        )?;
+        );
+        if let Err(cause) = recovered {
+            let cell_path = arguments.destination.join("cell.json");
+            let retention = (|| -> Result<()> {
+                let mut cell: CellEvidence = super::source::read_json(&cell_path)?;
+                if serde_json::to_value(&cell.identity)? != serde_json::to_value(&identity)?
+                    || cell.key != key
+                {
+                    return Err(CiError::Message(
+                        "failed cleanup cell evidence association differs".into(),
+                    ));
+                }
+                cell.cache_quiescent = false;
+                cell.cleanup_failures.push(cause.to_string());
+                super::source::write_json(&cell_path, &cell)?;
+                public_projection::publish(&arguments.destination, &cell, deadline)
+            })();
+            return crate::work_outcome::join_completed(
+                crate::work_outcome::WorkOutcome::<()>::from_result(Err(cause)),
+                crate::work_outcome::WorkOutcome::from_result(retention),
+            )
+            .into_result();
+        }
         owner.finalization_completed = true;
         super::source::write_json(&path, &owner)?;
         let cell_path = arguments.destination.join("cell.json");
@@ -622,7 +715,8 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
             ));
         }
         cell.cache_quiescent = true;
-        super::source::write_json(&cell_path, &cell)
+        super::source::write_json(&cell_path, &cell)?;
+        public_projection::publish(&arguments.destination, &cell, deadline)
     }
     #[cfg(windows)]
     {

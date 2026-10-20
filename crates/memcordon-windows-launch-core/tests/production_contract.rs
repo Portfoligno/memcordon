@@ -48,6 +48,78 @@ fn plan() -> ProductionLoaderPlanV1 {
     build_package_loader_plan(plan_input()).expect("fixture plan must be valid")
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn detached_support_plan_is_distinct_and_keeps_production_flags_closed() {
+    use memcordon_windows_launch_core::SupportDetachedConsolePlanV1;
+    let baseline = plan();
+    let descriptor = SupportDetachedConsolePlanV1::new(
+        baseline.clone(),
+        baseline.launch_plan_sha256().into(),
+        DIGEST_A.into(),
+    )
+    .unwrap();
+    assert_eq!(baseline.creation_flags(), 0x80404);
+    assert_eq!(descriptor.actual_creation_flags(), 0x8040c);
+    descriptor.validate_baseline(&baseline, DIGEST_A).unwrap();
+    let bytes = serde_json::to_vec(&descriptor).unwrap();
+    let decoded: SupportDetachedConsolePlanV1 = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, descriptor);
+    let mut production = serde_json::to_value(&baseline).unwrap();
+    production["creation_flags"] = serde_json::json!(0x8040c);
+    assert!(serde_json::from_value::<ProductionLoaderPlanV1>(production).is_err());
+    for flags in [0x80404, 0x80414, 0x08080404, 0x8040d] {
+        let mut altered = serde_json::to_value(&descriptor).unwrap();
+        altered["actual_creation_flags"] = serde_json::json!(flags);
+        assert!(serde_json::from_value::<SupportDetachedConsolePlanV1>(altered).is_err());
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn detached_comparison_binds_immutable_inputs_but_allows_fresh_endpoint_command() {
+    use memcordon_windows_launch_core::SupportDetachedConsolePlanV1;
+    let baseline = plan();
+    let mut input = plan_input();
+    input.command_line_sha256 = DIGEST_A.into();
+    let fresh = build_package_loader_plan(input.clone()).unwrap();
+    let selected = SupportDetachedConsolePlanV1::new(
+        fresh,
+        baseline.launch_plan_sha256().into(),
+        DIGEST_A.into(),
+    )
+    .unwrap();
+    selected.validate_baseline(&baseline, DIGEST_A).unwrap();
+    assert!(selected.validate_baseline(&baseline, DIGEST_B).is_err());
+    for dimension in 0..6 {
+        let mut changed = input.clone();
+        match dimension {
+            0 => changed.executable_sha256 = DIGEST_B.into(),
+            1 => changed.environment.sha256 = DIGEST_B.into(),
+            2 => changed.current_directory_sha256 = DIGEST_A.into(),
+            3 => changed.target_token.envelope_sha256 = DIGEST_A.into(),
+            4 => changed.desktop.exact_name.push_str("Other"),
+            _ => changed.process_security_descriptor_sddl = "D:P(A;;GA;;;BA)".into(),
+        }
+        let changed = build_package_loader_plan(changed).unwrap();
+        let descriptor = SupportDetachedConsolePlanV1::new(
+            changed,
+            baseline.launch_plan_sha256().into(),
+            DIGEST_A.into(),
+        )
+        .unwrap();
+        assert!(descriptor.validate_baseline(&baseline, DIGEST_A).is_err());
+    }
+    let wrong_baseline =
+        SupportDetachedConsolePlanV1::new(baseline.clone(), DIGEST_A.into(), DIGEST_A.into())
+            .unwrap();
+    assert!(
+        wrong_baseline
+            .validate_baseline(&baseline, DIGEST_A)
+            .is_err()
+    );
+}
+
 #[test]
 fn two_maximum_valid_loader_plan_copies_fit_terminal_diagnostic_budget() {
     let plan = plan();

@@ -286,9 +286,20 @@ pub fn run(
         || !retired
         || !observed.status.success()
     {
-        return Err(CiError::Message(
-            "original measured recovery failed or original scope/process changed".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "original measured recovery failed or original scope/process changed; expected-root-device={}; expected-root-inode={}; actual-root-device={}; actual-root-inode={}; actual-root-is-directory={}; pidfd-retirement-observed={retired}; native-status={:?}; native-wait-status={}; stdout-bytes={}; stdout={:?}; stderr-bytes={}; stderr={:?}",
+            directory_identity.dev(),
+            directory_identity.ino(),
+            named.dev(),
+            named.ino(),
+            named.is_dir(),
+            observed.status.code(),
+            observed.status.into_raw(),
+            observed.stdout.len(),
+            crate::command::bounded_excerpt(&observed.stdout),
+            observed.stderr.len(),
+            crate::command::bounded_excerpt(&observed.stderr),
+        )));
     }
     let result_bytes = super::linux_mixed_installed::read_owned_resource(
         &root.join(contract::RESULT_LEAF),

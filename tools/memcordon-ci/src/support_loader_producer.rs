@@ -7,6 +7,92 @@ pub const PREPARATION: Duration = Duration::from_secs(180);
 pub const BOOTSTRAP_WORK: Duration = Duration::from_secs(30);
 pub const BOOTSTRAP_CLEANUP: Duration = Duration::from_secs(60);
 
+/// A separate installed diagnostic consumes the existing lease, never renews it.
+pub fn installed_selection(
+    challenge: &[u8],
+    bootstrap_sha256: &str,
+    producer_binding_sha256: &str,
+    now: u64,
+    original_work_cutoff: u64,
+    original_cleanup_cutoff: u64,
+) -> Result<memcordon_core::WindowsLoaderDiagnosticSelectionV1> {
+    if original_cleanup_cutoff <= original_work_cutoff {
+        return Err(CiError::Message(
+            "installed diagnostic original cutoff order differs".into(),
+        ));
+    }
+    let selected = memcordon_core::WindowsLoaderDiagnosticSelectionV1 {
+        kind: memcordon_core::WindowsLoaderDiagnosticKindV1::OriginalRestrictedBootstrapConsoleComparison,
+        challenge: hex::encode(challenge),
+        support_bootstrap_sha256: bootstrap_sha256.into(),
+        producer_deadline_sha256: producer_binding_sha256.into(),
+        work_deadline_unix_ms: original_work_cutoff.min(
+            now.checked_add(30_000)
+                .ok_or_else(|| CiError::Message("installed diagnostic work overflow".into()))?,
+        ),
+        cleanup_deadline_unix_ms: original_cleanup_cutoff.min(
+            now.checked_add(60_000)
+                .ok_or_else(|| CiError::Message("installed diagnostic cleanup overflow".into()))?,
+        ),
+    };
+    selected
+        .validate_at(now)
+        .map_err(|error| CiError::Message(error.into()))?;
+    Ok(selected)
+}
+
+/// Admit only settled original loader refusals; this confers no launch authority.
+pub fn installed_trigger(
+    original: &memcordon_core::ResultV1,
+    provider: &memcordon_core::PublicProviderBindingV1,
+) -> Result<bool> {
+    use memcordon_core::result_v1::{AuthorizationV1, CleanupStateV1, LaunchStateV1};
+    use memcordon_core::{WindowsLoaderCleanupStatusV1, WindowsLoaderQualificationOutcomeV2};
+    if original
+        .provider_association
+        .as_ref()
+        .map(|association| &association.provider)
+        != Some(provider)
+    {
+        return Err(CiError::Message(
+            "installed diagnostic original provider differs".into(),
+        ));
+    }
+    if original.authorization != AuthorizationV1::RejectedBeforeRelease
+        || original.launch.state != LaunchStateV1::NotCreated
+        || original.cleanup.state != CleanupStateV1::Complete
+    {
+        return Ok(false);
+    }
+    Ok(original.attempts.last().is_some_and(|attempt| {
+        let Some(failure) = attempt.operational_failure.as_ref() else {
+            return false;
+        };
+        if failure.provider_association != original.provider_association {
+            return false;
+        }
+        let Some(rejection) = failure.windows_rejection.as_ref() else {
+            return false;
+        };
+        let Some(WindowsLoaderQualificationOutcomeV2::Failed(loader)) =
+            rejection.loader_qualification.as_ref()
+        else {
+            return false;
+        };
+        rejection.is_consistent()
+            && !rejection.target_created
+            && !rejection.target_released
+            && rejection.code == "MCSPAWN-FAILED"
+            && loader.cleanup.status == WindowsLoaderCleanupStatusV1::Complete
+            && loader.stable_code == "loader-control-pipe-accept"
+            && loader.detail.contains("bootstrap_role=loader-control")
+            && attempt.error.as_ref().is_some_and(|error| {
+                error.code == "MCSPAWN-FAILED"
+                    && error.message.contains("bootstrap_role=loader-control")
+            })
+    }))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticDeadline {
@@ -171,8 +257,14 @@ pub fn validate_frontend(
             "diagnostic canonical request association differs".into(),
         ));
     }
-    let mut retained = None;
+    let mut retained: Option<serde_json::Value> = None;
+    let mut retired = false;
     for bytes in &observation.authenticated_provider_frames {
+        if retired {
+            return Err(CiError::Message(
+                "diagnostic frame follows completed retirement".into(),
+            ));
+        }
         memcordon_core::canonical_json::reject_duplicate_json_keys(bytes)
             .map_err(CiError::Message)?;
         let response: WindowsProviderResponseV3 = serde_json::from_slice(bytes)?;
@@ -201,6 +293,11 @@ pub fn validate_frontend(
                         "diagnostic refusal crosses original request".into(),
                     ));
                 }
+                let reached_handshake = matches!(
+                    &rejection.loader_qualification,
+                    Some(memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure))
+                        if failure.stage == memcordon_core::WindowsLoaderQualificationStageV2::LoaderReadyHandshake
+                );
                 let trace = match &rejection.loader_qualification {
                     Some(memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure)) => {
                         failure.support_debug_observation.as_deref()
@@ -217,12 +314,52 @@ pub fn validate_frontend(
                         "diagnostic original child measurement differs".into(),
                     ));
                 }
+                let console_comparison = validate_console_comparison(
+                    trace,
+                    selected,
+                    match &rejection.loader_qualification {
+                        Some(memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(
+                            failure,
+                        )) => failure.launch_plan_json.as_deref(),
+                        _ => None,
+                    },
+                )?;
                 retained = Some(
                     serde_json::json!({"diagnostic_only":true,"certification_authority":false,
+                    "debug_capture_complete":reached_handshake && trace.omitted_events == 0
+                        && !trace.detached && trace.exit_event_continued
+                        && trace.process.process_id != 0
+                        && trace.process.creation_time_100ns != 0
+                        && trace.creator_thread_id != 0
+                        && trace.events.first().is_some_and(|event| event.code == 3)
+                        && trace.events.last().is_some_and(|event| event.code == 5 && event.native_exit_code.is_some())
+                        && trace.events.iter().all(|event| event.process_id == trace.process.process_id
+                            && event.thread_id != 0
+                            && (event.continuation == 0x0001_0002
+                                || event.code == 1 && event.continuation == 0x8001_0001)
+                            && event.continuation_error.is_none()),
+                    "console_comparison":console_comparison,
                     "attempt_id":attempt,"request_sha256":request,"original_refusal":rejection,
                     "terminal_receipt":rejection.terminal_receipt(),
                     "terminal_authority_sha256":crate::windows_causal_acceptance::sha256(response.terminal_authority_json()?.as_bytes())}),
                 );
+            }
+            WindowsProviderResponseV3::TerminalRetiredV2(receipt) => {
+                let digest = retained
+                    .as_ref()
+                    .and_then(|value| value["terminal_authority_sha256"].as_str())
+                    .ok_or_else(|| {
+                        CiError::Message("diagnostic retirement precedes refusal".into())
+                    })?;
+                if receipt.provider_generation != provider.generation.as_str()
+                    || receipt.disposition != memcordon_core::WindowsAttemptTerminalDispositionV1::PreauthorizationAbort
+                    || !receipt.is_consistent_for(&attempt, &launch.nonce, &request, digest)
+                {
+                    return Err(CiError::Message("diagnostic refusal retirement differs".into()));
+                }
+                retained.as_mut().expect("bound refusal checked above")["refusal_retirement"] =
+                    serde_json::to_value(receipt)?;
+                retired = true;
             }
             WindowsProviderResponseV3::TargetAuthorized { .. }
             | WindowsProviderResponseV3::Terminal(_) => {
@@ -244,6 +381,7 @@ pub fn validate_frontend(
                 request_sha256,
             } => {
                 if *schema_version != memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                    || retained.is_some()
                     || attempt_id != &attempt
                     || nonce != &launch.nonce
                     || request_sha256 != &request
@@ -260,5 +398,111 @@ pub fn validate_frontend(
             }
         }
     }
+    if !retired {
+        return Err(CiError::Message(
+            "bound diagnostic refusal retirement unavailable".into(),
+        ));
+    }
     retained.ok_or_else(|| CiError::Message("bound diagnostic refusal unavailable".into()))
+}
+
+pub fn validate_console_comparison(
+    baseline: &memcordon_core::WindowsLoaderDebugObservationV1,
+    selected: &memcordon_core::WindowsLoaderDiagnosticSelectionV1,
+    baseline_plan_json: Option<&str>,
+) -> Result<serde_json::Value> {
+    use memcordon_core::{
+        WindowsLoaderConsoleComparisonOutcomeV1 as Outcome, WindowsLoaderDiagnosticKindV1 as Kind,
+    };
+    let Some(comparison) = baseline.console_comparison.as_ref() else {
+        return if selected.kind == Kind::OriginalRestrictedBootstrap {
+            Ok(serde_json::json!({"selected":false}))
+        } else {
+            Ok(
+                serde_json::json!({"selected":true,"available":false,"reason":"comparison observation absent"}),
+            )
+        };
+    };
+    if selected.kind != Kind::OriginalRestrictedBootstrapConsoleComparison
+        || !comparison.is_consistent_for(baseline)
+    {
+        return Err(CiError::Message(
+            "console comparison selection or baseline binding differs".into(),
+        ));
+    }
+    if let Some(json) = comparison.diagnostic_plan_json.as_ref() {
+        let descriptor: memcordon_windows_launch_core::SupportDetachedConsolePlanV1 =
+            serde_json::from_str(json)?;
+        let original: memcordon_windows_launch_core::ProductionLoaderPlanV1 = serde_json::from_str(
+            baseline_plan_json
+                .ok_or_else(|| CiError::Message("comparison original plan absent".into()))?,
+        )?;
+        descriptor
+            .validate_baseline(&original, &selected.challenge)
+            .map_err(CiError::Message)?;
+        if descriptor.actual_creation_flags() != comparison.actual_creation_flags
+            || comparison.debug_observation.as_ref().is_some_and(|debug| {
+                debug.launch_plan_sha256 != descriptor.diagnostic_plan_sha256()
+            })
+        {
+            return Err(CiError::Message(
+                "comparison actual flags or trace plan differs".into(),
+            ));
+        }
+    }
+    if matches!(
+        comparison.outcome,
+        Outcome::NotApplicable {
+            baseline_schema_version: 2
+        }
+    ) {
+        let plan: memcordon_windows_launch_core::ProductionLoaderPlanV2 = serde_json::from_str(
+            baseline_plan_json
+                .ok_or_else(|| CiError::Message("comparison original V2 plan absent".into()))?,
+        )?;
+        if plan.launch_plan_sha256() != baseline.launch_plan_sha256 {
+            return Err(CiError::Message(
+                "comparison V2 baseline binding differs".into(),
+            ));
+        }
+        return Ok(
+            serde_json::json!({"selected":true,"applicable":false,"reason":"consoleless-loader-control-v2", "diagnostic_only":true,"certification_authority":false,"observation":comparison}),
+        );
+    }
+    let retired =
+        comparison.cleanup.status == memcordon_core::WindowsLoaderCleanupStatusV1::Complete;
+    let complete = comparison.debug_observation.as_ref().is_some_and(|debug| {
+        debug.omitted_events == 0
+            && !debug.detached
+            && debug.exit_event_continued
+            && debug.events.first().is_some_and(|event| event.code == 3)
+            && debug
+                .events
+                .last()
+                .is_some_and(|event| event.code == 5 && event.native_exit_code.is_some())
+            && debug.events.iter().all(|event| {
+                event.process_id == debug.process.process_id
+                    && event.thread_id != 0
+                    && event.continuation_error.is_none()
+                    && (event.continuation == 0x10002
+                        || event.code == 1 && event.continuation == 0x80010001)
+            })
+    });
+    Ok(
+        serde_json::json!({"selected":true,"diagnostic_only":true,"certification_authority":false,
+        "available":retired && complete,
+        "reached_handshake":retired && complete && matches!(comparison.outcome, Outcome::ReachedHandshake),
+        "retirement_complete":retired,"capture_complete":complete,"observation":comparison}),
+    )
+}
+
+/// A bound refusal is useful evidence even when the debugger never captured
+/// the original child. Such a refusal must not be reported as capture success.
+pub fn require_complete_debug_capture(refusal: &serde_json::Value) -> Result<()> {
+    if refusal["debug_capture_complete"] != true {
+        return Err(CiError::Message(
+            "original loader debug capture incomplete or unavailable".into(),
+        ));
+    }
+    Ok(())
 }

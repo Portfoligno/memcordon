@@ -31,6 +31,83 @@ fn record() -> NativeBudget {
 }
 
 #[test]
+fn privileged_same_operation_preserves_only_original_job_context_without_renewal() {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let options = crate::release::original_native_components::original_native_sudo_options();
+        assert_eq!(options[0], "-n");
+        assert_eq!(options[2], "--");
+        use crate::release::original_native_components::original_native_context_arguments;
+        assert_eq!(
+            original_native_context_arguments(true, 7),
+            [std::ffi::OsString::from("--github-context")]
+        );
+        assert_eq!(
+            original_native_context_arguments(false, 7),
+            [
+                std::ffi::OsString::from("--run-attempt"),
+                std::ffi::OsString::from("7")
+            ]
+        );
+        let names = options[1]
+            .strip_prefix("--preserve-env=")
+            .unwrap()
+            .split(',')
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "GITHUB_ACTIONS",
+                "GITHUB_RUN_ID",
+                "GITHUB_JOB",
+                "GITHUB_RUN_ATTEMPT"
+            ])
+        );
+    }
+    let retained = record();
+    let now = ClockReading {
+        domain: "boot-one".into(),
+        millis: retained.started + 70 * 60 * 1000,
+    };
+    let sanitized = Association {
+        run: String::new(),
+        job: String::new(),
+        attempt: String::new(),
+        checkout: association().checkout,
+    };
+    for (cleanup, duration, remaining) in [(false, WORK_MILLIS, 70), (true, CLEANUP_MILLIS, 85)] {
+        let check = |live: &Association| {
+            retained.remaining(
+                &selected(),
+                "host",
+                live,
+                &now,
+                WallWindow {
+                    started: retained.wall_started,
+                    cutoff: retained.wall_started + duration,
+                    now: retained.wall_started + 70 * 60 * 1000,
+                },
+                cleanup,
+            )
+        };
+        assert!(check(&sanitized).is_err());
+        assert_eq!(
+            check(&association()).unwrap(),
+            Duration::from_secs(remaining * 60)
+        );
+        for field in ["run", "job", "attempt"] {
+            let mut foreign = association();
+            match field {
+                "run" => foreign.run.push('2'),
+                "job" => foreign.job.push('2'),
+                _ => foreign.attempt.push('2'),
+            }
+            assert!(check(&foreign).is_err());
+        }
+    }
+}
+
+#[test]
 fn cache_and_action_time_reduce_original_interval_and_wall_rollback_never_renews_it() {
     let record = record();
     let now = ClockReading {

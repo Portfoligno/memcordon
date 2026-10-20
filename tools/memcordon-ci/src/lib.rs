@@ -9,6 +9,7 @@ pub mod cache_restore;
 pub mod cache_snapshot;
 pub mod caller_observation;
 pub mod capability;
+pub mod cargo_progress;
 pub mod ci_operation_time;
 pub mod command;
 pub mod config;

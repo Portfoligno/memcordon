@@ -18,12 +18,13 @@ use memcordon_windows_launch_core::{
     LoaderReadyEndpointV1, LoaderReadyEvidenceV1, NativeSecurityDescriptorV1, NativeStatusV1,
     PreparedCurrentDirectoryV1, PreparedLoaderCommandV1, PreparedLoaderEnvironmentV1,
     ProcessCreateFailure, ProductionLoaderPlanInputV1,
-    ProductionLoaderPlanV1 as ProductionLoaderPlan, ProductionNativeCreateRequestV1,
+    ProductionLoaderPlanV2 as ProductionLoaderPlan, ProductionNativeCreateRequest,
     ProductionQualificationDriver, SuspendedProcessAttestor, SuspendedProcessEvidenceV1,
     SuspendedProcessFactory, TargetTokenIdentityV1,
     WindowsLoaderQualificationOutcomeV2 as LaunchQualificationOutcomeV2,
-    WindowsLoaderQualificationStageV2 as LaunchQualificationStageV2, build_package_loader_plan,
-    create_process_as_user_native, create_process_native, create_suspended_in_job,
+    WindowsLoaderQualificationStageV2 as LaunchQualificationStageV2,
+    build_package_loader_plan_v2 as build_package_loader_plan, create_process_as_user_native,
+    create_process_native, create_suspended_in_job,
 };
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{

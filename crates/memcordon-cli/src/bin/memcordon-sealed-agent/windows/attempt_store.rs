@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use super::record::WindowsAttemptRecordV1;
 
+#[path = "publication_wait.rs"]
+mod publication_wait;
+
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_writer_queue.rs"]
 mod writer_queue_tests;
@@ -424,7 +427,7 @@ impl PublicationGuard {
         security: super::security::SecurityDescriptor,
         alternate: Option<super::security::SecurityDescriptor>,
     ) -> Result<Self, String> {
-        use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::Foundation::WAIT_FAILED;
         use windows_sys::Win32::System::Threading::{CreateMutexExW, WaitForSingleObject};
         super::record::validate_attempt_id(attempt_id)?;
         let attributes = security.attributes(false);
@@ -458,8 +461,11 @@ impl PublicationGuard {
         }
         // No waiting on another service or a stalled writer is introduced.
         let wait = unsafe { WaitForSingleObject(handle.raw(), 0) };
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            return Err("attempt publication owner is unavailable".to_owned());
+        let native_error = (wait == WAIT_FAILED)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        if let Some(detail) = publication_wait::failure_detail(wait, native_error) {
+            return Err(detail);
         }
         Ok(Self(handle))
     }

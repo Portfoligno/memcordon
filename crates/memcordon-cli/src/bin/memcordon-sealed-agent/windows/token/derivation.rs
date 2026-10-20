@@ -674,6 +674,23 @@ pub(crate) fn current_process_token_for_attestation() -> Result<OwnedHandle, Str
     current_process_token_with_attested_access(TOKEN_ATTESTATION_ACCESS, "source-attestation")
 }
 
+/// A borrowed SDK current-primary-token capability, limited to query access.
+/// It is not a handle-table entry and must never be owned or duplicated.
+pub(crate) struct CurrentProcessQueryToken;
+
+impl CurrentProcessQueryToken {
+    pub(crate) fn raw(&self) -> HANDLE {
+        // GetCurrentProcessToken is an inline SDK function returning -4.
+        // Windows 8+ grants only TOKEN_QUERY | TOKEN_QUERY_SOURCE. It needs no
+        // close and cannot be inherited or duplicated.
+        -4isize as HANDLE
+    }
+}
+
+pub(crate) fn current_process_query_token() -> CurrentProcessQueryToken {
+    CurrentProcessQueryToken
+}
+
 /// Opens the owner token for a complete snapshot followed by an AccessCheck
 /// that must derive a query-only impersonation token from the primary token.
 pub(crate) fn current_process_token_for_attestation_and_access_check() -> Result<OwnedHandle, String>

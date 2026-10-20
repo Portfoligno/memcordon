@@ -71,7 +71,41 @@ impl TargetCreateError {
     }
 }
 
+/// Terminate only the exact held creation process; Job membership is not a
+/// prerequisite for this fallback containment operation.
+pub(crate) fn terminate_held_target_if_live(process: HANDLE, status: u32) -> Result<(), String> {
+    // SAFETY: callers retain the original process handle throughout this call.
+    match unsafe { WaitForSingleObject(process, 0) } {
+        WAIT_OBJECT_0 => return Ok(()),
+        WAIT_TIMEOUT => {}
+        _ => {
+            return Err(format!(
+                "held target completion query: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    // SAFETY: the held creation handle has process-termination authority.
+    if unsafe { TerminateProcess(process, status) } == 0 {
+        let failure = io::Error::last_os_error();
+        // Actual completion, not an error code, resolves an exit race.
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        return Err(format!("held target termination: {failure}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../../../../../tests/sealed_agent/windows_target_retirement.rs"]
+mod target_retirement_tests;
+
 impl SuspendedTarget {
+    pub fn terminate_if_live(&self, status: u32) -> Result<(), String> {
+        terminate_held_target_if_live(self.process.raw(), status)
+    }
+
     pub fn desktop_owner_binding(&self) -> Option<(WindowsProcessIdentityV1, String, u64, u64)> {
         self._desktop_lease
             .as_ref()

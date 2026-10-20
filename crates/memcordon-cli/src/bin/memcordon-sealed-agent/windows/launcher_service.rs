@@ -2850,6 +2850,7 @@ fn launch_attempt(
                     .to_owned()
                     .into());
             }
+            target.terminate_if_live(CANCEL_STATUS)?;
             if !target.wait(Duration::from_secs(10))? {
                 return Err(
                     "suspended target did not reap after preauthorization failure"
@@ -3036,8 +3037,18 @@ fn launch_attempt(
         Err(failure) => retire_preauthorization_with_target!(failure),
     };
     macro_rules! retire_postauthorization_before_resume {
-        ($failure:expr) => {{
+        ($failure:expr) => {
+            retire_postauthorization_before_resume!($failure, None)
+        };
+        ($failure:expr, $premature:expr) => {{
             let mut failure = $failure;
+            let premature: Option<memcordon_core::WindowsPrematureReleaseWitnessV1> = $premature;
+            if premature.is_some() {
+                // The immutable failure payload retains the selected observation;
+                // delivery must use the durable Reject/ACK route, not the legacy
+                // diagnostic-only mutant terminal frame.
+                failure.mutant_observation = None;
+            }
             cleanup_guard.observe_failure(&failure);
             let authorization_offset = started.elapsed();
             let job_total_processes = job.total_processes()?;
@@ -3063,8 +3074,13 @@ fn launch_attempt(
                 Instant::now() + Duration::from_secs(30),
             )?;
             let relays_retired = RelaysRetired;
-            cleanup_guard.record.begin_postauthorization_retirement()?;
+            if premature.is_none() {
+                cleanup_guard.record.begin_postauthorization_retirement()?;
+            }
             job.terminate(CANCEL_STATUS)?;
+            if premature.is_some() {
+                target.terminate_if_live(CANCEL_STATUS)?;
+            }
             let job_terminated = JobTerminated;
             if !target.wait(Duration::from_secs(30))? {
                 return Err(
@@ -3116,9 +3132,18 @@ fn launch_attempt(
                 &cleanup_guard.record.causal_diagnostics,
             )
             .map_err(str::to_owned)?;
-            cleanup_guard
-                .record
-                .freeze_terminal_seed(process_observation.clone(), Some(primary_failure.clone()))?;
+            if let Some(witness) = premature.as_ref() {
+                cleanup_guard.record.freeze_premature_release_seed(
+                    witness.clone(),
+                    process_observation.clone(),
+                    Some(primary_failure.clone()),
+                )?;
+            } else {
+                cleanup_guard.record.freeze_terminal_seed(
+                    process_observation.clone(),
+                    Some(primary_failure.clone()),
+                )?;
+            }
             let mut record = cleanup_guard.finish();
             streams.close_for_retirement()?;
             relay_retired_event.close_for_retirement()?;
@@ -3131,7 +3156,11 @@ fn launch_attempt(
             registration.close_for_retirement()?;
             job.close_for_retirement()?;
             let final_handles_closed = FinalHandlesClosed;
-            record.complete_retirement()?;
+            if premature.is_some() {
+                record.complete_premature_release()?;
+            } else {
+                record.complete_retirement()?;
+            }
             let record_retired = RecordRetired;
             let completed = CompletedRetirement {
                 child_pid,
@@ -3139,7 +3168,11 @@ fn launch_attempt(
                 job_process_identities: Vec::new(),
                 cleanup_process_creation: None,
                 outcome,
-                target_release: TargetReleaseDisposition::CancelledWhileSuspended,
+                target_release: if premature.is_some() {
+                    TargetReleaseDisposition::Released
+                } else {
+                    TargetReleaseDisposition::CancelledWhileSuspended
+                },
                 job_terminated,
                 direct_target_reaped,
                 active_processes_zero,
@@ -3149,15 +3182,86 @@ fn launch_attempt(
                 record_retired,
                 loader_qualification: creation.loader_qualification.clone(),
             };
-            let mut historical =
-                build_terminal_receipt(&request, started, authorization_offset, completed);
-            if let Some((binding, checkpoint)) = record.workload_checkpoint.clone() {
-                bind_terminal_policy(&mut historical, binding, checkpoint)?;
-            }
-            let receipt = authoritative_terminal_receipt(historical, process_observation, &record)?;
+            let receipt = if let Some(witness) = premature {
+                build_premature_release_receipt(
+                    &request,
+                    started,
+                    completed,
+                    witness,
+                    process_observation,
+                    &record,
+                )?
+            } else {
+                let mut historical =
+                    build_terminal_receipt(&request, started, authorization_offset, completed);
+                if let Some((binding, checkpoint)) = record.workload_checkpoint.clone() {
+                    bind_terminal_policy(&mut historical, binding, checkpoint)?;
+                }
+                authoritative_terminal_receipt(historical, process_observation, &record)?
+            };
             record.stage_terminal_proof(&receipt, Some(primary_failure))?;
             failure.terminal_candidate = Some(TerminalCandidate::Authoritative(Box::new(receipt)));
             return Err(failure);
+        }};
+    }
+    let mut control_pid = 0;
+    // SAFETY: the authenticated private pipe supplies its actual kernel peer PID.
+    if unsafe { GetNamedPipeClientProcessId(connection, &raw mut control_pid) } == 0 {
+        return Err("authenticated control relay PID query failed"
+            .to_owned()
+            .into());
+    }
+    let control_identity = super::process::process_identity_for_pid(control_pid)?
+        .ok_or_else(|| "authenticated control relay exited before authorization".to_owned())?;
+    let service_relay_event_handle = register_relay_retirement_event(
+        &request.attempt_id,
+        &request.launch.nonce,
+        &request.request_sha256,
+        &request.caller_process_identity,
+        &relay_event_name,
+        relay_retired_event.raw(),
+    )?;
+    let mut relay_registration_guard =
+        PreauthorizationRelayRegistration(Some(request.attempt_id.clone()));
+    macro_rules! freeze_native_owners {
+        () => {{
+            cleanup_guard.record.owner_manifest = Some(build_live_owner_manifest(
+                &cleanup_guard.record,
+                &control_identity,
+                [
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::LauncherJob,
+                        job.handle() as usize as u64,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::ActiveRegistryDuplicate,
+                        active_job_handle,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::DirectTargetProcess,
+                        target.handle() as usize as u64,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::GuardianProcess,
+                        guardian.raw() as usize as u64,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::ControlRelay,
+                        connection as usize as u64,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::FrontendRelay,
+                        frontend.raw() as usize as u64,
+                    ),
+                    (
+                        memcordon_core::WindowsCapabilityOwnerRoleV1::LaunchGate,
+                        target.launch_gate_handle() as usize as u64,
+                    ),
+                ],
+                target.desktop_owner_binding(),
+                relay_retired_event.raw() as usize as u64,
+                service_relay_event_handle,
+            )?);
         }};
     }
     if let Some(
@@ -3165,7 +3269,8 @@ fn launch_attempt(
         | memcordon_core::WindowsSealedMutant::ResumeBeforeRelays),
     ) = request.certification_mutant
     {
-        if let Err(detail) = cleanup_guard.record.begin_preauthorization_abort() {
+        freeze_native_owners!();
+        if let Err(detail) = cleanup_guard.record.begin_premature_release(mutant) {
             retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
         }
         if let Err(detail) = target.resume(None) {
@@ -3181,14 +3286,31 @@ fn launch_attempt(
             retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
         }
         let guardian_ready = unsafe { WaitForSingleObject(ready.raw(), 0) } == WAIT_OBJECT_0;
-        retire_preauthorization_with_target!(LaunchAttemptError::mutant_observed(
+        let observation =
             memcordon_core::WindowsMutantNativeObservationV1::PrematureAuthorization {
                 guardian_ready,
                 relays_ready: mutant != memcordon_core::WindowsSealedMutant::ResumeBeforeRelays,
                 target_marker_observed: true,
-            },
-            memcordon_core::BoundarySetupPhase::Authorization,
-        ));
+            };
+        let witness = memcordon_core::WindowsPrematureReleaseWitnessV1 {
+            schema_version: 1,
+            mutant,
+            observation: observation.clone(),
+        };
+        if !witness.is_consistent() {
+            return Err(
+                "selected premature-release observation did not establish its failure"
+                    .to_owned()
+                    .into(),
+            );
+        }
+        retire_postauthorization_before_resume!(
+            LaunchAttemptError::mutant_observed(
+                observation,
+                memcordon_core::BoundarySetupPhase::Authorization,
+            ),
+            Some(witness)
+        );
     }
     #[cfg(any(test, feature = "test-support"))]
     if request.certification_fault == Some(WindowsSealedFault::GuardianKilledBeforeAuthorization) {
@@ -3269,25 +3391,6 @@ fn launch_attempt(
     } else {
         None
     };
-    let mut control_pid = 0;
-    // SAFETY: connection is the authenticated private pipe; the kernel writes one PID.
-    if unsafe { GetNamedPipeClientProcessId(connection, &raw mut control_pid) } == 0 {
-        return Err("authenticated control relay PID query failed"
-            .to_owned()
-            .into());
-    }
-    let control_identity = super::process::process_identity_for_pid(control_pid)?
-        .ok_or_else(|| "authenticated control relay exited before authorization".to_owned())?;
-    let service_relay_event_handle = register_relay_retirement_event(
-        &request.attempt_id,
-        &request.launch.nonce,
-        &request.request_sha256,
-        &request.caller_process_identity,
-        &relay_event_name,
-        relay_retired_event.raw(),
-    )?;
-    let mut relay_registration_guard =
-        PreauthorizationRelayRegistration(Some(request.attempt_id.clone()));
     let owner_manifest = build_live_owner_manifest(
         &cleanup_guard.record,
         &control_identity,
@@ -3600,11 +3703,11 @@ fn launch_attempt(
                 .into(),
         );
     }
-    inject_fault(
+    cleanup_guard.retain_retirement_fault(
         &request,
-        &[WindowsSealedFault::TerminateJob],
-        memcordon_core::BoundarySetupPhase::Retirement,
-    )?;
+        WindowsSealedFault::TerminateJob,
+        &mut monitor_failure,
+    );
     if request.certification_mutant
         == Some(memcordon_core::WindowsSealedMutant::SuccessBeforeActiveZero)
     {
@@ -3652,11 +3755,11 @@ fn launch_attempt(
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    inject_fault(
+    cleanup_guard.retain_retirement_fault(
         &request,
-        &[WindowsSealedFault::ActiveProcessQuery],
-        memcordon_core::BoundarySetupPhase::Retirement,
-    )?;
+        WindowsSealedFault::ActiveProcessQuery,
+        &mut monitor_failure,
+    );
     let empty = job.wait_empty(Instant::now() + Duration::from_secs(30))?;
     if !empty {
         return Err(
@@ -3714,11 +3817,11 @@ fn launch_attempt(
         ));
     }
     if control_connected {
-        inject_fault(
+        cleanup_guard.retain_retirement_fault(
             &request,
-            &[WindowsSealedFault::RelayRetire],
-            memcordon_core::BoundarySetupPhase::Retirement,
-        )?;
+            WindowsSealedFault::RelayRetire,
+            &mut monitor_failure,
+        );
         let delivered = pipe::write_frame_detailed(
             connection,
             &WindowsLauncherResponseV3::TargetRetired {
@@ -3765,22 +3868,17 @@ fn launch_attempt(
             }
         }
     }
-    if let Some(failure) = monitor_failure.as_ref() {
-        // The target's real status remains child information, never substitute
-        // authority for the transport failure observed after natural completion.
-        outcome = failed_retirement_outcome(failure, child_termination(target.exit_status()?));
-    }
     wait_for_relay_retirement_proof(
         relay_retired_event.raw(),
         frontend.raw(),
         Instant::now() + Duration::from_secs(30),
     )?;
     let relays_retired = RelaysRetired;
-    inject_fault(
+    cleanup_guard.retain_retirement_fault(
         &request,
-        &[WindowsSealedFault::GuardianReap],
-        memcordon_core::BoundarySetupPhase::Retirement,
-    )?;
+        WindowsSealedFault::GuardianReap,
+        &mut monitor_failure,
+    );
     // SAFETY: disarm is a live private event and signals the guardian's normal path.
     if unsafe { SetEvent(disarm.raw()) } == 0 {
         return Err(io::Error::last_os_error().to_string().into());
@@ -3792,6 +3890,31 @@ fn launch_attempt(
     let guardian_reaped = GuardianReaped;
     cleanup_guard.record.cleanup_state.guardian_reaped = true;
     cleanup_guard.record.store()?;
+    // Latch even the last selected retirement failure before freezing its
+    // outcome and causal seed. Native closure below is still mandatory.
+    cleanup_guard.retain_retirement_fault(
+        &request,
+        WindowsSealedFault::FinalHandleClose,
+        &mut monitor_failure,
+    );
+    #[cfg(feature = "test-support")]
+    if request.certification_fault == Some(WindowsSealedFault::RecordRetire) {
+        // The target's real signaled wait and native cleanup observations are
+        // already complete. Capture this cause before freezing its receipt.
+        super::diagnostics::set_phase(
+            memcordon_core::AttemptObservationPhaseV1::TargetExitObserved,
+        );
+    }
+    cleanup_guard.retain_retirement_fault(
+        &request,
+        WindowsSealedFault::RecordRetire,
+        &mut monitor_failure,
+    );
+    if let Some(failure) = monitor_failure.as_ref() {
+        // Actual target status is child information, never substitute authority
+        // for the retained original failure.
+        outcome = failed_retirement_outcome(failure, child_termination(target.exit_status()?));
+    }
     // Freeze the sampled evidence while the observation context and native
     // handles still exist. The seed is not terminal authority; it is the
     // immutable input from which later native closure proof may be published.
@@ -3835,11 +3958,6 @@ fn launch_attempt(
             )
         })?;
     let child_pid = target.process_id;
-    inject_fault(
-        &request,
-        &[WindowsSealedFault::FinalHandleClose],
-        memcordon_core::BoundarySetupPhase::Retirement,
-    )?;
     let mut record = cleanup_guard.finish();
     relay_retired_event.close_for_retirement()?;
     target_token.close_for_retirement()?;
@@ -3889,19 +4007,9 @@ fn launch_attempt(
         failure.terminal_candidate = Some(TerminalCandidate::Authoritative(Box::new(receipt)));
         return Err(failure);
     }
-    if let Some(
-        fault @ (WindowsSealedFault::RecordRetire
-        | WindowsSealedFault::GuardianKilledAfterAuthorization),
-    ) = request.certification_fault
+    if let Some(fault @ WindowsSealedFault::GuardianKilledAfterAuthorization) =
+        request.certification_fault
     {
-        #[cfg(feature = "test-support")]
-        if fault == WindowsSealedFault::RecordRetire {
-            // This branch follows the real signaled target wait and terminal
-            // proof staging; it does not infer exit from the selected enum.
-            super::diagnostics::set_phase(
-                memcordon_core::AttemptObservationPhaseV1::TargetExitObserved,
-            );
-        }
         return Err(LaunchAttemptError::certification_fault(
             fault,
             memcordon_core::BoundarySetupPhase::Retirement,
@@ -4090,11 +4198,24 @@ fn build_live_owner_manifest(
                 Role::DesktopBootstrapProcess => {
                     desktop.as_ref().map(|(_, binding, _, _)| binding.clone())
                 }
-                Role::PolicyReference => record.workload_checkpoint.as_ref().map(|(binding, _)| {
-                    let bytes =
-                        serde_json::to_vec(binding).expect("frozen policy binding serializes");
-                    super::record::digest(&bytes)
-                }),
+                Role::PolicyReference => record
+                    .workload_checkpoint
+                    .as_ref()
+                    .map(|(binding, _)| {
+                        let bytes =
+                            serde_json::to_vec(binding).expect("frozen policy binding serializes");
+                        super::record::digest(&bytes)
+                    })
+                    .or_else(|| {
+                        record.workload_admission.as_ref().map(|snapshot| {
+                            let bytes = serde_json::to_vec(&(
+                                "memcordon.windows-unadmitted-policy-reference-v1",
+                                snapshot,
+                            ))
+                            .expect("registered policy reference serializes");
+                            super::record::digest(&bytes)
+                        })
+                    }),
                 _ => None,
             });
         Entry {
@@ -4282,6 +4403,111 @@ fn authoritative_terminal_receipt(
         cleanup_process_creation: historical.cleanup_process_creation,
         restart_safety: historical.restart_safety,
         retirement_proof,
+    };
+    receipt.validate_for_attempt().map_err(str::to_owned)?;
+    Ok(receipt)
+}
+
+fn build_premature_release_receipt(
+    request: &WindowsLaunchBrokerRequestV1,
+    started: Instant,
+    completed: CompletedRetirement,
+    witness: memcordon_core::WindowsPrematureReleaseWitnessV1,
+    process_observation: memcordon_core::WindowsProcessObservationV2,
+    record: &super::record::WindowsAttemptRecordV1,
+) -> Result<memcordon_core::WindowsTerminalReceiptV2, String> {
+    if !witness.is_consistent()
+        || request.certification_mutant != Some(witness.mutant)
+        || record.authorization_unix_millis.is_some()
+        || record.resume_attempted
+        || !record.target_released
+        || record.workload_checkpoint.is_some()
+        || record
+            .terminal_disposition
+            .and_then(|value| value.premature_release_mutant())
+            != Some(witness.mutant)
+    {
+        return Err("premature-release receipt differs from selected native failure".to_owned());
+    }
+    let manifest = record
+        .owner_manifest
+        .as_ref()
+        .ok_or("premature-release owner manifest absent")?;
+    let policy = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.role == memcordon_core::WindowsCapabilityOwnerRoleV1::PolicyReference)
+        .ok_or("premature-release policy reference role absent")?;
+    let expected_policy = record
+        .workload_admission
+        .as_ref()
+        .map(|snapshot| {
+            serde_json::to_vec(&("memcordon.windows-unadmitted-policy-reference-v1", snapshot))
+                .map(|bytes| super::record::digest(&bytes))
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if policy.present != expected_policy.is_some()
+        || policy.capability_binding_sha256 != expected_policy
+    {
+        return Err("premature-release registered policy reference differs".to_owned());
+    }
+    let restart_safety = RestartSafetyProof {
+        direct_child_reaped: completed.direct_target_reaped.verified(),
+        workload_empty: Some(completed.active_processes_zero.verified()),
+        helpers_reaped: completed.guardian_reaped.verified(),
+        containment_removed: completed.final_handles_closed.verified(),
+        containment_incapable_of_live_members: completed.active_processes_zero.verified(),
+        sealed_boundary_retired: completed.record_retired.verified(),
+        errors: completed
+            .outcome
+            .cleanup()
+            .errors
+            .iter()
+            .map(|error| error.message.clone())
+            .collect(),
+    };
+    let proof = memcordon_core::WindowsRetirementProofV2 {
+        schema_version: 2,
+        source: memcordon_core::WindowsRetirementProofSourceV2::LiveNative,
+        attempt_id: record.attempt_id.clone(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        provider_generation: record.provider_generation.clone(),
+        launch_incarnation: record.launch_incarnation.clone(),
+        original_boot_id: record.boot_identity.clone(),
+        job_identity: record.job_identity_sha256.clone(),
+        owner_manifest_sha256: manifest.canonical_sha256().map_err(str::to_owned)?,
+        guardian_receipt_sha256: None,
+        current_boot_id: None,
+        capability_extinction: None,
+        target_completion_observed: completed.direct_target_reaped.verified(),
+        native_job_empty_observed: completed.job_terminated.verified()
+            && completed.active_processes_zero.verified(),
+        relay_closure_observed: completed.relays_retired.verified(),
+        guardian_completion_observed: completed.guardian_reaped.verified(),
+        owner_capabilities_closed: completed.final_handles_closed.verified(),
+        launch_gate_closed: completed.final_handles_closed.verified(),
+        // This binds the registered reference, not a successful admission checkpoint.
+        // Its actual retirement remains mandatory in the terminal ACK ledger.
+        policy_reference_bound: true,
+    };
+    let receipt = memcordon_core::WindowsTerminalReceiptV2 {
+        schema_version: 2,
+        policy_enforcement: None,
+        attempt_id: record.attempt_id.clone(),
+        nonce: record.nonce.clone(),
+        request_sha256: record.request_sha256.clone(),
+        payload: memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure {
+            witness,
+            child_pid: completed.child_pid,
+            duration_millis: millis(started.elapsed()),
+            outcome: completed.outcome,
+        },
+        process_observation,
+        cleanup_process_creation: None,
+        restart_safety,
+        retirement_proof: proof,
     };
     receipt.validate_for_attempt().map_err(str::to_owned)?;
     Ok(receipt)
@@ -5813,6 +6039,7 @@ impl Drop for TargetCleanupBarrier<'_> {
             return;
         }
         let _ = self.job.terminate(CANCEL_STATUS);
+        let _ = self.target.terminate_if_live(CANCEL_STATUS);
         let _ = self.target.wait(Duration::from_secs(30));
         let _ = self
             .job
@@ -5862,6 +6089,25 @@ impl<'a> AttemptCleanup<'a> {
         let _ = self.job.terminate(CANCEL_STATUS);
         if super::attempt_store::try_commit_diagnostics(&mut self.record).is_err() {
             self.record.causal_diagnostics.loss.writer_unavailable = true;
+        }
+    }
+    fn retain_retirement_fault(
+        &mut self,
+        request: &WindowsLaunchBrokerRequestV1,
+        fault: WindowsSealedFault,
+        primary: &mut Option<LaunchAttemptError>,
+    ) {
+        if let Err(failure) = inject_fault(
+            request,
+            &[fault],
+            memcordon_core::BoundarySetupPhase::Retirement,
+        ) {
+            self.observe_failure(&failure);
+            // Keep an earlier observed cause; the diagnostic journal retains
+            // this site's failure even when it is secondary.
+            if primary.is_none() {
+                *primary = Some(failure);
+            }
         }
     }
     fn new(

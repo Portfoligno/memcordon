@@ -27,6 +27,7 @@ pub mod mixed_advisory;
 pub mod mixed_observation;
 pub mod mixed_runtime;
 pub mod private_runtime;
+pub mod runtime_image_census;
 pub mod workload_admission_v2;
 pub mod workload_admission_v3;
 pub mod workload_codec;
@@ -109,11 +110,13 @@ pub use supervision::{
     RestartSummary, SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
     SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
     SupervisionTerminal, WindowsLoaderCleanupOutcomeV1, WindowsLoaderCleanupStatusV1,
-    WindowsLoaderDebugEventV1, WindowsLoaderDebugObservationV1,
-    WindowsLoaderMitigationObservationV1, WindowsLoaderMitigationPolicyObservationV1,
-    WindowsLoaderNativeStatusV1, WindowsLoaderQualificationFailureV2,
-    WindowsLoaderQualificationOutcomeV2, WindowsLoaderQualificationStageV2,
-    WindowsLoaderReadyEvidenceV1, WindowsSealedEvidenceV2, boundary_evidence_is_consistent,
+    WindowsLoaderConsoleComparisonOutcomeV1, WindowsLoaderConsoleComparisonV1,
+    WindowsLoaderDebugEventV1, WindowsLoaderDebugImagePathSourceV1,
+    WindowsLoaderDebugObservationV1, WindowsLoaderMitigationObservationV1,
+    WindowsLoaderMitigationPolicyObservationV1, WindowsLoaderNativeStatusV1,
+    WindowsLoaderQualificationFailureV2, WindowsLoaderQualificationOutcomeV2,
+    WindowsLoaderQualificationStageV2, WindowsLoaderReadyEvidenceV1, WindowsSealedEvidenceV2,
+    boundary_evidence_is_consistent,
 };
 pub use windows_capability_owner::{
     WINDOWS_CAPABILITY_OWNER_MANIFEST_SCHEMA_VERSION, WINDOWS_CAPABILITY_OWNER_ROLE_COUNT,
@@ -170,18 +173,18 @@ pub use windows_sealed::{
     WindowsMutantHookObservationV1, WindowsMutantKillEvidenceV1, WindowsMutantNativeObservationV1,
     WindowsMutantNativeReceiptV1, WindowsMutantObservationV1, WindowsPackageCleanupOutcomeV1,
     WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsPreauthorizationFaultMatrixEvidenceV2,
-    WindowsPreauthorizationRetirementProofV1, WindowsProcessIdentityV1, WindowsProviderProbeV1,
-    WindowsProviderRejectionDispositionV2, WindowsProviderRejectionV2,
-    WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1, WindowsProviderRequestV3,
-    WindowsProviderResponseV1, WindowsProviderResponseV3, WindowsPublicFrameFailureV1,
-    WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsReadOnlyQueryFailure,
-    WindowsReadOnlyQueryOperation, WindowsReadOnlyQueryPhase, WindowsRecoveryInventoryV1,
-    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1,
-    WindowsReplayPendingV1, WindowsReplayPendingV2, WindowsRetainedRecordBindingV1,
-    WindowsRetainedRecordUnavailableReasonV1, WindowsRetirementFaultMatrixEvidenceV1,
-    WindowsRetirementFaultMatrixEvidenceV2, WindowsRetirementLedgerCompletionV1,
-    WindowsRetirementProofSourceV2, WindowsRetirementProofV2, WindowsSealedFault,
-    WindowsSealedMutant, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
+    WindowsPreauthorizationRetirementProofV1, WindowsPrematureReleaseWitnessV1,
+    WindowsProcessIdentityV1, WindowsProviderProbeV1, WindowsProviderRejectionDispositionV2,
+    WindowsProviderRejectionV2, WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1,
+    WindowsProviderRequestV3, WindowsProviderResponseV1, WindowsProviderResponseV3,
+    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
+    WindowsReadOnlyQueryFailure, WindowsReadOnlyQueryOperation, WindowsReadOnlyQueryPhase,
+    WindowsRecoveryInventoryV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
+    WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsReplayPendingV2,
+    WindowsRetainedRecordBindingV1, WindowsRetainedRecordUnavailableReasonV1,
+    WindowsRetirementFaultMatrixEvidenceV1, WindowsRetirementFaultMatrixEvidenceV2,
+    WindowsRetirementLedgerCompletionV1, WindowsRetirementProofSourceV2, WindowsRetirementProofV2,
+    WindowsSealedFault, WindowsSealedMutant, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
     WindowsTerminalLifecycleV1, WindowsTerminalPayloadV2, WindowsTerminalReceiptV1,
     WindowsTerminalReceiptV2, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
     WindowsTerminalRetiredV2, WindowsTerminalSeedV2, WindowsTerminalizationCheckpointV1,

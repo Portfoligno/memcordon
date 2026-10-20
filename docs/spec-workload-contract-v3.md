@@ -10,6 +10,12 @@ An administrator imports each measured image with
 activates its grants with `package policy apply --file FILE`. Imports copy
 regular files into fresh protected inodes, check their declared bytes and native
 target, reconstruct declared links, and durably publish the immutable image.
+Only manifest-declared objects enter that image; an undeclared source object
+does not acquire installed path or descriptor authority. Root may observe the
+complete protected image using `package policy image inspect --definition FILE
+--cutoff-unix-millis ORIGINAL_CUTOFF --json`. This read-only census binds the
+published manifest, declared members and implicit directories under the supplied
+absolute cutoff; it grants no workload admission or execution authority.
 Image retirement uses `package policy image retire --definition FILE`; current
 policy and live attempt references prevent retirement of an image still in use.
 

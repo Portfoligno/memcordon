@@ -1,6 +1,10 @@
 //! Reviewed native command inventory. Runtime values never become shell source.
 #[derive(Clone, Copy)]
 pub(super) enum LiteralRun {
+    InstalledLoaderCleanupNative,
+    InstalledLoaderCleanupCargo,
+    LinuxProjectedProducerSeal,
+    LinuxProjectedProducerColdSeal,
     R0,
     R1,
     R2,
@@ -1730,6 +1734,18 @@ pub(super) enum LiteralRun {
 impl LiteralRun {
     pub(super) fn command(self) -> &'static str {
         match self {
+            Self::InstalledLoaderCleanupNative => {
+                "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"
+            }
+            Self::InstalledLoaderCleanupCargo => {
+                "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"
+            }
+            Self::LinuxProjectedProducerSeal => {
+                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell"
+            }
+            Self::LinuxProjectedProducerColdSeal => {
+                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell"
+            }
             Self::R0 => "rustup toolchain install 1.97.1 --profile minimal",
             Self::R1 => {
                 "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci"

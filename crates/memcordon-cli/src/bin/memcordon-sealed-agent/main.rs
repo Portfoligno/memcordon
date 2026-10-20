@@ -198,6 +198,37 @@ fn main() {
                 policy_registry::inspect()
             }
             #[cfg(all(target_os = "linux", feature = "private-tcp"))]
+            [
+                package,
+                policy,
+                image,
+                operation,
+                definition,
+                path,
+                cutoff,
+                millis,
+                json,
+            ] if package == "package"
+                && policy == "policy"
+                && image == "image"
+                && operation == "inspect"
+                && definition == "--definition"
+                && cutoff == "--cutoff-unix-millis"
+                && json == "--json" =>
+            {
+                millis
+                    .to_str()
+                    .ok_or_else(|| "image census cutoff is not UTF8".to_owned())
+                    .and_then(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "image census cutoff is invalid".to_owned())
+                    })
+                    .and_then(|value| {
+                        linux::runtime_image::inspect(std::path::Path::new(path), value)
+                    })
+            }
+            #[cfg(all(target_os = "linux", feature = "private-tcp"))]
             [package, policy, image, operation, definition, path, json]
                 if package == "package"
                     && policy == "policy"

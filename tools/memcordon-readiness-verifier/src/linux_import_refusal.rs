@@ -44,6 +44,24 @@ pub struct LinuxIsolationImportEvidence {
     pub retirement_stdout: String,
     pub retirement_stderr: String,
     pub replaced_original: Option<String>,
+    #[serde(default)]
+    pub outcome: LinuxIsolationImportOutcome,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum LinuxIsolationImportOutcome {
+    #[default]
+    Refused,
+    Excluded {
+        invocation: String,
+        native_creation: String,
+        native_process: String,
+        exit: String,
+        stdout: String,
+        stderr: String,
+        source_after: String,
+    },
 }
 impl LinuxIsolationImportEvidence {
     pub(crate) fn artifact_paths(&self) -> Vec<&str> {
@@ -80,6 +98,26 @@ impl LinuxIsolationImportEvidence {
         ];
         if let Some(path) = &self.replaced_original {
             paths.push(path);
+        }
+        if let LinuxIsolationImportOutcome::Excluded {
+            invocation,
+            native_creation,
+            native_process,
+            exit,
+            stdout,
+            stderr,
+            source_after,
+        } = &self.outcome
+        {
+            paths.extend([
+                invocation.as_str(),
+                native_creation,
+                native_process,
+                exit,
+                stdout,
+                stderr,
+                source_after,
+            ]);
         }
         paths
     }
@@ -432,11 +470,15 @@ pub(crate) fn verify(
     products: &BTreeMap<ProductKey, &ProductObservation>,
     custody: &custody::Custody,
 ) -> VerificationResult<()> {
-    header(
-        &e.format,
-        e.revision,
-        "memcordon.consumer-readiness.linux-isolation-import-refusal",
-    )?;
+    match (&e.outcome, e.format.as_str(), e.revision) {
+        (
+            LinuxIsolationImportOutcome::Refused,
+            "memcordon.consumer-readiness.linux-isolation-import-refusal",
+            1,
+        ) => {}
+        (_, "memcordon.consumer-readiness.linux-isolation-import", 2) => {}
+        _ => return Err("isolation importer typed outcome/version differs".into()),
+    }
     let origin = producer_origin(index, &record.key.target, record.key.channel.as_deref())?;
     if e.key != record.key
         || e.run_id != origin.run_id
@@ -626,7 +668,10 @@ pub(crate) fn verify(
         custody.bytes(&e.stderr)?,
         &agent.installed_sha256,
     )?;
-    if status == 0
+    let excluded = matches!(e.outcome, LinuxIsolationImportOutcome::Excluded { .. });
+    if (excluded && (status != 0 || e.key.scenario != "input-socket"))
+        || (!excluded && status == 0)
+        || (!excluded && e.revision == 2 && e.key.scenario == "input-socket")
         || command["identity"] != identity
         || command["cell"] != cell
         || command["lease_id"] != e.lease_id
@@ -810,5 +855,195 @@ pub(crate) fn verify(
         &decode(&e.source_retirement)?,
         &decode(&e.source_closure)?,
         custody,
-    )
+    )?;
+    if excluded {
+        validate_exclusion(e, custody, &command, &source, &agent.installed_sha256)?;
+    }
+    Ok(())
+}
+
+fn validate_exclusion(
+    e: &LinuxIsolationImportEvidence,
+    custody: &custody::Custody,
+    original_command: &Value,
+    source: &Value,
+    agent_sha: &str,
+) -> VerificationResult<()> {
+    let LinuxIsolationImportOutcome::Excluded {
+        invocation,
+        native_creation,
+        native_process,
+        exit,
+        stdout,
+        stderr,
+        source_after,
+    } = &e.outcome
+    else {
+        return Err("installed exclusion observation absent".into());
+    };
+    if e.format != "memcordon.consumer-readiness.linux-isolation-import"
+        || e.revision != 2
+        || e.key.scenario != "input-socket"
+    {
+        return Err("installed exclusion crosses explicit scenario/version".into());
+    }
+    let decode = |path: &str| crate::wire::json(custody.bytes(path)?);
+    let installation = decode(&e.stdout)?;
+    closed(
+        &installation,
+        &[
+            "format",
+            "revision",
+            "image",
+            "target",
+            "policy_activated",
+            "member_count",
+        ],
+    )?;
+    let definition = decode(&e.definition)?;
+    if installation["format"] != "memcordon.runtime-image-installation"
+        || installation["revision"] != 1
+        || installation["image"]
+            != crate::linux_build::linux_image_reference(&definition, &e.key.target)?
+        || installation["target"] != e.key.target
+        || installation["policy_activated"] != false
+        || installation["member_count"]
+            != definition["entries"]
+                .as_array()
+                .ok_or("excluded image members absent")?
+                .len()
+    {
+        return Err("excluded source lacks exact successful installation receipt".into());
+    }
+    let command = decode(invocation)?;
+    let native = decode(native_process)?;
+    let status = crate::linux_images::validate_linux_image_native_command(
+        &command,
+        &native,
+        custody.bytes(native_creation)?,
+        &decode(exit)?,
+        custody.bytes(invocation)?,
+        custody.bytes(stdout)?,
+        custody.bytes(stderr)?,
+        agent_sha,
+    )?;
+    if status != 0
+        || command["format"] != "memcordon.linux-isolation-image-inspection-command"
+        || command["cwd"]
+            .as_str()
+            .and_then(|path| path.strip_suffix("/installed-image-inspection"))
+            != original_command["cwd"].as_str()
+        || command["argv"]
+            != json!([
+                "package",
+                "policy",
+                "image",
+                "inspect",
+                "--definition",
+                original_command["argv"][5],
+                "--cutoff-unix-millis",
+                original_command["work_deadline_unix_millis"]
+                    .as_u64()
+                    .ok_or("exclusion original cutoff absent")?
+                    .to_string(),
+                "--json"
+            ])
+        || [
+            "identity",
+            "cell",
+            "lease_id",
+            "scenario",
+            "definition_sha256",
+            "work_deadline_unix_millis",
+            "cleanup_deadline_unix_millis",
+        ]
+        .iter()
+        .any(|field| command[*field] != original_command[*field])
+    {
+        return Err("installed exclusion native observer command differs".into());
+    }
+    for prior in [&e.native_process, &e.retirement_process] {
+        let prior = decode(prior)?;
+        if prior["process_id"] == native["process_id"] && prior["birth"] == native["birth"] {
+            return Err("installed exclusion reuses import/retirement process authority".into());
+        }
+    }
+    let census = decode(stdout)?;
+    crate::linux_image_census::validate_linux_installed_image_census(
+        &census,
+        &definition,
+        custody.hash(&e.definition)?,
+        &e.key.target,
+    )?;
+    if census["cutoff_unix_millis"] != original_command["work_deadline_unix_millis"] {
+        return Err("installed exclusion renewed original cutoff".into());
+    }
+    let after = decode(source_after)?;
+    closed(&after, &["format", "revision", "inventory", "listener"])?;
+    let inventory = decode(&e.inventory)?;
+    if after["format"] != "memcordon.linux-isolation-import-source-after"
+        || after["revision"] != 1
+        || after["inventory"] != inventory
+        || after["listener"] != source["mutation"]["listener"]
+    {
+        return Err("excluded socket/source changed across actual installed observation".into());
+    }
+    let mut source_identities = std::collections::BTreeSet::new();
+    for inventory in [decode(&e.original_inventory)?, inventory] {
+        source_identities.insert((
+            inventory["root"]["device"]
+                .as_u64()
+                .ok_or("source root device absent")?,
+            inventory["root"]["inode"]
+                .as_u64()
+                .ok_or("source root inode absent")?,
+        ));
+        for member in inventory["members"]
+            .as_array()
+            .ok_or("exclusion source population absent")?
+        {
+            source_identities.insert((
+                member["device"]
+                    .as_u64()
+                    .ok_or("source member device absent")?,
+                member["inode"]
+                    .as_u64()
+                    .ok_or("source member inode absent")?,
+            ));
+        }
+    }
+    source_identities.insert((
+        source["parent"]["device"]
+            .as_u64()
+            .ok_or("source parent device absent")?,
+        source["parent"]["inode"]
+            .as_u64()
+            .ok_or("source parent inode absent")?,
+    ));
+    source_identities.insert((
+        after["listener"]["device"]
+            .as_u64()
+            .ok_or("socket listener device absent")?,
+        after["listener"]["inode"]
+            .as_u64()
+            .ok_or("socket listener inode absent")?,
+    ));
+    let excluded_path = source["mutation"]["path"]
+        .as_str()
+        .ok_or("excluded source path absent")?;
+    if source_identities.contains(&crate::linux_image_census::identity(&census["root"])?)
+        || source_identities.contains(&crate::linux_image_census::identity(&census["store"])?)
+        || census["members"]
+            .as_array()
+            .ok_or("excluded installed population absent")?
+            .iter()
+            .any(|member| {
+                member["path"] == excluded_path
+                    || crate::linux_image_census::identity(&member["identity"])
+                        .is_ok_and(|identity| source_identities.contains(&identity))
+            })
+    {
+        return Err("installed image retained source path/inode/socket authority instead of fresh projection".into());
+    }
+    Ok(())
 }

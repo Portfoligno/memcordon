@@ -121,3 +121,168 @@ fn closed_native_pipe_retains_actual_write_error() {
     assert_eq!(failure.transferred_bytes, 0);
     assert!(failure.peer_closed);
 }
+
+#[cfg(feature = "test-support")]
+fn pumped_frame_pipe_pair() -> (OwnedHandle, OwnedHandle) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = wide_null(&format!(
+        r"\\.\pipe\memcordon-pumped-frame-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    // SAFETY: the finite unique local name and no-security-pointer arguments
+    // remain valid for creation; returned handles are exclusively owned.
+    let server = OwnedHandle::new(unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            256,
+            256,
+            0,
+            ptr::null(),
+        )
+    })
+    .unwrap();
+    // SAFETY: the existing pipe name is live; no security attributes or
+    // template handle are supplied, and the returned client is owned.
+    let client = OwnedHandle::new(unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    })
+    .unwrap();
+    // SAFETY: the current-process pseudo-handle is only borrowed by accept.
+    let server = accept_target_desktop_bootstrap_pipe(
+        server,
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() },
+        std::time::Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    (server, client)
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn pumped_pending_read_makes_progress_without_losing_frame_or_owner() {
+    let (server, client) = pumped_frame_pipe_pair();
+    let mut calls = 0;
+    let value: String = read_frame_bounded_pumped(
+        server.raw(),
+        None,
+        std::time::Instant::now() + Duration::from_secs(2),
+        TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+        &mut || {
+            calls += 1;
+            if calls == 1 {
+                write_frame(client.raw(), &"authenticated ready")?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(value, "authenticated ready");
+    assert_ne!(calls, 0);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn failed_pump_cancels_pending_read_before_next_frame() {
+    let (server, client) = pumped_frame_pipe_pair();
+    let failure = read_frame_bounded_pumped::<String>(
+        server.raw(),
+        None,
+        std::time::Instant::now() + Duration::from_secs(2),
+        TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+        &mut || Err("actual diagnostic pump failure".into()),
+    )
+    .unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("actual diagnostic pump failure")
+    );
+    write_frame(client.raw(), &"next intact frame").unwrap();
+    let next: String = read_frame_bounded(
+        server.raw(),
+        None,
+        std::time::Instant::now() + Duration::from_secs(2),
+        TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+    )
+    .unwrap();
+    assert_eq!(next, "next intact frame");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn pumped_pending_write_preserves_exact_frame_bytes() {
+    let (server, client) = pumped_frame_pipe_pair();
+    let value = "release".repeat(2048);
+    let payload = serde_json::to_vec(&value).unwrap();
+    let mut expected = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+    expected.extend(payload);
+    let mut observed = Vec::new();
+    let mut calls = 0;
+    let mut receive = || -> Result<(), String> {
+        calls += 1;
+        let mut available = 0;
+        // SAFETY: only the writable availability scalar is supplied, and the
+        // client handle stays live throughout this callback.
+        if unsafe {
+            PeekNamedPipe(
+                client.raw(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &raw mut available,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if available != 0 {
+            let mut bytes = [0_u8; 512];
+            let mut read = 0;
+            // SAFETY: the requested byte count fits this live stack buffer;
+            // the synchronous client has no outstanding operation.
+            if unsafe {
+                ReadFile(
+                    client.raw(),
+                    bytes.as_mut_ptr().cast(),
+                    available.min(512),
+                    &raw mut read,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            observed.extend_from_slice(&bytes[..read as usize]);
+        }
+        Ok(())
+    };
+    write_frame_bounded_pumped(
+        server.raw(),
+        None,
+        std::time::Instant::now() + Duration::from_secs(2),
+        TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
+        &value,
+        &mut receive,
+    )
+    .unwrap();
+    // Any trailing buffered bytes remain readable after write completion.
+    for _ in 0..64 {
+        receive().unwrap();
+    }
+    assert_ne!(calls, 0);
+    assert_eq!(observed, expected);
+}

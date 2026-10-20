@@ -28,6 +28,9 @@ use memcordon_core::{WINDOWS_MAX_FRAME_BYTES, WindowsSealedFault};
 
 use super::security::{NamedPipeSecurityError, NamedPipeSecurityMismatch, SecurityDescriptor};
 
+#[path = "pipe_connect_observation.rs"]
+mod connect_observation;
+
 const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 
 pub const TARGET_DESKTOP_BOOTSTRAP_PIPE_PREFIX: &str =
@@ -425,6 +428,7 @@ pub fn connect_with_fault(
 ) -> Result<OwnedHandle, String> {
     let endpoint = name;
     let name = wide_null(endpoint);
+    let mut observation = connect_observation::ConnectObservation::default();
     for _ in 0..100 {
         if certification_fault == Some(WindowsSealedFault::PrivatePipeConnect) {
             return Err(
@@ -451,6 +455,7 @@ pub fn connect_with_fault(
         let code = error
             .raw_os_error()
             .and_then(|value| u32::try_from(value).ok());
+        observation.record_create_failure(code);
         if !matches!(code, Some(ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND)) {
             let native_code = error
                 .raw_os_error()
@@ -463,10 +468,19 @@ pub fn connect_with_fault(
             std::thread::sleep(Duration::from_millis(10));
         } else {
             // SAFETY: name remains NUL-terminated for the call.
-            unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
+            let available = unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
+            // Last-error is meaningful only when this existing wait failed.
+            let result = if available == 0 {
+                Err(io::Error::last_os_error()
+                    .raw_os_error()
+                    .and_then(|value| u32::try_from(value).ok()))
+            } else {
+                Ok(())
+            };
+            observation.record_wait(result);
         }
     }
-    Err("timed out waiting for the sealed provider pipe".to_owned())
+    Err(observation.timeout_error())
 }
 
 pub fn endpoint_exists(name: &str) -> Result<bool, String> {
@@ -628,76 +642,133 @@ fn wait_overlapped(
     segment: &'static str,
     requested: u32,
 ) -> Result<u32, TargetDesktopBootstrapPipeError> {
-    let handles = [overlapped.hEvent, peer_process.unwrap_or(ptr::null_mut())];
-    let handle_count = if peer_process.is_some() { 2 } else { 1 };
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            cancel_and_drain(handle, overlapped);
-            return Err(TargetDesktopBootstrapPipeError::protocol(
-                operation,
-                format!(
-                    "segment={segment} requested={requested} target desktop bootstrap pipe operation timed out"
-                ),
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(now).as_millis();
-        let timeout = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
-        let wait = unsafe { WaitForMultipleObjects(handle_count, handles.as_ptr(), 0, timeout) };
-        if wait == WAIT_OBJECT_0 {
-            let mut transferred = 0_u32;
-            if unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) } == 0 {
+    BootstrapFrameProgress {
+        peer_process,
+        deadline,
+        operation,
+        pump: None,
+    }
+    .wait(handle, overlapped, segment, requested)
+}
+
+struct BootstrapFrameProgress<'a> {
+    peer_process: Option<HANDLE>,
+    deadline: std::time::Instant,
+    operation: TargetDesktopBootstrapPipeOperation,
+    pump: Option<&'a mut dyn FnMut() -> Result<(), String>>,
+}
+
+impl BootstrapFrameProgress<'_> {
+    fn wait(
+        &mut self,
+        handle: HANDLE,
+        overlapped: &mut OVERLAPPED,
+        segment: &'static str,
+        requested: u32,
+    ) -> Result<u32, TargetDesktopBootstrapPipeError> {
+        let peer_process = self.peer_process;
+        let deadline = self.deadline;
+        let operation = self.operation;
+        let handles = [overlapped.hEvent, peer_process.unwrap_or(ptr::null_mut())];
+        let handle_count = if peer_process.is_some() { 2 } else { 1 };
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                cancel_and_drain(handle, overlapped);
+                return Err(TargetDesktopBootstrapPipeError::protocol(
+                    operation,
+                    format!(
+                        "segment={segment} requested={requested} target desktop bootstrap pipe operation timed out"
+                    ),
+                ));
+            }
+            let pump_result = self.pump.as_mut().map(|pump| pump());
+            if let Some(Err(detail)) = pump_result {
+                cancel_and_drain(handle, overlapped);
+                return Err(TargetDesktopBootstrapPipeError::protocol(
+                    operation,
+                    format!("segment={segment} debug event pump failed: {detail}"),
+                ));
+            }
+            let now = if self.pump.is_some() {
+                std::time::Instant::now()
+            } else {
+                now
+            };
+            if self.pump.is_some() && now >= deadline {
+                cancel_and_drain(handle, overlapped);
+                return Err(TargetDesktopBootstrapPipeError::protocol(
+                    operation,
+                    format!(
+                        "segment={segment} requested={requested} target desktop bootstrap pipe operation timed out"
+                    ),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now).as_millis();
+            let mut timeout = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
+            if self.pump.is_some() {
+                timeout = timeout.min(1);
+            }
+            let wait =
+                unsafe { WaitForMultipleObjects(handle_count, handles.as_ptr(), 0, timeout) };
+            if wait == WAIT_OBJECT_0 {
+                let mut transferred = 0_u32;
+                if unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) } == 0
+                {
+                    let error = io::Error::last_os_error();
+                    return Err(TargetDesktopBootstrapPipeError::native(
+                        operation, segment, &error,
+                    ));
+                }
+                return Ok(transferred);
+            }
+            if handle_count == 2 && wait == WAIT_OBJECT_0 + 1 {
+                let peer_process = peer_process.expect("peer handle count proves peer presence");
+                let mut transferred = 0_u32;
+                // A final frame and process exit may race. Consume an already
+                // completed operation before diagnosing peer termination.
+                if unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) } != 0
+                {
+                    return Ok(transferred);
+                }
+                let completion_error = io::Error::last_os_error();
+                if completion_error.raw_os_error() == Some(ERROR_IO_INCOMPLETE as i32)
+                    && unsafe { WaitForSingleObject(overlapped.hEvent, 50) } == WAIT_OBJECT_0
+                    && unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) }
+                        != 0
+                {
+                    return Ok(transferred);
+                }
+                cancel_and_drain(handle, overlapped);
+                let mut exit_code = 0_u32;
+                if unsafe { GetExitCodeProcess(peer_process, &raw mut exit_code) } == 0 {
+                    let error = io::Error::last_os_error();
+                    return Err(TargetDesktopBootstrapPipeError::native(
+                        operation,
+                        "peer-exit-query",
+                        &error,
+                    ));
+                }
+                return Err(target_desktop_bootstrap_peer_exit_error(
+                    operation, segment, requested, exit_code,
+                ));
+            }
+            if wait == WAIT_TIMEOUT {
+                continue;
+            }
+            if wait == WAIT_FAILED {
+                cancel_and_drain(handle, overlapped);
                 let error = io::Error::last_os_error();
                 return Err(TargetDesktopBootstrapPipeError::native(
                     operation, segment, &error,
                 ));
             }
-            return Ok(transferred);
-        }
-        if handle_count == 2 && wait == WAIT_OBJECT_0 + 1 {
-            let peer_process = peer_process.expect("peer handle count proves peer presence");
-            let mut transferred = 0_u32;
-            // A final frame and process exit may race. Consume an already
-            // completed operation before diagnosing peer termination.
-            if unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) } != 0 {
-                return Ok(transferred);
-            }
-            let completion_error = io::Error::last_os_error();
-            if completion_error.raw_os_error() == Some(ERROR_IO_INCOMPLETE as i32)
-                && unsafe { WaitForSingleObject(overlapped.hEvent, 50) } == WAIT_OBJECT_0
-                && unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 0) } != 0
-            {
-                return Ok(transferred);
-            }
             cancel_and_drain(handle, overlapped);
-            let mut exit_code = 0_u32;
-            if unsafe { GetExitCodeProcess(peer_process, &raw mut exit_code) } == 0 {
-                let error = io::Error::last_os_error();
-                return Err(TargetDesktopBootstrapPipeError::native(
-                    operation,
-                    "peer-exit-query",
-                    &error,
-                ));
-            }
-            return Err(target_desktop_bootstrap_peer_exit_error(
-                operation, segment, requested, exit_code,
+            return Err(TargetDesktopBootstrapPipeError::protocol(
+                operation,
+                format!("segment={segment} unexpected pipe wait result={wait}"),
             ));
         }
-        if wait == WAIT_TIMEOUT {
-            continue;
-        }
-        if wait == WAIT_FAILED {
-            cancel_and_drain(handle, overlapped);
-            let error = io::Error::last_os_error();
-            return Err(TargetDesktopBootstrapPipeError::native(
-                operation, segment, &error,
-            ));
-        }
-        cancel_and_drain(handle, overlapped);
-        return Err(TargetDesktopBootstrapPipeError::protocol(
-            operation,
-            format!("segment={segment} unexpected pipe wait result={wait}"),
-        ));
     }
 }
 
@@ -1017,6 +1088,30 @@ fn overlapped_transfer(
     operation: TargetDesktopBootstrapPipeOperation,
     segment: &'static str,
 ) -> Result<u32, TargetDesktopBootstrapPipeError> {
+    transfer_with_progress(
+        handle,
+        buffer,
+        length,
+        write,
+        segment,
+        &mut BootstrapFrameProgress {
+            peer_process,
+            deadline,
+            operation,
+            pump: None,
+        },
+    )
+}
+
+fn transfer_with_progress(
+    handle: HANDLE,
+    buffer: *mut u8,
+    length: u32,
+    write: bool,
+    segment: &'static str,
+    progress: &mut BootstrapFrameProgress<'_>,
+) -> Result<u32, TargetDesktopBootstrapPipeError> {
+    let operation = progress.operation;
     let (_event, mut overlapped) = overlapped_event()
         .map_err(|detail| TargetDesktopBootstrapPipeError::protocol(operation, detail))?;
     let mut immediate = 0_u32;
@@ -1048,15 +1143,7 @@ fn overlapped_transfer(
         .and_then(|value| u32::try_from(value).ok())
         == Some(ERROR_IO_PENDING)
     {
-        wait_overlapped(
-            handle,
-            peer_process,
-            &mut overlapped,
-            deadline,
-            operation,
-            segment,
-            length,
-        )
+        progress.wait(handle, &mut overlapped, segment, length)
     } else {
         Err(TargetDesktopBootstrapPipeError::native(
             operation, segment, &error,
@@ -1071,6 +1158,45 @@ pub fn write_frame_bounded<T: Serialize>(
     operation: TargetDesktopBootstrapPipeOperation,
     value: &T,
 ) -> Result<(), TargetDesktopBootstrapPipeError> {
+    write_frame_with_progress(
+        handle,
+        value,
+        &mut BootstrapFrameProgress {
+            peer_process,
+            deadline,
+            operation,
+            pump: None,
+        },
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn write_frame_bounded_pumped<T: Serialize>(
+    handle: HANDLE,
+    peer_process: Option<HANDLE>,
+    deadline: std::time::Instant,
+    operation: TargetDesktopBootstrapPipeOperation,
+    value: &T,
+    pump: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), TargetDesktopBootstrapPipeError> {
+    write_frame_with_progress(
+        handle,
+        value,
+        &mut BootstrapFrameProgress {
+            peer_process,
+            deadline,
+            operation,
+            pump: Some(pump),
+        },
+    )
+}
+
+fn write_frame_with_progress<T: Serialize>(
+    handle: HANDLE,
+    value: &T,
+    progress: &mut BootstrapFrameProgress<'_>,
+) -> Result<(), TargetDesktopBootstrapPipeError> {
+    let operation = progress.operation;
     let payload = serde_json::to_vec(value)
         .map_err(|error| TargetDesktopBootstrapPipeError::protocol(operation, error))?;
     if payload.len() > WINDOWS_MAX_FRAME_BYTES {
@@ -1084,17 +1210,15 @@ pub fn write_frame_bounded<T: Serialize>(
     bytes.extend_from_slice(&payload);
     let mut offset = 0;
     while offset < bytes.len() {
-        let transferred = match overlapped_transfer(
+        let transferred = match transfer_with_progress(
             handle,
-            peer_process,
-            deadline,
             bytes[offset..].as_mut_ptr(),
             u32::try_from(bytes.len() - offset).map_err(|_| {
                 TargetDesktopBootstrapPipeError::protocol(operation, "frame is not representable")
             })?,
             true,
-            operation,
             "frame",
+            progress,
         ) {
             Ok(transferred) => transferred as usize,
             Err(error) => return Err(error.with_bytes_transferred(offset)),
@@ -1111,27 +1235,24 @@ pub fn write_frame_bounded<T: Serialize>(
     Ok(())
 }
 
-fn read_exact_bounded(
+fn read_exact_with_progress(
     handle: HANDLE,
-    peer_process: Option<HANDLE>,
-    deadline: std::time::Instant,
     buffer: &mut [u8],
-    operation: TargetDesktopBootstrapPipeOperation,
     segment: &'static str,
+    progress: &mut BootstrapFrameProgress<'_>,
 ) -> Result<(), TargetDesktopBootstrapPipeError> {
+    let operation = progress.operation;
     let mut offset = 0;
     while offset < buffer.len() {
-        let transferred = overlapped_transfer(
+        let transferred = transfer_with_progress(
             handle,
-            peer_process,
-            deadline,
             buffer[offset..].as_mut_ptr(),
             u32::try_from(buffer.len() - offset).map_err(|_| {
                 TargetDesktopBootstrapPipeError::protocol(operation, "frame is not representable")
             })?,
             false,
-            operation,
             segment,
+            progress,
         )? as usize;
         if transferred == 0 {
             return Err(TargetDesktopBootstrapPipeError::protocol(
@@ -1150,15 +1271,43 @@ pub fn read_frame_bounded<T: DeserializeOwned>(
     deadline: std::time::Instant,
     operation: TargetDesktopBootstrapPipeOperation,
 ) -> Result<T, TargetDesktopBootstrapPipeError> {
-    let mut length = [0_u8; 4];
-    read_exact_bounded(
+    read_frame_with_progress(
         handle,
-        peer_process,
-        deadline,
-        &mut length,
-        operation,
-        "length",
-    )?;
+        &mut BootstrapFrameProgress {
+            peer_process,
+            deadline,
+            operation,
+            pump: None,
+        },
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn read_frame_bounded_pumped<T: DeserializeOwned>(
+    handle: HANDLE,
+    peer_process: Option<HANDLE>,
+    deadline: std::time::Instant,
+    operation: TargetDesktopBootstrapPipeOperation,
+    pump: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<T, TargetDesktopBootstrapPipeError> {
+    read_frame_with_progress(
+        handle,
+        &mut BootstrapFrameProgress {
+            peer_process,
+            deadline,
+            operation,
+            pump: Some(pump),
+        },
+    )
+}
+
+fn read_frame_with_progress<T: DeserializeOwned>(
+    handle: HANDLE,
+    progress: &mut BootstrapFrameProgress<'_>,
+) -> Result<T, TargetDesktopBootstrapPipeError> {
+    let operation = progress.operation;
+    let mut length = [0_u8; 4];
+    read_exact_with_progress(handle, &mut length, "length", progress)?;
     let length = u32::from_le_bytes(length) as usize;
     if length > WINDOWS_MAX_FRAME_BYTES {
         return Err(TargetDesktopBootstrapPipeError::protocol(
@@ -1167,14 +1316,7 @@ pub fn read_frame_bounded<T: DeserializeOwned>(
         ));
     }
     let mut payload = vec![0_u8; length];
-    read_exact_bounded(
-        handle,
-        peer_process,
-        deadline,
-        &mut payload,
-        operation,
-        "payload",
-    )?;
+    read_exact_with_progress(handle, &mut payload, "payload", progress)?;
     serde_json::from_slice(&payload)
         .map_err(|error| TargetDesktopBootstrapPipeError::protocol(operation, error))
 }

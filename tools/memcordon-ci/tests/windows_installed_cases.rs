@@ -139,6 +139,15 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
         sha256: artifacts::checksum(b"selected archive"),
     };
     std::fs::write(&archive.path, b"selected archive").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let output_owner = tempfile::tempdir_in(&cwd).unwrap();
+    let relative_output = output_owner
+        .path()
+        .strip_prefix(&cwd)
+        .unwrap()
+        .join("fresh/cases/windows-installed");
+    assert!(!relative_output.is_absolute());
+    assert!(!cwd.join(&relative_output).exists());
     let construct = |source: &SelectedSource| {
         InstalledWindowsPayload::from_materialized(
             InstalledChannel::NativeBundle,
@@ -148,10 +157,30 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
             directory.path(),
             fixture.clone(),
             &directory.path().join("installed"),
-            directory.path().join("reports"),
+            relative_output.clone(),
         )
     };
     let payload = construct(&source).unwrap();
+    assert_eq!(payload.output_directory, cwd.join(&relative_output));
+    assert!(payload.output_directory.is_absolute());
+    assert!(!payload.output_directory.exists());
+    let retained: InstalledWindowsPayload =
+        serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&retained).unwrap(),
+        serde_json::to_value(&payload).unwrap()
+    );
+    let original_pending = payload.output_directory.join("pending-loader-diagnostic");
+    let support_pending = retained.output_directory.join("pending-loader-diagnostic");
+    assert_eq!(original_pending, support_pending);
+    for selected in [
+        original_pending.join("memcordon-target-desktop-bootstrap.exe"),
+        support_pending.join("original-payload.json"),
+        retained.output_directory.join("separate-loader-support"),
+    ] {
+        assert!(selected.is_absolute());
+        assert!(selected.starts_with(&payload.output_directory));
+    }
     assert_eq!(payload.components.len(), 4);
     assert_eq!(payload.cli.path, directory.path().join("memcordon.exe"));
     assert_eq!(payload.installed_components.len(), 3);

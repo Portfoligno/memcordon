@@ -121,11 +121,12 @@ pub(crate) use attestation::{
     token_attestation_snapshot, token_query_attestation_snapshot,
 };
 pub(crate) use derivation::{
-    LauncherHolderTokenDerivation, LauncherHolderTokenDerivationError,
+    CurrentProcessQueryToken, LauncherHolderTokenDerivation, LauncherHolderTokenDerivationError,
     LauncherHolderTokenDerivationStage, SessionBrokerHolderToken,
-    canonical_same_access_restricting_sids, current_process_token_for_access_check,
-    current_process_token_for_attestation, current_process_token_for_attestation_and_access_check,
-    derive_launcher_holder_primary, derive_session_broker_holder_primary, granted_handle_access,
+    canonical_same_access_restricting_sids, current_process_query_token,
+    current_process_token_for_access_check, current_process_token_for_attestation,
+    current_process_token_for_attestation_and_access_check, derive_launcher_holder_primary,
+    derive_session_broker_holder_primary, granted_handle_access,
     normalize_current_session_broker_source_privileges, validate_holder_session_derivation,
     validate_normalized_session_broker_source_snapshot, with_scoped_loader_profile_privileges,
     with_scoped_service_owner_restore_privilege, with_session_broker_launch_privileges,

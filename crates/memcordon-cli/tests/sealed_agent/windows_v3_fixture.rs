@@ -197,6 +197,7 @@ pub fn postauthorization_failure(
         request_sha256: record.request_sha256.clone(),
         process_observation: observation,
         primary_failure: Some(failure.clone()),
+        premature_release: None,
     });
     record.retirement_proof = Some(proof);
     record.lifecycle = memcordon_core::WindowsTerminalLifecycleV1::ProofReady;

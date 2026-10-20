@@ -2,20 +2,23 @@
 //! This module never supplies an input to publication or admits a workload.
 use super::{
     artifacts,
-    http::{self, ReadBudget, Transport},
+    http::{self, ReadBudget, StreamingTransport, Transport},
 };
 use crate::{
     CiError, Result,
     consumer_readiness_ledger::{CellEvidence, SourceIdentity},
 };
 use memcordon_readiness_verifier::{
-    Artifact, JobOutcome, JobResult, ProducerManifest, ProducerOrigin,
+    Artifact, JobOutcome, JobResult, MAX_PRODUCER_ARCHIVE_BYTES, MAX_PRODUCER_BYTES,
+    ProducerManifest, ProducerOrigin,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Cursor, Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 pub struct DownloadedProducer {
@@ -23,6 +26,83 @@ pub struct DownloadedProducer {
     pub cell: CellEvidence,
     pub directory: PathBuf,
     pub archive: Artifact,
+}
+
+fn copy_hashed(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    maximum: u64,
+    deadline: Instant,
+) -> Result<(u64, String)> {
+    let mut digest = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(CiError::Message("producer custody deadline expired".into()));
+        }
+        let admission = usize::try_from(maximum.saturating_sub(length).saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let count = reader.read(&mut buffer[..admission])?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > maximum.saturating_sub(length) {
+            return Err(CiError::Message(format!(
+                "producer stream exceeds bound: limit={maximum}; observed-at-least={}",
+                length + count as u64
+            )));
+        }
+        writer.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+        length += count as u64;
+    }
+    Ok((length, hex::encode(digest.finalize())))
+}
+
+pub fn retain_downloaded_archive(
+    directory: &Path,
+    archive: &Artifact,
+    destination: &Path,
+    deadline: Instant,
+) -> Result<()> {
+    let mut source = fs::File::open(directory.join(&archive.path))?;
+    let mut destination = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    let (length, sha256) = copy_hashed(
+        &mut source,
+        &mut destination,
+        MAX_PRODUCER_ARCHIVE_BYTES,
+        deadline,
+    )?;
+    if length != archive.length || sha256 != archive.sha256 {
+        return Err(CiError::Message(
+            "retained producer archive custody differs".into(),
+        ));
+    }
+    destination.sync_all()?;
+    Ok(())
+}
+
+pub fn check_evidence_budget(existing: &[Artifact], producer: &DownloadedProducer) -> Result<()> {
+    let mut total = producer.archive.length;
+    for artifact in existing.iter().chain(&producer.cell.artifacts) {
+        total = total
+            .checked_add(artifact.length)
+            .filter(|total| *total <= MAX_PRODUCER_BYTES)
+            .ok_or_else(|| {
+                CiError::Message("producer custody exceeds total evidence budget".into())
+            })?;
+    }
+    if total > MAX_PRODUCER_BYTES {
+        return Err(CiError::Message(
+            "producer custody exceeds total evidence budget".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn positive(value: &serde_json::Value, field: &str) -> Result<u64> {
@@ -237,7 +317,7 @@ pub fn job_outcomes(
     reason = "Download custody independently binds transport budget, run, attempt, artifact, producer, source, and destination"
 )]
 pub fn download_producer(
-    transport: &impl Transport,
+    transport: &impl StreamingTransport,
     budget: &ReadBudget,
     headers: &[(String, String)],
     repository: &str,
@@ -285,35 +365,48 @@ pub fn download_producer(
     let declared = text(&metadata, "digest")?
         .strip_prefix("sha256:")
         .ok_or_else(|| CiError::Message("producer upload lacks actual SHA256 digest".into()))?;
-    let bytes = http::download(
+    let declared_length = positive(&metadata, "size_in_bytes")?;
+    if declared_length > MAX_PRODUCER_ARCHIVE_BYTES {
+        return Err(CiError::Message(format!(
+            "producer ZIP exceeds container bound: job={job}; run={run}; artifact={artifact_id}; declared={declared_length}; limit={MAX_PRODUCER_ARCHIVE_BYTES}"
+        )));
+    }
+    fs::create_dir(destination)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(destination)?;
+    let observed = http::download_to_file(
         transport,
         budget,
         &http::github_url(repository, &["actions", "artifacts", &id, "zip"])?,
         headers,
-        512 * 1024 * 1024,
+        declared_length,
+        temporary.as_file_mut(),
+    ).map_err(|error| CiError::Message(format!("producer ZIP download failed: job={job}; run={run}; artifact={artifact_id}; declared={declared_length}; limit={MAX_PRODUCER_ARCHIVE_BYTES}; {error}")))?;
+    if observed != declared_length {
+        return Err(CiError::Message(format!(
+            "producer ZIP length differs: job={job}; run={run}; artifact={artifact_id}; declared={declared_length}; observed={observed}"
+        )));
+    }
+    temporary.as_file_mut().seek(SeekFrom::Start(0))?;
+    let (length, sha256) = copy_hashed(
+        temporary.as_file_mut(),
+        &mut std::io::sink(),
+        declared_length,
+        budget.deadline(),
     )?;
-    let sha256 = artifacts::checksum(&bytes);
-    if sha256 != declared
-        || metadata
-            .get("size_in_bytes")
-            .and_then(serde_json::Value::as_u64)
-            != Some(bytes.len() as u64)
-    {
+    if sha256 != declared || length != declared_length {
         return Err(CiError::Message(
             "downloaded producer ZIP differs from actual immutable upload".into(),
         ));
     }
-    fs::create_dir(destination)?;
     let archive_name = format!("producer-{artifact_id}.zip");
     let archive_path = destination.join(&archive_name);
-    let mut retained = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&archive_path)?;
-    retained.write_all(&bytes)?;
+    let mut retained = temporary
+        .persist_noclobber(&archive_path)
+        .map_err(|error| error.error)?;
     retained.sync_all()?;
-    let mut zip = zip::ZipArchive::new(Cursor::new(&bytes))
-        .map_err(|error| CiError::Message(error.to_string()))?;
+    retained.seek(SeekFrom::Start(0))?;
+    let mut zip =
+        zip::ZipArchive::new(retained).map_err(|error| CiError::Message(error.to_string()))?;
     if zip.len() > 65_536 {
         return Err(CiError::Message(
             "producer ZIP member count exceeds bound".into(),
@@ -394,6 +487,14 @@ pub fn download_producer(
             return Err(CiError::Message("producer raw file exceeds bound".into()));
         }
     }
+    if total
+        .checked_add(declared_length)
+        .is_none_or(|total| total > MAX_PRODUCER_BYTES)
+    {
+        return Err(CiError::Message(
+            "producer archive and decoded artifacts exceed total evidence budget".into(),
+        ));
+    }
     for artifact in &manifest.artifacts {
         let relative = artifacts::safe_relative(Path::new(&artifact.path))?;
         if relative == Path::new("cell.json")
@@ -414,20 +515,23 @@ pub fn download_producer(
                 "producer ZIP member length/type differs".into(),
             ));
         }
-        let mut data = Vec::new();
-        member.take(artifact.length + 1).read_to_end(&mut data)?;
-        if data.len() as u64 != artifact.length || artifacts::checksum(&data) != artifact.sha256 {
-            return Err(CiError::Message(
-                "producer original raw artifact bytes differ".into(),
-            ));
-        }
         let path = destination.join(relative);
         fs::create_dir_all(path.parent().expect("artifact parent"))?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)?;
-        file.write_all(&data)?;
+        let (length, sha256) = copy_hashed(
+            &mut member.take(artifact.length + 1),
+            &mut file,
+            artifact.length,
+            budget.deadline(),
+        )?;
+        if length != artifact.length || sha256 != artifact.sha256 {
+            return Err(CiError::Message(
+                "producer original raw artifact bytes differ".into(),
+            ));
+        }
         file.sync_all()?;
     }
     let cell_bytes = {
@@ -494,7 +598,7 @@ pub fn download_producer(
         directory: destination.into(),
         archive: Artifact {
             path: archive_name,
-            length: bytes.len() as u64,
+            length,
             sha256,
         },
     })

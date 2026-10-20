@@ -7,6 +7,16 @@ mod loader_mitigations;
 #[path = "original_loader_debug.rs"]
 mod original_loader_debug;
 
+#[cfg(feature = "test-support")]
+#[path = "original_loader_console_comparison.rs"]
+mod original_loader_console_comparison;
+
+#[path = "bootstrap_entry_failure.rs"]
+mod bootstrap_entry_failure;
+
+#[path = "bootstrap_probe_policy.rs"]
+mod bootstrap_probe_policy;
+
 fn original_loader_work_cutoff() -> Instant {
     let cutoff = Instant::now() + Duration::from_secs(30);
     #[cfg(feature = "test-support")]
@@ -1109,6 +1119,8 @@ pub(crate) use self::TargetDesktopBootstrapRoleV1 as TargetDesktopBootstrapRole;
 pub(super) struct TargetDesktopBootstrapBindingV3 {
     schema_version: u32,
     role: TargetDesktopBootstrapRoleV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_creation_policy: Option<bootstrap_probe_policy::ConsolelessProbePolicyV1>,
     target_user_object_policy_role: super::security::TargetUserObjectPolicyRoleV1,
     nonce: String,
     binding_sha256: String,
@@ -1128,6 +1140,10 @@ pub(super) struct TargetDesktopBootstrapBindingV3 {
     target_envelope: WindowsCallerTokenEnvelopeV1,
     target_request_snapshot: super::token::TokenAttestationSnapshot,
 }
+
+#[cfg(test)]
+#[path = "../../../../../tests/sealed_agent/windows_bootstrap_binding.rs"]
+mod windows_bootstrap_binding;
 
 impl TargetDesktopBootstrapBindingV3 {
     fn seal(mut self) -> Result<Self, String> {
@@ -1150,7 +1166,12 @@ impl TargetDesktopBootstrapBindingV3 {
             .ok_or_else(|| "target desktop bootstrap binding is not an object".to_owned())?
             .remove("binding_sha256")
             .ok_or_else(|| "target desktop bootstrap binding digest field is absent".to_owned())?;
-        let mut canonical = b"memcordon-target-desktop-binding-v8\0".to_vec();
+        let mut canonical = bootstrap_probe_policy::binding_domain(
+            self.schema_version,
+            self.role.diagnostic(),
+            self.probe_creation_policy.as_ref(),
+        )?
+        .to_vec();
         canonical.extend(serde_json::to_vec(&claims).map_err(|error| error.to_string())?);
         Ok(super::record::digest(&canonical))
     }
@@ -1493,6 +1514,7 @@ pub(crate) fn validate_loader_control_desktop_evidence(
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
 pub(super) enum TargetDesktopBootstrapMessageV1 {
+    EntryFailure(bootstrap_entry_failure::EntryFailureV1),
     LoaderReady {
         schema_version: u32,
         nonce: String,
@@ -1762,6 +1784,7 @@ impl TargetDesktopLease {
         let binding = TargetDesktopBootstrapBindingV3 {
             schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
             role: TargetDesktopBootstrapRoleV1::Holder,
+            probe_creation_policy: None,
             target_user_object_policy_role: policy_role,
             nonce,
             binding_sha256: String::new(),
@@ -2543,6 +2566,21 @@ pub(super) fn launch_target_desktop_loader_control(
             started,
             exact_desktop,
         );
+        #[cfg(feature = "test-support")]
+        if let Some(execution) = crate::windows::support_loader_diagnostic::current() {
+            original_loader_console_comparison::compare_after_baseline(&execution, error, || {
+                launch_target_desktop_loader_control_inner(
+                    target_token,
+                    target_envelope,
+                    target_snapshot,
+                    exact_desktop,
+                    launch_context,
+                    association_preflight,
+                    window_station_security_descriptor_sddl,
+                    desktop_security_descriptor_sddl,
+                )
+            });
+        }
     }
     result
 }
@@ -2654,14 +2692,20 @@ struct PackageLoaderFactory<'a> {
     thread_security: &'a NativeSecurityDescriptorV1,
 }
 
-impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
+impl<const VERSION: u32> SuspendedProcessFactory<VERSION> for PackageLoaderFactory<'_> {
     type Process = PackageLoaderProcess;
 
-    fn desktop_preflight(&self, _plan: &ProductionLoaderPlan) -> Result<(), ProcessCreateFailure> {
+    fn desktop_preflight(
+        &self,
+        _plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
+    ) -> Result<(), ProcessCreateFailure> {
         Ok(())
     }
 
-    fn create(&self, plan: &ProductionLoaderPlan) -> Result<Self::Process, ProcessCreateFailure> {
+    fn create(
+        &self,
+        plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
+    ) -> Result<Self::Process, ProcessCreateFailure> {
         #[cfg(feature = "test-support")]
         let diagnostic_execution = crate::windows::support_loader_diagnostic::current();
         #[cfg(feature = "test-support")]
@@ -2678,7 +2722,7 @@ impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
         let mut command = self.command.borrow_mut();
         let mut environment = self.environment.borrow_mut();
         let mut desktop = self.desktop.borrow_mut();
-        let native = create_suspended_in_job(ProductionNativeCreateRequestV1 {
+        let request = ProductionNativeCreateRequest {
             plan,
             target_token: self.target_token,
             job: self.job.handle(),
@@ -2689,8 +2733,27 @@ impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
             desktop: &mut desktop,
             process_security: Some(self.process_security),
             thread_security: Some(self.thread_security),
-        })
-        .map_err(|error| ProcessCreateFailure {
+        };
+        #[cfg(feature = "test-support")]
+        let native = if let Some(execution) = diagnostic_execution
+            .as_ref()
+            .filter(|value| value.detached_console.get())
+        {
+            let plan = execution.active_console_plan.borrow();
+            memcordon_windows_launch_core::create_support_detached_console(
+                request,
+                plan.as_ref().ok_or_else(|| ProcessCreateFailure {
+                    stable_code: "support-console-plan-absent".into(),
+                    native_status: None,
+                    detail: "diagnostic native request lacks its distinct plan".into(),
+                })?,
+            )
+        } else {
+            create_suspended_in_job(request)
+        };
+        #[cfg(not(feature = "test-support"))]
+        let native = create_suspended_in_job(request);
+        let native = native.map_err(|error| ProcessCreateFailure {
             stable_code: error.stable_code.to_owned(),
             native_status: error.win32_error.map(|code| NativeStatusV1::Win32 { code }),
             detail: error.detail,
@@ -2713,7 +2776,11 @@ impl SuspendedProcessFactory for PackageLoaderFactory<'_> {
         if let Some(execution) = &_process.diagnostic_execution {
             let cleanup = if let Some(owner) = _process.debug_owner.as_mut() {
                 let result = owner.cleanup_until(self.job, execution.cleanup);
-                *execution.observation.borrow_mut() = Some(owner.observation());
+                if execution.detached_console.get() {
+                    *execution.variant_observation.borrow_mut() = Some(owner.observation());
+                } else {
+                    *execution.observation.borrow_mut() = Some(owner.observation());
+                }
                 result
             } else {
                 self.job
@@ -2774,11 +2841,13 @@ struct PackageLoaderAttestor<'a> {
     executable: &'a Path,
 }
 
-impl SuspendedProcessAttestor<PackageLoaderProcess> for PackageLoaderAttestor<'_> {
+impl<const VERSION: u32> SuspendedProcessAttestor<PackageLoaderProcess, VERSION>
+    for PackageLoaderAttestor<'_>
+{
     fn attest(
         &self,
         process: &PackageLoaderProcess,
-        plan: &ProductionLoaderPlan,
+        plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
     ) -> Result<SuspendedProcessEvidenceV1, ProcessCreateFailure> {
         self.process_security
             .verify_kernel_object(
@@ -2924,11 +2993,13 @@ struct PackageLoaderChannel<'a> {
     exact_desktop: &'a str,
 }
 
-impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
+impl<const VERSION: u32> LoaderReadyChannel<PackageLoaderProcess, VERSION>
+    for PackageLoaderChannel<'_>
+{
     fn resume(
         &self,
         process: &mut PackageLoaderProcess,
-        plan: &ProductionLoaderPlan,
+        plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure> {
         let cutoff = Instant::now() + Duration::from_secs(30);
         #[cfg(feature = "test-support")]
@@ -2998,12 +3069,23 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                     identity,
                     execution.selection.challenge.clone(),
                     plan.executable_sha256().to_owned(),
-                    plan.launch_plan_sha256().to_owned(),
+                    execution.active_console_plan.borrow().as_ref().map_or_else(
+                        || plan.launch_plan_sha256().to_owned(),
+                        |diagnostic| diagnostic.diagnostic_plan_sha256().to_owned(),
+                    ),
                     accept,
                     execution.cleanup,
                 )
                 .map_err(|error| package_process_failure("support-loader-attach", error.into()))?,
             );
+            process
+                .debug_owner
+                .as_mut()
+                .expect("diagnostic attachment retains its debug owner")
+                .prepare_resume(process.native.thread_id(), cutoff)
+                .map_err(|error| {
+                    package_process_failure("support-loader-initial-debug-events", error.into())
+                })?;
             if Instant::now() >= cutoff {
                 return Err(ProcessCreateFailure {
                     stable_code: "support-loader-original-cutoff".into(),
@@ -3026,7 +3108,7 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
     fn await_ready(
         &self,
         process: &mut PackageLoaderProcess,
-        plan: &ProductionLoaderPlan,
+        plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
     ) -> Result<memcordon_windows_launch_core::HandshakeOutcomeV1, ProcessCreateFailure> {
         let identity = process
             .identity
@@ -3143,19 +3225,50 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                 TargetDesktopLeaseCreateError::from(detail),
             )
         })?;
-        let loader_ready: TargetDesktopBootstrapMessageV1 = super::pipe::read_frame_bounded(
+        #[cfg(feature = "test-support")]
+        let loader_ready = if let Some(owner) = process.debug_owner.as_mut() {
+            super::pipe::read_frame_bounded_pumped(
+                connection.raw(),
+                Some(process.native.process_handle()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+                &mut || owner.pump_handshake_until(deadline),
+            )
+        } else {
+            super::pipe::read_frame_bounded(
+                connection.raw(),
+                Some(process.native.process_handle()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+            )
+        };
+        #[cfg(not(feature = "test-support"))]
+        let loader_ready = super::pipe::read_frame_bounded(
             connection.raw(),
             Some(process.native.process_handle()),
             deadline,
             super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
-        )
-        .map_err(|detail| {
+        );
+        let loader_ready: TargetDesktopBootstrapMessageV1 = loader_ready.map_err(|detail| {
             package_process_failure(
                 "loader-control-ready-read",
                 TargetDesktopLeaseCreateError::from(detail),
             )
         })?;
         let desktop_evidence = match loader_ready {
+            #[cfg(feature = "test-support")]
+            TargetDesktopBootstrapMessageV1::EntryFailure(failure)
+                if process.diagnostic_execution.is_some()
+                    && failure.validate_for(self.nonce).is_ok() =>
+            {
+                // Authentication of the held native client above is mandatory.
+                // A failure observation never reaches desktop validation or Release.
+                return Err(ProcessCreateFailure {
+                    stable_code: "support-loader-entry-failure".into(),
+                    native_status: None,
+                    detail: failure.diagnostic_detail(),
+                });
+            }
             TargetDesktopBootstrapMessageV1::LoaderReady {
                 schema_version,
                 nonce: observed_nonce,
@@ -3192,18 +3305,39 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
             }
         };
         validate_loader_control_desktop_evidence(self.exact_desktop, &desktop_evidence)?;
-        super::pipe::write_frame_bounded(
+        let release = TargetDesktopBootstrapMessageV1::LoaderControlRelease {
+            schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
+            nonce: self.nonce.to_owned(),
+            expected_desktop: self.exact_desktop.to_owned(),
+        };
+        #[cfg(feature = "test-support")]
+        let release_result = if let Some(owner) = process.debug_owner.as_mut() {
+            super::pipe::write_frame_bounded_pumped(
+                connection.raw(),
+                Some(process.native.process_handle()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
+                &release,
+                &mut || owner.pump_handshake_until(deadline),
+            )
+        } else {
+            super::pipe::write_frame_bounded(
+                connection.raw(),
+                Some(process.native.process_handle()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
+                &release,
+            )
+        };
+        #[cfg(not(feature = "test-support"))]
+        let release_result = super::pipe::write_frame_bounded(
             connection.raw(),
             Some(process.native.process_handle()),
             deadline,
             super::pipe::TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
-            &TargetDesktopBootstrapMessageV1::LoaderControlRelease {
-                schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
-                nonce: self.nonce.to_owned(),
-                expected_desktop: self.exact_desktop.to_owned(),
-            },
-        )
-        .map_err(|detail| {
+            &release,
+        );
+        release_result.map_err(|detail| {
             package_process_failure(
                 "loader-control-release-write",
                 TargetDesktopLeaseCreateError::from(detail),
@@ -3228,7 +3362,7 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
     fn attest_containment(
         &self,
         process: &PackageLoaderProcess,
-        _plan: &ProductionLoaderPlan,
+        _plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure> {
         match self.control_job.contains(process.native.process_handle()) {
             Ok(true) => Ok(()),
@@ -3248,7 +3382,7 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
     fn drain_exit(
         &self,
         process: &mut PackageLoaderProcess,
-        _plan: &ProductionLoaderPlan,
+        _plan: &memcordon_windows_launch_core::ProductionLoaderPlan<VERSION>,
     ) -> Result<(), ProcessCreateFailure> {
         if unsafe { WaitForSingleObject(process.native.process_handle(), 30_000) } != WAIT_OBJECT_0
         {
@@ -3403,11 +3537,18 @@ pub(super) fn launch_target_desktop_loader_control_inner(
         job_at_creation: true,
     })
     .map_err(|error| TargetDesktopLeaseCreateError::from(error.to_string()))?;
-    if let Err(error) = store_production_loader_plan(&production) {
-        eprintln!(
-            "secondary production loader plan artifact persistence failure: {}",
-            error.detail
-        );
+    #[cfg(feature = "test-support")]
+    let detached_console = crate::windows::support_loader_diagnostic::current()
+        .is_some_and(|execution| execution.detached_console.get());
+    #[cfg(not(feature = "test-support"))]
+    let detached_console = false;
+    if !detached_console {
+        if let Err(error) = store_production_loader_plan(&production) {
+            eprintln!(
+                "secondary production loader plan artifact persistence failure: {}",
+                error.detail
+            );
+        }
     }
     let factory = PackageLoaderFactory {
         target_token,
@@ -3440,6 +3581,21 @@ pub(super) fn launch_target_desktop_loader_control_inner(
         nonce: &nonce,
         exact_desktop,
     };
+    #[cfg(feature = "test-support")]
+    if detached_console {
+        let execution = crate::windows::support_loader_diagnostic::current()
+            .expect("diagnostic scope remains live across comparison");
+        original_loader_console_comparison::run_variant(
+            &execution,
+            &production,
+            &factory,
+            &attestor,
+            &channel,
+        );
+        return Err(TargetDesktopLeaseCreateError::from(
+            "separate console comparison complete; original refusal retained".to_owned(),
+        ));
+    }
     let outcome = ProductionQualificationDriver::new(factory, attestor, channel)
         .qualify(&production, &qualification_id);
     let mut result = match &outcome {
@@ -3558,6 +3714,7 @@ pub(super) fn launch_target_desktop_probe(
         &target_user_object_policy.desktop_sddl(),
     )?;
     let probe_result = (|| -> Result<(), TargetDesktopLeaseCreateError> {
+        let probe_creation_policy = bootstrap_probe_policy::ConsolelessProbePolicyV1::new();
         holder_lease
             .attest_live()
             .map_err(TargetDesktopLeaseCreateError::from)?;
@@ -3622,7 +3779,7 @@ pub(super) fn launch_target_desktop_probe(
                 &raw const process_attributes,
                 &raw const thread_attributes,
                 0,
-                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                probe_creation_policy.creation_flags(),
                 environment.as_mut_ptr().cast(),
                 current_directory.as_ptr(),
                 &raw const startup.StartupInfo,
@@ -3676,8 +3833,10 @@ pub(super) fn launch_target_desktop_probe(
         let launcher_token_handle =
             duplicate_remote_token_query(launcher_token.raw(), probe_process.raw())?;
         let binding = TargetDesktopBootstrapBindingV3 {
-            schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
+            schema_version:
+                bootstrap_probe_policy::ConsolelessProbePolicyV1::BINDING_SCHEMA_VERSION,
             role: TargetDesktopBootstrapRoleV1::Probe,
+            probe_creation_policy: Some(probe_creation_policy),
             target_user_object_policy_role: policy_role,
             nonce: nonce.clone(),
             binding_sha256: String::new(),
@@ -4244,6 +4403,67 @@ fn observe_current_loader_desktop_binding()
     })
 }
 
+fn observe_bootstrap_entry_result<T>(
+    result: Result<T, String>,
+    pipe_name: &str,
+    nonce: &str,
+    role: TargetDesktopBootstrapRoleV1,
+    stage: bootstrap_entry_failure::EntryStage,
+    connection: Option<HANDLE>,
+    deadline: Instant,
+) -> Result<T, String> {
+    result.map_err(|primary| {
+        if role != TargetDesktopBootstrapRoleV1::LoaderControl {
+            return primary;
+        }
+        let failure = bootstrap_entry_failure::EntryFailureV1::new(nonce, stage, &primary);
+        let report = (|| -> Result<(), String> {
+            if Instant::now() >= deadline {
+                return Err("original bootstrap entry report cutoff expired".into());
+            }
+            // A preconnect operation failed. Only its failure path attempts
+            // the same endpoint; successful startup keeps its original order.
+            let temporary = if connection.is_none() {
+                let pipe = super::pipe::connect_target_desktop_bootstrap_pipe(pipe_name, deadline)?;
+                clear_inherit(pipe.raw())?;
+                verify_not_inheritable(pipe.raw())?;
+                Some(pipe)
+            } else {
+                None
+            };
+            let handle = connection.unwrap_or_else(|| {
+                temporary
+                    .as_ref()
+                    .expect("entry report owns its temporary connection")
+                    .raw()
+            });
+            super::pipe::write_frame_bounded(
+                handle,
+                None,
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyWrite,
+                &TargetDesktopBootstrapMessageV1::EntryFailure(failure),
+            )
+            .map_err(|error| error.to_string())
+        })();
+        bootstrap_entry_failure::preserve_primary(primary, report)
+    })
+}
+
+enum BootstrapSelfToken {
+    Query(super::token::CurrentProcessQueryToken),
+    Owned(OwnedHandle),
+}
+
+impl BootstrapSelfToken {
+    fn raw(&self) -> HANDLE {
+        match self {
+            Self::Query(token) => token.raw(),
+            Self::Owned(token) => token.raw(),
+        }
+    }
+}
+
 pub(crate) fn target_desktop_bootstrap(
     pipe_name: &std::ffi::OsStr,
     nonce: &std::ffi::OsStr,
@@ -4290,21 +4510,58 @@ pub(crate) fn target_desktop_bootstrap(
     let deadline = Instant::now() + Duration::from_secs(30);
     let process_token = match role {
         TargetDesktopBootstrapRoleV1::Holder => {
-            super::token::current_process_token_for_access_check()
+            super::token::current_process_token_for_access_check().map(BootstrapSelfToken::Owned)
         }
-        TargetDesktopBootstrapRoleV1::LoaderControl => {
-            super::token::current_process_token_for_attestation_and_access_check()
-        }
+        TargetDesktopBootstrapRoleV1::LoaderControl => Ok(BootstrapSelfToken::Query(
+            super::token::current_process_query_token(),
+        )),
         TargetDesktopBootstrapRoleV1::Probe => {
             super::token::current_process_token_for_attestation_and_access_check()
+                .map(BootstrapSelfToken::Owned)
         }
-    }?;
+    };
+    let process_token = observe_bootstrap_entry_result(
+        process_token,
+        pipe_name,
+        nonce,
+        role,
+        bootstrap_entry_failure::EntryStage::SelfToken,
+        None,
+        deadline,
+    )?;
     let connection = super::pipe::connect_target_desktop_bootstrap_pipe(pipe_name, deadline)?;
     clear_inherit(connection.raw())?;
     verify_not_inheritable(connection.raw())?;
-    let bootstrap_identity = process_identity(unsafe { GetCurrentProcess() })?;
-    let process_envelope = super::token::envelope(process_token.raw())?;
-    let process_snapshot = super::token::token_query_attestation_snapshot(process_token.raw())?;
+    let bootstrap_identity = process_identity(unsafe { GetCurrentProcess() });
+    let bootstrap_identity = observe_bootstrap_entry_result(
+        bootstrap_identity,
+        pipe_name,
+        nonce,
+        role,
+        bootstrap_entry_failure::EntryStage::ProcessIdentity,
+        Some(connection.raw()),
+        deadline,
+    )?;
+    let process_envelope = super::token::envelope(process_token.raw());
+    let process_envelope = observe_bootstrap_entry_result(
+        process_envelope,
+        pipe_name,
+        nonce,
+        role,
+        bootstrap_entry_failure::EntryStage::TokenEnvelope,
+        Some(connection.raw()),
+        deadline,
+    )?;
+    let process_snapshot = super::token::token_query_attestation_snapshot(process_token.raw());
+    let process_snapshot = observe_bootstrap_entry_result(
+        process_snapshot,
+        pipe_name,
+        nonce,
+        role,
+        bootstrap_entry_failure::EntryStage::TokenSnapshot,
+        Some(connection.raw()),
+        deadline,
+    )?;
     let observed_desktop_binding = match role {
         TargetDesktopBootstrapRoleV1::Holder => None,
         TargetDesktopBootstrapRoleV1::LoaderControl | TargetDesktopBootstrapRoleV1::Probe => {
@@ -4687,7 +4944,12 @@ pub(super) fn authenticate_target_desktop_bootstrap_server(
             error,
         )
     })?;
-    if binding.schema_version != TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
+    if bootstrap_probe_policy::binding_domain(
+        binding.schema_version,
+        binding.role.diagnostic(),
+        binding.probe_creation_policy.as_ref(),
+    )
+    .is_err()
         || binding.nonce != expected_nonce
         || binding.bootstrap_image_sha256 != installed_bootstrap_sha256
         || binding.launcher_session_id != 0

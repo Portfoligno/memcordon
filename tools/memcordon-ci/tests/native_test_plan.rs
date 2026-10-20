@@ -43,7 +43,14 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
             25 * 60
         })
     );
-    assert_eq!(release[1].deadline, Duration::from_secs(15 * 60));
+    let execution_deadline = Duration::from_secs(
+        if cfg!(any(windows, target_os = "macos")) {
+            30
+        } else {
+            15
+        } * 60,
+    );
+    assert_eq!(release[1].deadline, execution_deadline);
     assert_eq!(release[0].arguments.last(), Some(&"--no-run"));
     let build_inputs: Vec<_> = release[0]
         .arguments
@@ -69,7 +76,7 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
     let ordinary = commands(false);
     assert_eq!(ordinary.len(), 2);
     assert_eq!(ordinary[0].deadline, Duration::from_secs(25 * 60));
-    assert_eq!(ordinary[1].deadline, Duration::from_secs(15 * 60));
+    assert_eq!(ordinary[1].deadline, execution_deadline);
     assert_eq!(ordinary[0].arguments.last(), Some(&"--no-run"));
     assert!(!ordinary[0].arguments.contains(&"--no-fail-fast"));
     assert!(!ordinary[0].arguments.contains(&"--release"));
@@ -129,7 +136,15 @@ fn cold_platform_build_allowances_preserve_the_complete_execution_graph() {
                     plan[0].deadline,
                     Duration::from_secs(if release { release_minutes } else { 25 } * 60)
                 );
-                assert_eq!(plan[1].deadline, Duration::from_secs(15 * 60));
+                let execution_minutes = if platform != NativePlatform::Other {
+                    30
+                } else {
+                    15
+                };
+                assert_eq!(
+                    plan[1].deadline,
+                    Duration::from_secs(execution_minutes * 60)
+                );
                 let build_inputs: Vec<_> = plan[0]
                     .arguments
                     .iter()
@@ -148,6 +163,63 @@ fn cold_platform_build_allowances_preserve_the_complete_execution_graph() {
                 }
                 assert!(!plan[0].arguments.contains(&"--exclude"));
                 assert!(!plan[1].arguments.contains(&"--ignored"));
+            }
+        }
+    }
+}
+
+#[test]
+fn platform_execution_headroom_is_finite_and_preserves_every_phase_input() {
+    for release in [false, true] {
+        for mode in [FailureMode::StopAfterFailure, FailureMode::CollectAll] {
+            let windows = commands_for_platform(release, mode, NativePlatform::Windows);
+            for platform in [NativePlatform::MacOs, NativePlatform::Other] {
+                let other = commands_for_platform(release, mode, platform);
+                assert_eq!(windows.len(), 2);
+                assert_eq!(windows[0].arguments, other[0].arguments);
+                assert_eq!(windows[1].arguments, other[1].arguments);
+                // Explicit headroom above progressing 900s Windows and Mac
+                // runs, not a claim of measured complete-suite runtime.
+                assert_eq!(
+                    windows[1].deadline,
+                    other[1].deadline
+                        * if platform == NativePlatform::Other {
+                            2
+                        } else {
+                            1
+                        }
+                );
+                let total = other[0].deadline.checked_add(other[1].deadline).unwrap();
+                let total_minutes = match (platform, release) {
+                    (NativePlatform::MacOs, true) => 70,
+                    (NativePlatform::MacOs, false) => 55,
+                    (NativePlatform::Other, _) => 40,
+                    _ => unreachable!(),
+                };
+                assert_eq!(total, Duration::from_secs(total_minutes * 60));
+            }
+            assert_eq!(windows[1].deadline, Duration::from_secs(30 * 60));
+            let total = windows[0]
+                .deadline
+                .checked_add(windows[1].deadline)
+                .unwrap();
+            assert_eq!(
+                total,
+                Duration::from_secs(if release { 90 } else { 55 } * 60)
+            );
+            assert!(windows[1].deadline < total);
+            assert_eq!(
+                windows[0]
+                    .arguments
+                    .iter()
+                    .filter(|arg| **arg == "--no-run")
+                    .count(),
+                1
+            );
+            assert!(!windows[1].arguments.contains(&"--no-run"));
+            for forbidden in ["--ignored", "--exclude", "--skip"] {
+                assert!(!windows[0].arguments.contains(&forbidden));
+                assert!(!windows[1].arguments.contains(&forbidden));
             }
         }
     }

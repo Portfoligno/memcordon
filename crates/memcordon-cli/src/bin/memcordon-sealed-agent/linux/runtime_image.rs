@@ -15,6 +15,14 @@ use sha2::{Digest, Sha256};
 
 const IMAGE_STORE: &str = "/var/lib/memcordon/runtime-images";
 
+#[path = "runtime_image_census.rs"]
+mod census;
+
+/// Retain the administrative inspection API when this module is compiled without the CLI.
+pub fn inspect(definition_path: &Path, cutoff_unix_millis: u64) -> Result<(), String> {
+    census::inspect(definition_path, cutoff_unix_millis)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImageRetirementIntent {

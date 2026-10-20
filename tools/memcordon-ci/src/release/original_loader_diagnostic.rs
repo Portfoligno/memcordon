@@ -504,5 +504,5 @@ fn execute(
         &artifacts_directory.join("bound-refusal.json"),
         &serde_json::to_vec(&refusal)?,
     )?;
-    Ok(())
+    crate::support_loader_producer::require_complete_debug_capture(&refusal)
 }

@@ -3,7 +3,7 @@ use memcordon_ci::{
     consumer_readiness_ledger::{CellEvidence, SourceIdentity},
     release::{
         artifacts,
-        http::{ReadBudget, Response, Transport},
+        http::{ReadBudget, Response, StreamedResponse, StreamingTransport, Transport},
         readiness_transport,
     },
 };
@@ -31,11 +31,36 @@ impl Transport for Replies {
         Ok(Response {
             status: 200,
             headers: BTreeMap::new(),
-            body: if url.path().ends_with("/zip") {
-                self.zip.clone()
-            } else {
+            body: {
+                assert!(
+                    !url.path().ends_with("/zip"),
+                    "producer ZIP must use streaming transport"
+                );
                 self.metadata.clone()
             },
+        })
+    }
+}
+impl StreamingTransport for Replies {
+    fn request_to(
+        &self,
+        url: &url::Url,
+        _: &[(String, String)],
+        _: Instant,
+        maximum: u64,
+        destination: &mut dyn Write,
+    ) -> Result<StreamedResponse> {
+        assert!(url.path().ends_with("/zip"));
+        if self.zip.len() as u64 > maximum {
+            return Err(memcordon_ci::CiError::Message(
+                "fixture stream exceeds bound".into(),
+            ));
+        }
+        destination.write_all(&self.zip)?;
+        Ok(StreamedResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            length: self.zip.len() as u64,
         })
     }
 }
@@ -217,6 +242,118 @@ fn immutable_original_bundle_transport_rejects_attempt_relabel_and_cell_substitu
                     .is_file()
             );
             assert!(!producer.cell.cache_quiescent);
+            readiness_transport::check_evidence_budget(&[], &producer).unwrap();
+            let existing = memcordon_readiness_verifier::Artifact {
+                path: "prior-evidence".into(),
+                length: memcordon_readiness_verifier::MAX_PRODUCER_BYTES,
+                sha256: "d".repeat(64),
+            };
+            assert!(readiness_transport::check_evidence_budget(&[existing], &producer).is_err());
+            let retained = temp.path().join("retained.zip");
+            readiness_transport::retain_downloaded_archive(
+                &producer.directory,
+                &producer.archive,
+                &retained,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(retained).unwrap(), replies.zip);
         }
     }
+}
+
+#[test]
+fn producer_stream_rejects_metadata_overrun_truncation_and_digest_without_admission() {
+    for mutation in ["oversize", "truncated", "overrun", "digest"] {
+        let (identity, mut replies) = payload(3, false);
+        let mut metadata: serde_json::Value = serde_json::from_slice(&replies.metadata).unwrap();
+        match mutation {
+            "oversize" => {
+                metadata["size_in_bytes"] =
+                    (memcordon_readiness_verifier::MAX_PRODUCER_ARCHIVE_BYTES + 1).into()
+            }
+            "truncated" => metadata["size_in_bytes"] = (replies.zip.len() as u64 + 1).into(),
+            "overrun" => metadata["size_in_bytes"] = (replies.zip.len() as u64 - 1).into(),
+            "digest" => metadata["digest"] = format!("sha256:{}", "d".repeat(64)).into(),
+            _ => unreachable!(),
+        }
+        replies.metadata = serde_json::to_vec(&metadata).unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("producer");
+        let result = readiness_transport::download_producer(
+            &replies,
+            &budget(),
+            &[],
+            "owner/repository",
+            12,
+            3,
+            42,
+            "candidate-linux-x64-native",
+            &identity,
+            &"c".repeat(64),
+            &destination,
+        );
+        assert!(result.is_err(), "{mutation}");
+        if destination.exists() {
+            assert_eq!(
+                std::fs::read_dir(&destination).unwrap().count(),
+                0,
+                "{mutation} must remove partial transfer"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_stream_removes_partial_file_before_returning_error() {
+    struct Interrupted(Replies);
+    impl Transport for Interrupted {
+        fn request(
+            &self,
+            method: &str,
+            url: &url::Url,
+            headers: &[(String, String)],
+            body: &[u8],
+            deadline: Instant,
+            maximum: u64,
+        ) -> Result<Response> {
+            self.0
+                .request(method, url, headers, body, deadline, maximum)
+        }
+    }
+    impl StreamingTransport for Interrupted {
+        fn request_to(
+            &self,
+            _: &url::Url,
+            _: &[(String, String)],
+            _: Instant,
+            _: u64,
+            destination: &mut dyn Write,
+        ) -> Result<StreamedResponse> {
+            destination.write_all(b"partial")?;
+            Err(memcordon_ci::CiError::Message(
+                "fixture interrupted stream".into(),
+            ))
+        }
+    }
+    let (identity, replies) = payload(3, false);
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("producer");
+    let error = readiness_transport::download_producer(
+        &Interrupted(replies),
+        &budget(),
+        &[],
+        "owner/repository",
+        12,
+        3,
+        42,
+        "candidate-linux-x64-native",
+        &identity,
+        &"c".repeat(64),
+        &destination,
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("artifact=42"));
+    assert_eq!(std::fs::read_dir(destination).unwrap().count(), 0);
 }

@@ -107,15 +107,20 @@ fn actual_nonzero_child_is_failed_and_settled() {
 
 #[test]
 fn actual_timeout_reaps_child_and_readers_without_passing_work() {
-    let outcome = child("child_waits", Duration::from_millis(200)).run_owned();
+    // Match the testkit's settled-timeout oracle: a hosted native spawn took
+    // 262ms, exceeding the former 200ms before its callback could be admitted.
+    let outcome = child("child_waits", Duration::from_secs(1)).run_owned();
     assert!(!outcome.is_ok());
-    assert_eq!(outcome.writers(), WriterSettlement::Settled);
+    let writers = outcome.writers();
+    let error = outcome.into_result().unwrap_err();
+    assert_eq!(
+        writers,
+        WriterSettlement::Settled,
+        "inner command: {error:?}"
+    );
     assert!(
-        outcome
-            .into_result()
-            .unwrap_err()
-            .to_string()
-            .contains("exceeded")
+        error.to_string().contains("exceeded"),
+        "inner command: {error:?}"
     );
 }
 

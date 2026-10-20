@@ -180,6 +180,7 @@ impl WindowsRelayPhaseV1 {
             | (Phase::AwaitStreams, Event::MutantTerminal)
             | (Phase::AwaitRelaysReady, Event::MutantTerminal)
             | (Phase::AwaitAuthorizationOrAbort, Event::MutantTerminal)
+            | (Phase::AwaitAbortRejection, Event::MutantTerminal)
             | (Phase::Authorized, Event::MutantTerminal)
             | (Phase::AwaitRelayAck, Event::MutantTerminal)
             | (Phase::AwaitTerminal, Event::MutantTerminal) => Phase::Terminal,
@@ -367,6 +368,34 @@ impl WindowsMutantNativeReceiptV1 {
             && self.nonce == nonce
             && !self.nonce.is_empty()
             && self.request_sha256 == request_sha256
+    }
+}
+
+/// Actual observation of a selected invalid release ordering. This is failure
+/// evidence, never execution authorization or successful boundary certification.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsPrematureReleaseWitnessV1 {
+    pub schema_version: u32,
+    pub mutant: WindowsSealedMutant,
+    pub observation: WindowsMutantNativeObservationV1,
+}
+
+impl WindowsPrematureReleaseWitnessV1 {
+    pub fn is_consistent(&self) -> bool {
+        self.schema_version == 1
+            && matches!(
+                self.mutant,
+                WindowsSealedMutant::ResumeBeforeGuardian | WindowsSealedMutant::ResumeBeforeRelays
+            )
+            && matches!(
+                self.observation,
+                WindowsMutantNativeObservationV1::PrematureAuthorization {
+                    target_marker_observed: true,
+                    ..
+                }
+            )
+            && self.observation.rejects(self.mutant)
     }
 }
 
@@ -1223,6 +1252,24 @@ pub enum WindowsAttemptStateV1 {
 pub enum WindowsAttemptTerminalDispositionV1 {
     PreauthorizationAbort,
     Posttarget,
+    PrematureReleaseFailure { mutant: WindowsSealedMutant },
+}
+
+impl WindowsAttemptTerminalDispositionV1 {
+    pub fn premature_release_mutant(self) -> Option<WindowsSealedMutant> {
+        match self {
+            Self::PrematureReleaseFailure { mutant }
+                if matches!(
+                    mutant,
+                    WindowsSealedMutant::ResumeBeforeGuardian
+                        | WindowsSealedMutant::ResumeBeforeRelays
+                ) =>
+            {
+                Some(mutant)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1418,6 +1465,8 @@ pub struct WindowsTerminalSeedV2 {
     pub request_sha256: String,
     pub process_observation: crate::WindowsProcessObservationV2,
     pub primary_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premature_release: Option<WindowsPrematureReleaseWitnessV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1652,6 +1701,22 @@ pub fn authenticate_decoded_windows_attempt_record_v4(
                 .primary_failure
                 .as_ref()
                 .is_some_and(|failure| !failure.is_consistent())
+            || match (
+                record
+                    .terminal_disposition
+                    .and_then(|value| value.premature_release_mutant()),
+                seed.premature_release.as_ref(),
+            ) {
+                (Some(mutant), Some(witness)) => {
+                    !witness.is_consistent()
+                        || witness.mutant != mutant
+                        || !record.target_released
+                        || record.authorization_unix_millis.is_some()
+                        || record.resume_attempted
+                }
+                (None, None) => false,
+                _ => true,
+            }
         {
             return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-seed");
         }
@@ -1732,6 +1797,26 @@ pub fn authenticate_decoded_windows_attempt_record_v4(
 fn windows_durable_attempt_v4_state_error(
     record: &WindowsDurableAttemptRecordV4,
 ) -> Option<&'static str> {
+    let premature_release = record
+        .terminal_disposition
+        .and_then(|value| value.premature_release_mutant())
+        .is_some();
+    if matches!(
+        record.terminal_disposition,
+        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. })
+    ) && (!premature_release
+        || record.authorization_unix_millis.is_some()
+        || record.resume_attempted
+        || record.owner_manifest.is_none()
+        || record.workload_checkpoint.is_some()
+        || !record.cleanup_state.termination_requested
+        || !matches!(
+            record.state,
+            WindowsAttemptStateV1::Terminating | WindowsAttemptStateV1::Empty
+        ))
+    {
+        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=premature-release-intent");
+    }
     let guardian_required = matches!(
         record.state,
         WindowsAttemptStateV1::GuardianReady
@@ -1758,7 +1843,11 @@ fn windows_durable_attempt_v4_state_error(
     if target_required && record.target_identity.is_none() && !preauthorization_abort {
         return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-target-missing");
     }
-    if record.target_released && !record.resume_attempted && !preauthorization_abort {
+    if record.target_released
+        && !record.resume_attempted
+        && !preauthorization_abort
+        && !premature_release
+    {
         return Some(
             "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-release-without-intent",
         );
@@ -1867,6 +1956,26 @@ pub fn windows_terminal_outbox_is_bound_v3(
                 && request_sha256 == &record.request_sha256
                 && rejection.is_consistent()
                 && match (record.terminal_disposition, &rejection.disposition) {
+                    (
+                        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure {
+                            mutant,
+                        }),
+                        WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt },
+                    ) => {
+                        receipt_bound(receipt)
+                            && record.authorization_unix_millis.is_none()
+                            && !record.resume_attempted
+                            && record.target_released
+                            && record.target_identity == receipt.process_observation.root_identity
+                            && record.terminal_seed.as_ref().is_some_and(|seed| {
+                                seed.process_observation == receipt.process_observation
+                            })
+                            && matches!(&receipt.payload,
+                            WindowsTerminalPayloadV2::PrematureReleaseFailure { witness, .. }
+                                if witness.mutant == mutant
+                                    && record.terminal_seed.as_ref()
+                                        .and_then(|seed| seed.premature_release.as_ref()) == Some(witness))
+                    }
                     (
                         Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort),
                         WindowsProviderRejectionDispositionV2::Preauthorization { .. },
@@ -2051,6 +2160,12 @@ const fn windows_process_identity_is_valid(identity: &WindowsProcessIdentityV1) 
 fn windows_durable_attempt_state_error(
     record: &WindowsDurableAttemptRecordV1,
 ) -> Option<&'static str> {
+    if matches!(
+        record.terminal_disposition,
+        Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. })
+    ) {
+        return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=premature-release-requires-v4");
+    }
     let guardian_required = matches!(
         record.state,
         WindowsAttemptStateV1::GuardianReady
@@ -2210,7 +2325,10 @@ pub fn windows_terminal_outbox_is_bound(
                         receipt.attempt_id == attempt_id && receipt.request_sha256 == request_sha256
                     })
                 }
-                None => false,
+                None
+                | Some(WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure { .. }) => {
+                    false
+                }
             };
             response_attempt_id == attempt_id
                 && response_request_sha256 == request_sha256
@@ -2499,6 +2617,7 @@ pub struct WindowsCallerTokenEnvelopeV1 {
 #[serde(rename_all = "kebab-case")]
 pub enum WindowsLoaderDiagnosticKindV1 {
     OriginalRestrictedBootstrap,
+    OriginalRestrictedBootstrapConsoleComparison,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3641,6 +3760,16 @@ impl WindowsTerminalRetiredV2 {
             && !self.launch_incarnation.is_empty()
             && windows_sha256_text_is_valid(&self.job_identity)
             && match (&self.disposition, &self.preauthorization_retirement_proof) {
+                (
+                    disposition @ WindowsAttemptTerminalDispositionV1::PrematureReleaseFailure {
+                        ..
+                    },
+                    None,
+                ) => {
+                    disposition.premature_release_mutant().is_some()
+                        && windows_sha256_text_is_valid(&self.owner_manifest_sha256)
+                        && windows_sha256_text_is_valid(&self.retirement_proof_sha256)
+                }
                 (WindowsAttemptTerminalDispositionV1::Posttarget, None) => {
                     windows_sha256_text_is_valid(&self.owner_manifest_sha256)
                 }
@@ -3845,6 +3974,47 @@ pub type WindowsProviderResponseV1 =
     WindowsProviderResponse<WindowsTerminalReceiptV1, ProviderRejectionEvidence>;
 pub type WindowsProviderResponseV3 =
     WindowsProviderResponse<WindowsTerminalReceiptV2, WindowsProviderRejectionV2>;
+
+impl WindowsProviderResponseV3 {
+    /// Report preparation failure without granting terminal or retirement authority.
+    pub fn recovery_attempt_unavailable(
+        attempt_id: &str,
+        challenge: &str,
+        detail: &str,
+        native_detail_allowed: bool,
+    ) -> Result<Self, String> {
+        const DETAIL_LIMIT: usize = 1024;
+        const TRUNCATED: &str = " [detail truncated]";
+        let attempt_id = crate::BoundedText::<128>::new(attempt_id).map_err(str::to_owned)?;
+        let challenge = crate::BoundedText::<128>::new(challenge).map_err(str::to_owned)?;
+        if attempt_id.as_str().is_empty() || challenge.as_str().is_empty() {
+            return Err("recovery unavailability context is empty".into());
+        }
+        let detail = if native_detail_allowed {
+            if detail.is_empty() {
+                return Err("recovery preparation error is empty".into());
+            }
+            detail
+        } else {
+            "recovery preparation unavailable"
+        };
+        let detail = if detail.len() > DETAIL_LIMIT {
+            let mut end = DETAIL_LIMIT - TRUNCATED.len();
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{TRUNCATED}", &detail[..end])
+        } else {
+            detail.to_owned()
+        };
+        Ok(Self::RecoveryAttemptUnavailable {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge: challenge.as_str().to_owned(),
+            attempt_id: attempt_id.as_str().to_owned(),
+            detail,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
@@ -4193,6 +4363,12 @@ pub enum WindowsTerminalPayloadV2 {
         target_creation_observed: bool,
         resume_attempted: bool,
     },
+    PrematureReleaseFailure {
+        witness: WindowsPrematureReleaseWitnessV1,
+        child_pid: u32,
+        duration_millis: u64,
+        outcome: RunOutcome,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4241,7 +4417,8 @@ impl WindowsTerminalReceiptV2 {
                 boundary_detail,
                 ..
             } => Some((*child_pid, outcome, boundary_detail)),
-            WindowsTerminalPayloadV2::RecoveredClosure { .. } => None,
+            WindowsTerminalPayloadV2::RecoveredClosure { .. }
+            | WindowsTerminalPayloadV2::PrematureReleaseFailure { .. } => None,
         }
     }
 
@@ -4276,6 +4453,37 @@ impl WindowsTerminalReceiptV2 {
             return Err("retirement_proof.unexpected_capability_extinction");
         }
         match (&self.payload, proof.source) {
+            (
+                WindowsTerminalPayloadV2::PrematureReleaseFailure {
+                    witness,
+                    child_pid,
+                    outcome,
+                    ..
+                },
+                WindowsRetirementProofSourceV2::LiveNative,
+            ) if witness.is_consistent()
+                && self.policy_enforcement.is_none()
+                && self.cleanup_process_creation.is_none()
+                && matches!(
+                    outcome,
+                    RunOutcome::MonitorFailed {
+                        child_after_termination: Some(_),
+                        ..
+                    }
+                )
+                && proof.target_completion_observed
+                && proof.native_job_empty_observed
+                && proof.relay_closure_observed
+                && proof.guardian_completion_observed
+                && proof.guardian_receipt_sha256.is_none()
+                && proof.current_boot_id.is_none()
+                && *child_pid != 0
+                && self
+                    .process_observation
+                    .root_identity
+                    .as_ref()
+                    .is_some_and(|root| root.process_id == *child_pid)
+                && self.restart_safety.is_safe_for(BoundaryRequirement::Sealed) => {}
             (
                 WindowsTerminalPayloadV2::Execution { child_pid, .. },
                 WindowsRetirementProofSourceV2::LiveNative,
@@ -4471,6 +4679,9 @@ pub enum WindowsProviderRejectionDispositionV2 {
     PostauthorizationFailure {
         receipt: Box<WindowsTerminalReceiptV2>,
     },
+    PrematureReleaseFailure {
+        receipt: Box<WindowsTerminalReceiptV2>,
+    },
     Retained {
         evidence: Box<WindowsAttemptRetainedV1>,
     },
@@ -4507,14 +4718,16 @@ impl WindowsProviderRejectionV2 {
             WindowsProviderRejectionDispositionV2::Preauthorization {
                 terminal_ack_required,
             } => terminal_ack_required,
-            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { .. } => true,
+            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { .. }
+            | WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { .. } => true,
             WindowsProviderRejectionDispositionV2::Retained { .. } => false,
         }
     }
 
     pub fn terminal_receipt(&self) -> Option<&WindowsTerminalReceiptV2> {
         match &self.disposition {
-            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt } => {
+            WindowsProviderRejectionDispositionV2::PostauthorizationFailure { receipt }
+            | WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt } => {
                 Some(receipt)
             }
             _ => None,
@@ -4562,6 +4775,19 @@ impl WindowsProviderRejectionV2 {
             return false;
         }
         match &self.disposition {
+            WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt } => {
+                self.target_created && self.target_released && self.cleanup_attempted
+                    && receipt.validate_for_attempt().is_ok()
+                    && matches!(receipt.payload, WindowsTerminalPayloadV2::PrematureReleaseFailure { .. })
+                    && receipt.restart_safety == self.restart_safety
+                    && self.provider_failure.as_ref().is_none_or(|failure| {
+                        failure.provider_binding.generation.as_str() == receipt.retirement_proof.provider_generation
+                            && String::from(failure.attempt_id.clone()) == receipt.attempt_id
+                            && String::from(failure.request_sha256.clone()) == receipt.request_sha256
+                            && matches!(failure.original, crate::OriginalFailureV1::Observed { ref event }
+                            if event.sequence > 0)
+                    })
+            }
             WindowsProviderRejectionDispositionV2::Preauthorization {
                 terminal_ack_required,
             } => !self.target_released && (!terminal_ack_required || self.cleanup_attempted),
@@ -4582,6 +4808,7 @@ impl WindowsProviderRejectionV2 {
                         *target_creation_observed == self.target_created
                             && (!self.target_released || *resume_attempted)
                     }
+                    WindowsTerminalPayloadV2::PrematureReleaseFailure { .. } => false,
                 };
                 // Expirable diagnostics are omitted from the immutable terminal
                 // outbox. When present, they must still match its primary cause.

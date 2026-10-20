@@ -167,6 +167,24 @@ pub(crate) fn inspect_removal_plan_for_agent(
     output: &Path,
     deadline: Instant,
 ) -> Result<WindowsRemovalPlan> {
+    inspect_removal_plan_for_source(
+        root,
+        agent,
+        &identity.source_commit,
+        &identity.version,
+        output,
+        deadline,
+    )
+}
+
+pub(super) fn inspect_removal_plan_for_source(
+    root: &Path,
+    agent: &crate::windows_installed_cases::SelectedArtifact,
+    source_commit: &str,
+    version: &str,
+    output: &Path,
+    deadline: Instant,
+) -> Result<WindowsRemovalPlan> {
     let held = crate::windows_readiness_adapter::hold_artifact(
         &agent.path,
         Some(&agent.sha256),
@@ -189,8 +207,8 @@ pub(crate) fn inspect_removal_plan_for_agent(
     memcordon_core::canonical_json::reject_duplicate_json_keys(&inspected.stdout)
         .map_err(CiError::Message)?;
     let inspection: serde_json::Value = serde_json::from_slice(&inspected.stdout)?;
-    if inspection["source_commit"] != identity.source_commit
-        || inspection["version"] != identity.version
+    if inspection["source_commit"] != source_commit
+        || inspection["version"] != version
         || inspection["platform"] != "windows-service"
     {
         return Err(CiError::Message(

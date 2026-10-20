@@ -24,6 +24,9 @@ use std::{
 #[path = "admin_link_inventory.rs"]
 mod admin_link_inventory;
 
+#[path = "owned_resource_open_error.rs"]
+mod owned_resource_open_error;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixtureBarrierDecision {
     Continue,
@@ -1101,6 +1104,17 @@ impl InstalledMixedDriver {
         legacy: &memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
         deadline: std::time::Instant,
     ) -> Result<()> {
+        self.finalize_owned_resources_with_publication(workspace, output, output, legacy, deadline)
+    }
+
+    pub fn finalize_owned_resources_with_publication(
+        &mut self,
+        workspace: &Path,
+        output: &Path,
+        publication: &Path,
+        legacy: &memcordon_core::workload_registry_v2::RuntimePrivatePolicyRegistry,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         if !self.active.is_empty()
             || self
                 .cross_attempt_reports
@@ -1176,13 +1190,13 @@ impl InstalledMixedDriver {
         };
         let retain_attempt = |label: &str, bytes: &[u8]| -> Result<()> {
             for ordinal in 0..128 {
-                let path = output.join(format!("resource-retirement-{label}-{ordinal}.json"));
+                let path = publication.join(format!("resource-retirement-{label}-{ordinal}.json"));
                 match OpenOptions::new().write(true).create_new(true).open(path) {
                     Ok(mut file) => {
                         file.write_all(bytes)?;
                         file.write_all(b"\n")?;
                         file.sync_all()?;
-                        File::open(output)?.sync_all()?;
+                        File::open(publication)?.sync_all()?;
                         return Ok(());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1194,7 +1208,7 @@ impl InstalledMixedDriver {
             ))
         };
         if !self.legacy_restored {
-            let path = output.join("original-legacy-restore.policy.json");
+            let path = publication.join("original-legacy-restore.policy.json");
             let bytes = serde_json::to_vec(legacy)?;
             match std::fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1231,6 +1245,11 @@ impl InstalledMixedDriver {
                 ));
             }
             self.legacy_restored = true;
+        }
+        for report in &mut self.isolation_import_reports {
+            if let Some(digest) = report.retire_definition(deadline)? {
+                self.retired_images.insert(digest);
+            }
         }
         for report in &mut self.image_reports {
             super::linux_readiness_image_cases::finalize_retained_images(report, deadline)?;
@@ -2322,6 +2341,7 @@ impl InstalledMixedDriver {
                         cell: &input.cell,
                         provider: input.provider,
                         contract: &policy.contract,
+                        images: self.images.as_ref().expect("owned images"),
                         contract_path: &directory.join("mixed.contract.json"),
                         artifact_root: input.artifact_root,
                         lease_id: &input.lease_id,
@@ -2391,6 +2411,7 @@ impl InstalledMixedDriver {
                         cell: &input.cell,
                         provider: input.provider,
                         contract: &policy.contract,
+                        images: self.images.as_ref().expect("owned images"),
                         contract_path: &directory.join("mixed.contract.json"),
                         artifact_root: input.artifact_root,
                         lease_id: &input.lease_id,
@@ -2421,6 +2442,7 @@ impl InstalledMixedDriver {
                             &input,
                             &prefix,
                             &agent_sha256,
+                            report.fixture_budgets.get(&completed_key),
                         )?;
                         self.completed.push((completed_key, collection));
                     }
@@ -2518,6 +2540,11 @@ impl InstalledMixedDriver {
                     archive_cross_attempt_sources(
                         &source_output,
                         input.artifact_root,
+                        &report
+                            .attempts
+                            .iter()
+                            .map(|owner| &owner.launch)
+                            .collect::<Vec<_>>(),
                         &mut target.persisted.artifacts,
                     )?;
                     normalize_completed_case(
@@ -4153,11 +4180,38 @@ pub fn completed_case_base(
     })
 }
 
+#[path = "linux_cross_source_custody.rs"]
+mod cross_source_custody;
+
 fn archive_cross_attempt_sources(
     directory: &Path,
     root: &Path,
+    frontends: &[&InstalledMixedLaunch],
     artifacts: &mut Vec<memcordon_readiness_verifier::Artifact>,
 ) -> Result<()> {
+    // Caller output already passed collect_completed's native/protocol checks.
+    // It is not root-owned source authority, and must not be reclassified as it.
+    if frontends.len() != 2 {
+        return Err(CiError::Message(
+            "cross source frontend boundary inventory differs".into(),
+        ));
+    }
+    let mut caller_boundaries = std::collections::BTreeMap::new();
+    for frontend in frontends {
+        let access = &frontend.file_access;
+        let path = &access.frontend_directory_path;
+        if path.parent().and_then(Path::parent) != Some(directory)
+            || frontend.result.parent() != Some(path.as_path())
+            || access.caller_uid == 0
+            || !frontend.capture_owners_settled()
+            || frontend.frontend_status.is_none()
+            || caller_boundaries.insert(path.clone(), *frontend).is_some()
+        {
+            return Err(CiError::Message(
+                "cross source original frontend boundary differs".into(),
+            ));
+        }
+    }
     let mut pending = vec![directory.to_path_buf()];
     let mut count = 0usize;
     while let Some(directory) = pending.pop() {
@@ -4169,11 +4223,29 @@ fn archive_cross_attempt_sources(
                 ));
             }
             let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())?;
+            let source = entry.path();
+            let metadata = std::fs::symlink_metadata(&source)?;
+            if let Some(frontend) = caller_boundaries.remove(&source) {
+                let access = &frontend.file_access;
+                let held = access.frontend_directory_owner.metadata()?;
+                cross_source_custody::require_caller_boundary(
+                    &metadata,
+                    &held,
+                    access.directory_stamp,
+                    access.caller_uid,
+                    access.caller_gid,
+                )
+                .map_err(|error| CiError::Message(format!("{error}: {source:?}")))?;
+                continue;
+            }
             if metadata.is_dir() {
-                pending.push(entry.path());
+                if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 || metadata.nlink() == 0 {
+                    return Err(CiError::Message(format!(
+                        "cross administrative source directory custody differs: {source:?}"
+                    )));
+                }
+                pending.push(source);
             } else if metadata.is_file() {
-                let source = entry.path();
                 let path = source
                     .strip_prefix(root)
                     .map_err(|error| CiError::Message(error.to_string()))?
@@ -4206,6 +4278,11 @@ fn archive_cross_attempt_sources(
                 ));
             }
         }
+    }
+    if !caller_boundaries.is_empty() {
+        return Err(CiError::Message(
+            "cross source original caller boundaries not observed".into(),
+        ));
     }
     Ok(())
 }
@@ -9837,7 +9914,7 @@ pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|error| CiError::Message(format!("open owned resource {path:?}: {error}")))?;
+        .map_err(|error| owned_resource_open_error::open_error(path, error))?;
     let before = file.metadata()?;
     if !before.is_file()
         || before.uid() != 0
@@ -9845,9 +9922,14 @@ pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
         || before.mode() & 0o022 != 0
         || before.len() > bound
     {
-        return Err(CiError::Message(
-            "owned resource readback custody differs".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "owned resource readback custody differs: path={path:?}; regular={}; uid={}; links={}; mode={:#o}; bytes={}; bound={bound}",
+            before.is_file(),
+            before.uid(),
+            before.nlink(),
+            before.mode(),
+            before.len(),
+        )));
     }
     let mut bytes = Vec::new();
     file.try_clone()?.take(bound + 1).read_to_end(&mut bytes)?;

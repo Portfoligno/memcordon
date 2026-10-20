@@ -1445,3 +1445,29 @@ fn windows_loader_outcome_binds_optional_plan_json_to_its_digest() {
     malformed.set_launch_plan_json(String::from("not-json"));
     assert!(!malformed.is_consistent());
 }
+
+#[test]
+fn aborted_mutant_terminal_requires_retired_relays_and_is_one_shot() {
+    use WindowsRelayEventV1 as Event;
+    use WindowsRelayPhaseV1 as Phase;
+
+    let mut phase = Phase::AwaitStreams;
+    phase.advance(Event::StreamsPrepared).unwrap();
+    assert_eq!(phase, Phase::AwaitRelaysReady);
+    phase.advance(Event::RelaysReady).unwrap();
+    assert_eq!(phase, Phase::AwaitAuthorizationOrAbort);
+    phase.advance(Event::RelaysAbort).unwrap();
+    assert_eq!(phase, Phase::AwaitAbortRelayAck);
+
+    assert!(phase.advance(Event::MutantTerminal).is_err());
+    assert_eq!(phase, Phase::AwaitAbortRelayAck);
+    phase.advance(Event::RelaysRetired).unwrap();
+    assert_eq!(phase, Phase::AwaitAbortRejection);
+    phase.advance(Event::MutantTerminal).unwrap();
+    assert_eq!(phase, Phase::Terminal);
+
+    assert!(phase.advance(Event::MutantTerminal).is_err());
+    assert_eq!(phase, Phase::Terminal);
+    assert!(phase.advance(Event::TargetAuthorized).is_err());
+    assert_eq!(phase, Phase::Terminal);
+}

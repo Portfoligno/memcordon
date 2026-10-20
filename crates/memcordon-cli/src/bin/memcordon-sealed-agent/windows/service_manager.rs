@@ -1545,13 +1545,16 @@ pub fn query_status(service: &ScHandle) -> Result<SERVICE_STATUS_PROCESS, String
 }
 
 pub(super) fn launcher_startup_observation(minimum_tick: u64) -> Result<String, String> {
-    let manager = manager_connect()?;
+    let manager = manager_connect()
+        .map_err(|error| format!("launcher startup observation SCM connect failed: {error}"))?;
     let service = open(
         &manager,
         memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
         SERVICE_QUERY_STATUS,
-    )?;
-    let status = status_process(&service)?;
+    )
+    .map_err(|error| format!("launcher startup observation service open failed: {error}"))?;
+    let status = status_process(&service)
+        .map_err(|error| format!("launcher startup observation status query failed: {error}"))?;
     let expected = if status.dwProcessId == 0 {
         Ok(None)
     } else {

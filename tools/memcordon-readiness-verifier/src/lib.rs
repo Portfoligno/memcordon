@@ -18,8 +18,10 @@ pub mod linux_frontend_access;
 mod linux_isolation;
 mod linux_path;
 pub use linux_account_refusal::LinuxAccountRefusalEvidence;
+mod linux_image_census;
 mod linux_import_refusal;
-pub use linux_import_refusal::LinuxIsolationImportEvidence;
+pub use linux_image_census::validate_linux_installed_image_census;
+pub use linux_import_refusal::{LinuxIsolationImportEvidence, LinuxIsolationImportOutcome};
 pub use linux_isolation::validate_linux_outside_file;
 mod linux_policy;
 pub mod windows_acceptance;
@@ -107,6 +109,10 @@ use std::path::Path;
 pub const PROFILE: &str = "memcordon.consumer-readiness.v1";
 pub const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_PRODUCER_ARTIFACTS: usize = 131_072;
+pub const MAX_PRODUCER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Encoded producer containers share the existing total evidence custody budget.
+pub const MAX_PRODUCER_ARCHIVE_BYTES: u64 = MAX_PRODUCER_BYTES;
 pub type VerificationResult<T> = Result<T, String>;
 
 pub fn validate_windows_receiptless_cause(
@@ -139,11 +145,9 @@ fn validate_producer_bundle(
     if custody.hash(&origin.bundle_artifact)? != origin.artifact_sha256 {
         return Err("actual downloaded producer archive digest differs".into());
     }
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(
-        custody.bytes(&origin.bundle_artifact)?,
-    ))
-    .map_err(|error| error.to_string())?;
-    if archive.len() > 131_072 {
+    let mut archive = zip::ZipArchive::new(custody.archive(&origin.bundle_artifact)?)
+        .map_err(|error| error.to_string())?;
+    if archive.len() > MAX_PRODUCER_ARTIFACTS {
         return Err("producer ZIP member count exceeds finite bound".into());
     }
     let mut members = BTreeSet::new();
@@ -173,7 +177,7 @@ fn validate_producer_bundle(
         total = total
             .checked_add(member.size())
             .ok_or("producer ZIP total overflow")?;
-        if total > 4 * 1024 * 1024 * 1024 {
+        if total > MAX_PRODUCER_BYTES {
             return Err("producer ZIP decoded bytes exceed finite bound".into());
         }
     }
@@ -214,7 +218,7 @@ fn validate_producer_bundle(
                 .into(),
         );
     }
-    if manifest.artifacts.len() > 131_072
+    if manifest.artifacts.len() > MAX_PRODUCER_ARTIFACTS
         || manifest.products.len() > 1
         || manifest.component_builds.len() > 1
         || manifest.records.len() > 16_384
@@ -239,16 +243,26 @@ fn validate_producer_bundle(
         if member.is_dir() || member.size() != artifact.length {
             return Err("producer member type/length differs".into());
         }
-        let mut bytes = Vec::new();
-        member
-            .take(artifact.length + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        if bytes.len() as u64 != artifact.length {
-            return Err("producer member decoded length differs/exceeds bound".into());
+        let mut member = member.take(artifact.length + 1);
+        let mut offset = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = member
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            let end = offset
+                .checked_add(count)
+                .ok_or("producer member offset overflow")?;
+            if expected.get(offset..end) != Some(&buffer[..count]) {
+                return Err("current raw evidence bytes differ from original producer ZIP".into());
+            }
+            offset = end;
         }
-        if bytes != expected {
-            return Err("current raw evidence bytes differ from original producer ZIP".into());
+        if offset != expected.len() {
+            return Err("producer member decoded length differs/exceeds bound".into());
         }
     }
     fn equal<T: Serialize>(left: &T, right: &T) -> VerificationResult<bool> {
@@ -391,7 +405,9 @@ fn validate_producer_bundle(
                 return Err("producer row points outside original archive custody table".into());
             }
             let raw: serde_json::Value = wire::decode(custody.bytes(path)?)?;
-            if raw["format"] == "memcordon.consumer-readiness.linux-isolation-import-refusal" {
+            if raw["format"] == "memcordon.consumer-readiness.linux-isolation-import-refusal"
+                || raw["format"] == "memcordon.consumer-readiness.linux-isolation-import"
+            {
                 let evidence: LinuxIsolationImportEvidence =
                     serde_json::from_value(raw).map_err(|error| error.to_string())?;
                 if evidence.key != record.key
@@ -1155,6 +1171,9 @@ fn validate_producer_bundle(
             return Err("passed row is absent from original producer archive".into());
         }
     }
+    // The seekable archive is a held native file, not a whole-container snapshot.
+    // Recheck its bound digest after decoding before accepting its evidence.
+    custody.archive(&origin.bundle_artifact)?;
     Ok(())
 }
 
@@ -3064,7 +3083,8 @@ fn verify_index(
         identifier(&origin.run_id)?;
         digest(&origin.artifact_sha256)?;
     }
-    let custody = custody::Custody::new(artifact_root, &index.artifacts)?;
+    let custody =
+        custody::Custody::for_evidence(artifact_root, &index.artifacts, &index.producer_origins)?;
     for origin in &index.producer_origins {
         validate_producer_bundle(index, origin, &custody)?;
     }
@@ -3951,7 +3971,7 @@ pub fn validate_linux_policy_case(
     {
         return Err("record is outside installed Linux no-target policy applicability".into());
     }
-    let custody = custody::Custody::new(root, &index.artifacts)?;
+    let custody = custody::Custody::for_evidence(root, &index.artifacts, &index.producer_origins)?;
     let products = index
         .products
         .iter()
@@ -3975,7 +3995,7 @@ pub fn validate_case_record(
     record: &CaseRecord,
     root: &Path,
 ) -> VerificationResult<()> {
-    let custody = custody::Custody::new(root, &index.artifacts)?;
+    let custody = custody::Custody::for_evidence(root, &index.artifacts, &index.producer_origins)?;
     let products = index
         .products
         .iter()
@@ -4750,7 +4770,9 @@ fn verify_record(
                 .ok_or("passed row omits persisted evidence")?,
         )?,
     )?;
-    if raw["format"] == "memcordon.consumer-readiness.linux-isolation-import-refusal" {
+    if raw["format"] == "memcordon.consumer-readiness.linux-isolation-import-refusal"
+        || raw["format"] == "memcordon.consumer-readiness.linux-isolation-import"
+    {
         let evidence: LinuxIsolationImportEvidence =
             serde_json::from_value(raw).map_err(|error| error.to_string())?;
         return linux_import_refusal::verify(index, record, &evidence, products, custody);

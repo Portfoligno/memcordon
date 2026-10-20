@@ -1008,93 +1008,111 @@ fn recover_attempt_session(
 ) -> Result<(), String> {
     super::record::validate_attempt_id(attempt_id)?;
     super::record::validate_attempt_id(request_sha256)?;
-    let (launcher, _process, _identity) = authenticated_launcher()?;
-    pipe::write_frame(
-        launcher.raw(),
-        &WindowsLauncherRequestV3::RecoverAttempt {
-            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
-            attempt_id: attempt_id.to_owned(),
-            nonce: nonce.to_owned(),
-            request_sha256: request_sha256.to_owned(),
-            challenge: challenge.to_owned(),
-            caller,
-        },
-    )?;
-    let response = pipe::read_response_frame::<WindowsLauncherResponseV3>(launcher.raw())?;
-    let (public_response, ack_digest) = match response {
-        WindowsLauncherResponseV3::Terminal(receipt)
-            if receipt.attempt_id == attempt_id
-                && receipt.nonce == nonce
-                && receipt.request_sha256 == request_sha256
-                && receipt.validate_for_attempt().is_ok() =>
-        {
-            let response = WindowsProviderResponseV3::Terminal(receipt);
-            let digest = super::record::digest(
-                response
-                    .terminal_authority_json()
-                    .map_err(|error| error.to_string())?
-                    .as_bytes(),
-            );
-            (response, Some(digest))
-        }
-        WindowsLauncherResponseV3::Reject {
-            schema_version,
-            attempt_id: returned_attempt,
-            nonce: returned_nonce,
-            request_sha256: returned_digest,
-            rejection,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
-            && returned_attempt == attempt_id
-            && returned_nonce == nonce
-            && returned_digest == request_sha256
-            && rejection.terminal_ack_required()
-            && rejection.is_consistent() =>
-        {
-            let response = WindowsProviderResponseV3::Reject {
-                schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    let native_detail_allowed = caller.access_floor.elevated;
+    let prepared: Result<_, String> = (|| {
+        let (launcher, _process, _identity) = authenticated_launcher()?;
+        pipe::write_frame(
+            launcher.raw(),
+            &WindowsLauncherRequestV3::RecoverAttempt {
+                schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                attempt_id: attempt_id.to_owned(),
+                nonce: nonce.to_owned(),
+                request_sha256: request_sha256.to_owned(),
+                challenge: challenge.to_owned(),
+                caller,
+            },
+        )?;
+        let response = pipe::read_response_frame::<WindowsLauncherResponseV3>(launcher.raw())?;
+        let (public_response, ack_digest) = match response {
+            WindowsLauncherResponseV3::Terminal(receipt)
+                if receipt.attempt_id == attempt_id
+                    && receipt.nonce == nonce
+                    && receipt.request_sha256 == request_sha256
+                    && receipt.validate_for_attempt().is_ok() =>
+            {
+                let response = WindowsProviderResponseV3::Terminal(receipt);
+                let digest = super::record::digest(
+                    response
+                        .terminal_authority_json()
+                        .map_err(|error| error.to_string())?
+                        .as_bytes(),
+                );
+                (response, Some(digest))
+            }
+            WindowsLauncherResponseV3::Reject {
+                schema_version,
                 attempt_id: returned_attempt,
                 nonce: returned_nonce,
                 request_sha256: returned_digest,
                 rejection,
-            };
-            let digest = super::record::digest(
-                response
-                    .terminal_authority_json()
-                    .map_err(|error| error.to_string())?
-                    .as_bytes(),
-            );
-            (response, Some(digest))
-        }
-        WindowsLauncherResponseV3::TerminalRetiredV2(retired)
-            if retired.is_consistent_for(
-                attempt_id,
-                nonce,
-                request_sha256,
-                &retired.terminal_response_sha256,
-            ) =>
-        {
-            (WindowsProviderResponseV3::TerminalRetiredV2(retired), None)
-        }
-        WindowsLauncherResponseV3::RecoveryAttemptUnavailable {
-            schema_version,
-            challenge: returned_challenge,
-            attempt_id: returned_attempt,
-            detail,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
-            && returned_challenge == challenge
-            && returned_attempt == attempt_id =>
-        {
-            (
-                WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+            } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                && returned_attempt == attempt_id
+                && returned_nonce == nonce
+                && returned_digest == request_sha256
+                && rejection.terminal_ack_required()
+                && rejection.is_consistent() =>
+            {
+                let response = WindowsProviderResponseV3::Reject {
                     schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
-                    challenge: returned_challenge,
                     attempt_id: returned_attempt,
-                    detail,
-                },
-                None,
-            )
+                    nonce: returned_nonce,
+                    request_sha256: returned_digest,
+                    rejection,
+                };
+                let digest = super::record::digest(
+                    response
+                        .terminal_authority_json()
+                        .map_err(|error| error.to_string())?
+                        .as_bytes(),
+                );
+                (response, Some(digest))
+            }
+            WindowsLauncherResponseV3::TerminalRetiredV2(retired)
+                if retired.is_consistent_for(
+                    attempt_id,
+                    nonce,
+                    request_sha256,
+                    &retired.terminal_response_sha256,
+                ) =>
+            {
+                (WindowsProviderResponseV3::TerminalRetiredV2(retired), None)
+            }
+            WindowsLauncherResponseV3::RecoveryAttemptUnavailable {
+                schema_version,
+                challenge: returned_challenge,
+                attempt_id: returned_attempt,
+                detail,
+            } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+                && returned_challenge == challenge
+                && returned_attempt == attempt_id =>
+            {
+                (
+                    WindowsProviderResponseV3::RecoveryAttemptUnavailable {
+                        schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+                        challenge: returned_challenge,
+                        attempt_id: returned_attempt,
+                        detail,
+                    },
+                    None,
+                )
+            }
+            _ => return Err("launcher recovery response was not exactly bound".to_owned()),
+        };
+        Ok((launcher, _process, _identity, public_response, ack_digest))
+    })();
+    let (launcher, _process, _identity, public_response, ack_digest) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return pipe::write_frame(
+                public,
+                &WindowsProviderResponseV3::recovery_attempt_unavailable(
+                    attempt_id,
+                    challenge,
+                    &error,
+                    native_detail_allowed,
+                )?,
+            );
         }
-        _ => return Err("launcher recovery response was not exactly bound".to_owned()),
     };
     pipe::write_frame(public, &public_response)?;
     if let Some(digest) = ack_digest {
@@ -1707,7 +1725,7 @@ fn authenticated_launcher_detailed() -> Result<
         let observation = super::service_manager::launcher_startup_observation(
             LAST_AUTHENTICATED_LAUNCHER_TICK.load(std::sync::atomic::Ordering::Acquire),
         )
-        .unwrap_or_else(|_| "unavailable".to_owned());
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
         LauncherAuthenticationError::new(
             STARTUP_LAUNCHER_AUTHENTICATION_PIPE_CONNECT,
             format!("{error}; launcher_startup_observation={observation}"),

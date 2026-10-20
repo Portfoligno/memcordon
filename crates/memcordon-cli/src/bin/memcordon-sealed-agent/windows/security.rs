@@ -297,6 +297,18 @@ pub fn state_sddl() -> Result<String, String> {
     ))
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn support_console_comparison_intent_sddl() -> Result<String, String> {
+    let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
+    // This exact leaf may be inspected and removed by the administrative
+    // package owner. Its parent policy deliberately does not inherit that
+    // capability, and Administrators receive no content-write authority here.
+    // Synchronous CreateFile metadata opens also require SYNCHRONIZE.
+    Ok(format!(
+        "O:SYD:P(D;;WDWO;;;OW)(A;;FA;;;SY)(A;;0x00130080;;;BA)(A;;GRGW;;;{launcher})"
+    ))
+}
+
 pub fn state_parent_sddl() -> Result<String, String> {
     let control = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;

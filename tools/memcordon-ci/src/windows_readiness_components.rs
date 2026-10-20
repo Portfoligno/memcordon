@@ -177,7 +177,8 @@ pub fn authenticated_transport_injection_authority(
 
 /// These are actual native injection points, not installed-product case rows.
 #[derive(Clone, Debug)]
-pub struct ObservedFrontendKill {
+pub struct ObservedFrontendLoss {
+    selected: memcordon_core::WindowsSealedFault,
     identity: memcordon_core::WindowsProcessIdentityV1,
     native_status: u32,
 }
@@ -188,7 +189,7 @@ pub fn frontend_kill_observation(
     action: &serde_json::Value,
     held: &memcordon_core::WindowsProcessIdentityV1,
     native_status: u32,
-) -> Option<ObservedFrontendKill> {
+) -> Option<ObservedFrontendLoss> {
     (held.process_id != 0
         && held.creation_time_100ns != 0
         && native_status == 0xC000_013A
@@ -200,7 +201,32 @@ pub fn frontend_kill_observation(
         && action["target_authorization_observed"] == true
         && action["controller_release_observed"] == true
         && action["requested_exit_status"].as_u64() == Some(u64::from(native_status)))
-    .then(|| ObservedFrontendKill {
+    .then(|| ObservedFrontendLoss {
+        selected: memcordon_core::WindowsSealedFault::FrontendKilledAfterAuthorization,
+        identity: held.clone(),
+        native_status,
+    })
+}
+
+/// A disconnect is not a process-kill witness: retain its actual wrapper exit.
+pub fn frontend_disconnect_observation(
+    action: &serde_json::Value,
+    held: &memcordon_core::WindowsProcessIdentityV1,
+    native_status: u32,
+) -> Option<ObservedFrontendLoss> {
+    (held.process_id != 0
+        && held.creation_time_100ns != 0
+        && native_status == 125
+        && action["format"] == "memcordon.windows-component-frontend-action"
+        && action["revision"] == 1
+        && action["kind"] == "disconnect-public-channel"
+        && action["process"]["process_id"].as_u64() == Some(u64::from(held.process_id))
+        && action["process"]["creation_time_100ns"].as_u64() == Some(held.creation_time_100ns)
+        && action["target_authorization_observed"] == true
+        && action["controller_release_observed"] == true
+        && action.get("requested_exit_status") == Some(&serde_json::Value::Null))
+    .then(|| ObservedFrontendLoss {
+        selected: memcordon_core::WindowsSealedFault::FrontendDisconnectedAfterAuthorization,
         identity: held.clone(),
         native_status,
     })
@@ -213,10 +239,14 @@ pub fn frontend_guardian_injection_authority(
     attempt: &str,
     request: &str,
     live: &memcordon_core::WindowsGuardianAttemptObservation,
-    killed: &ObservedFrontendKill,
+    observed: &ObservedFrontendLoss,
 ) -> bool {
     use memcordon_core::*;
-    if selected != WindowsSealedFault::FrontendKilledAfterAuthorization
+    if !matches!(
+        selected,
+        WindowsSealedFault::FrontendKilledAfterAuthorization
+            | WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+    ) || observed.selected != selected
         || !rejection.is_consistent()
     {
         return false;
@@ -240,9 +270,11 @@ pub fn frontend_guardian_injection_authority(
         || live.worker_process_identity.as_ref() != Some(&guardian.worker_identity)
         || terminal.attempt_id != attempt
         || terminal.request_sha256 != request
+        || terminal.validate_for_attempt().is_err()
+        || terminal.process_observation.root_identity != live.live_target_identity
         || live.live_nonce.as_ref() != Some(&terminal.nonce)
         || !matches!(&guardian.cleanup_trigger, Some(WindowsGuardianCleanupTriggerV1::FrontendLost { frontend, native_exit_status })
-            if frontend == &killed.identity && *native_exit_status == killed.native_status)
+            if frontend == &observed.identity && *native_exit_status == observed.native_status)
         || !terminal
             .execution()
             .is_some_and(|(_, outcome, _)| matches!(outcome, RunOutcome::MonitorFailed { .. }))
@@ -347,6 +379,54 @@ pub fn control_service_recovery_process_matches(
         && replacement.process_id == scm_process_id
 }
 
+/// Select only deliberate service-process loss, never worker-only loss.
+/// Endpoint availability admits recovery work; it supplies no terminal authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceRecoveryRole {
+    Control,
+    Launcher,
+}
+
+impl ServiceRecoveryRole {
+    pub fn for_fault(fault: Option<memcordon_core::WindowsSealedFault>) -> Option<Self> {
+        use memcordon_core::WindowsSealedFault;
+        match fault {
+            Some(WindowsSealedFault::ControlServiceKilledAfterAuthorization) => Some(Self::Control),
+            Some(
+                WindowsSealedFault::LauncherServiceKilledAfterAuthorization
+                | WindowsSealedFault::AllJobOwnersClosedAfterAuthorization,
+            ) => Some(Self::Launcher),
+            _ => None,
+        }
+    }
+
+    pub fn service_name(self) -> &'static str {
+        match self {
+            Self::Control => memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
+            Self::Launcher => memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+        }
+    }
+
+    pub fn pipe_name(self) -> &'static str {
+        match self {
+            Self::Control => memcordon_core::WINDOWS_CONTROL_PIPE,
+            Self::Launcher => memcordon_core::WINDOWS_LAUNCHER_PIPE,
+        }
+    }
+
+    #[cfg(windows)]
+    fn observe_status(self) -> std::io::Result<serde_json::Value> {
+        match self {
+            Self::Control => crate::windows_readiness_faults::observe_control_service_status(),
+            Self::Launcher => crate::windows_readiness_faults::observe_launcher_service_status(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[path = "windows_extinction_staging.rs"]
+mod extinction_staging;
+
 #[cfg(windows)]
 pub fn run_installed(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
@@ -392,10 +472,11 @@ mod native {
     }
 
     #[allow(unsafe_code)] // WaitNamedPipe is a query only; the later recovery command authenticates provider authority.
-    fn wait_control_service_recovery(
+    fn wait_service_recovery(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input: &ComponentInput,
         original: &HeldWorker,
+        role: super::ServiceRecoveryRole,
         directory: &std::path::Path,
         record: &mut ComponentAssessment,
         cutoff: Instant,
@@ -404,32 +485,37 @@ mod native {
             Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT},
             System::Pipes::{NMPWAIT_NOWAIT, WaitNamedPipeW},
         };
+        let service_label = match role {
+            super::ServiceRecoveryRole::Control => "control",
+            super::ServiceRecoveryRole::Launcher => "launcher",
+        };
         let status = super::worker_wait::wait_until(&original.thread, cutoff)?;
         if status != 0xC000_013A {
-            return Err(CiError::Message(
-                "original control service fault exit differs".into(),
-            ));
+            return Err(CiError::Message(format!(
+                "original {service_label} service fault exit differs"
+            )));
         }
         let original_identity = memcordon_core::WindowsProcessIdentityV1 {
             process_id: original.process.identity.pid,
             creation_time_100ns: u64::try_from(original.process.identity.birth).map_err(|_| {
-                CiError::Message("original control service birth exceeds bound".into())
+                CiError::Message(format!(
+                    "original {service_label} service birth exceeds bound"
+                ))
             })?,
         };
-        let pipe: Vec<_> = memcordon_core::WINDOWS_CONTROL_PIPE
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
+        let pipe: Vec<_> = role.pipe_name().encode_utf16().chain(Some(0)).collect();
         loop {
             let remaining = cutoff
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| *remaining > Duration::from_millis(10))
                 .ok_or_else(|| {
-                    CiError::Message("original control service recovery cutoff exhausted".into())
+                    CiError::Message(format!(
+                        "original {service_label} service recovery cutoff exhausted"
+                    ))
                 })?;
             if original.process.has_exited()? {
-                let scm = crate::windows_readiness_faults::observe_control_service_status()?;
-                if scm["name"] != memcordon_core::WINDOWS_CONTROL_SERVICE_NAME {
+                let scm = role.observe_status()?;
+                if scm["name"] != role.service_name() {
                     return Err(CiError::Message(
                         "recovery SCM service identity differs".into(),
                     ));
@@ -471,8 +557,7 @@ mod native {
                                 "recovery SCM replacement identity differs".into(),
                             ));
                         }
-                        if crate::windows_readiness_faults::observe_control_service_status()? == scm
-                        {
+                        if role.observe_status()? == scm {
                             if crate::windows_causal_acceptance::sha256(&read(
                                 &config.installed_agent.path,
                                 512 * 1024 * 1024,
@@ -486,18 +571,33 @@ mod native {
                             let available =
                                 unsafe { WaitNamedPipeW(pipe.as_ptr(), NMPWAIT_NOWAIT) } != 0;
                             if available {
-                                if Instant::now() >= cutoff || replacement.has_exited()?
-                                    || crate::windows_readiness_faults::observe_control_service_status()? != scm
+                                if Instant::now() >= cutoff
+                                    || replacement.has_exited()?
+                                    || role.observe_status()? != scm
                                 {
-                                    return Err(CiError::Message("recovery service changed at endpoint readiness".into()));
+                                    return Err(CiError::Message(
+                                        "recovery service changed at endpoint readiness".into(),
+                                    ));
                                 }
+                                let (leaf, format, status_key) = match role {
+                                    super::ServiceRecoveryRole::Control => (
+                                        "control-service-recovery-ready.json",
+                                        "memcordon.windows-component-control-service-recovery",
+                                        "control_service",
+                                    ),
+                                    super::ServiceRecoveryRole::Launcher => (
+                                        "launcher-service-recovery-ready.json",
+                                        "memcordon.windows-component-launcher-service-recovery",
+                                        "launcher_service",
+                                    ),
+                                };
                                 retain(
-                                    &directory.join("control-service-recovery-ready.json"),
+                                    &directory.join(leaf),
                                     &serde_json::to_vec(&serde_json::json!({
-                                        "format":"memcordon.windows-component-control-service-recovery","revision":1,
+                                        "format":format,"revision":1,
                                         "original_process":original_identity,"original_process_exit_observed":true,
                                         "original_thread_exit_status":status,"replacement_process":replacement_identity,
-                                        "selected_image_sha256":config.installed_agent.sha256,"control_service":scm,
+                                        "selected_image_sha256":config.installed_agent.sha256,(status_key):scm,
                                         "endpoint_available":true,"provider_authority_authenticated":false,
                                         "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
                                     }))?,
@@ -1835,7 +1935,7 @@ mod native {
                 .pointer("/launch/nonce")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| CiError::Message("component launch nonce absent".into()))?;
-            let mut observed_frontend_kill = None;
+            let mut observed_frontend_loss = None;
             if fault.is_some_and(|fault| {
                 matches!(
                     fault,
@@ -1895,7 +1995,7 @@ mod native {
                     }))?,
                     record,
                 )?;
-                if kill {
+                {
                     let identity = memcordon_core::WindowsProcessIdentityV1 {
                         process_id: frontend.identity.pid,
                         creation_time_100ns: u64::try_from(frontend.identity.birth).map_err(
@@ -1906,19 +2006,18 @@ mod native {
                             },
                         )?,
                     };
-                    observed_frontend_kill = Some(
-                        frontend_kill_observation(
-                            action,
-                            &identity,
-                            frontend.native_exit_status()?.ok_or_else(|| {
-                                CiError::Message(
-                                    "held killed frontend has no native exit status".into(),
-                                )
-                            })?,
-                        )
+                    let native_status = frontend.native_exit_status()?.ok_or_else(|| {
+                        CiError::Message("held frontend has no native exit status".into())
+                    })?;
+                    observed_frontend_loss = Some(
+                        (if kill {
+                            frontend_kill_observation(action, &identity, native_status)
+                        } else {
+                            frontend_disconnect_observation(action, &identity, native_status)
+                        })
                         .ok_or_else(|| {
                             CiError::Message(
-                                "held frontend kill action is not exactly bound".into(),
+                                "held frontend loss action is not exactly bound".into(),
                             )
                         })?,
                     );
@@ -1950,6 +2049,23 @@ mod native {
                 let bytes: Vec<u8> = serde_json::from_value(raw.clone())?;
                 let response: memcordon_core::WindowsProviderResponseV3 =
                     serde_json::from_slice(&bytes)?;
+                if fault
+                    == Some(memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization)
+                {
+                    let held = live
+                        .lock()
+                        .map_err(|_| CiError::Message("component association poisoned".into()))?;
+                    rejected |=
+                        crate::windows_component_failed_recovery::guardian_loss_original_authority(
+                            &response,
+                            memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization,
+                            held.as_ref().ok_or_else(|| {
+                                CiError::Message("original held guardian association absent".into())
+                            })?,
+                            &config.provider,
+                        )
+                        .map_err(CiError::Message)?;
+                }
                 if fault
                     == Some(
                         memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization,
@@ -1992,6 +2108,40 @@ mod native {
                         {
                             rejected = true;
                         }
+                    }
+                }
+                if let (
+                    Some(expected),
+                    memcordon_core::WindowsProviderResponseV3::Reject {
+                        schema_version,
+                        attempt_id,
+                        nonce: actual_nonce,
+                        request_sha256,
+                        rejection,
+                        ..
+                    },
+                ) = (mutant, &response)
+                {
+                    if let memcordon_core::WindowsProviderRejectionDispositionV2::PrematureReleaseFailure { receipt }
+                        = &rejection.disposition
+                    {
+                        let held = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
+                        rejected |= *schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+                            && attempt_id == attempt && actual_nonce == nonce && request_sha256 == request
+                            && rejection.is_consistent()
+                            && receipt.validate_for_attempt().is_ok()
+                            && receipt.attempt_id == attempt && receipt.nonce == nonce
+                            && receipt.request_sha256 == request
+                            && receipt.retirement_proof.provider_generation == config.provider.generation.as_str()
+                            && held.as_ref().is_none_or(|held| held.is_consistent()
+                                && held.association.provider == config.provider
+                                && String::from(held.association.attempt_id.clone()) == attempt
+                                && String::from(held.association.request_sha256.clone()) == request
+                                && held.live_nonce.as_deref() == Some(nonce)
+                                && receipt.process_observation.root_identity == held.live_target_identity)
+                            && matches!(&receipt.payload,
+                                memcordon_core::WindowsTerminalPayloadV2::PrematureReleaseFailure { witness, .. }
+                                    if witness.mutant == expected && witness.is_consistent());
                     }
                 }
                 if let memcordon_core::WindowsProviderResponseV3::Reject {
@@ -2104,26 +2254,30 @@ mod native {
                         ));
                     }
                 }
-                let _restarted_control_service = if control_process_loss {
-                    let original = control_worker.lock().map_err(|_| {
-                        CiError::Message("control worker ownership poisoned".into())
-                    })?;
-                    let original = original.as_ref().ok_or_else(|| {
-                        CiError::Message(
-                            "control service recovery lacks original held owner".into(),
-                        )
-                    })?;
-                    Some(wait_control_service_recovery(
-                        config,
-                        input,
-                        original,
-                        directory,
-                        record,
-                        recovery_cutoff,
-                    )?)
-                } else {
-                    None
-                };
+                let _restarted_service =
+                    if let Some(role) = super::ServiceRecoveryRole::for_fault(fault) {
+                        let owner = match role {
+                            super::ServiceRecoveryRole::Control => &control_worker,
+                            super::ServiceRecoveryRole::Launcher => &worker,
+                        };
+                        let original = owner.lock().map_err(|_| {
+                            CiError::Message("service recovery worker ownership poisoned".into())
+                        })?;
+                        let original = original.as_ref().ok_or_else(|| {
+                            CiError::Message("service recovery lacks original held owner".into())
+                        })?;
+                        Some(wait_service_recovery(
+                            config,
+                            input,
+                            original,
+                            role,
+                            directory,
+                            record,
+                            recovery_cutoff,
+                        )?)
+                    } else {
+                        None
+                    };
                 let recovery_budget = recovery_cutoff
                     .checked_duration_since(Instant::now())
                     .filter(|budget| !budget.is_zero())
@@ -2218,11 +2372,11 @@ mod native {
                         matches!(&response, memcordon_core::WindowsProviderResponseV3::Reject { rejection, .. }
                             if rejection.provider_failure.as_ref().is_some_and(|failure|
                                 transport_injection_authority(failure, selected, &config.provider, attempt, request))));
-                    let selected_frontend_guardian_original = if let (Some(selected),Some(killed)) = (fault,observed_frontend_kill.as_ref()) {
+                    let selected_frontend_guardian_original = if let (Some(selected),Some(observed)) = (fault,observed_frontend_loss.as_ref()) {
                         let association = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
                         association.as_ref().is_some_and(|association|
                             matches!(&response,memcordon_core::WindowsProviderResponseV3::Reject {rejection,..}
-                                if frontend_guardian_injection_authority(rejection,selected,&config.provider,attempt,request,association,killed)))
+                                if frontend_guardian_injection_authority(rejection,selected,&config.provider,attempt,request,association,observed)))
                     } else { false };
                     if let Some(receipt) = receipt {
                         receipt.validate_for_attempt().map_err(|error| CiError::Message(error.into()))?;
@@ -2398,12 +2552,11 @@ mod native {
                 )?;
                 let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
                     serde_json::from_slice(&output.stdout)?;
-                if output.status.code() != Some(1)
-                    || !inventory.is_consistent()
-                    || inventory.provider_generation != config.provider.generation.as_str()
-                    || inventory.unacknowledged_outboxes != 1
-                    || inventory.incomplete_proof != 0
-                {
+                if !super::extinction_staging::accepts_pending_authority(
+                    output.status.code(),
+                    &inventory,
+                    config.provider.generation.as_str(),
+                ) {
                     return Err(CiError::Message(
                         "extinction staging did not retain exact terminal authority for caller ACK"
                             .into(),

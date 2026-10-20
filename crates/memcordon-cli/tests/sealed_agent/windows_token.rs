@@ -422,6 +422,33 @@ fn process_query_and_owner_source_capabilities_are_not_interchangeable() {
 }
 
 #[test]
+fn borrowed_current_process_query_token_matches_owned_attestation_across_scopes() {
+    let owned = current_process_token_for_attestation().unwrap();
+    let expected_envelope = envelope(owned.raw()).unwrap();
+    let expected_snapshot = token_query_attestation_snapshot(owned.raw()).unwrap();
+
+    for _ in 0..2 {
+        let borrowed = crate::windows::token::current_process_query_token();
+        assert_eq!(envelope(borrowed.raw()).unwrap(), expected_envelope);
+        assert_eq!(
+            token_query_attestation_snapshot(borrowed.raw()).unwrap(),
+            expected_snapshot
+        );
+    }
+
+    let borrowed = crate::windows::token::current_process_query_token();
+    assert_eq!(envelope(borrowed.raw()).unwrap(), expected_envelope);
+    assert_eq!(
+        token_query_attestation_snapshot(borrowed.raw()).unwrap(),
+        expected_snapshot
+    );
+    assert_eq!(
+        token_query_attestation_snapshot(owned.raw()).unwrap(),
+        expected_snapshot
+    );
+}
+
+#[test]
 fn assigned_process_authority_ignores_only_token_id_and_types_every_other_difference() {
     let token = restricted_current_primary().unwrap();
     let source = token_attestation_snapshot(token.raw()).unwrap();

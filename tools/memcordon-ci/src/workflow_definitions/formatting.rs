@@ -2,6 +2,46 @@
 use crate::{CiError, Result};
 use serde_yaml::Value;
 
+/// Reuse pinned action scalars with native YAML anchors. Aliases change only
+/// presentation; the parsed document is checked against the authored data.
+fn mark_actions(document: &mut Value, replacements: &mut Vec<(String, String)>) {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for job in document["jobs"].as_mapping().expect("source jobs").values() {
+        for step in job["steps"].as_sequence().expect("source steps") {
+            if let Some(action) = step["uses"].as_str() {
+                *counts.entry(action.to_owned()).or_default() += 1;
+            }
+        }
+    }
+    let mut anchors = std::collections::BTreeMap::<String, String>::new();
+    for job in document["jobs"]
+        .as_mapping_mut()
+        .expect("source jobs")
+        .values_mut()
+    {
+        for step in job["steps"].as_sequence_mut().expect("source steps") {
+            let Some(action) = step["uses"].as_str().filter(|value| value.contains('@')) else {
+                continue;
+            };
+            if counts.get(action).copied().unwrap_or_default() < 2 {
+                continue;
+            }
+            let action = action.to_owned();
+            let replacement = if let Some(anchor) = anchors.get(&action) {
+                format!("*{anchor}")
+            } else {
+                let anchor = format!("action_{}", anchors.len());
+                let replacement = format!("&{anchor} {action}");
+                anchors.insert(action, anchor);
+                replacement
+            };
+            let marker = format!("MEMCORDON_ACTION_{}_END", replacements.len());
+            replacements.push((marker.clone(), replacement));
+            step["uses"] = Value::String(marker);
+        }
+    }
+}
+
 fn inline(value: &Value) -> Result<String> {
     match value {
         Value::Sequence(items) => Ok(format!(
@@ -138,7 +178,8 @@ fn indent_sequences(yaml: &str) -> String {
 
 pub(super) fn serialize(name: &str, document: &Value) -> Result<String> {
     let mut styled = document.clone();
-    let replacements = mark_inline(name, &mut styled)?;
+    let mut replacements = mark_inline(name, &mut styled)?;
+    mark_actions(&mut styled, &mut replacements);
     let mut yaml = serde_yaml::to_string(&styled)?;
     for (marker, collection) in replacements {
         yaml = yaml.replace(&marker, &collection);

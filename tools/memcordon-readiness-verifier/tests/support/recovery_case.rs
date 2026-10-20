@@ -8,6 +8,7 @@ use memcordon_readiness_verifier::*;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 const MANIFEST: &str = include_str!("../../../../ci/consumer-readiness-v1.toml");
 
 fn hash(bytes: &[u8]) -> String {
@@ -275,18 +276,30 @@ fn recovery_case(lost_terminal: bool) -> PersistedCase {
         reason: None,
         evidence: Some(path("case-evidence.json")),
     };
+    // Row validation still requires actual custody of each declared producer
+    // archive; this transport fixture does not claim full bundle readiness.
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file(
+            "native-executable.bin",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    archive.write_all(executable_bytes).unwrap();
+    let archive = archive.finish().unwrap().into_inner();
     let index:EvidenceIndex=serde_json::from_value(json!({"format":"memcordon.consumer-readiness.evidence","revision":1,"profile":PROFILE,"run_id":run,"source_commit":commit,
         "source_tree_sha256":tree,"version":version,"manifest_sha256":hash(MANIFEST.as_bytes()),"repository":"example/memcordon","products":[],"component_builds":[{"target":target,"source_commit":commit,"source_tree_sha256":tree,
             "host":{"kernel":"Linux","native_target":target,"executable_target":target,"emulated":false,"toolchain_identity":"fixture compiler","toolchain_sha256":hash(b"compiler"),"lockfile_sha256":hash(b"lockfile")},
             "recipe_id":recipe,"recipe_sha256":hash(b"native recipe"),"executable":"native-executable.bin","instrumented":true,"actor_executable":null,"parser_executable":null}],
         "workflow_cells":[],"fixture_cases":[],"artifacts":[],"records":[record],"producer_origins":[{"job":"native-linux-x64","run_id":run,"run_attempt":1,"artifact_id":"123",
-            "artifact_sha256":hash(b"bundle"),"bundle_artifact":"bundle.zip","source_commit":commit,"source_tree_sha256":tree,"version":version,"manifest_sha256":hash(MANIFEST.as_bytes()),"repository":"example/memcordon"}],
+            "artifact_sha256":hash(&archive),"bundle_artifact":"bundle.zip","source_commit":commit,"source_tree_sha256":tree,"version":version,"manifest_sha256":hash(MANIFEST.as_bytes()),"repository":"example/memcordon"}],
         "job_outcomes":[],"assessment_failures":[]})).unwrap();
     let mut case = PersistedCase {
         root: tempfile::tempdir().unwrap(),
         index,
         record,
     };
+    case.write("bundle.zip", &archive);
     case.write("native-executable.bin", executable_bytes);
     case.write("source.tar", source_bytes);
     for (leaf, value) in [

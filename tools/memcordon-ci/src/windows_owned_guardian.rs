@@ -3,6 +3,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CiError, Result};
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct LauncherServiceStatus {
+    pub service_type: u32,
+    pub current_state: u32,
+    pub controls_accepted: u32,
+    pub win32_exit_code: u32,
+    pub service_specific_exit_code: u32,
+    pub checkpoint: u32,
+    pub wait_hint: u32,
+    pub process_id: u32,
+    pub service_flags: u32,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum LauncherServiceQueryStage {
+    ScmOpen,
+    ServiceOpen,
+    StatusQuery,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct LauncherServiceQueryError {
+    pub stage: LauncherServiceQueryStage,
+    pub win32_error: Option<u32>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianAssociationIdentity {
@@ -170,6 +200,60 @@ mod native {
             return Err(native_failure("cannot inspect guardian slot status"));
         }
         Ok(result)
+    }
+
+    /// Additional diagnostic query only. It never participates in guardian
+    /// admission, quiescence, recovery convergence, or process identity.
+    pub(crate) fn launcher_service_status()
+    -> std::result::Result<LauncherServiceStatus, LauncherServiceQueryError> {
+        let failure = |stage| LauncherServiceQueryError {
+            stage,
+            win32_error: std::io::Error::last_os_error()
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok()),
+        };
+        // Only the existing owner context's read-only local SCM connection.
+        let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+        if manager.is_null() {
+            return Err(failure(LauncherServiceQueryStage::ScmOpen));
+        }
+        let manager = ServiceHandle(manager);
+        let name = memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let service = unsafe { OpenServiceW(manager.0, name.as_ptr(), SERVICE_QUERY_STATUS) };
+        if service.is_null() {
+            return Err(failure(LauncherServiceQueryStage::ServiceOpen));
+        }
+        let service = ServiceHandle(service);
+        let mut raw = SERVICE_STATUS_PROCESS::default();
+        let mut required = 0;
+        // Exact fixed output size, held query-only service, no config/process
+        // lookup and no retry. SCM reports its latest received state only.
+        if unsafe {
+            QueryServiceStatusEx(
+                service.0,
+                SC_STATUS_PROCESS_INFO,
+                (&mut raw as *mut SERVICE_STATUS_PROCESS).cast(),
+                u32::try_from(std::mem::size_of_val(&raw)).expect("service status size"),
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(failure(LauncherServiceQueryStage::StatusQuery));
+        }
+        Ok(LauncherServiceStatus {
+            service_type: raw.dwServiceType,
+            current_state: raw.dwCurrentState,
+            controls_accepted: raw.dwControlsAccepted,
+            win32_exit_code: raw.dwWin32ExitCode,
+            service_specific_exit_code: raw.dwServiceSpecificExitCode,
+            checkpoint: raw.dwCheckPoint,
+            wait_hint: raw.dwWaitHint,
+            process_id: raw.dwProcessId,
+            service_flags: raw.dwServiceFlags,
+        })
     }
 
     fn config_hash(service: &ServiceHandle) -> Result<String> {
@@ -605,5 +689,7 @@ mod native {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use native::launcher_service_status;
 #[cfg(windows)]
 pub use native::{GuardianBaseline, HeldGuardian};

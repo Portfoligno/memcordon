@@ -9,7 +9,6 @@ use clap::{Args, ValueEnum};
 use memcordon_readiness_verifier::{Artifact, JobOutcome, JobResult};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -229,6 +228,7 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
                 Err(error) => failure(&mut index, error),
                 Ok(mut producer) => {
                     let result = (|| -> Result<()> {
+                        readiness_transport::check_evidence_budget(&index.artifacts, &producer)?;
                         consumer_readiness_ledger::ingest(
                             &mut index,
                             producer.cell,
@@ -239,14 +239,12 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
                         let relative = format!("origins/{job}/{}", producer.archive.path);
                         let path = custody.join(&relative);
                         fs::create_dir_all(path.parent().expect("origin parent"))?;
-                        let bytes =
-                            artifacts::read_file(&producer.directory.join(&producer.archive.path))?;
-                        let mut file = fs::OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .open(&path)?;
-                        file.write_all(&bytes)?;
-                        file.sync_all()?;
+                        readiness_transport::retain_downloaded_archive(
+                            &producer.directory,
+                            &producer.archive,
+                            &path,
+                            deadline,
+                        )?;
                         fs::File::open(path.parent().expect("origin parent"))?.sync_all()?;
                         producer.origin.bundle_artifact = relative.clone();
                         index.artifacts.push(Artifact {

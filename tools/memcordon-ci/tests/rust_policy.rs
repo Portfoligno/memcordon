@@ -285,6 +285,37 @@ fn offline_download_permission_is_exact_in_path_key_and_value() {
 }
 
 #[test]
+fn driver_fixture_environment_is_exact_in_path_key_value_and_count() {
+    let fixture = Path::new("tools/memcordon-ci/tests/driver_cache.rs");
+    let actual = include_str!("driver_cache.rs");
+    validate_rust_policy_bytes(fixture, actual.as_bytes()).unwrap();
+    for changed in [
+        actual.replace("\"GITHUB_EVENT_NAME\", event", "\"GITHUB_EVENT_NAME\", \"push\""),
+        actual.replace("refs/heads/test", "refs/tags/test"),
+        actual.replace("\"GITHUB_OUTPUT\", &outputs", "\"GITHUB_OUTPUT\", \"unowned-output\""),
+        actual.replace("join(\"cargo-home\")", "join(\"unowned-home\")"),
+        actual.replace("\"GITHUB_REF\"", "\"CUSTOM_CI_REF\""),
+        actual.replace(".env(\"GITHUB_REF\", \"refs/heads/test\")", ""),
+        [actual, r#"fn extra(command: &mut Command) { command.env("GITHUB_REF", "refs/heads/test"); }"#].join("\n"),
+        [actual, r#"fn extra(command: &mut Command) { command.env("CUSTOM_CI_FLAG", "value"); }"#].join("\n"),
+        [actual, r#"fn extra(command: &mut Command, key: &str) { command.env(key, "value"); }"#].join("\n"),
+        [actual, r#"fn extra(command: &mut Command) { command.envs([("GITHUB_REF", "refs/heads/test")]); }"#].join("\n"),
+        [actual, r#"fn extra(command: &mut Command) { command.env_clear(); }"#].join("\n"),
+        [actual, r#"fn extra(command: &mut Command) { command.env_remove("GITHUB_REF"); }"#].join("\n"),
+    ] {
+        assert_ne!(changed, actual, "mutation must change the real fixture");
+        assert!(validate_rust_policy_bytes(fixture, changed.as_bytes()).is_err());
+    }
+    for path in [
+        "tools/memcordon-ci/tests/unreviewed_driver_cache.rs",
+        "tools/memcordon-ci/tests/cache_download_families.rs",
+        "tools/memcordon-ci/src/driver_cache.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(path), actual.as_bytes()).is_err());
+    }
+}
+
+#[test]
 fn cargo_fuzz_budget_is_reviewed_only_at_the_owned_command_boundary() {
     let boundary = Path::new("tools/memcordon-ci/src/command.rs");
     let actual = include_str!("../src/command.rs");

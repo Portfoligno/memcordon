@@ -5,6 +5,9 @@ use memcordon_core::{
     PublicProviderBindingV1, WindowsGuardianAttemptObservation, WindowsProviderResponseV3,
 };
 
+#[path = "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/publication_wait.rs"]
+mod publication_wait;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryBinding {
     pub attempt: String,
@@ -83,6 +86,64 @@ impl RecoveryBinding {
     }
 }
 
+/// Admit an original guardian-loss execution receipt before its frontend ACK.
+/// The caller still independently verifies the selected held guardian's native
+/// termination and retirement; a later receipt-free tombstone is not authority.
+pub fn guardian_loss_original_authority(
+    response: &WindowsProviderResponseV3,
+    selected: memcordon_core::WindowsSealedFault,
+    held: &WindowsGuardianAttemptObservation,
+    provider: &PublicProviderBindingV1,
+) -> Result<bool, String> {
+    use memcordon_core::*;
+    if selected != WindowsSealedFault::GuardianKilledAfterAuthorization {
+        return Ok(false);
+    }
+    let WindowsProviderResponseV3::Reject { rejection, .. } = response else {
+        return Ok(false);
+    };
+    if rejection.code != "MCSEALED-WINDOWS-JOB-QUERY"
+        || rejection.phase != BoundarySetupPhase::Monitoring
+        || !rejection.target_created
+        || !rejection.target_released
+        || !rejection.cleanup_attempted
+    {
+        return Ok(false);
+    }
+    let binding = RecoveryBinding::from_held(held, provider)?;
+    binding.validate_response(response)?;
+    if !rejection.is_consistent() {
+        return Err("original guardian rejection is inconsistent".into());
+    }
+    let Some(receipt) = rejection.terminal_receipt() else {
+        return Ok(false);
+    };
+    let Some(failure) = rejection.provider_failure.as_ref() else {
+        return Ok(false);
+    };
+    Ok(failure.is_consistent()
+        && failure.provider_binding == *provider
+        && String::from(failure.attempt_id.clone()) == binding.attempt
+        && String::from(failure.request_sha256.clone()) == binding.request
+        && matches!(&failure.original, OriginalFailureV1::Observed { event }
+            if event.sequence > 0
+                && event.origin == DiagnosticOriginV1::Launcher
+                && event.category == FailureCategoryV1::Monitor
+                && event.operation == FailureOperationV1::CheckGuardian
+                && event.code == FailureCodeV1::GuardianLoss
+                && event.native_code.is_none()
+                && event.observed_phase == AttemptObservationPhaseV1::Monitoring
+                && event.safe_detail == SafeDiagnosticDetailV1::NoAdditionalDetail)
+        && receipt.process_observation.root_identity.as_ref() == held.live_target_identity.as_ref()
+        && matches!(
+            &receipt.payload,
+            WindowsTerminalPayloadV2::Execution {
+                outcome: RunOutcome::MonitorFailed { .. },
+                ..
+            }
+        ))
+}
+
 /// Certifies only the actual authenticated worker-loss recovery response,
 /// after the caller has independently required a complete original capture.
 pub fn worker_loss_recovery_authority(
@@ -133,7 +194,8 @@ pub fn worker_loss_recovery_authority(
 }
 
 /// The caller additionally requires duplicate-key-free captured bytes.
-/// Only the exact still-live original frontend relay is a retryable dependency.
+/// Only exact original relay closure or an observed publication WAIT_TIMEOUT
+/// is a scheduling dependency. Neither response grants recovery authority.
 pub fn pending_original_frontend_relay(
     wrapper: &serde_json::Value,
     held: &WindowsGuardianAttemptObservation,
@@ -200,10 +262,13 @@ pub fn pending_original_frontend_relay(
         "exact recovery pending checked closure: frozen owner remains live without checked owner retirement; role=FrontendRelay; pid={}; birth={}",
         frontend.process_id, frontend.creation_time_100ns
     );
+    let publication_busy =
+        publication_wait::failure_detail(publication_wait::WAIT_TIMEOUT_STATUS, None)
+            .expect("WAIT_TIMEOUT has a publication dependency detail");
     Ok(
         schema_version == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
             && attempt_id == binding.attempt
             && response_challenge == challenge
-            && detail == expected,
+            && (detail == expected || detail == publication_busy),
     )
 }

@@ -2,6 +2,56 @@ use super::finalize_with;
 use crate::{CiError, work_outcome::WorkOutcome};
 
 #[test]
+fn action_cache_paths_present_verbatim_drives_and_unc_without_namespace_globs() {
+    use std::path::{Path, PathBuf};
+    for (native, expected) in [
+        (
+            r"\\?\C:\a\memcordon\target\ci-transfer\out\archives",
+            "C:/a/memcordon/target/ci-transfer/out/archives",
+        ),
+        (r"\\?\d:\with space\café\index", "d:/with space/café/index"),
+        (
+            r"\\?\UNC\server\share\target\archives",
+            "//server/share/target/archives",
+        ),
+        (r"C:\ordinary\target", r"C:\ordinary\target"),
+        (r"\\server\share\ordinary", r"\\server\share\ordinary"),
+        ("/tmp/native/target", "/tmp/native/target"),
+        ("target/relative", "target/relative"),
+    ] {
+        let path = Path::new(native);
+        assert_eq!(super::action_path(path).unwrap(), expected);
+        assert_eq!(path.as_os_str(), native);
+    }
+    for unsupported in [
+        r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+        r"\\?\C:relative",
+        r"\\?\UNC\server",
+        r"\\?\UNC\\share",
+    ] {
+        assert!(super::action_path(Path::new(unsupported)).is_err());
+    }
+    let native = [
+        PathBuf::from(r"\\?\C:\a\archives"),
+        PathBuf::from(r"\\?\C:\a\index"),
+    ];
+    assert_eq!(
+        super::action_paths(&native).unwrap(),
+        "C:/a/archives\nC:/a/index"
+    );
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    super::write_to(
+        Some(temp.path()),
+        &[("archives-path", super::action_path(&native[0]).unwrap())],
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path()).unwrap(),
+        "archives-path=C:/a/archives\n"
+    );
+}
+
+#[test]
 fn optional_projection_preserves_only_actual_unresolved_owner_evidence() {
     use crate::work_outcome::{WriterSettlement, has_unresolved_owner};
     let unknown = WorkOutcome::<()>::observed(

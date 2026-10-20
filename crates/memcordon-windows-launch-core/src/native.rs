@@ -1,6 +1,6 @@
 use crate::{
     PreparedCurrentDirectoryV1, PreparedLoaderCommandV1, PreparedLoaderEnvironmentV1,
-    ProductionLoaderPlanV1,
+    ProductionLoaderPlan,
 };
 use sha2::{Digest, Sha256};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -340,8 +340,8 @@ impl Drop for NativeSecurityDescriptorV1 {
     }
 }
 
-pub struct ProductionNativeCreateRequestV1<'a> {
-    pub plan: &'a ProductionLoaderPlanV1,
+pub struct ProductionNativeCreateRequest<'a, const VERSION: u32> {
+    pub plan: &'a ProductionLoaderPlan<VERSION>,
     pub target_token: HANDLE,
     pub job: HANDLE,
     pub application: &'a [u16],
@@ -354,6 +354,9 @@ pub struct ProductionNativeCreateRequestV1<'a> {
     /// `None` asks Windows to apply its default thread-object descriptor.
     pub thread_security: Option<&'a NativeSecurityDescriptorV1>,
 }
+
+pub type ProductionNativeCreateRequestV1<'a> = ProductionNativeCreateRequest<'a, 1>;
+pub type ProductionNativeCreateRequestV2<'a> = ProductionNativeCreateRequest<'a, 2>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeCreateErrorV1 {
@@ -764,13 +767,37 @@ impl SuspendedNativeProcessV1 {
         }
         // SAFETY: the thread handle is owned and the production contract calls
         // this exactly once after suspended-process attestation.
-        if unsafe { ResumeThread(self.thread.raw()) } == 1 {
-            Ok(())
-        } else {
-            Err(last_error("resume-thread"))
-        }
+        let previous_suspend_count = unsafe { ResumeThread(self.thread.raw()) };
+        interpret_resume_count(previous_suspend_count, || last_error("resume-thread"))
     }
 }
+
+fn interpret_resume_count(
+    previous_suspend_count: u32,
+    native_failure: impl FnOnce() -> NativeCreateErrorV1,
+) -> Result<(), NativeCreateErrorV1> {
+    match previous_suspend_count {
+        1 => Ok(()),
+        u32::MAX => {
+            let mut error = native_failure();
+            error.detail = format!(
+                "ResumeThread failed: previous_suspend_count={previous_suspend_count}; {}",
+                error.detail
+            );
+            Err(error)
+        }
+        count => Err(contract_error(
+            "resume-thread-count",
+            &format!(
+                "ResumeThread did not consume the sole selected suspension: previous_suspend_count={count}; required=1"
+            ),
+        )),
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/private/native_resume.rs"]
+mod resume_tests;
 
 /// Reads the suspended child's live handle-table cardinality.
 ///
@@ -848,14 +875,30 @@ pub fn query_process_handle_count(
     }
 }
 
-pub fn create_suspended_in_job(
-    request: ProductionNativeCreateRequestV1<'_>,
+pub fn create_suspended_in_job<const VERSION: u32>(
+    request: ProductionNativeCreateRequest<'_, VERSION>,
 ) -> Result<SuspendedNativeProcessV1, NativeCreateErrorV1> {
-    create_suspended_in_job_inner(request)
+    let flags = request.plan.creation_flags();
+    create_suspended_in_job_inner(request, flags)
 }
 
-fn create_suspended_in_job_inner(
-    request: ProductionNativeCreateRequestV1<'_>,
+#[cfg(feature = "test-support")]
+pub fn create_support_detached_console<const VERSION: u32>(
+    request: ProductionNativeCreateRequest<'_, VERSION>,
+    diagnostic: &crate::SupportDetachedConsolePlanV1,
+) -> Result<SuspendedNativeProcessV1, NativeCreateErrorV1> {
+    if VERSION != 1 || request.plan.canonical_bytes() != diagnostic.input_plan().canonical_bytes() {
+        return Err(contract_error(
+            "support-console-plan-mismatch",
+            "native inputs differ from diagnostic plan",
+        ));
+    }
+    create_suspended_in_job_inner(request, diagnostic.actual_creation_flags())
+}
+
+fn create_suspended_in_job_inner<const VERSION: u32>(
+    request: ProductionNativeCreateRequest<'_, VERSION>,
+    creation_flags: u32,
 ) -> Result<SuspendedNativeProcessV1, NativeCreateErrorV1> {
     validate_request(&request)?;
     let jobs = [request.job];
@@ -889,7 +932,7 @@ fn create_suspended_in_job_inner(
                 .as_ref()
                 .map_or(ptr::null(), |value| value as *const SECURITY_ATTRIBUTES),
             0,
-            request.plan.creation_flags(),
+            creation_flags,
             request.environment.units_mut().as_mut_ptr().cast(),
             request.current_directory.units().as_ptr(),
             &raw const startup.StartupInfo,
@@ -944,8 +987,8 @@ fn create_suspended_in_job_inner(
     })
 }
 
-fn validate_request(
-    request: &ProductionNativeCreateRequestV1<'_>,
+fn validate_request<const VERSION: u32>(
+    request: &ProductionNativeCreateRequest<'_, VERSION>,
 ) -> Result<(), NativeCreateErrorV1> {
     for (name, value) in [
         ("application", request.application),

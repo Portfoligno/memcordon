@@ -4121,7 +4121,7 @@ fn check_release_structure(jobs: &Mapping) -> Result<()> {
         ordinary_driver_before_suite(steps, build)?;
         if !id.starts_with("macos") {
             let selected = "runner.os == 'Linux' || runner.os == 'Windows'";
-            let always_selected = "always() && (runner.os == 'Linux' || runner.os == 'Windows')";
+            let always_selected = "always() && (steps.native_readiness.outcome == 'success' || steps.native_readiness.outcome == 'failure' || steps.native_readiness.outcome == 'cancelled') && (runner.os == 'Linux' || runner.os == 'Windows')";
             let expected = [
                 (
                     "./target/ci/release/consumer-readiness identity --github-context --build-source .release/build-source.json --output .release/native-readiness-identity.json",
@@ -5634,6 +5634,33 @@ fn check_workflow(
     )
 }
 
+fn driver_fixture_environment_slot(key: &str, value: &syn::Expr) -> Option<usize> {
+    match (key, value) {
+        ("GITHUB_EVENT_NAME", syn::Expr::Path(event)) if event.path.is_ident("event") => Some(0),
+        (
+            "GITHUB_REF",
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(reference),
+                ..
+            }),
+        ) if reference.value() == "refs/heads/test" => Some(1),
+        ("GITHUB_OUTPUT", syn::Expr::Reference(output)) if matches!(output.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("outputs")) => {
+            Some(2)
+        }
+        ("CARGO_HOME", syn::Expr::MethodCall(home))
+            if home.method == "join"
+                && home.args.len() == 1
+                && matches!(home.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(directory), .. })) if directory.value() == "cargo-home")
+                && matches!(home.receiver.as_ref(), syn::Expr::MethodCall(unwrap) if unwrap.method == "unwrap" && unwrap.args.is_empty()
+                    && matches!(unwrap.receiver.as_ref(), syn::Expr::MethodCall(canonical) if canonical.method == "canonicalize" && canonical.args.is_empty()
+                        && matches!(canonical.receiver.as_ref(), syn::Expr::Path(root) if root.path.is_ident("root")))) =>
+        {
+            Some(3)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct RustPolicy {
     violations: Vec<String>,
@@ -5650,6 +5677,7 @@ struct RustPolicy {
     cargo_job_budget_mutations: usize,
     managed_miri_sysroot_mutations: usize,
     standard_output_mutations: usize,
+    driver_fixture_mutations: [usize; 4],
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -5723,6 +5751,17 @@ impl<'ast> Visit<'ast> for RustPolicy {
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.subprocess_env_mutations += 1;
+            if expression.method == "env"
+                && expression.args.len() == 2
+                && let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(key),
+                    ..
+                }) = &expression.args[0]
+                && let Some(slot) =
+                    driver_fixture_environment_slot(&key.value(), &expression.args[1])
+            {
+                self.driver_fixture_mutations[slot] += 1;
+            }
             if expression.method == "env"
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "PATH")
             {
@@ -5837,6 +5876,15 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
 }
 
 fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {
+    // The driver fixture must simulate both trusted push and untrusted PR
+    // events, an owned output receipt, and its isolated standard Cargo home.
+    // Every setter has one exact source/value shape; no ambient state changes.
+    if relative == Path::new("tools/memcordon-ci/tests/driver_cache.rs") {
+        return visitor.driver_fixture_mutations == [1; 4]
+            && visitor.subprocess_env_mutations
+                == visitor.driver_fixture_mutations.iter().sum::<usize>()
+            && visitor.cleared_environments == 0;
+    }
     // Only the authored-registry installation fixture forces Cargo offline;
     // other transport fixtures retain the existing home/output-only boundary.
     let offline = if relative == Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs") {
@@ -6418,6 +6466,50 @@ fn removal_only_legacy_token(source: &str) -> bool {
     reviewed != 0 && reviewed == source.matches("CARGO_REGISTRY_TOKEN").count()
 }
 
+fn trusted_workflow_definition_token(source: &str) -> bool {
+    fn text_literal(expression: &syn::Expr) -> Option<String> {
+        let syn::Expr::Call(call) = expression else {
+            return None;
+        };
+        let syn::Expr::Path(function) = call.func.as_ref() else {
+            return None;
+        };
+        if !function.path.is_ident("text") || call.args.len() != 1 {
+            return None;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) = call.args.first()?
+        else {
+            return None;
+        };
+        Some(value.value())
+    }
+    struct Bindings(usize);
+    impl<'ast> Visit<'ast> for Bindings {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "insert"
+                && call.args.len() == 2
+                && text_literal(&call.args[0]).as_deref() == Some("CARGO_REGISTRY_TOKEN")
+                && text_literal(&call.args[1]).as_deref()
+                    == Some("${{ steps.registry-auth.outputs.token }}")
+            {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let Ok(syntax) = syn::parse_file(source) else {
+        return false;
+    };
+    let mut bindings = Bindings(0);
+    bindings.visit_file(&syntax);
+    // Other reads, writes, literals and interfaces remain prohibited even in
+    // the authoritative workflow source. Emitted auth flow is checked below.
+    bindings.0 != 0 && bindings.0 == source.matches("CARGO_REGISTRY_TOKEN").count()
+}
+
 pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> Result<()> {
     let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
     if source.contains(legacy_secret_source.as_str()) {
@@ -6443,6 +6535,8 @@ pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> R
     .iter()
     .any(|path| relative == Path::new(path));
     if established
+        || relative == Path::new("tools/memcordon-ci/src/workflow_definitions/release.rs")
+            && trusted_workflow_definition_token(source)
         || relative == Path::new("tools/memcordon-ci/src/rehearsal_support/coordinator.rs")
             && removal_only_legacy_token(source)
     {

@@ -362,7 +362,7 @@ pub(super) fn retain_original_host(
 /// Build the separately measured internal fault actor package. These binaries
 /// never replace the ordinary installed consumer or enter its native archive.
 #[cfg(windows)]
-fn build_windows_actor(
+pub(super) fn build_windows_actor(
     root: &Path,
     selected: &source::BuildSourceIdentity,
     target: &str,

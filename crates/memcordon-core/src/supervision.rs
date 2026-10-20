@@ -247,6 +247,45 @@ pub struct WindowsLoaderQualificationFailureV2 {
     pub support_debug_observation: Option<Box<WindowsLoaderDebugObservationV1>>,
 }
 
+impl WindowsLoaderQualificationFailureV2 {
+    /// Admission for one separate console-policy experiment, never readiness.
+    pub fn admits_detached_console_comparison(&self) -> bool {
+        self.stage == WindowsLoaderQualificationStageV2::LoaderReadyHandshake
+            && self.stable_code == "loader-control-pipe-accept"
+            && self.cleanup.status == WindowsLoaderCleanupStatusV1::Complete
+            && self
+                .support_debug_observation
+                .as_ref()
+                .is_some_and(|debug| {
+                    debug.console_comparison.is_none()
+                        && debug.process.process_id != 0
+                        && debug.process.creation_time_100ns != 0
+                        && debug.creator_thread_id != 0
+                        && debug.omitted_events == 0
+                        && !debug.detached
+                        && debug.exit_event_continued
+                        && self.launch_plan_sha256.as_ref() == Some(&debug.launch_plan_sha256)
+                        && debug.events.first().is_some_and(|event| {
+                            event.code == 3
+                                && event.process_id == debug.process.process_id
+                                && event.thread_id != 0
+                        })
+                        && debug.events.last().is_some_and(|event| {
+                            event.code == 5
+                                && event.process_id == debug.process.process_id
+                                && event.native_exit_code == Some(0xc0000142)
+                        })
+                        && debug.events.iter().all(|event| {
+                            event.process_id == debug.process.process_id
+                                && event.thread_id != 0
+                                && event.continuation_error.is_none()
+                                && (event.continuation == 0x10002
+                                    || (event.code == 1 && event.continuation == 0x80010001))
+                        })
+                })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "observation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsLoaderMitigationPolicyObservationV1 {
@@ -280,6 +319,114 @@ pub struct WindowsLoaderDebugObservationV1 {
     pub omitted_events: u64,
     pub detached: bool,
     pub exit_event_continued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_comparison: Option<Box<WindowsLoaderConsoleComparisonV1>>,
+}
+
+/// Expirable support evidence. This type cannot express production readiness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderConsoleComparisonV1 {
+    pub schema_version: u32,
+    pub baseline_plan_sha256: String,
+    /// Actual alternative-child flags, or zero when no child was created
+    /// because the comparison is explicitly not applicable.
+    pub actual_creation_flags: u32,
+    pub diagnostic_plan_json: Option<String>,
+    pub diagnostic_plan_json_sha256: Option<String>,
+    pub outcome: WindowsLoaderConsoleComparisonOutcomeV1,
+    pub cleanup: WindowsLoaderCleanupOutcomeV1,
+    pub debug_observation: Option<Box<WindowsLoaderDebugObservationV1>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WindowsLoaderConsoleComparisonOutcomeV1 {
+    NotApplicable { baseline_schema_version: u32 },
+    Unavailable { detail: String },
+    CreationFailure { detail: String },
+    NativeFailure { stage: String, detail: String },
+    ReachedHandshake,
+}
+
+impl WindowsLoaderConsoleComparisonV1 {
+    pub fn is_consistent_for(&self, baseline: &WindowsLoaderDebugObservationV1) -> bool {
+        let bounded =
+            |detail: &str| !detail.is_empty() && detail.len() <= 2048 && !detail.contains('\0');
+        self.schema_version == 1
+            && self.baseline_plan_sha256 == baseline.launch_plan_sha256
+            && self.actual_creation_flags
+                == if matches!(
+                    self.outcome,
+                    WindowsLoaderConsoleComparisonOutcomeV1::NotApplicable { .. }
+                ) {
+                    0
+                } else {
+                    0x0008_040c
+                }
+            && match self.cleanup.status {
+                WindowsLoaderCleanupStatusV1::Failed => {
+                    self.cleanup.stable_code.as_deref().is_some_and(bounded)
+                }
+                WindowsLoaderCleanupStatusV1::NotStarted
+                | WindowsLoaderCleanupStatusV1::Complete => self.cleanup.stable_code.is_none(),
+            }
+            && match (
+                &self.diagnostic_plan_json,
+                &self.diagnostic_plan_json_sha256,
+            ) {
+                (Some(json), Some(digest)) => {
+                    !json.is_empty()
+                        && json.len() <= 65536
+                        && !json.contains('\0')
+                        && String::from(crate::DiagnosticSha256::from_bytes(
+                            Sha256::digest(json.as_bytes()).into(),
+                        )) == *digest
+                }
+                (None, None) => matches!(
+                    self.outcome,
+                    WindowsLoaderConsoleComparisonOutcomeV1::Unavailable { .. }
+                        | WindowsLoaderConsoleComparisonOutcomeV1::NotApplicable { .. }
+                ),
+                _ => false,
+            }
+            && match &self.outcome {
+                WindowsLoaderConsoleComparisonOutcomeV1::NotApplicable {
+                    baseline_schema_version,
+                } => {
+                    *baseline_schema_version == 2
+                        && self.cleanup.status == WindowsLoaderCleanupStatusV1::NotStarted
+                        && self.debug_observation.is_none()
+                        && self.diagnostic_plan_json.is_none()
+                }
+                WindowsLoaderConsoleComparisonOutcomeV1::Unavailable { detail }
+                | WindowsLoaderConsoleComparisonOutcomeV1::CreationFailure { detail } => {
+                    bounded(detail)
+                }
+                WindowsLoaderConsoleComparisonOutcomeV1::NativeFailure { stage, detail } => {
+                    bounded(stage) && bounded(detail)
+                }
+                WindowsLoaderConsoleComparisonOutcomeV1::ReachedHandshake => {
+                    self.debug_observation.is_some()
+                }
+            }
+            && self.debug_observation.as_ref().is_none_or(|debug| {
+                debug.console_comparison.is_none()
+                    && debug.process.process_id != 0
+                    && debug.process.creation_time_100ns != 0
+                    && debug.process != baseline.process
+                    && debug.creator_thread_id != 0
+                    && debug.challenge == baseline.challenge
+                    && debug.executable_sha256 == baseline.executable_sha256
+                    && debug.events.len() <= 64
+                    && debug.events.iter().all(|event| {
+                        event
+                            .image_path
+                            .as_ref()
+                            .is_none_or(|path| path.len() <= 2048)
+                    })
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -294,8 +441,17 @@ pub struct WindowsLoaderDebugEventV1 {
     pub native_exit_code: Option<u32>,
     pub image_path: Option<String>,
     pub image_path_error: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_path_source: Option<WindowsLoaderDebugImagePathSourceV1>,
     pub continuation: u32,
     pub continuation_error: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsLoaderDebugImagePathSourceV1 {
+    EventFile,
+    MappedImage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -385,6 +541,9 @@ impl WindowsLoaderQualificationOutcomeV2 {
                                         .as_ref()
                                         .is_none_or(|path| path.len() <= 2048)
                                 })
+                                && observation.console_comparison.as_ref().is_none_or(
+                                    |comparison| comparison.is_consistent_for(observation),
+                                )
                         })
                     && failure
                         .launch_plan_sha256

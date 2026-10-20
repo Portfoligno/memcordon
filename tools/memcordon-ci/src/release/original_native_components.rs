@@ -1,4 +1,8 @@
 //! Original native-job component collection. Public installed cells stay separate.
+#[cfg(windows)]
+use super::windows_launcher_diagnostic::{
+    self, WindowsDiagnosticClock, WindowsOriginalOwner, launcher_diagnostic_binding,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,21 +105,6 @@ struct AcquiredActor {
 #[cfg(windows)]
 #[derive(serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WindowsOriginalOwner {
-    format: String,
-    revision: u32,
-    identity: SourceIdentity,
-    job: String,
-    run_attempt: u64,
-    config: crate::windows_installed_cases::InstalledWindowsPayload,
-    removal: crate::windows_readiness_adapter::WindowsRemovalPlan,
-    original_work_unix_millis: u64,
-    original_cleanup_unix_millis: u64,
-}
-
-#[cfg(windows)]
-#[derive(serde::Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WindowsInstallIntent {
     format: String,
     revision: u32,
@@ -140,10 +129,10 @@ struct WindowsSettlement {
 #[cfg(windows)]
 #[derive(serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WindowsCleanupReceipts {
-    recovery: crate::windows_installed_cases::SelectedArtifact,
-    uninstall: crate::windows_installed_cases::SelectedArtifact,
-    removal: crate::windows_installed_cases::SelectedArtifact,
+pub(super) struct WindowsCleanupReceipts {
+    pub(super) recovery: crate::windows_installed_cases::SelectedArtifact,
+    pub(super) uninstall: crate::windows_installed_cases::SelectedArtifact,
+    pub(super) removal: crate::windows_installed_cases::SelectedArtifact,
 }
 
 #[cfg(windows)]
@@ -575,11 +564,17 @@ fn select_with_diagnostic_deadline(
         // Same live operation: cache/action time counts, and missing timing
         // inputs cannot silently mint another readiness interval.
         cleanup = cleanup.min(native_component_harness::resume_original_deadline(
-            root, &identity, target, true,
+            root,
+            &roles.source,
+            target,
+            true,
         )?);
         if !args.cleanup {
             work = work.min(native_component_harness::resume_original_deadline(
-                root, &identity, target, false,
+                root,
+                &roles.source,
+                target,
+                false,
             )?);
         }
     }
@@ -735,10 +730,14 @@ fn retain_file_with_alias(
             .open(source)?;
         let before = file.metadata()?;
         if let Some(alias) = alias {
-            if source_state(&before) != *alias || !before.is_file() || before.len() > limit {
-                return Err(CiError::Message(
-                    "native recovery held source differs from closed alias inventory".into(),
-                ));
+            let observed = source_state(&before);
+            let state_changed = observed != *alias;
+            let non_regular = !before.is_file();
+            let size_exceeded = before.len() > limit;
+            if state_changed || non_regular || size_exceeded {
+                return Err(CiError::Message(format!(
+                    "native recovery held source differs from closed alias inventory; source={source:?}; relative={relative:?}; state_changed={state_changed}; non_regular={non_regular}; size_exceeded={size_exceeded}; expected={alias:?}; actual={observed:?}; limit={limit}"
+                )));
             }
         } else {
             super::native_source_identity::validate(
@@ -917,6 +916,28 @@ fn source_archive(
     })
 }
 
+/// Exact standard context permitted through the same-operation sudo boundary.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn original_native_sudo_options() -> [&'static str; 3] {
+    [
+        "-n",
+        "--preserve-env=GITHUB_ACTIONS,GITHUB_RUN_ID,GITHUB_JOB,GITHUB_RUN_ATTEMPT",
+        "--",
+    ]
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn original_native_context_arguments(
+    github_context: bool,
+    attempt: u64,
+) -> Vec<std::ffi::OsString> {
+    if github_context {
+        vec!["--github-context".into()]
+    } else {
+        vec!["--run-attempt".into(), attempt.to_string().into()]
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn run(root: &Path, args: &Args) -> Result<()> {
     use super::linux_native_component::NativeAdminScope;
@@ -940,7 +961,10 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
             &root,
             selection.cleanup.saturating_duration_since(Instant::now()),
         )
-        .args(["-n", "--"])
+        // sudo sanitizes its environment. Keep the original live-job binding
+        // across this same-operation privilege boundary; resume still checks
+        // the retained source, job, checkout, boot domain and fixed intervals.
+        .args(original_native_sudo_options())
         .arg("/usr/bin/env")
         .arg(native_path)
         .arg(rustup_environment)
@@ -948,8 +972,10 @@ pub fn run(root: &Path, args: &Args) -> Result<()> {
         .arg("consumer-readiness-native-components")
         .arg("--identity")
         .arg(std::path::absolute(&args.identity)?)
-        .arg("--run-attempt")
-        .arg(selection.run_attempt.to_string())
+        .args(original_native_context_arguments(
+            args.github_context,
+            selection.run_attempt,
+        ))
         .arg("--destination")
         .arg(std::path::absolute(&args.destination)?)
         .bounded_until(selection.cleanup);
@@ -1446,6 +1472,7 @@ fn prepare_windows_support_until(
         lifetime.join("observations"),
     )?;
     std::fs::create_dir(&config.output_directory)?;
+    let diagnostic_clock = crate::ci_operation_time::clock_reading()?;
     let owner = WindowsOriginalOwner {
         format: "memcordon.consumer-readiness.windows-original-owner".into(),
         revision: 1,
@@ -1456,6 +1483,10 @@ fn prepare_windows_support_until(
         removal,
         original_work_unix_millis: selection.deadline.work_deadline_unix_millis,
         original_cleanup_unix_millis: selection.deadline.cleanup_deadline_unix_millis,
+        diagnostic_clock: Some(WindowsDiagnosticClock {
+            domain: diagnostic_clock.domain,
+            millis: diagnostic_clock.millis,
+        }),
     };
     // This checked no-overwrite publication precedes the first native package mutation.
     let owner_path = lifetime.join("owner.json");
@@ -1467,6 +1498,11 @@ fn prepare_windows_support_until(
         Some(&artifacts::checksum(&owner_bytes)),
         16 * 1024 * 1024,
     )?);
+    windows_launcher_diagnostic::publish_epoch(
+        launcher_diagnostic_binding(&owner)?,
+        &lifetime.join("launcher-diagnostic-epoch.json"),
+        work,
+    )?;
     Ok((owner, custody))
 }
 
@@ -2210,6 +2246,23 @@ fn windows_package(
     operation: &str,
     deadline: Instant,
 ) -> Result<crate::windows_installed_cases::SelectedArtifact> {
+    support_package(
+        &owner.config,
+        &owner.job,
+        owner.run_attempt,
+        operation,
+        deadline,
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn support_package(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    job: &str,
+    run_attempt: u64,
+    operation: &str,
+    deadline: Instant,
+) -> Result<crate::windows_installed_cases::SelectedArtifact> {
     let budget = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_secs(120));
@@ -2220,8 +2273,7 @@ fn windows_package(
     }
     let capture = (0..128)
         .map(|ordinal| {
-            owner
-                .config
+            config
                 .output_directory
                 .join(format!("package-{operation}-{ordinal}.json"))
         })
@@ -2231,17 +2283,14 @@ fn windows_package(
     let _intent = crate::windows_readiness_adapter::publish_receipt(
         &intent,
         &serde_json::to_vec(
-            &serde_json::json!({"operation":operation,"agent":owner.config.agent,"original_job":owner.job,"original_attempt":owner.run_attempt}),
+            &serde_json::json!({"operation":operation,"agent":config.agent,"original_job":job,"original_attempt":run_attempt}),
         )?,
     )?;
-    let output = crate::command::CommandSpec::new(
-        &owner.config.agent.path,
-        &owner.config.output_directory,
-        budget,
-    )
-    .args(["package", operation])
-    .bounded_until(deadline)
-    .output_quiet()?;
+    let output =
+        crate::command::CommandSpec::new(&config.agent.path, &config.output_directory, budget)
+            .args(["package", operation])
+            .bounded_until(deadline)
+            .output_quiet()?;
     let bytes = serde_json::to_vec(
         &serde_json::json!({"operation":operation,"status":output.status.code(),"stdout":output.stdout,"stderr":output.stderr}),
     )?;
@@ -2263,9 +2312,43 @@ fn settle_windows_support(
     directory: &Path,
     cleanup: Instant,
 ) -> Result<WindowsCleanupReceipts> {
+    let diagnostic = (|| -> Result<()> {
+        let lifetime = owner.config.output_directory.parent().ok_or_else(|| {
+            CiError::Message("original launcher diagnostic lifetime absent".into())
+        })?;
+        windows_launcher_diagnostic::retain(
+            &launcher_diagnostic_binding(owner)?,
+            &lifetime.join("launcher-diagnostic-epoch.json"),
+            &owner.removal.policy_root,
+            directory,
+            cleanup,
+        )
+    })();
+    if let Err(error) = diagnostic {
+        eprintln!("secondary original launcher startup retention unavailable: {error}");
+    }
+    settle_support(
+        &owner.config,
+        &owner.removal,
+        &owner.job,
+        owner.run_attempt,
+        directory,
+        cleanup,
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn settle_support(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    removal_plan: &crate::windows_readiness_adapter::WindowsRemovalPlan,
+    job: &str,
+    run_attempt: u64,
+    directory: &Path,
+    cleanup: Instant,
+) -> Result<WindowsCleanupReceipts> {
     let mut errors = Vec::new();
     match crate::windows_readiness_adapter::recover_and_observe_quiescence(
-        &owner.config,
+        config,
         &directory.join("recovery"),
         cleanup,
     ) {
@@ -2284,13 +2367,13 @@ fn settle_windows_support(
     if !errors.is_empty() {
         return Err(CiError::Message(errors.join("; ")));
     }
-    let uninstall = windows_package(owner, "uninstall", cleanup);
+    let uninstall = support_package(config, job, run_attempt, "uninstall", cleanup);
     if let Err(error) = &uninstall {
         errors.push(error.to_string());
     }
     let removal = crate::windows_readiness_adapter::observe_removed(
-        &owner.config,
-        &owner.removal,
+        config,
+        removal_plan,
         &directory.join("removal"),
         cleanup,
     );

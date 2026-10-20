@@ -73,6 +73,14 @@ fn linux_runtime_image_retire_command(arguments: &[OsString]) -> bool {
                 && json == "--json")
 }
 
+fn linux_runtime_image_inspect_command(arguments: &[OsString]) -> bool {
+    matches!(arguments,
+        [package, policy, image, operation, definition, _, cutoff, _, json]
+            if package == "package" && policy == "policy" && image == "image"
+                && operation == "inspect" && definition == "--definition"
+                && cutoff == "--cutoff-unix-millis" && json == "--json")
+}
+
 fn linux_bounded_uninstall_command(arguments: &[OsString]) -> bool {
     matches!(arguments,
         [package, operation, cutoff, _]
@@ -89,6 +97,7 @@ pub(crate) fn retired_release_command(platform: ReleasePlatform, arguments: &[Os
             && (linux_entrypoint_install_command(arguments)
                 || linux_runtime_image_install_command(arguments)
                 || linux_runtime_image_retire_command(arguments)
+                || linux_runtime_image_inspect_command(arguments)
                 || linux_bounded_uninstall_command(arguments))
         {
             return false;

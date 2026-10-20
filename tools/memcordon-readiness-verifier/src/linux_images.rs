@@ -561,6 +561,7 @@ pub(crate) fn validate_linux_image_native_command(
         Some(
             "memcordon.linux-image-import-command"
                 | "memcordon.linux-isolation-image-retirement-command"
+                | "memcordon.linux-isolation-image-inspection-command"
         )
     ) || command["revision"] != 1
         || command["program"] != "/usr/libexec/memcordon-sealed-agent"

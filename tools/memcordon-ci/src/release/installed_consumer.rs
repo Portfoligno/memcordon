@@ -1610,13 +1610,20 @@ pub fn run_materialized_channel(
                 payload: older,
             },
         )?;
+        let deadlines = crate::windows_installed_cases::WindowsLeaseDeadlines::finite_default();
         let assessment = crate::windows_installed_cases::run_from_source_with_observer_until(
             root,
             &config,
             &mut |_| Ok(()),
-            crate::windows_installed_cases::WindowsLeaseDeadlines::finite_default(),
+            deadlines,
         )?;
         source::write_json(&output.join("windows-assessment.json"), &assessment)?;
+        #[cfg(windows)]
+        if let Err(error) =
+            super::installed_loader_support::run(root, payload, &config, &assessment, deadlines)
+        {
+            eprintln!("secondary separate installed loader support unavailable: {error}");
+        }
         if !assessment.accepted() {
             return Err(CiError::Message(format!(
                 "actual installed Windows case or retirement failed; install/smoke: {:?}; upgrade: {:?}; uninstall: {:?}",

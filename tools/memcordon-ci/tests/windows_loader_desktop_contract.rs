@@ -6,8 +6,7 @@ const LAUNCH_CORE_NATIVE_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../crates/memcordon-windows-launch-core/src/native.rs"
 ));
-const PACKAGE_LOADER_CHANNEL_IMPL_EVIDENCE: &str =
-    "impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {";
+const PACKAGE_LOADER_CHANNEL_IMPL_EVIDENCE: &str = "impl<const VERSION: u32> LoaderReadyChannel<PackageLoaderProcess, VERSION>\n    for PackageLoaderChannel<'_>\n{";
 const AWAIT_READY_EVIDENCE: &str = "    fn await_ready(";
 const ATTEST_CONTAINMENT_EVIDENCE: &str = "    fn attest_containment(";
 const AUTHENTICATION_EVIDENCE: &str = "authenticate_target_desktop_bootstrap_client(";

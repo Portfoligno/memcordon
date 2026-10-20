@@ -249,7 +249,7 @@ fn original_native_component_jobs_preserve_execution_cleanup_and_immutable_uploa
         "native-windows-x64",
         "native-windows-arm64",
     ] {
-        for mutation in 0..3 {
+        for mutation in 0..7 {
             let mut changed = original.clone();
             let steps = changed["jobs"][job]["steps"].as_sequence_mut().unwrap();
             match mutation {
@@ -267,7 +267,7 @@ fn original_native_component_jobs_preserve_execution_cleanup_and_immutable_uploa
                         .unwrap();
                     cleanup["if"] = Value::String("success()".into());
                 }
-                _ => {
+                2 => {
                     let upload = steps
                         .iter_mut()
                         .find(|step| {
@@ -275,6 +275,38 @@ fn original_native_component_jobs_preserve_execution_cleanup_and_immutable_uploa
                         })
                         .unwrap();
                     upload["with"]["overwrite"] = Value::Bool(true);
+                }
+                3 | 4 => {
+                    let cleanup = steps
+                        .iter_mut()
+                        .find(|step| step["id"].as_str() == Some("native_readiness_cleanup"))
+                        .unwrap();
+                    cleanup["if"] = if mutation == 3 {
+                        "always() && (runner.os == 'Linux' || runner.os == 'Windows')".into()
+                    } else {
+                        cleanup["if"]
+                            .as_str()
+                            .unwrap()
+                            .replace(" || steps.native_readiness.outcome == 'cancelled'", "")
+                            .into()
+                    };
+                }
+                _ => {
+                    let upload = steps
+                        .iter_mut()
+                        .find(|step| {
+                            step["with"]["path"].as_str() == Some(".release/native-readiness")
+                        })
+                        .unwrap();
+                    upload["if"] = if mutation == 5 {
+                        "always() && (runner.os == 'Linux' || runner.os == 'Windows')".into()
+                    } else {
+                        upload["if"]
+                            .as_str()
+                            .unwrap()
+                            .replace(" || steps.native_readiness.outcome == 'cancelled'", "")
+                            .into()
+                    };
                 }
             }
             assert!(

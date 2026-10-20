@@ -16,13 +16,22 @@ use memcordon_readiness_verifier::{Artifact, CaseKey, EvidenceClass, ProductKey}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use super::linux_fixture_memory_budget::FrozenImageMemoryBudget;
+
+#[allow(unsafe_code)] // Query only the native page-size scalar for admitted fixture sizing.
+fn native_page_bytes() -> Result<u64> {
+    // SAFETY: sysconf has no pointer arguments and returns a scalar or negative failure.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|_| error("cross fixture page size unavailable"))
+}
 
 pub struct CrossAttemptContext<'a> {
     pub identity: &'a SourceIdentity,
@@ -53,6 +62,10 @@ pub struct CrossAttemptOwner {
     pub contract_path: PathBuf,
     pub prefix: String,
     pub key: CaseKey,
+    budget: FrozenImageMemoryBudget,
+    budget_file: File,
+    budget_receipt: Vec<u8>,
+    maximum_receipt: Option<Vec<u8>>,
 }
 
 pub struct CrossAttemptReport {
@@ -488,6 +501,38 @@ fn start(
     report.directory_owners.push(hold_directory(&directory)?);
     let contract_path = directory.join("contract.json");
     retain(&contract_path, &serde_json::to_vec(&contract)?)?;
+    let budget = FrozenImageMemoryBudget::for_images(
+        &context.images.runtime,
+        &context.images.input,
+        &contract.runtime_image,
+        &contract.input_image,
+        native_page_bytes()?,
+        256 * 1024 * 1024,
+    )
+    .map_err(CiError::Message)?;
+    let budget_receipt = serde_json::to_vec(&json!({
+        "format":"memcordon.linux-cross-fixture-memory-budget", "revision":1,
+        "source":context.identity, "cell":context.cell, "lease_id":context.lease_id,
+        "role":stem, "contract_sha256":hash(&serde_json::to_vec(&contract)?), "budget":budget,
+    }))?;
+    if budget_receipt.len() > 65536 {
+        return Err(error("cross fixture budget receipt exceeds bound"));
+    }
+    let mut budget_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("fixture-memory-budget.json"))?;
+    budget_file.write_all(&budget_receipt)?;
+    budget_file.sync_all()?;
+    report
+        .directory_owners
+        .last()
+        .expect("held cross recipe directory")
+        .sync_all()?;
+    let memory = budget.token();
     let mut arguments = vec![std::ffi::OsString::from(mode), challenge.into()];
     if mode == "forbidden-abstract" {
         arguments.push(format!("memcordon-readiness-{challenge}").into());
@@ -505,7 +550,7 @@ fn start(
         caller_gid: 65534,
         target_arguments: &arguments,
         deadline: std::ffi::OsStr::new(&duration),
-        memory: std::ffi::OsStr::new("+256MiB"),
+        memory: std::ffi::OsStr::new(&memory),
     })?;
     let prefix = format!(
         "{}/{}/cross-attempt-abstract/{stem}",
@@ -533,6 +578,10 @@ fn start(
         contract_path,
         prefix,
         key,
+        budget,
+        budget_file,
+        budget_receipt,
+        maximum_receipt: None,
     });
     let index = report.attempts.len() - 1;
     report.attempts[index].frontend = Some(report.attempts[index].launch.hold_original_frontend()?);
@@ -550,6 +599,50 @@ fn start(
         .observer
         .as_ref()
         .expect("retained original prepared family");
+    let group = observer
+        .retain_cgroup_descriptor()
+        .map_err(CiError::Message)?;
+    let maximum = File::from(
+        rustix::fs::openat(
+            &group,
+            "memory.max",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?,
+    );
+    let maximum_bytes = super::linux_readiness_limits_cases::read_memory_counter_file(
+        &maximum,
+        "memory.max",
+        context.deadline,
+    )?;
+    let observed_limit = std::str::from_utf8(&maximum_bytes)
+        .map_err(|error| CiError::Message(error.to_string()))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    owner
+        .budget
+        .require_maximum(observed_limit)
+        .map_err(CiError::Message)?;
+    let group_metadata = group.metadata()?;
+    let maximum_metadata = maximum.metadata()?;
+    let maximum_receipt = serde_json::to_vec(&json!({
+        "format":"memcordon.linux-cross-fixture-memory-maximum", "revision":1,
+        "source":context.identity, "cell":context.cell, "lease_id":context.lease_id,
+        "key":owner.key, "budget_sha256":hash(&owner.budget_receipt),
+        "group_device":group_metadata.dev(), "group_inode":group_metadata.ino(),
+        "maximum_device":maximum_metadata.dev(), "maximum_inode":maximum_metadata.ino(),
+        "memory_max":maximum_bytes,
+    }))?;
+    if maximum_receipt.len() > 65536 || group_metadata.nlink() == 0 {
+        return Err(error("cross fixture native memory maximum custody differs"));
+    }
+    retain(
+        &directory.join("fixture-memory-maximum.json"),
+        &maximum_receipt,
+    )?;
+    owner.maximum_receipt = Some(maximum_receipt);
     owner.prepared_target = Some(observer.target.live_snapshot().map_err(CiError::Message)?);
     owner.native_receipt = Some(
         observer
@@ -661,6 +754,61 @@ fn collect(
         context.artifact_root,
         bounded(context.deadline, Duration::from_secs(30))?,
     )?;
+    let mut held = owner.budget_file.try_clone()?;
+    held.seek(SeekFrom::Start(0))?;
+    let metadata = held.metadata()?;
+    let mut receipt = Vec::new();
+    held.take(65537).read_to_end(&mut receipt)?;
+    if metadata.uid() != 0
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || receipt != owner.budget_receipt
+    {
+        return Err(error("held cross fixture budget receipt changed"));
+    }
+    let reconstructed = FrozenImageMemoryBudget::for_images(
+        &context.images.runtime,
+        &context.images.input,
+        &owner.contract.runtime_image,
+        &owner.contract.input_image,
+        owner.budget.page_bytes,
+        owner.budget.headroom_bytes,
+    )
+    .map_err(CiError::Message)?;
+    if serde_json::to_vec(&reconstructed)? != serde_json::to_vec(&owner.budget)? {
+        return Err(error("cross fixture budget differs from admitted images"));
+    }
+    let invocation: memcordon_readiness_verifier::NativeInvocation = decode(&read(
+        &context
+            .artifact_root
+            .join(&collection.public_invocation.path),
+        4 * 1024 * 1024,
+    )?)?;
+    owner
+        .budget
+        .require_invocation_tokens(
+            invocation.memory_token.as_deref(),
+            collection.result.invocation.memory_token.as_deref(),
+        )
+        .map_err(CiError::Message)?;
+    let path = format!("{}/fixture-memory-budget.json", owner.prefix);
+    retain(&context.artifact_root.join(&path), &receipt)?;
+    collection.persisted.artifacts.push(Artifact {
+        path,
+        length: receipt.len() as u64,
+        sha256: hash(&receipt),
+    });
+    let maximum = owner
+        .maximum_receipt
+        .as_ref()
+        .ok_or_else(|| error("cross fixture native maximum receipt absent"))?;
+    let path = format!("{}/fixture-memory-maximum.json", owner.prefix);
+    retain(&context.artifact_root.join(&path), maximum)?;
+    collection.persisted.artifacts.push(Artifact {
+        path,
+        length: maximum.len() as u64,
+        sha256: hash(maximum),
+    });
     for (leaf, bytes) in [
         (
             "original-frontend-invocation.json",

@@ -27,7 +27,7 @@ jobs:
       has-split: ${{ steps.plan.outputs.stress-has-split }}
       standalone-common: ${{ steps.scope.outputs.standalone-common }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: &action_0 actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
         timeout-minutes: 6
@@ -37,7 +37,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: &action_1 actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -55,7 +55,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -68,7 +68,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -77,7 +77,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -90,7 +90,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -99,7 +99,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: &action_2 actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -107,7 +107,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -116,7 +116,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -124,7 +124,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -133,7 +133,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -141,7 +141,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -149,7 +149,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -158,7 +158,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -166,7 +166,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -174,7 +174,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -194,7 +194,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -203,7 +203,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -211,7 +211,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -220,7 +220,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -228,7 +228,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -236,7 +236,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -268,14 +268,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 341
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
       - id: miri-deps
         continue-on-error: true
         if: hashFiles('Cargo.lock') != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: |
             ~/.cargo/registry/cache
@@ -289,7 +289,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -307,7 +307,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -320,7 +320,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -329,7 +329,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -342,7 +342,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -351,7 +351,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -359,7 +359,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -368,7 +368,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -376,7 +376,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -385,7 +385,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -393,7 +393,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -401,7 +401,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -410,7 +410,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -418,7 +418,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -426,7 +426,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -446,7 +446,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -455,7 +455,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -463,7 +463,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -472,7 +472,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -480,7 +480,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -488,7 +488,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -508,7 +508,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
@@ -517,7 +517,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -526,7 +526,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
@@ -539,7 +539,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -548,7 +548,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -556,7 +556,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
@@ -564,7 +564,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
@@ -584,7 +584,7 @@ jobs:
         if: steps.miri-sysroot-setup-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup-request.outputs.source-key }}
           path: ${{ steps.miri-sysroot-setup-request.outputs.source-path }}
@@ -593,7 +593,7 @@ jobs:
         if: steps.miri-sysroot-setup-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup-request.outputs.archives-partial-key }}
           path: ${{ steps.miri-sysroot-setup-request.outputs.archives-partial-inbox }}
@@ -602,7 +602,7 @@ jobs:
         if: steps.miri-sysroot-setup-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup-request.outputs.index-partial-key }}
           path: ${{ steps.miri-sysroot-setup-request.outputs.index-partial-inbox }}
@@ -611,7 +611,7 @@ jobs:
         if: steps.miri-sysroot-setup-request.outputs.sysroot-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup-request.outputs.sysroot-key }}
           path: ${{ steps.miri-sysroot-setup-request.outputs.sysroot-path }}
@@ -624,7 +624,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.source-complete-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.source-complete-path }}
@@ -633,7 +633,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.source-complete-save == 'true' && steps.miri-sysroot-setup-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.source-complete-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.source-complete-path }}
@@ -641,7 +641,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.archives-partial-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.archives-partial-path }}
@@ -649,7 +649,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.index-partial-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.index-partial-path }}
@@ -657,7 +657,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.sysroot-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.sysroot-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.sysroot-path }}
@@ -666,7 +666,7 @@ jobs:
         if: always() && steps.miri-sysroot-setup.outputs.sysroot-save == 'true' && steps.miri-sysroot-setup-sysroot-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-sysroot-setup.outputs.sysroot-key }}
           path: ${{ steps.miri-sysroot-setup.outputs.sysroot-path }}
@@ -682,7 +682,7 @@ jobs:
         if: steps.miri-quarter-one-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-one-request.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-one-request.outputs.compiled-complete-inbox }}
@@ -691,7 +691,7 @@ jobs:
         if: steps.miri-quarter-one-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-one-request.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-one-request.outputs.compiled-partial-inbox }}
@@ -704,7 +704,7 @@ jobs:
         if: always() && steps.miri-quarter-one.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-one.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-one.outputs.compiled-complete-path }}
@@ -713,7 +713,7 @@ jobs:
         if: always() && steps.miri-quarter-one.outputs.compiled-complete-save == 'true' && steps.miri-quarter-one-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-one.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-one.outputs.compiled-complete-path }}
@@ -721,7 +721,7 @@ jobs:
         if: always() && steps.miri-quarter-one.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-one.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-one.outputs.compiled-partial-path }}
@@ -737,7 +737,7 @@ jobs:
         if: steps.miri-quarter-three-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-three-request.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-three-request.outputs.compiled-complete-inbox }}
@@ -746,7 +746,7 @@ jobs:
         if: steps.miri-quarter-three-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-three-request.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-three-request.outputs.compiled-partial-inbox }}
@@ -759,7 +759,7 @@ jobs:
         if: always() && steps.miri-quarter-three.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-three.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-three.outputs.compiled-complete-path }}
@@ -768,7 +768,7 @@ jobs:
         if: always() && steps.miri-quarter-three.outputs.compiled-complete-save == 'true' && steps.miri-quarter-three-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-three.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-three.outputs.compiled-complete-path }}
@@ -776,7 +776,7 @@ jobs:
         if: always() && steps.miri-quarter-three.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-three.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-three.outputs.compiled-partial-path }}
@@ -792,7 +792,7 @@ jobs:
         if: steps.miri-quarter-two-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-two-request.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-two-request.outputs.compiled-complete-inbox }}
@@ -801,7 +801,7 @@ jobs:
         if: steps.miri-quarter-two-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-two-request.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-two-request.outputs.compiled-partial-inbox }}
@@ -814,7 +814,7 @@ jobs:
         if: always() && steps.miri-quarter-two.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-two.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-two.outputs.compiled-complete-path }}
@@ -823,7 +823,7 @@ jobs:
         if: always() && steps.miri-quarter-two.outputs.compiled-complete-save == 'true' && steps.miri-quarter-two-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-two.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-two.outputs.compiled-complete-path }}
@@ -831,7 +831,7 @@ jobs:
         if: always() && steps.miri-quarter-two.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-two.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-two.outputs.compiled-partial-path }}
@@ -847,7 +847,7 @@ jobs:
         if: steps.miri-quarter-four-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-four-request.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-four-request.outputs.compiled-complete-inbox }}
@@ -856,7 +856,7 @@ jobs:
         if: steps.miri-quarter-four-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-four-request.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-four-request.outputs.compiled-partial-inbox }}
@@ -869,7 +869,7 @@ jobs:
         if: always() && steps.miri-quarter-four.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.miri-quarter-four.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-four.outputs.compiled-complete-path }}
@@ -878,7 +878,7 @@ jobs:
         if: always() && steps.miri-quarter-four.outputs.compiled-complete-save == 'true' && steps.miri-quarter-four-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-four.outputs.compiled-complete-key }}
           path: ${{ steps.miri-quarter-four.outputs.compiled-complete-path }}
@@ -886,7 +886,7 @@ jobs:
         if: always() && steps.miri-quarter-four.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.miri-quarter-four.outputs.compiled-partial-key }}
           path: ${{ steps.miri-quarter-four.outputs.compiled-partial-path }}
@@ -916,7 +916,7 @@ jobs:
         if: needs.fuzz-setup.result != 'success'
         timeout-minutes: 1
         run: 'false'
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
@@ -925,7 +925,7 @@ jobs:
         timeout-minutes: 15
       - id: fuzz-setup-download
         timeout-minutes: 5
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: &action_3 actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.fuzz-setup.outputs.artifact-id }}
           path: target/ci/fuzz-setup-download
@@ -947,7 +947,7 @@ jobs:
         if: steps.shard-workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.shard-workspace-fetch-request.outputs.source-path }}
@@ -956,7 +956,7 @@ jobs:
         if: steps.shard-workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.shard-workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -965,7 +965,7 @@ jobs:
         if: steps.shard-workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.shard-workspace-fetch-request.outputs.index-partial-inbox }}
@@ -978,7 +978,7 @@ jobs:
         if: always() && steps.shard-workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.shard-workspace-fetch.outputs.source-complete-path }}
@@ -987,7 +987,7 @@ jobs:
         if: always() && steps.shard-workspace-fetch.outputs.source-complete-save == 'true' && steps.shard-workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.shard-workspace-fetch.outputs.source-complete-path }}
@@ -995,7 +995,7 @@ jobs:
         if: always() && steps.shard-workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.shard-workspace-fetch.outputs.archives-partial-path }}
@@ -1003,7 +1003,7 @@ jobs:
         if: always() && steps.shard-workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.shard-workspace-fetch.outputs.index-partial-path }}
@@ -1019,7 +1019,7 @@ jobs:
         if: steps.shard-fuzz-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-fuzz-fetch-request.outputs.source-key }}
           path: ${{ steps.shard-fuzz-fetch-request.outputs.source-path }}
@@ -1028,7 +1028,7 @@ jobs:
         if: steps.shard-fuzz-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-fuzz-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.shard-fuzz-fetch-request.outputs.archives-partial-inbox }}
@@ -1037,7 +1037,7 @@ jobs:
         if: steps.shard-fuzz-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-fuzz-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.shard-fuzz-fetch-request.outputs.index-partial-inbox }}
@@ -1050,7 +1050,7 @@ jobs:
         if: always() && steps.shard-fuzz-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.shard-fuzz-fetch.outputs.source-complete-key }}
           path: ${{ steps.shard-fuzz-fetch.outputs.source-complete-path }}
@@ -1059,7 +1059,7 @@ jobs:
         if: always() && steps.shard-fuzz-fetch.outputs.source-complete-save == 'true' && steps.shard-fuzz-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-fuzz-fetch.outputs.source-complete-key }}
           path: ${{ steps.shard-fuzz-fetch.outputs.source-complete-path }}
@@ -1067,7 +1067,7 @@ jobs:
         if: always() && steps.shard-fuzz-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-fuzz-fetch.outputs.archives-partial-key }}
           path: ${{ steps.shard-fuzz-fetch.outputs.archives-partial-path }}
@@ -1075,7 +1075,7 @@ jobs:
         if: always() && steps.shard-fuzz-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.shard-fuzz-fetch.outputs.index-partial-key }}
           path: ${{ steps.shard-fuzz-fetch.outputs.index-partial-path }}
@@ -1091,7 +1091,7 @@ jobs:
         if: steps.fuzz-one-compile-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-one-compile-request.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-one-compile-request.outputs.compiled-complete-inbox }}
@@ -1100,7 +1100,7 @@ jobs:
         if: steps.fuzz-one-compile-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-one-compile-request.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-one-compile-request.outputs.compiled-partial-inbox }}
@@ -1113,7 +1113,7 @@ jobs:
         if: always() && steps.fuzz-one-compile.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-one-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-one-compile.outputs.compiled-complete-path }}
@@ -1122,7 +1122,7 @@ jobs:
         if: always() && steps.fuzz-one-compile.outputs.compiled-complete-save == 'true' && steps.fuzz-one-compile-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-one-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-one-compile.outputs.compiled-complete-path }}
@@ -1130,7 +1130,7 @@ jobs:
         if: always() && steps.fuzz-one-compile.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-one-compile.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-one-compile.outputs.compiled-partial-path }}
@@ -1146,7 +1146,7 @@ jobs:
         if: always() && steps.fuzz-one.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-one.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-one.outputs.compiled-complete-path }}
@@ -1155,7 +1155,7 @@ jobs:
         if: always() && steps.fuzz-one.outputs.compiled-complete-save == 'true' && steps.fuzz-one-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-one.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-one.outputs.compiled-complete-path }}
@@ -1163,7 +1163,7 @@ jobs:
         if: always() && steps.fuzz-one.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-one.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-one.outputs.compiled-partial-path }}
@@ -1179,7 +1179,7 @@ jobs:
         if: steps.fuzz-two-compile-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-two-compile-request.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-two-compile-request.outputs.compiled-complete-inbox }}
@@ -1188,7 +1188,7 @@ jobs:
         if: steps.fuzz-two-compile-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-two-compile-request.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-two-compile-request.outputs.compiled-partial-inbox }}
@@ -1201,7 +1201,7 @@ jobs:
         if: always() && steps.fuzz-two-compile.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-two-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-two-compile.outputs.compiled-complete-path }}
@@ -1210,7 +1210,7 @@ jobs:
         if: always() && steps.fuzz-two-compile.outputs.compiled-complete-save == 'true' && steps.fuzz-two-compile-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-two-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-two-compile.outputs.compiled-complete-path }}
@@ -1218,7 +1218,7 @@ jobs:
         if: always() && steps.fuzz-two-compile.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-two-compile.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-two-compile.outputs.compiled-partial-path }}
@@ -1234,7 +1234,7 @@ jobs:
         if: always() && steps.fuzz-two.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-two.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-two.outputs.compiled-complete-path }}
@@ -1243,7 +1243,7 @@ jobs:
         if: always() && steps.fuzz-two.outputs.compiled-complete-save == 'true' && steps.fuzz-two-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-two.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-two.outputs.compiled-complete-path }}
@@ -1251,7 +1251,7 @@ jobs:
         if: always() && steps.fuzz-two.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-two.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-two.outputs.compiled-partial-path }}
@@ -1267,7 +1267,7 @@ jobs:
         if: steps.fuzz-three-compile-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-three-compile-request.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-three-compile-request.outputs.compiled-complete-inbox }}
@@ -1276,7 +1276,7 @@ jobs:
         if: steps.fuzz-three-compile-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-three-compile-request.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-three-compile-request.outputs.compiled-partial-inbox }}
@@ -1289,7 +1289,7 @@ jobs:
         if: always() && steps.fuzz-three-compile.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-three-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-three-compile.outputs.compiled-complete-path }}
@@ -1298,7 +1298,7 @@ jobs:
         if: always() && steps.fuzz-three-compile.outputs.compiled-complete-save == 'true' && steps.fuzz-three-compile-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-three-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-three-compile.outputs.compiled-complete-path }}
@@ -1306,7 +1306,7 @@ jobs:
         if: always() && steps.fuzz-three-compile.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-three-compile.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-three-compile.outputs.compiled-partial-path }}
@@ -1322,7 +1322,7 @@ jobs:
         if: always() && steps.fuzz-three.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-three.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-three.outputs.compiled-complete-path }}
@@ -1331,7 +1331,7 @@ jobs:
         if: always() && steps.fuzz-three.outputs.compiled-complete-save == 'true' && steps.fuzz-three-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-three.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-three.outputs.compiled-complete-path }}
@@ -1339,7 +1339,7 @@ jobs:
         if: always() && steps.fuzz-three.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-three.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-three.outputs.compiled-partial-path }}
@@ -1355,7 +1355,7 @@ jobs:
         if: steps.fuzz-four-compile-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-four-compile-request.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-four-compile-request.outputs.compiled-complete-inbox }}
@@ -1364,7 +1364,7 @@ jobs:
         if: steps.fuzz-four-compile-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-four-compile-request.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-four-compile-request.outputs.compiled-partial-inbox }}
@@ -1377,7 +1377,7 @@ jobs:
         if: always() && steps.fuzz-four-compile.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-four-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-four-compile.outputs.compiled-complete-path }}
@@ -1386,7 +1386,7 @@ jobs:
         if: always() && steps.fuzz-four-compile.outputs.compiled-complete-save == 'true' && steps.fuzz-four-compile-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-four-compile.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-four-compile.outputs.compiled-complete-path }}
@@ -1394,7 +1394,7 @@ jobs:
         if: always() && steps.fuzz-four-compile.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-four-compile.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-four-compile.outputs.compiled-partial-path }}
@@ -1410,7 +1410,7 @@ jobs:
         if: always() && steps.fuzz-four.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.fuzz-four.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-four.outputs.compiled-complete-path }}
@@ -1419,7 +1419,7 @@ jobs:
         if: always() && steps.fuzz-four.outputs.compiled-complete-save == 'true' && steps.fuzz-four-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-four.outputs.compiled-complete-key }}
           path: ${{ steps.fuzz-four.outputs.compiled-complete-path }}
@@ -1427,7 +1427,7 @@ jobs:
         if: always() && steps.fuzz-four.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.fuzz-four.outputs.compiled-partial-key }}
           path: ${{ steps.fuzz-four.outputs.compiled-partial-path }}
@@ -1453,14 +1453,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 288
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
       - id: stress-deps
         continue-on-error: true
         if: hashFiles('Cargo.lock') != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: |
             ~/.cargo/registry/cache
@@ -1474,7 +1474,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -1492,7 +1492,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -1505,7 +1505,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -1514,7 +1514,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -1527,7 +1527,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -1536,7 +1536,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -1544,7 +1544,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -1553,7 +1553,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -1561,7 +1561,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -1570,7 +1570,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -1578,7 +1578,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -1586,7 +1586,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -1595,7 +1595,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -1603,7 +1603,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -1611,7 +1611,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -1631,7 +1631,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -1640,7 +1640,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -1648,7 +1648,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -1657,7 +1657,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -1665,7 +1665,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -1673,7 +1673,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -1689,7 +1689,7 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -1707,7 +1707,7 @@ jobs:
         if: steps.driver-context-windows.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.image-key }}
           path: ${{ steps.driver-context-windows.outputs.image-inbox }}
@@ -1720,7 +1720,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-complete-inbox }}
@@ -1729,7 +1729,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-partial-inbox }}
@@ -1742,7 +1742,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -1751,7 +1751,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true' && steps.driver-managed-build-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -1759,7 +1759,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -1768,7 +1768,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true' && steps.driver-managed-build-windows-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -1776,7 +1776,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -1785,7 +1785,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -1793,7 +1793,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
@@ -1801,7 +1801,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -1810,7 +1810,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true' && steps.driver-managed-build-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -1818,7 +1818,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.archives-partial-path }}
@@ -1826,7 +1826,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.index-partial-path }}
@@ -1846,7 +1846,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -1855,7 +1855,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -1863,7 +1863,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -1872,7 +1872,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -1880,7 +1880,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
@@ -1888,7 +1888,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
@@ -1908,7 +1908,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
@@ -1917,7 +1917,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -1926,7 +1926,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
@@ -1939,7 +1939,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -1948,7 +1948,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -1956,7 +1956,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
@@ -1964,7 +1964,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
@@ -1980,7 +1980,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.source-path }}
@@ -1989,7 +1989,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-inbox }}
@@ -1998,7 +1998,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-inbox }}
@@ -2011,7 +2011,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -2020,7 +2020,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true' && steps.workspace-fetch-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -2028,7 +2028,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.archives-partial-path }}
@@ -2036,7 +2036,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.index-partial-path }}
@@ -2052,7 +2052,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-complete-inbox }}
@@ -2061,7 +2061,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-partial-inbox }}
@@ -2074,7 +2074,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -2083,7 +2083,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true' && steps.stress-run-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -2091,7 +2091,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run.outputs.compiled-partial-path }}
@@ -2107,7 +2107,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-complete-inbox }}
@@ -2116,7 +2116,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-partial-inbox }}
@@ -2129,7 +2129,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -2138,7 +2138,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true' && steps.stress-run-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -2146,7 +2146,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-partial-path }}
@@ -2177,14 +2177,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 288
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
       - id: sources
         continue-on-error: true
         if: hashFiles('Cargo.lock') != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: |
             ~/.cargo/registry/cache
@@ -2198,7 +2198,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -2216,7 +2216,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -2229,7 +2229,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -2238,7 +2238,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -2251,7 +2251,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -2260,7 +2260,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -2268,7 +2268,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -2277,7 +2277,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -2285,7 +2285,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -2294,7 +2294,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -2302,7 +2302,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -2310,7 +2310,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -2319,7 +2319,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -2327,7 +2327,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -2335,7 +2335,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -2355,7 +2355,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -2364,7 +2364,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -2372,7 +2372,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -2381,7 +2381,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -2389,7 +2389,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -2397,7 +2397,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -2413,7 +2413,7 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -2431,7 +2431,7 @@ jobs:
         if: steps.driver-context-windows.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.image-key }}
           path: ${{ steps.driver-context-windows.outputs.image-inbox }}
@@ -2444,7 +2444,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-complete-inbox }}
@@ -2453,7 +2453,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-partial-inbox }}
@@ -2466,7 +2466,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -2475,7 +2475,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true' && steps.driver-managed-build-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -2483,7 +2483,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -2492,7 +2492,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true' && steps.driver-managed-build-windows-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -2500,7 +2500,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -2509,7 +2509,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -2517,7 +2517,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
@@ -2525,7 +2525,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -2534,7 +2534,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true' && steps.driver-managed-build-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -2542,7 +2542,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.archives-partial-path }}
@@ -2550,7 +2550,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.index-partial-path }}
@@ -2570,7 +2570,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -2579,7 +2579,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -2587,7 +2587,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -2596,7 +2596,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -2604,7 +2604,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
@@ -2612,7 +2612,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
@@ -2632,7 +2632,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
@@ -2641,7 +2641,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -2650,7 +2650,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
@@ -2663,7 +2663,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -2672,7 +2672,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -2680,7 +2680,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
@@ -2688,7 +2688,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
@@ -2704,7 +2704,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.source-path }}
@@ -2713,7 +2713,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-inbox }}
@@ -2722,7 +2722,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-inbox }}
@@ -2735,7 +2735,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -2744,7 +2744,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true' && steps.workspace-fetch-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -2752,7 +2752,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.archives-partial-path }}
@@ -2760,7 +2760,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.index-partial-path }}
@@ -2776,7 +2776,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-complete-inbox }}
@@ -2785,7 +2785,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-partial-inbox }}
@@ -2798,7 +2798,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -2807,7 +2807,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true' && steps.stress-run-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -2815,7 +2815,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run.outputs.compiled-partial-path }}
@@ -2831,7 +2831,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-complete-inbox }}
@@ -2840,7 +2840,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-partial-inbox }}
@@ -2853,7 +2853,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -2862,7 +2862,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true' && steps.stress-run-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -2870,7 +2870,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-partial-path }}
@@ -2899,14 +2899,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 288
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
       - id: sources
         continue-on-error: true
         if: hashFiles('Cargo.lock') != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: |
             ~/.cargo/registry/cache
@@ -2920,7 +2920,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -2938,7 +2938,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -2951,7 +2951,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -2960,7 +2960,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -2973,7 +2973,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -2982,7 +2982,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -2990,7 +2990,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -2999,7 +2999,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -3007,7 +3007,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3016,7 +3016,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3024,7 +3024,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -3032,7 +3032,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -3041,7 +3041,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -3049,7 +3049,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -3057,7 +3057,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -3077,7 +3077,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -3086,7 +3086,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -3094,7 +3094,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -3103,7 +3103,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -3111,7 +3111,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -3119,7 +3119,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -3135,7 +3135,7 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -3153,7 +3153,7 @@ jobs:
         if: steps.driver-context-windows.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.image-key }}
           path: ${{ steps.driver-context-windows.outputs.image-inbox }}
@@ -3166,7 +3166,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-complete-inbox }}
@@ -3175,7 +3175,7 @@ jobs:
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context-windows.outputs.compiled-partial-inbox }}
@@ -3188,7 +3188,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -3197,7 +3197,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true' && steps.driver-managed-build-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
@@ -3205,7 +3205,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -3214,7 +3214,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true' && steps.driver-managed-build-windows-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
@@ -3222,7 +3222,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -3231,7 +3231,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-complete-path }}
@@ -3239,7 +3239,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
@@ -3247,7 +3247,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -3256,7 +3256,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true' && steps.driver-managed-build-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.source-complete-path }}
@@ -3264,7 +3264,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.archives-partial-path }}
@@ -3272,7 +3272,7 @@ jobs:
         if: always() && steps.driver-managed-build-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.index-partial-path }}
@@ -3292,7 +3292,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -3301,7 +3301,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-windows-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
@@ -3309,7 +3309,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -3318,7 +3318,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.source-complete-path }}
@@ -3326,7 +3326,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.archives-partial-path }}
@@ -3334,7 +3334,7 @@ jobs:
         if: always() && steps.driver-cold-adopt-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.index-partial-path }}
@@ -3354,7 +3354,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
@@ -3363,7 +3363,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -3372,7 +3372,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
@@ -3385,7 +3385,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -3394,7 +3394,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -3402,7 +3402,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
@@ -3410,7 +3410,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
@@ -3426,7 +3426,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.source-path }}
@@ -3435,7 +3435,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-inbox }}
@@ -3444,7 +3444,7 @@ jobs:
         if: steps.workspace-fetch-windows-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-inbox }}
@@ -3457,7 +3457,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -3466,7 +3466,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true' && steps.workspace-fetch-windows-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.source-complete-path }}
@@ -3474,7 +3474,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.archives-partial-path }}
@@ -3482,7 +3482,7 @@ jobs:
         if: always() && steps.workspace-fetch-windows.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch-windows.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-windows.outputs.index-partial-path }}
@@ -3498,7 +3498,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-complete-inbox }}
@@ -3507,7 +3507,7 @@ jobs:
         if: steps.stress-run-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-request.outputs.compiled-partial-inbox }}
@@ -3520,7 +3520,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -3529,7 +3529,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-complete-save == 'true' && steps.stress-run-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run.outputs.compiled-complete-path }}
@@ -3537,7 +3537,7 @@ jobs:
         if: always() && steps.stress-run.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run.outputs.compiled-partial-path }}
@@ -3553,7 +3553,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-complete-inbox }}
@@ -3562,7 +3562,7 @@ jobs:
         if: steps.stress-run-windows-request.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows-request.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows-request.outputs.compiled-partial-inbox }}
@@ -3575,7 +3575,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -3584,7 +3584,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-complete-save == 'true' && steps.stress-run-windows-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-complete-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-complete-path }}
@@ -3592,7 +3592,7 @@ jobs:
         if: always() && steps.stress-run-windows.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.stress-run-windows.outputs.compiled-partial-key }}
           path: ${{ steps.stress-run-windows.outputs.compiled-partial-path }}
@@ -3617,11 +3617,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 135
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: *action_3
         with:
           pattern: stress-*
           path: target/ci/stress-artifacts
@@ -3632,7 +3632,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -3650,7 +3650,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -3663,7 +3663,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -3672,7 +3672,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -3685,7 +3685,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -3694,7 +3694,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -3702,7 +3702,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -3711,7 +3711,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -3719,7 +3719,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3728,7 +3728,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3736,7 +3736,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -3744,7 +3744,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -3753,7 +3753,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -3761,7 +3761,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -3769,7 +3769,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -3789,7 +3789,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -3798,7 +3798,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -3806,7 +3806,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -3815,7 +3815,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -3823,7 +3823,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -3831,7 +3831,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -3858,7 +3858,7 @@ jobs:
     if: needs.performance-plan.outputs.standalone-common == 'true'
     name: fuzz setup
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: *action_0
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
@@ -3866,7 +3866,7 @@ jobs:
       - id: fuzz-deps
         continue-on-error: true
         if: hashFiles('Cargo.lock') != '' && hashFiles('fuzz/Cargo.lock') != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: |
             ~/.cargo/registry/cache
@@ -3880,7 +3880,7 @@ jobs:
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -3898,7 +3898,7 @@ jobs:
         if: steps.driver-context.outputs.image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
           path: ${{ steps.driver-context.outputs.image-inbox }}
@@ -3911,7 +3911,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
           path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
@@ -3920,7 +3920,7 @@ jobs:
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
           path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
@@ -3933,7 +3933,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -3942,7 +3942,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true' && steps.driver-managed-build-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
@@ -3950,7 +3950,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -3959,7 +3959,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.image-save == 'true' && steps.driver-managed-build-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
@@ -3967,7 +3967,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3976,7 +3976,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true' && steps.driver-managed-build-compiled-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-complete-path }}
@@ -3984,7 +3984,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.compiled-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
@@ -3992,7 +3992,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -4001,7 +4001,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true' && steps.driver-managed-build-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.source-complete-key }}
           path: ${{ steps.driver-managed-build.outputs.source-complete-path }}
@@ -4009,7 +4009,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.archives-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.archives-partial-path }}
@@ -4017,7 +4017,7 @@ jobs:
         if: always() && steps.driver-managed-build.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-managed-build.outputs.index-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.index-partial-path }}
@@ -4037,7 +4037,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -4046,7 +4046,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true' && steps.driver-cold-adopt-bootstrap-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
@@ -4054,7 +4054,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -4063,7 +4063,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true' && steps.driver-cold-adopt-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.source-complete-key }}
           path: ${{ steps.driver-cold-adopt.outputs.source-complete-path }}
@@ -4071,7 +4071,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.archives-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.archives-partial-path }}
@@ -4079,7 +4079,7 @@ jobs:
         if: always() && steps.driver-cold-adopt.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.driver-cold-adopt.outputs.index-partial-key }}
           path: ${{ steps.driver-cold-adopt.outputs.index-partial-path }}
@@ -4099,7 +4099,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
@@ -4108,7 +4108,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
@@ -4117,7 +4117,7 @@ jobs:
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
@@ -4130,7 +4130,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -4139,7 +4139,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
@@ -4147,7 +4147,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
@@ -4155,7 +4155,7 @@ jobs:
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
@@ -4171,7 +4171,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.source-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.source-path }}
@@ -4180,7 +4180,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.archives-partial-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.archives-partial-inbox }}
@@ -4189,7 +4189,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.index-partial-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.index-partial-inbox }}
@@ -4198,7 +4198,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.cargo-fuzz-image-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-image-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-image-path }}
@@ -4207,7 +4207,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.cargo-fuzz-source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-source-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-source-path }}
@@ -4216,7 +4216,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.cargo-fuzz-complete-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-complete-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-complete-inbox }}
@@ -4225,7 +4225,7 @@ jobs:
         if: steps.prepare-fuzz-request.outputs.cargo-fuzz-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-partial-key }}
           path: ${{ steps.prepare-fuzz-request.outputs.cargo-fuzz-partial-inbox }}
@@ -4238,7 +4238,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz.outputs.source-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.source-complete-path }}
@@ -4247,7 +4247,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.source-complete-save == 'true' && steps.prepare-fuzz-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.source-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.source-complete-path }}
@@ -4255,7 +4255,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.archives-partial-key }}
           path: ${{ steps.prepare-fuzz.outputs.archives-partial-path }}
@@ -4263,7 +4263,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.index-partial-key }}
           path: ${{ steps.prepare-fuzz.outputs.index-partial-path }}
@@ -4271,7 +4271,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-image-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-image-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-image-path }}
@@ -4280,7 +4280,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-image-save == 'true' && steps.prepare-fuzz-cargo-fuzz-image-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-image-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-image-path }}
@@ -4288,7 +4288,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-path }}
@@ -4297,7 +4297,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-save == 'true' && steps.prepare-fuzz-cargo-fuzz-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-source-complete-path }}
@@ -4305,7 +4305,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-complete-path }}
@@ -4314,7 +4314,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-complete-save == 'true' && steps.prepare-fuzz-cargo-fuzz-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-complete-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-complete-path }}
@@ -4322,7 +4322,7 @@ jobs:
         if: always() && steps.prepare-fuzz.outputs.cargo-fuzz-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_2
         with:
           key: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-partial-key }}
           path: ${{ steps.prepare-fuzz.outputs.cargo-fuzz-partial-path }}

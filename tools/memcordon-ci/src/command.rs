@@ -23,6 +23,35 @@ pub fn require_successful_output(operation: &str, output: &ObservedOutput) -> Re
     )))
 }
 
+/// Keep a known native failure visible even when publishing its receipt fails.
+/// Successful work still requires receipt publication to succeed.
+pub fn require_successful_retained_output(
+    operation: &str,
+    output: &ObservedOutput,
+    retention: Result<()>,
+) -> Result<()> {
+    match require_successful_output(operation, output) {
+        Ok(()) => retention,
+        Err(primary) => {
+            let stdout_end = output.stdout.len().min(2048);
+            let retention_error = retention.err().map(|error| error.to_string());
+            let retention_bytes = retention_error
+                .as_ref()
+                .map_or(&[][..], |error| error.as_bytes());
+            let retention_end = retention_bytes.len().min(2048);
+            Err(CiError::Message(format!(
+                "{primary}; stdout-truncated={}; stdout={:?}; receipt-error-present={}; receipt-error-bytes={}; receipt-error-truncated={}; receipt-error={:?}",
+                stdout_end != output.stdout.len(),
+                String::from_utf8_lossy(&output.stdout[..stdout_end]),
+                retention_error.is_some(),
+                retention_bytes.len(),
+                retention_end != retention_bytes.len(),
+                String::from_utf8_lossy(&retention_bytes[..retention_end]),
+            )))
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     program: PathBuf,
@@ -648,13 +677,17 @@ impl CommandSpec {
                       observed_budget: Duration,
                       result: Option<
             &std::result::Result<ObservedOutput, memcordon_testkit::ProcessTestError>,
-        >|
+        >,
+                      cargo_progress: Option<&crate::cargo_progress::CargoProgress>|
          -> Result<()> {
             let Some(phase) = self.phase else {
                 return Ok(());
             };
             let mut value = serde_json::json!({"phase": phase.name(), "state": state, "program": self.program.to_string_lossy(), "arguments": self.arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>(), "toolchain": format!("{:?}", self.toolchain), "original-budget-ms": self.deadline.as_millis(), "available-budget-ms": observed_budget.as_millis(), "elapsed-ms": started.elapsed().as_millis()});
             value["selection"] = self.selection.clone().unwrap_or(serde_json::Value::Null);
+            if let Some(cargo_progress) = cargo_progress {
+                value["cargo-progress"] = serde_json::to_value(cargo_progress)?;
+            }
             if let Some(group) = &group {
                 let (failure, stop, elapsed) = group.timing();
                 value["operation-timing"] = serde_json::json!({
@@ -759,7 +792,7 @@ impl CommandSpec {
             std::fs::rename(temporary, path)?;
             Ok(())
         };
-        if let Err(error) = report("in-progress", budget, None) {
+        if let Err(error) = report("in-progress", budget, None, None) {
             eprintln!("diagnostic retention incomplete: {error}");
         }
         let budget = self.available_budget()?;
@@ -786,39 +819,45 @@ impl CommandSpec {
         } else {
             None
         };
-        let (result, logger_settled) =
-            std::thread::scope(|scope| {
-                let lane = match std::thread::current().name() {
-                    Some("ci-source-lane") => "first",
-                    Some("ci-auxiliary-lane") => "second",
-                    _ => "owner",
-                };
-                let phase = self.phase.map_or("command", CiPhase::name);
-                let (sender, receiver) =
-                    std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
-                let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let logger_done = done.clone();
-                let secrets: Vec<String> = [
-                    "GH_TOKEN",
-                    "GITHUB_TOKEN",
-                    "CARGO_REGISTRY_TOKEN",
-                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
-                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-                ]
-                .into_iter()
-                .filter_map(|key| std::env::var(key).ok())
-                .filter(|value| !value.is_empty())
-                .collect();
-                let logger = scope.spawn(move || {
+        let observe_cargo_progress = cfg!(target_os = "macos")
+            && matches!(self.phase, Some(CiPhase::NativeCompile))
+            && matches!(self.toolchain, Some(ToolchainInvocation::Cargo { .. }));
+        let (result, logger_settled, cargo_progress) = std::thread::scope(|scope| {
+            let lane = match std::thread::current().name() {
+                Some("ci-source-lane") => "first",
+                Some("ci-auxiliary-lane") => "second",
+                _ => "owner",
+            };
+            let phase = self.phase.map_or("command", CiPhase::name);
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
+            let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let logger_done = done.clone();
+            let secrets: Vec<String> = [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            ]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .collect();
+            let logger = scope.spawn(move || {
+                let mut cargo_progress = observe_cargo_progress
+                    .then(|| crate::cargo_progress::CargoProgress::new(budget));
                 let mut pending = [Vec::new(), Vec::new()];
                 let mut discarding = [false, false];
                 let mut remaining: usize = 1024 * 1024;
-                let mut omitted_lines = 0;
+                let mut omitted_lines = 0_u64;
                 let mut final_chunks = 0;
                 loop {
                     let next = if logger_done.load(std::sync::atomic::Ordering::Acquire) {
-                        if final_chunks == 32 { break; }
+                        if final_chunks == 32 {
+                            break;
+                        }
                         final_chunks += 1;
                         receiver
                             .try_recv()
@@ -858,10 +897,13 @@ impl CommandSpec {
                                 }
                                 let safe: String =
                                     text.chars().flat_map(char::escape_default).collect();
+                                if let Some(observed) = &mut cargo_progress {
+                                    observed.observe_line(started.elapsed(), chunk.stream, &safe);
+                                }
                                 remaining = remaining.saturating_sub(safe.len());
                                 eprintln!("[ci {lane} {phase} {:?}] {safe}", chunk.stream);
                             } else if !discarding[stream] {
-                                omitted_lines += 1;
+                                omitted_lines = omitted_lines.saturating_add(1);
                             }
                             pending[stream].clear();
                             discarding[stream] = false;
@@ -872,52 +914,62 @@ impl CommandSpec {
                             // credential split at the progress/capture boundary.
                             pending[stream].clear();
                             discarding[stream] = true;
-                            omitted_lines += 1;
+                            omitted_lines = omitted_lines.saturating_add(1);
                         }
                     }
                 }
-                omitted_lines += pending.iter().filter(|line| !line.is_empty()).count();
+                omitted_lines = omitted_lines.saturating_add(
+                    u64::try_from(pending.iter().filter(|line| !line.is_empty()).count())
+                        .unwrap_or(u64::MAX),
+                );
                 if omitted_lines != 0 {
                     eprintln!(
                         "[ci child] omitted {omitted_lines} incomplete or oversized progress lines"
                     );
                 }
+                (cargo_progress, omitted_lines)
             });
-                let progress = progress.then(|| memcordon_testkit::ProgressOutput {
-                    sender,
-                    omitted: omitted.clone(),
-                });
-                let failure = if self.defer_group_failure {
-                    None
-                } else {
-                    group.clone().map(|group| {
-                        let operation = self.phase.map_or("command", CiPhase::name);
-                        std::sync::Arc::new(move |notice| {
-                            group.request_command_failure_notice(operation, notice)
-                        })
-                            as std::sync::Arc<
-                                dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
-                            >
+            let progress = progress.then(|| memcordon_testkit::ProgressOutput {
+                sender,
+                omitted: omitted.clone(),
+            });
+            let failure = if self.defer_group_failure {
+                None
+            } else {
+                group.clone().map(|group| {
+                    let operation = self.phase.map_or("command", CiPhase::name);
+                    std::sync::Arc::new(move |notice| {
+                        group.request_command_failure_notice(operation, notice)
                     })
-                };
-                let result = memcordon_testkit::run_with_deadline_failure_notice_output_limit(
-                    command,
-                    budget,
-                    self.output_limit,
-                    cancellation,
-                    progress,
-                    failure,
-                );
-                done.store(true, std::sync::atomic::Ordering::Release);
-                // Incomplete reader settlement cannot keep the logger waiting for
-                // a sender forever. The native result remains authoritative.
-                let logger_settled = logger.join().is_ok();
-                let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
-                if omitted != 0 {
-                    eprintln!("[ci child] omitted {omitted} progress chunks");
-                }
-                (result, logger_settled)
-            });
+                        as std::sync::Arc<
+                            dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
+                        >
+                })
+            };
+            let result = memcordon_testkit::run_with_deadline_failure_notice_output_limit(
+                command,
+                budget,
+                self.output_limit,
+                cancellation,
+                progress,
+                failure,
+            );
+            done.store(true, std::sync::atomic::Ordering::Release);
+            // Incomplete reader settlement cannot keep the logger waiting for
+            // a sender forever. The native result remains authoritative.
+            let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
+                Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
+                Err(_) => (false, None, 0),
+            };
+            let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
+            if let Some(observed) = &mut cargo_progress {
+                observed.finish(omitted_lines, omitted);
+            }
+            if omitted != 0 {
+                eprintln!("[ci child] omitted {omitted} progress chunks");
+            }
+            (result, logger_settled, cargo_progress)
+        });
         if !self.defer_group_failure
             && (result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|output| !output.status.success()))
@@ -964,7 +1016,7 @@ impl CommandSpec {
         } else {
             "failed"
         };
-        if let Err(error) = report(state, budget, Some(&result)) {
+        if let Err(error) = report(state, budget, Some(&result), cargo_progress.as_ref()) {
             eprintln!("diagnostic retention incomplete: {error}");
         }
         finish_native_observation(result, logger_settled).into_result()

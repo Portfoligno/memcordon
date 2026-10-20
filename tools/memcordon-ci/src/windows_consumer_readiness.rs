@@ -16,6 +16,10 @@ pub mod descriptor;
 #[path = "windows_loader_event_diagnostics.rs"]
 pub mod loader_event_diagnostics;
 
+#[cfg(any(windows, test))]
+#[path = "windows_installed_loader_diagnostic.rs"]
+pub(crate) mod installed_loader_diagnostic;
+
 #[cfg(windows)]
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/fixture_environment.rs"]
 pub(crate) mod fixture_environment;
@@ -456,10 +460,51 @@ enum FrontendObservation<'a> {
     Diagnostic {
         selection: &'a Path,
         observation: &'a Path,
+        system_environment: bool,
     },
 }
 
 pub fn support_loader_command(
+    cli: &Path,
+    fixture: &Path,
+    directory: &Path,
+    report: &Path,
+    case: &CaseInput,
+    selection: &Path,
+    observation: &Path,
+) -> Result<crate::command::CommandSpec> {
+    support_loader_command_with_environment::<false>(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        selection,
+        observation,
+    )
+}
+
+pub fn installed_support_loader_command(
+    cli: &Path,
+    fixture: &Path,
+    directory: &Path,
+    report: &Path,
+    case: &CaseInput,
+    selection: &Path,
+    observation: &Path,
+) -> Result<crate::command::CommandSpec> {
+    support_loader_command_with_environment::<true>(
+        cli,
+        fixture,
+        directory,
+        report,
+        case,
+        selection,
+        observation,
+    )
+}
+
+fn support_loader_command_with_environment<const SYSTEM_ENVIRONMENT: bool>(
     cli: &Path,
     fixture: &Path,
     directory: &Path,
@@ -496,6 +541,7 @@ pub fn support_loader_command(
         FrontendObservation::Diagnostic {
             selection,
             observation,
+            system_environment: SYSTEM_ENVIRONMENT,
         },
     )
 }
@@ -509,6 +555,14 @@ fn public_command_observation(
     observation: FrontendObservation<'_>,
 ) -> Result<crate::command::CommandSpec> {
     let terminal_observation = matches!(observation, FrontendObservation::Terminal);
+    let system_environment = terminal_observation
+        || matches!(
+            observation,
+            FrontendObservation::Diagnostic {
+                system_environment: true,
+                ..
+            }
+        );
     #[cfg(windows)]
     let request_observation = matches!(observation, FrontendObservation::Request);
     #[cfg(not(windows))]
@@ -552,6 +606,7 @@ fn public_command_observation(
     if let FrontendObservation::Diagnostic {
         selection,
         observation,
+        ..
     } = observation
     {
         args = [
@@ -567,7 +622,7 @@ fn public_command_observation(
     if case.expected_token.restricted {
         let mut restricted: Vec<OsString> = vec![
             "consumer-readiness-windows".into(),
-            if terminal_observation {
+            if system_environment {
                 "system-restricted-frontend"
             } else {
                 "restricted-frontend"
@@ -1024,6 +1079,30 @@ pub fn run_installed(
     )
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn write_activated_contract(
+    output_directory: &Path,
+    key: &CaseKey,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    use std::io::Write;
+    let directory = std::path::absolute(output_directory)?
+        .join(&key.family)
+        .join(&key.scenario);
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("requested-contract.json");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?
+        .write_all(bytes)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+#[path = "../tests/private/windows_activated_contract.rs"]
+mod activated_contract_tests;
+
 #[cfg(windows)]
 pub fn run_installed_until(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
@@ -1031,7 +1110,23 @@ pub fn run_installed_until(
     assessments: &mut Vec<CaseAssessment>,
     work_deadline: std::time::Instant,
 ) -> Result<()> {
-    native::run(config, input_path, assessments, work_deadline)
+    native::run(config, input_path, assessments, work_deadline, None)
+}
+
+#[cfg(windows)]
+pub fn run_installed_with_deadlines(
+    config: &crate::windows_installed_cases::InstalledWindowsPayload,
+    input_path: &Path,
+    assessments: &mut Vec<CaseAssessment>,
+    deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+) -> Result<()> {
+    native::run(
+        config,
+        input_path,
+        assessments,
+        deadlines.work,
+        Some(deadlines),
+    )
 }
 
 #[cfg(windows)]
@@ -4383,11 +4478,47 @@ pub(crate) mod native {
         retirement
     }
 
+    fn diagnose_installed_refusal(
+        config: &crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &CaseInput,
+        deadlines: crate::windows_installed_cases::WindowsLeaseDeadlines,
+    ) -> Result<()> {
+        let capture = read(
+            &config
+                .output_directory
+                .join(&input.key.family)
+                .join(&input.key.scenario)
+                .join("result.callback-failure.json"),
+            16 * 1024,
+        )?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&capture)
+            .map_err(CiError::Message)?;
+        let capture: serde_json::Value = serde_json::from_slice(&capture)?;
+        if capture["format"] != "memcordon.windows-positive-callback-failure"
+            || capture["revision"] != 1
+            || capture["capture_complete"] != true
+            || capture["cleanup"] != serde_json::json!({"Ok":null})
+        {
+            return Err(CiError::Message(
+                "installed diagnostic original frontend is not settled".into(),
+            ));
+        }
+        deadlines.work_budget(Duration::from_secs(30))?;
+        let _quiescent = GuardianBaseline::quiescent(
+            &config.installed_agent.path,
+            &config.installed_manifest.path,
+            &config.installed_agent.sha256,
+            &config.installed_manifest.sha256,
+        )?;
+        super::installed_loader_diagnostic::retain(config, input, deadlines)
+    }
+
     pub fn run(
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         input_path: &Path,
         assessments: &mut Vec<CaseAssessment>,
         work_deadline: Instant,
+        diagnostic_deadlines: Option<crate::windows_installed_cases::WindowsLeaseDeadlines>,
     ) -> Result<()> {
         let input: SuiteInput = serde_json::from_slice(&read(input_path, 4 * 1024 * 1024)?)?;
         validate_suite(&input)?;
@@ -4510,20 +4641,19 @@ pub(crate) mod native {
             )?)
             .map_err(CiError::Message)?;
             contract.expected_epoch = activated.epoch.clone();
-            let directory = config
-                .output_directory
-                .join(&case.key.family)
-                .join(&case.key.scenario);
-            fs::create_dir_all(&directory)?;
-            execution.workload_contract = directory.join("requested-contract.json");
             let contract = serde_json::to_vec(&contract)?;
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&execution.workload_contract)?
-                .write_all(&contract)?;
+            execution.workload_contract =
+                write_activated_contract(&config.output_directory, &case.key, &contract)?;
             assessment.contract_sha256 = Some(crate::windows_causal_acceptance::sha256(&contract));
             if let Err(error) = execute_until(config, &execution, assessment, work_deadline) {
+                if case.key.family == "W-ENVELOPE"
+                    && case.key.scenario == "restricted"
+                    && let Some(deadlines) = diagnostic_deadlines
+                    && let Err(diagnostic) =
+                        diagnose_installed_refusal(config, &execution, deadlines)
+                {
+                    eprintln!("secondary installed loader diagnostic unavailable: {diagnostic}");
+                }
                 if first_error.is_none() {
                     first_error = Some(error);
                 }

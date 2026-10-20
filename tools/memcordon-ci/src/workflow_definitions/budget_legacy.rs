@@ -84,6 +84,8 @@ pub(super) fn reviewed_legacy_minutes(command: &str) -> Option<u64> {
             // production planning envelope as a newly enforced Actions step
             // guard. It is not a shared Rust clock or a child-deadline change.
             "working-windows-consumer" => Some(135),
+            // Resume is clamped to the original persisted15min cleanup reserve.
+            "cleanup-installed-loader-support" => Some(15),
             // readiness_report::run has an original15min verifier deadline.
             "consumer-readiness-report" => Some(20),
             _ => None,

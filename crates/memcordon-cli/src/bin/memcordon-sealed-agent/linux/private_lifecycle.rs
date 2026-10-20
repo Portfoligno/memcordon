@@ -590,7 +590,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                     observed.observation
                 ),
                 Err(startup_error) => format!(
-                    "{root_error}; authenticated namespace startup unavailable: {startup_error}"
+                    "{root_error}; authenticated namespace startup unavailable: {startup_error}; original-init-exit={}",
+                    observe_init_exit(init),
                 ),
             }
         })?;
@@ -2272,6 +2273,41 @@ fn receive_control_packet(
         }
         return Ok(Some(packet[..received as usize].to_vec()));
     }
+}
+
+fn observe_init_exit(init: &NamespaceInit) -> String {
+    // Observe only the original held child. WNOWAIT leaves its status and
+    // ownership intact for the existing retirement path; WNOHANG never waits.
+    // SAFETY: zero is the required empty output state for nonblocking waitid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the live pidfd is owned by this original child owner, and info
+    // is writable for one siginfo_t. These flags never reap or block.
+    let observed = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            init.pidfd.as_raw_fd() as libc::id_t,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if observed == -1 {
+        return format!("unavailable: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: successful waitid initialized the child-status siginfo fields.
+    let pid = unsafe { info.si_pid() };
+    if pid == 0 {
+        return "not-observed".into();
+    }
+    if pid != init.host_pid {
+        return format!(
+            "identity-mismatch: expected={} observed={pid}",
+            init.host_pid
+        );
+    }
+    // SAFETY: the same successful child-status waitid initialized si_status.
+    format!("pid={pid},code={},status={}", info.si_code, unsafe {
+        info.si_status()
+    })
 }
 
 fn wait_exact_child(

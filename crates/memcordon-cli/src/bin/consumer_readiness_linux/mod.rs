@@ -644,20 +644,26 @@ pub fn run() -> Result<()> {
             wait_release()?;
             memory_pressure()
         }
+        "memory-pressure-stopped-child" => {
+            announce_child(Vec::new())?;
+            // The native controller resumes this exact held allocator after
+            // arming counters. Its release must not depend on the provider's
+            // deliberately paused stdin relay.
+            // SAFETY: raise has no pointer arguments and signals only this allocator.
+            if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            memory_pressure()
+        }
         "memory-pressure-descendant" => {
             let (mut child, observation) =
-                native_child("memory-pressure-child", &transcript.challenge)?;
+                native_child("memory-pressure-stopped-child", &transcript.challenge)?;
             let result = (|| -> Result<()> {
                 transcript.record(
                     "memory-pressure-descendant-held",
                     serde_json::json!({"native_tree":observation,"chunk_bytes":1048576}),
                 )?;
                 wait_release()?;
-                child
-                    .stdin
-                    .as_mut()
-                    .ok_or("memory child input owner absent")?
-                    .write_all(b"R")?;
                 loop {
                     std::thread::park_timeout(Duration::from_secs(1));
                 }
@@ -1649,16 +1655,13 @@ fn tcp_http(
                         )?;
                         wait_release()?;
                         if memory {
-                            let (mut allocator, observation) =
-                                native_child("memory-pressure-child", &transcript.challenge)?;
+                            let (mut allocator, observation) = native_child(
+                                "memory-pressure-stopped-child",
+                                &transcript.challenge,
+                            )?;
                             let result = (|| -> Result<()> {
                                 transcript.record("memory-pressure-descendant-held", serde_json::json!({"native_tree":observation,"chunk_bytes":1048576}))?;
                                 wait_release()?;
-                                allocator
-                                    .stdin
-                                    .as_mut()
-                                    .ok_or("joint allocator input owner absent")?
-                                    .write_all(b"R")?;
                                 loop {
                                     std::thread::park_timeout(Duration::from_secs(1));
                                 }

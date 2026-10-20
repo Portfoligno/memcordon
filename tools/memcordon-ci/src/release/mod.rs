@@ -8,12 +8,16 @@ pub mod finalize;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;
+#[cfg(any(windows, test))]
+mod installed_loader_support;
 #[cfg(target_os = "linux")]
 pub mod linux_account_normalize;
 #[cfg(target_os = "linux")]
 pub mod linux_cross_attempt_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_export_recovery;
+#[cfg(target_os = "linux")]
+mod linux_fixture_memory_budget;
 #[cfg(target_os = "linux")]
 pub mod linux_image_normalize;
 #[cfg(target_os = "linux")]
@@ -82,6 +86,8 @@ pub mod source;
 pub mod tag;
 pub mod target;
 pub mod windows_installed_consumer;
+#[cfg(any(windows, test))]
+mod windows_launcher_diagnostic;
 #[cfg(windows)]
 pub mod windows_readiness_lease;
 
@@ -117,6 +123,10 @@ pub enum ReleaseCommand {
     },
     WorkingWindowsPrepare {
         #[arg(long, default_value = "target/ci/windows-prepared")]
+        destination: PathBuf,
+    },
+    CleanupInstalledLoaderSupport {
+        #[arg(long)]
         destination: PathBuf,
     },
     WorkingWindowsConsumer {
@@ -335,6 +345,19 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         }
         ReleaseCommand::WorkingWindowsPrepare { destination } => {
             windows_installed_consumer::prepare_working(root, &destination)
+        }
+        ReleaseCommand::CleanupInstalledLoaderSupport { destination } => {
+            #[cfg(windows)]
+            {
+                installed_loader_support::cleanup(root, &destination)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = destination;
+                Err(CiError::Message(
+                    "installed support cleanup requires native Windows".into(),
+                ))
+            }
         }
         ReleaseCommand::WorkingWindowsConsumer {
             prepared,

@@ -143,7 +143,10 @@ pub struct LoaderReadyEvidenceV1 {
 
 impl LoaderReadyEvidenceV1 {
     #[must_use]
-    pub fn authenticated(plan: &crate::ProductionLoaderPlanV1, elapsed_millis: u64) -> Self {
+    pub fn authenticated<const VERSION: u32>(
+        plan: &crate::ProductionLoaderPlan<VERSION>,
+        elapsed_millis: u64,
+    ) -> Self {
         Self {
             schema_version: 1,
             launch_plan_sha256: String::from(plan.launch_plan_sha256()),
@@ -216,12 +219,12 @@ pub struct WindowsLoaderQualificationFailureV2 {
 
 impl WindowsLoaderQualificationFailureV2 {
     #[must_use]
-    pub fn new(
+    pub fn new<const VERSION: u32>(
         stable_code: impl Into<String>,
         stage: WindowsLoaderQualificationStageV2,
         native_status: Option<NativeStatusV1>,
         elapsed_millis: u64,
-        plan: &crate::ProductionLoaderPlanV1,
+        plan: &crate::ProductionLoaderPlan<VERSION>,
         qualification_id: impl Into<String>,
         detail: impl Into<String>,
     ) -> Self {

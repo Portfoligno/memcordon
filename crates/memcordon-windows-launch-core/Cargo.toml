@@ -11,6 +11,9 @@ description = "Typed, observer-free Windows loader launch contract shared by Mem
 keywords = ["windows", "sandbox", "process", "job-object"]
 categories = ["os::windows-apis"]
 
+[features]
+test-support = []
+
 [dependencies]
 hex.workspace = true
 memcordon-core = { path = "../memcordon-core", version = "=0.5.8-dev" }

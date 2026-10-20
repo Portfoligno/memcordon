@@ -342,7 +342,7 @@ fn publication_mutex_preserves_exclusivity_without_owner_mutation_rights() {
     })
     .join()
     .unwrap();
-    assert_eq!(error, "attempt publication owner is unavailable");
+    assert_eq!(error, "attempt publication writer is busy (WAIT_TIMEOUT)");
 
     let name: Vec<u16> = format!("Global\\MemCordon.Attempt.Writer.{attempt}")
         .encode_utf16()
@@ -1045,7 +1045,7 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
                 wait_attempted
                     .recv_timeout(Duration::from_secs(10))
                     .unwrap(),
-                Some("attempt publication owner is unavailable".to_owned())
+                Some("attempt publication writer is busy (WAIT_TIMEOUT)".to_owned())
             );
         }
         release.send(()).unwrap();
@@ -1056,9 +1056,9 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         } else {
             let error = publication.unwrap_err();
             assert!(error.starts_with("attempt cleanup publication is unconfirmed;"));
-            assert!(
-                error.contains("first-publisher-error=attempt publication owner is unavailable")
-            );
+            assert!(error.contains(
+                "first-publisher-error=attempt publication writer is busy (WAIT_TIMEOUT)"
+            ));
         }
         let committed: WindowsAttemptRecordV1 = serde_json::from_slice(
             &read_record_bounded(&directory.path().join("attempt.json")).unwrap(),

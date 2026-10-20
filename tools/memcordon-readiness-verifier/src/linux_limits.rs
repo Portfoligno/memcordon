@@ -1131,7 +1131,7 @@ fn memory_events(bytes: &[u8]) -> Result<BTreeMap<&str, u64>, String> {
             .ok_or("native memory counter shape differs")?;
         if !matches!(
             name,
-            "low" | "high" | "max" | "oom" | "oom_kill" | "oom_group_kill"
+            "low" | "high" | "max" | "oom" | "oom_kill" | "oom_group_kill" | "sock_throttled"
         ) || value.is_empty()
             || !value.bytes().all(|byte| byte.is_ascii_digit())
             || (value.len() > 1 && value.starts_with('0'))
@@ -1145,7 +1145,10 @@ fn memory_events(bytes: &[u8]) -> Result<BTreeMap<&str, u64>, String> {
             return Err("native memory counter repeated".into());
         }
     }
-    if counters.len() != 6 {
+    if ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"]
+        .iter()
+        .any(|name| !counters.contains_key(name))
+    {
         return Err("native memory counter inventory differs".into());
     }
     Ok(counters)
@@ -1156,6 +1159,9 @@ fn memory_events(bytes: &[u8]) -> Result<BTreeMap<&str, u64>, String> {
 pub fn validate_memory_event_transition(before: &[u8], after: &[u8]) -> Result<(), String> {
     let before = memory_events(before)?;
     let after = memory_events(after)?;
+    if !before.keys().eq(after.keys()) {
+        return Err("native memory counter inventory changed during interval".into());
+    }
     if before["oom_kill"] != 0 || after["oom_kill"] == 0 {
         return Err("actual fresh cgroup OOM-kill transition absent".into());
     }

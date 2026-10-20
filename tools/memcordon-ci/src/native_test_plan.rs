@@ -1,9 +1,13 @@
 use std::time::Duration;
 
 const STANDARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
+// Windows and macOS workspaces exhausted 15 minutes while fixtures were still
+// passing. Reserve finite operational headroom, not a measured completion time,
+// separately from cold compilation.
+const DESKTOP_EXECUTION_DEADLINE: Duration = Duration::from_secs(30 * 60);
 // Cold Windows and macOS all-targets release builds include the native service and
 // fixture graphs as well as the workspace tests. Keep compilation finite,
-// independently of the shorter execution deadline and enclosing lane budget.
+// independently of the execution deadline and enclosing lane budget.
 const BUILD_DEADLINE: Duration = Duration::from_secs(25 * 60);
 const MACOS_RELEASE_BUILD_DEADLINE: Duration = Duration::from_secs(40 * 60);
 // A cold Windows x64 workspace/test graph exceeded forty minutes while
@@ -107,7 +111,10 @@ pub fn commands_for_platform(
         },
         NativeTestCommand {
             arguments,
-            deadline: STANDARD_DEADLINE,
+            deadline: match platform {
+                NativePlatform::Windows | NativePlatform::MacOs => DESKTOP_EXECUTION_DEADLINE,
+                NativePlatform::Other => STANDARD_DEADLINE,
+            },
         },
     ]
 }

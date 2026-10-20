@@ -56,6 +56,11 @@ pub fn state_root() -> PathBuf {
         .join("sealed")
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn support_console_comparison_intent_path(root: &Path) -> PathBuf {
+    root.join(PackageArtifact::SupportConsoleComparisonIntent.name())
+}
+
 pub fn installed_binary() -> PathBuf {
     install_root().join("memcordon-sealed-agent.exe")
 }
@@ -2323,6 +2328,8 @@ pub(crate) fn remove_installed_binary_with_convergence(
 
 #[derive(Clone, Copy, Debug)]
 enum PackageArtifact {
+    #[cfg(feature = "test-support")]
+    SupportConsoleComparisonIntent,
     EphemeralCi,
     ScmLauncherConnectOwnership,
     PreauthorizationFaultMatrix,
@@ -2335,6 +2342,8 @@ enum PackageArtifact {
 impl PackageArtifact {
     fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "test-support")]
+            Self::SupportConsoleComparisonIntent => "support-console-comparison-intent.json",
             Self::EphemeralCi => "ephemeral-ci",
             Self::ScmLauncherConnectOwnership => SCM_CONNECT_ACE_MARKER,
             Self::PreauthorizationFaultMatrix => "preauthorization-fault-matrix.json",
@@ -2347,6 +2356,8 @@ impl PackageArtifact {
 
     fn phase(self) -> &'static str {
         match self {
+            #[cfg(feature = "test-support")]
+            Self::SupportConsoleComparisonIntent => "remove support console comparison intent",
             Self::EphemeralCi => "remove ephemeral package marker",
             Self::ScmLauncherConnectOwnership => "remove SCM launcher connect ownership marker",
             Self::PreauthorizationFaultMatrix => "remove preauthorization fault matrix",
@@ -2404,8 +2415,16 @@ fn remove_provider_state(context: ProviderRemovalContext) -> Result<(), String> 
         }
     };
     if state_present {
+        #[cfg(feature = "test-support")]
+        remove_file_if_present(
+            &support_console_comparison_intent_path(&state),
+            PackageArtifact::SupportConsoleComparisonIntent,
+            context,
+        )?;
         let package = state.join("package");
         for artifact in [
+            #[cfg(feature = "test-support")]
+            PackageArtifact::SupportConsoleComparisonIntent,
             PackageArtifact::EphemeralCi,
             PackageArtifact::ScmLauncherConnectOwnership,
             PackageArtifact::PreauthorizationFaultMatrix,

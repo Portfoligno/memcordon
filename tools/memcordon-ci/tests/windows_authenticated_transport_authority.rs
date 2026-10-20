@@ -4,6 +4,48 @@ use memcordon_ci::windows_readiness_components::authenticated_transport_injectio
 use memcordon_core::*;
 
 #[test]
+fn only_original_service_process_loss_selects_its_exact_recovery_endpoint() {
+    use memcordon_ci::windows_readiness_components::ServiceRecoveryRole;
+
+    assert_eq!(ServiceRecoveryRole::for_fault(None), None);
+    for (fault, role, service, pipe) in [
+        (
+            WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+            ServiceRecoveryRole::Control,
+            WINDOWS_CONTROL_SERVICE_NAME,
+            WINDOWS_CONTROL_PIPE,
+        ),
+        (
+            WindowsSealedFault::LauncherServiceKilledAfterAuthorization,
+            ServiceRecoveryRole::Launcher,
+            WINDOWS_LAUNCHER_SERVICE_NAME,
+            WINDOWS_LAUNCHER_PIPE,
+        ),
+        (
+            WindowsSealedFault::AllJobOwnersClosedAfterAuthorization,
+            ServiceRecoveryRole::Launcher,
+            WINDOWS_LAUNCHER_SERVICE_NAME,
+            WINDOWS_LAUNCHER_PIPE,
+        ),
+    ] {
+        let selected = ServiceRecoveryRole::for_fault(Some(fault)).unwrap();
+        assert_eq!(selected, role);
+        assert_eq!(selected.service_name(), service);
+        assert_eq!(selected.pipe_name(), pipe);
+    }
+    for fault in memcordon_ci::windows_readiness_components::fault_selectors() {
+        if !matches!(
+            fault,
+            WindowsSealedFault::ControlServiceKilledAfterAuthorization
+                | WindowsSealedFault::LauncherServiceKilledAfterAuthorization
+                | WindowsSealedFault::AllJobOwnersClosedAfterAuthorization
+        ) {
+            assert_eq!(ServiceRecoveryRole::for_fault(Some(fault)), None);
+        }
+    }
+}
+
+#[test]
 fn service_recovery_executor_never_substitutes_for_original_held_owner() {
     use memcordon_ci::windows_readiness_components::control_service_recovery_process_matches;
     let original = WindowsProcessIdentityV1 {
