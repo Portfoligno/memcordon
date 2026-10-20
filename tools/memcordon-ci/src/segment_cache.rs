@@ -72,8 +72,20 @@ pub fn write_event() -> bool {
 }
 
 pub fn write_event_for(event: Option<&str>, reference: Option<&str>) -> bool {
-    matches!(event, Some("push" | "workflow_dispatch"))
-        && reference.is_some_and(|reference| reference.starts_with("refs/heads/"))
+    let Some(reference) = reference else {
+        return false;
+    };
+    let branch = reference
+        .strip_prefix("refs/heads/")
+        .is_some_and(|name| !name.is_empty());
+    let tag = reference
+        .strip_prefix("refs/tags/")
+        .is_some_and(|name| !name.is_empty());
+    match event {
+        Some("push") => branch || tag,
+        Some("workflow_dispatch") => branch,
+        _ => false,
+    }
 }
 
 fn unsafe_cache(error: &CiError) -> bool {

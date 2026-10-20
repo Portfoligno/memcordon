@@ -1,5 +1,8 @@
 //! Native containment used only by black-box process tests.
 
+mod ci_interrupt;
+pub use ci_interrupt::{CiInterrupt, CiInterruptRegistration, CiInterruptToken};
+
 #[cfg(target_os = "linux")]
 #[path = "private_network_source.rs"]
 mod private_network_source;

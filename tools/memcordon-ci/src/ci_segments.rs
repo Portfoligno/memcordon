@@ -23,7 +23,17 @@ pub fn event_mode() -> Result<FailureMode> {
     if std::fs::metadata(&path)?.len() > 1024 * 1024 {
         return Err(CiError::Message("event exceeds segment input bound".into()));
     }
-    let event: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    event_mode_bytes("workflow_dispatch", &std::fs::read(path)?)
+}
+
+fn event_mode_bytes(event_name: &str, bytes: &[u8]) -> Result<FailureMode> {
+    if event_name != "workflow_dispatch" {
+        return Ok(FailureMode::StopAfterFailure);
+    }
+    if bytes.len() > 1024 * 1024 {
+        return Err(CiError::Message("event exceeds segment input bound".into()));
+    }
+    let event: serde_json::Value = serde_json::from_slice(bytes)?;
     match event
         .get("inputs")
         .and_then(|inputs| inputs.get("failure-mode"))
@@ -360,7 +370,19 @@ pub fn operation(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
 }
 
 pub fn run(root: &Path, suite: Suite) -> Result<()> {
-    let mode = event_mode()?;
+    dispatch(suite, event_mode()?, |mode| run_resolved(root, suite, mode))
+}
+
+fn dispatch<T>(
+    suite: Suite,
+    requested: FailureMode,
+    operation: impl FnOnce(FailureMode) -> Result<T>,
+) -> Result<T> {
+    let mode = suite.resolve_failure_mode(memcordon_ci::suite::ModeRequest::Workflow(requested))?;
+    operation(mode)
+}
+
+fn run_resolved(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
     let sources = matches!(
         suite,
         Suite::WorkspaceFetch
@@ -501,3 +523,7 @@ fn requests_inner(root: &Path, suite: Suite) -> Result<()> {
 pub fn cleanup(root: &Path, suite: Suite) -> Result<()> {
     memcordon_ci::segment_cache::cleanup(root, &scopes(suite))
 }
+
+#[cfg(test)]
+#[path = "../tests/private/ci_segment_routing.rs"]
+mod tests;

@@ -74,6 +74,25 @@ pub fn cargo_home(cwd: &Path) -> Result<PathBuf> {
     Ok(home)
 }
 
+/// Initialize only the repository-owned home selected by the workflow.
+pub fn prepare_job_home(root: &Path) -> Result<()> {
+    let expected = root.join("target").join("ci-cargo-home");
+    if cargo_home(root)? != expected {
+        return Ok(());
+    }
+    let owned = crate::cache_restore::safe_root(root, Path::new("target/ci-cargo-home"))
+        .map_err(|error| CiError::CacheSafety(Box::new(error)))?;
+    crate::cache_snapshot::ordinary(&owned)?;
+    std::fs::create_dir_all(&owned)?;
+    crate::cache_snapshot::ordinary(&owned)?;
+    if !owned.is_dir() || owned.canonicalize()? != expected.canonicalize()? {
+        return Err(CiError::CacheSafety(Box::new(CiError::Message(
+            "managed Cargo home redirected or not a directory".into(),
+        ))));
+    }
+    Ok(())
+}
+
 fn default_home() -> Result<PathBuf> {
     // std uses native Windows profile discovery, unlike a POSIX HOME fallback.
     #[allow(deprecated)]

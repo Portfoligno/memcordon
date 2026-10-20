@@ -32,7 +32,6 @@ struct Recipe {
     features: Vec<String>,
     companions: Vec<String>,
     hosts: Vec<String>,
-    enabled_hosts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -188,12 +187,6 @@ fn read_recipe(root: &Path) -> Result<Recipe> {
         ));
     }
     let mut names = BTreeSet::new();
-    let mut enabled = BTreeSet::new();
-    for host in &recipe.enabled_hosts {
-        if !recipe.hosts.contains(host) || !enabled.insert(host) {
-            return Err(error("unsupported or duplicate enabled driver host"));
-        }
-    }
     for name in &recipe.companions {
         if !single_name(name) || name == executable() || name == MANIFEST || !names.insert(name) {
             return Err(error("invalid driver companion inventory"));
@@ -208,10 +201,6 @@ fn host_name() -> &'static str {
 
 fn recipe_hash(recipe: &Recipe) -> Result<String> {
     Ok(artifacts::checksum(&serde_json::to_vec(recipe)?))
-}
-
-fn reuse_enabled(recipe: &Recipe) -> bool {
-    recipe.enabled_hosts.iter().any(|host| host == host_name())
 }
 
 fn single_name(name: &str) -> bool {
@@ -342,7 +331,7 @@ pub(crate) fn preparation_members(root: &Path) -> Result<Vec<PathBuf>> {
         METADATA_LIMIT,
     )?)?;
     // The supported cold source path deliberately adopts Bootstrap at CURRENT
-    // while executable-cache rollout is disabled. Its fresh-build provenance
+    // for a cold source build. Its fresh-build provenance
     // comes from the required same-run producer and preparation input record,
     // never from a fabricated Current cache identity.
     if image.class == ImageClass::Bootstrap && !image.source.is_empty() {
@@ -753,9 +742,6 @@ pub fn bootstrap(root: &Path) -> Result<()> {
 fn bootstrap_owned(root: &Path) -> Result<()> {
     crate::workflow_output::write(&[("bootstrap-ready", "false".into())])?;
     let recipe = read_recipe(root)?;
-    if !reuse_enabled(&recipe) {
-        return Ok(());
-    }
     if std::env::current_exe()?.canonicalize()?
         != root.join(CANDIDATE).join(executable()).canonicalize()?
     {
@@ -778,6 +764,7 @@ pub fn context(root: &Path) -> Result<()> {
 }
 
 fn context_bounded(root: &Path) -> Result<()> {
+    crate::download_cache::prepare_job_home(root)?;
     let mut result =
         crate::segment_cache::requests(root, &[], crate::download_cache::DownloadFamily::Workspace);
     if let Err(error) = context_owned(root) {
@@ -787,13 +774,26 @@ fn context_bounded(root: &Path) -> Result<()> {
 }
 
 fn context_owned(root: &Path) -> Result<()> {
+    crate::cache::with_driver_context(root, || context_current(root))
+}
+
+fn context_current(root: &Path) -> Result<()> {
     let recipe = read_recipe(root)?;
-    let selected = if reuse_enabled(&recipe) {
-        optional_identity(root, &recipe)?
-    } else {
-        None
-    };
-    crate::workflow_output::write(&[
+    let selection = compiler_selection();
+    context_requests(
+        || optional_identity(root, &recipe),
+        |complete| crate::cache_snapshot::transfer_request(root, selection, complete),
+        crate::workflow_output::write,
+    )
+}
+
+fn context_requests(
+    image: impl FnOnce() -> Result<Option<Identity>>,
+    mut compiled: impl FnMut(bool) -> Result<crate::cache_snapshot::TransferRequest>,
+    mut emit: impl FnMut(&[(&str, String)]) -> Result<()>,
+) -> Result<()> {
+    let selected = image()?;
+    emit(&[
         ("image-restore", selected.is_some().to_string()),
         (
             "image-key",
@@ -809,27 +809,15 @@ fn context_owned(root: &Path) -> Result<()> {
         ),
         ("image-inbox", IMAGE_IN.into()),
     ])?;
-    let selection = compiler_selection();
     for complete in [true, false] {
-        if !reuse_enabled(&recipe) {
-            crate::workflow_output::write(&[(
-                if complete {
-                    "compiled-complete-restore"
-                } else {
-                    "compiled-partial-restore"
-                },
-                "false".into(),
-            )])?;
-            continue;
-        }
         let prefix = if complete {
             "compiled-complete"
         } else {
             "compiled-partial"
         };
-        let request = crate::cache_snapshot::transfer_request(root, selection, complete);
+        let request = compiled(complete);
         match request {
-            Ok(request) => crate::workflow_output::write(&[
+            Ok(request) => emit(&[
                 (
                     if complete {
                         "compiled-complete-restore"
@@ -871,7 +859,7 @@ fn context_owned(root: &Path) -> Result<()> {
             }
             Err(error) => {
                 eprintln!("optional {prefix} request unavailable: {error}");
-                crate::workflow_output::write(&[(
+                emit(&[(
                     if complete {
                         "compiled-complete-restore"
                     } else {
@@ -892,9 +880,6 @@ pub fn select(root: &Path) -> Result<()> {
 fn select_owned(root: &Path) -> Result<()> {
     unavailable()?;
     let recipe = read_recipe(root)?;
-    if !reuse_enabled(&recipe) {
-        return Ok(());
-    }
     let Some(identity) = optional_identity(root, &recipe)? else {
         return Ok(());
     };
@@ -959,7 +944,7 @@ fn offer_image(
     class: ImageClass,
     source: &str,
 ) -> Result<()> {
-    if !trusted_write() || !reuse_enabled(recipe) {
+    if !trusted_write() {
         return Ok(());
     }
     let path = if class == ImageClass::Current {
@@ -1078,6 +1063,7 @@ fn adopt_cold_owned(root: &Path) -> Result<()> {
 }
 
 pub fn build(root: &Path) -> Result<()> {
+    crate::download_cache::prepare_job_home(root)?;
     let mut budget = crate::segment_cache::OptionalBudget::default();
     let source = budget.run(|| {
         Ok(crate::segment_cache::SourceSession::begin(
@@ -1132,18 +1118,31 @@ fn build_owned(
         ] {
             crate::cache_snapshot::import_source(root, kind)?;
         }
-        let before = if reuse_enabled(&recipe) {
-            optional_identity(root, &recipe)?
-        } else {
-            None
-        };
-        if before.is_some() {
-            crate::cache_snapshot::import_transfer(root, compiler_selection())?;
-        }
-        Ok(before)
+        crate::cache::with_driver_context(root, || {
+            let before_compiled =
+                match crate::cache_snapshot::transfer_request(root, compiler_selection(), true) {
+                    Ok(request) => Some(request.key),
+                    Err(error)
+                        if crate::segment_cache::cache_safety_error(&error)
+                            || crate::work_outcome::has_unresolved_owner(&error) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        eprintln!("optional compiled identity unavailable: {error}");
+                        None
+                    }
+                };
+            let before = optional_identity(root, &recipe)?;
+            if before_compiled.is_some() {
+                crate::cache_snapshot::import_transfer(root, compiler_selection())?;
+            }
+            Ok((before, before_compiled))
+        })
     })?
-    .flatten();
-    if before.is_none() {
+    .unwrap_or((None, None));
+    let (before, before_compiled) = before;
+    if before_compiled.is_none() {
         crate::cache_restore::prepare(
             root,
             "ci-driver-build",
@@ -1173,15 +1172,29 @@ fn build_owned(
             );
         }
         let after = optional(budget, || {
-            if reuse_enabled(&recipe) {
-                optional_identity(root, &recipe)
-            } else {
-                Ok(None)
-            }
+            crate::cache::with_driver_context(root, || {
+                let compiled =
+                    match crate::cache_snapshot::transfer_request(root, compiler_selection(), true)
+                    {
+                        Ok(request) => Some(request.key),
+                        Err(error)
+                            if crate::segment_cache::cache_safety_error(&error)
+                                || crate::work_outcome::has_unresolved_owner(&error) =>
+                        {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            eprintln!("optional compiled identity unavailable: {error}");
+                            None
+                        }
+                    };
+                Ok((optional_identity(root, &recipe)?, compiled))
+            })
         })
-        .map(Option::flatten);
+        .map(|value| value.unwrap_or((None, None)));
         match after {
-            Ok(after) => {
+            Ok((after, after_compiled)) => {
+                let compiled_unchanged = matches!((&before_compiled, &after_compiled), (Some(before), Some(after)) if before == after);
                 let unchanged = matches!((&before, &after), (Some(before), Some(after)) if before.key == after.key && before.recipe == after.recipe);
                 let changed = matches!((&before,&after),(Some(before),Some(after)) if before.key != after.key || before.recipe != after.recipe);
                 if succeeded && changed {
@@ -1234,7 +1247,7 @@ fn build_owned(
                 // Invalid executables can still leave a useful partial target.
                 let decision = crate::segment_cache::compilation_retention(
                     trusted_write(),
-                    unchanged,
+                    compiled_unchanged,
                     modeled,
                     writers,
                     succeeded && ready,

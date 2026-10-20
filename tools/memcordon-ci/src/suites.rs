@@ -1620,7 +1620,19 @@ pub(crate) struct SuiteOptions {
 }
 
 pub fn run(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
-    let result = run_result(root, suite, options);
+    run_with(suite, options, |options| run_result(root, suite, options))
+}
+
+pub(crate) fn run_with(
+    suite: Suite,
+    options: SuiteOptions,
+    operation: impl FnOnce(SuiteOptions) -> Result<()>,
+) -> Result<()> {
+    let mode = suite.resolve_failure_mode(memcordon_ci::suite::ModeRequest::Explicit(
+        options.failure_mode,
+    ))?;
+    let options = SuiteOptions { failure_mode: mode };
+    let result = operation(options);
     if result.is_ok()
         && !matches!(
             suite,
@@ -1687,55 +1699,6 @@ fn run_result(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
 }
 
 fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
-    if options.failure_mode == crate::failure_mode::FailureMode::CollectAll
-        && !matches!(
-            suite,
-            Suite::Native
-                | Suite::NativeCompile
-                | Suite::NativeExecute
-                | Suite::Quality
-                | Suite::QualityCompile
-                | Suite::QualityCompiler
-                | Suite::ReleaseQualityCompiler
-                | Suite::QualityDocumentation
-                | Suite::SupplyAuditPrepare
-                | Suite::SupplyAuditCheck
-                | Suite::SupplyDenyPrepare
-                | Suite::SupplyDenyCheck
-                | Suite::SupplyChain
-                | Suite::Msrv
-                | Suite::Miri
-                | Suite::MiriFirst
-                | Suite::MiriSecond
-                | Suite::MiriQuarterOne
-                | Suite::MiriQuarterTwo
-                | Suite::MiriQuarterThree
-                | Suite::MiriQuarterFour
-                | Suite::Fuzz
-                | Suite::FuzzFirst
-                | Suite::FuzzSecond
-                | Suite::FuzzQuarterOne
-                | Suite::FuzzQuarterTwo
-                | Suite::FuzzQuarterThree
-                | Suite::FuzzQuarterFour
-                | Suite::FuzzCompileFirst
-                | Suite::FuzzCompileSecond
-                | Suite::FuzzCompileQuarterOne
-                | Suite::FuzzCompileQuarterTwo
-                | Suite::FuzzCompileQuarterThree
-                | Suite::FuzzCompileQuarterFour
-                | Suite::FuzzExecuteFirst
-                | Suite::FuzzExecuteSecond
-                | Suite::FuzzExecuteQuarterOne
-                | Suite::FuzzExecuteQuarterTwo
-                | Suite::FuzzExecuteQuarterThree
-                | Suite::FuzzExecuteQuarterFour
-        )
-    {
-        return Err(CiError::Message(
-            "collect-all is unsupported for this stateful suite".into(),
-        ));
-    }
     let toolchains = config::toolchains(root)?;
     let phased_fuzz = match suite {
         Suite::FuzzCompileFirst => Some((0, 2, true)),

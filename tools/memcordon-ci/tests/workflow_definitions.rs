@@ -197,7 +197,19 @@ fn fuzz_split_binds_actual_immutable_artifact_and_source() {
                         .as_str()
                         .is_some_and(|r| r.ends_with(" ci driver-image-probe"))
                 }),
-            "checkout" => changed["jobs"]["fuzz-setup"]["steps"][0]["with"]["ref"] = "main".into(),
+            "checkout" => {
+                let checkout = changed["jobs"]["fuzz-setup"]["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| {
+                        step["uses"]
+                            .as_str()
+                            .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+                    })
+                    .unwrap();
+                checkout["with"]["ref"] = "main".into();
+            }
             _ => unreachable!(),
         }
         let error = workflow_definitions::validate_semantics(&changed)

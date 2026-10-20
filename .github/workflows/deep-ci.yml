@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       failure-mode:
-        description: Stop independent work after a failure or collect applicable diagnostics
+        description: Stop after failure, or collect independent failures in supported suites.
         type: choice
         default: collect-all
         options: ["stop-after-failure", "collect-all"]
@@ -19,7 +19,7 @@ jobs:
   performance-plan:
     if: github.event.deleted != true
     runs-on: ubuntu-24.04
-    timeout-minutes: 123
+    timeout-minutes: 132
     outputs:
       combined: ${{ steps.plan.outputs.stress-combined }}
       split: ${{ steps.plan.outputs.stress-split }}
@@ -27,17 +27,32 @@ jobs:
       has-split: ${{ steps.plan.outputs.stress-has-split }}
       standalone-common: ${{ steps.scope.outputs.standalone-common }}
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: &action_0 actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: &action_1 actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
         timeout-minutes: 2
-        uses: &action_1 actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: *action_1
         with:
           path: target/ci-bootstrap-in
           key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
@@ -64,6 +79,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -256,6 +298,8 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci ci performance-plan
         if: runner.os != 'Windows'
         timeout-minutes: 5
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   miri:
     needs: performance-plan
     if: needs.performance-plan.outputs.standalone-common == 'true'
@@ -266,25 +310,29 @@ jobs:
       matrix:
         shard: ["quarter-one", "quarter-two", "quarter-three", "quarter-four"]
     runs-on: ubuntu-24.04
-    timeout-minutes: 341
+    timeout-minutes: 348
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - id: miri-deps
-        continue-on-error: true
-        if: hashFiles('Cargo.lock') != ''
-        uses: *action_1
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
-          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
-        timeout-minutes: 2
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -316,6 +364,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -901,6 +976,8 @@ jobs:
           path: target/ci/reports/miri
           if-no-files-found: warn
         timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   fuzz:
     needs: ["performance-plan", "fuzz-setup"]
     if: always() && needs.performance-plan.result == 'success' && (needs.performance-plan.outputs.standalone-common == 'true')
@@ -1451,25 +1528,29 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.performance-plan.outputs.combined) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 288
+    timeout-minutes: 295
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - id: stress-deps
-        continue-on-error: true
-        if: hashFiles('Cargo.lock') != ''
-        uses: *action_1
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
-          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
-        timeout-minutes: 2
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -1501,6 +1582,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -1716,6 +1824,33 @@ jobs:
         if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-select
+      - id: driver-context-windows-source-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.source-key }}
+          path: ${{ steps.driver-context-windows.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.source-prefix }}
+      - id: driver-context-windows-archives-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
+      - id: driver-context-windows-index-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
       - id: driver-context-windows-compiled-complete-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -2166,6 +2301,8 @@ jobs:
             target/ci/reports/stress-deep_short_child_iterations.json
           if-no-files-found: warn
         timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   stress-packages:
     name: stress packages / ${{ matrix.id }}
     needs: performance-plan
@@ -2175,25 +2312,29 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.performance-plan.outputs.split) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 288
+    timeout-minutes: 295
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - id: sources
-        continue-on-error: true
-        if: hashFiles('Cargo.lock') != ''
-        uses: *action_1
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
-          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
-        timeout-minutes: 2
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -2225,6 +2366,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -2440,6 +2608,33 @@ jobs:
         if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-select
+      - id: driver-context-windows-source-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.source-key }}
+          path: ${{ steps.driver-context-windows.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.source-prefix }}
+      - id: driver-context-windows-archives-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
+      - id: driver-context-windows-index-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
       - id: driver-context-windows-compiled-complete-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -2888,6 +3083,8 @@ jobs:
             target/ci/reports/stress-active-target.txt
           if-no-files-found: warn
         timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   stress-lifecycle:
     name: stress lifecycle / ${{ matrix.id }}
     needs: performance-plan
@@ -2897,25 +3094,29 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.performance-plan.outputs.split) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 288
+    timeout-minutes: 295
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
         timeout-minutes: 6
-      - id: sources
-        continue-on-error: true
-        if: hashFiles('Cargo.lock') != ''
-        uses: *action_1
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
-          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
-        timeout-minutes: 2
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -2947,6 +3148,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -3162,6 +3390,33 @@ jobs:
         if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-select
+      - id: driver-context-windows-source-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.source-key }}
+          path: ${{ steps.driver-context-windows.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.source-prefix }}
+      - id: driver-context-windows-archives-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
+      - id: driver-context-windows-index-partial-restore
+        if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
       - id: driver-context-windows-compiled-complete-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -3611,12 +3866,17 @@ jobs:
             target/ci/reports/stress-deep_short_child_iterations.json
           if-no-files-found: warn
         timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   stress-assessment:
     if: always() && github.event.deleted != true
     needs: ["performance-plan", "stress", "stress-packages", "stress-lifecycle"]
     runs-on: ubuntu-24.04
-    timeout-minutes: 135
+    timeout-minutes: 144
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
@@ -3628,6 +3888,18 @@ jobs:
         timeout-minutes: 6
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -3659,6 +3931,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -3853,29 +4152,35 @@ jobs:
           path: target/ci/reports/stress-assessment.json
           if-no-files-found: warn
         timeout-minutes: 6
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   fuzz-setup:
     needs: performance-plan
     if: needs.performance-plan.outputs.standalone-common == 'true'
     name: fuzz setup
     steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
       - uses: *action_0
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
         timeout-minutes: 6
-      - id: fuzz-deps
-        continue-on-error: true
-        if: hashFiles('Cargo.lock') != '' && hashFiles('fuzz/Cargo.lock') != ''
-        uses: *action_1
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
-          restore-keys: mc-download-bootstrap-v5-${{ runner.os }}-
-        timeout-minutes: 2
       - run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
       - id: driver-bootstrap-cache
         if: runner.os != 'Windows'
         continue-on-error: true
@@ -3907,6 +4212,33 @@ jobs:
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
         timeout-minutes: 4
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+      - id: driver-context-source-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.source-key }}
+          path: ${{ steps.driver-context.outputs.source-path }}
+          restore-keys: ${{ steps.driver-context.outputs.source-prefix }}
+      - id: driver-context-archives-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.archives-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.archives-partial-key }}
+          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
+      - id: driver-context-index-partial-restore
+        if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: *action_1
+        with:
+          key: ${{ steps.driver-context.outputs.index-partial-key }}
+          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
         continue-on-error: true
@@ -4342,6 +4674,64 @@ jobs:
           if-no-files-found: error
           overwrite: false
     runs-on: ubuntu-24.04
-    timeout-minutes: 256
+    timeout-minutes: 263
     outputs:
       artifact-id: ${{ steps.fuzz-setup-upload.outputs.artifact-id }}
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+  source-seed:
+    name: Public Cargo source seed / ${{ matrix.runner }}
+    if: github.event.deleted != true && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/tags/') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/'))
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 56
+    continue-on-error: true
+    env:
+      CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install pinned Cargo toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+        timeout-minutes: 15
+      - id: public-source-seed-restore
+        uses: *action_1
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}
+          restore-keys: mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-
+      - name: Acquire locked public workspace sources
+        run: rustup run 1.97.1 cargo fetch --locked
+        timeout-minutes: 25
+        id: public-source-fetch
+      - id: public-source-seed-save
+        if: always() && steps.public-source-fetch.outcome == 'success' && steps.public-source-seed-restore.outputs.cache-primary-key != '' && steps.public-source-seed-restore.outputs.cache-hit != 'true' && ((github.event_name == 'push' && ((startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/') || (startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/tags/'))) || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/'))
+        uses: *action_2
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: |-
+            target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate
+            target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
+            target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
+          key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}

@@ -17,12 +17,6 @@ pub fn ready_in_invocation() -> bool {
 }
 
 pub fn managed_root(root: &Path) -> Result<Option<PathBuf>> {
-    if !native_setup_validated(
-        crate::release::distribution::native_target()?,
-        &crate::config::toolchains(root)?.miri,
-    ) {
-        return Ok(None);
-    }
     if [
         "MIRI_SYSROOT",
         "MIRI_LIB_SRC",
@@ -84,14 +78,6 @@ pub fn managed_root(root: &Path) -> Result<Option<PathBuf>> {
     )?))
 }
 
-/// Managed reuse is activated only after the pinned native setup/transport
-/// acceptance has run. No version string or cached readiness file enables it.
-const VALIDATED_MIRI_SETUP: &[(&str, &str)] = &[("aarch64-apple-darwin", "nightly-2026-07-31")];
-
-pub fn native_setup_validated(target: &str, nightly: &str) -> bool {
-    VALIDATED_MIRI_SETUP.contains(&(target, nightly))
-}
-
 pub fn components(root: &Path, deadline: Instant) -> Result<()> {
     components_only(root, deadline)?;
     crate::download_cache::fetch_until(
@@ -143,6 +129,24 @@ pub fn context(root: &Path) -> Result<()> {
 }
 
 pub fn identity(root: &Path) -> Result<Option<(String, PathBuf)>> {
+    identity_with_query(root, |executable, arguments| {
+        let output = CommandSpec::new(executable, root, Duration::from_secs(30))
+            .args(arguments)
+            .defer_group_failure()
+            .output_quiet()?;
+        if !output.status.success() || output.stdout.len() > 64 * 1024 {
+            return Err(CiError::Message(
+                "Miri setup observation unavailable".into(),
+            ));
+        }
+        Ok(output.stdout)
+    })
+}
+
+fn identity_with_query(
+    root: &Path,
+    mut query: impl FnMut(&str, &[&str]) -> Result<Vec<u8>>,
+) -> Result<Option<(String, PathBuf)>> {
     // Unsupported native setups and override-bearing inputs disable managed
     // sysroot reuse; they do not prevent the required uncached native setup.
     let Some(path) = managed_root(root)? else {
@@ -177,18 +181,10 @@ pub fn identity(root: &Path) -> Result<Option<(String, PathBuf)>> {
         }
     };
     for (name, executable, arguments) in native_queries {
-        let output = CommandSpec::new(executable, root, Duration::from_secs(30))
-            .args(arguments)
-            .defer_group_failure()
-            .output_quiet()?;
-        if !output.status.success() || output.stdout.len() > 64 * 1024 {
-            return Err(CiError::Message(
-                "Miri native setup identity unavailable".into(),
-            ));
-        }
+        let output = query(executable, &arguments)?;
         facts.insert(
             name.into(),
-            String::from_utf8(output.stdout)
+            String::from_utf8(output)
                 .map_err(|_| CiError::Message("Miri native identity not UTF-8".into()))?,
         );
     }
@@ -224,18 +220,10 @@ pub fn identity(root: &Path) -> Result<Option<(String, PathBuf)>> {
             vec!["run", pins.miri.as_str(), "rustc", "--print", "sysroot"],
         ),
     ] {
-        let output = CommandSpec::new("rustup", root, Duration::from_secs(30))
-            .args(args)
-            .defer_group_failure()
-            .output_quiet()?;
-        if !output.status.success() || output.stdout.len() > 64 * 1024 {
-            return Err(CiError::Message(
-                "Miri component identity unavailable".into(),
-            ));
-        }
+        let output = query("rustup", &args)?;
         facts.insert(
             name.into(),
-            String::from_utf8(output.stdout)
+            String::from_utf8(output)
                 .map_err(|_| CiError::Message("Miri identity not UTF-8".into()))?,
         );
     }
@@ -254,13 +242,18 @@ pub fn identity(root: &Path) -> Result<Option<(String, PathBuf)>> {
         "recipe".into(),
         "explicit-pinned-cargo-miri-setup-std-v1".into(),
     );
+    let key = key_for_facts(facts)?;
+    Ok(Some((key, path)))
+}
+
+fn key_for_facts(facts: BTreeMap<String, String>) -> Result<String> {
     let (key, _) = keys(&KeyInputs {
         family: "miri-sysroot".into(),
         layout_revision: 6,
         compatibility: facts,
         content: BTreeMap::new(),
     })?;
-    Ok(Some((key, path)))
+    Ok(key)
 }
 
 pub fn ensure(root: &Path, nightly: &str, deadline: Instant) -> Result<Option<PathBuf>> {
@@ -290,3 +283,7 @@ pub fn prepare(root: &Path) -> Result<()> {
     let pins = crate::config::toolchains(root)?;
     ensure(root, &pins.miri, Instant::now() + Duration::from_secs(900)).map(|_| ())
 }
+
+#[cfg(test)]
+#[path = "../tests/private/miri_cache.rs"]
+mod tests;

@@ -1,11 +1,11 @@
 # CI cache recipes
 
 Source downloads and compilation products have separate identities. The
-`mc-download-bootstrap-v5` entry is explicitly a partial bootstrap seed. It
+`mc-ci-public-source-v1` entry is explicitly a partial public source seed. It
 never establishes workspace, fuzz, audit, deny or cargo-fuzz completeness.
 Postbootstrap source contexts resolve the actual Cargo home and emit only its
 registry archives and Git databases. Credentials, extracted sources and installed
-state are excluded. A different home suppresses the default-home bootstrap save.
+state are excluded. Eligible jobs select the owned standard Cargo home explicitly.
 
 Complete workspace and fuzz entries require their actual locked fetch recipe.
 Each auxiliary tool has its own source family, native installation target and
@@ -17,8 +17,8 @@ Population outputs belong to the current process and remain separate from writer
 settlement. A source save rechecks its acquisition identity and retains its
 original requested key, exact-hit exclusion and trusted-event guards.
 
-Retention is independent of the job's aggregate success. Bootstrap seeds save
-after the driver build and its home-only check; complete workspace downloads
+Retention is independent of the job's aggregate success. Public source seeds save
+after independent successful native acquisition; complete workspace downloads
 save after the locked fetch. Release compilation retention precedes readiness
 and uploads. Required tests, cleanup, rehearsal and publication still fail on
 their actual errors. A save-action conclusion proves an attempt, not durable
@@ -128,12 +128,30 @@ Execution after a compile checkpoint does not reimport an older compilation
 inbox over newly compiled work.
 
 The driver has separate cold/build/runtime/inbox/transfer roots. Its executable
-cache rollout is disabled by default in `ci/driver-bootstrap.toml` until each
-native host has passed real cold/warm acceptance. Cold source compilation remains
+cache reuse is active for every supported native host, subject to actual input
+compatibility and bounded image validation. Cold source compilation remains
 the fallback; a failed first cold compilation cannot fabricate native settlement
 or a ready image. Executable cache data is ordinary trusted-scope cache material,
 not authentication or source approval. Credential-bearing publishers and actual
 rehearsal do not execute cached bootstrap/current images.
+
+An independent three-OS `source-seed` job acquires locked public crates.io
+archives and sparse-index data with native Cargo. Release owns branch-push
+production and Deep owns tag-push production; standalone branch dispatches own
+their acquisition, except publication-only recovery. Consumers never depend on
+this job. Successful acquisition can save even when an unrelated first driver
+compilation fails. Its finite raw source paths contain no compiler output,
+credentials, extracted sources, or readiness fact. Managed source transfers keep
+their ordinary envelope checks and actual settled-owner requirements.
+
+Eligible build jobs use standard `CARGO_HOME` at `target/ci-cargo-home` and
+normalize checkout bytes before source-key hashing. A compatible source restore
+never replaces current Cargo work. Driver images and compilation transfers have
+independent eligibility: missing exact-image metadata does not disable usable
+dependency outputs. Supported generated Miri sysroots use actual setup identity,
+without a host/nightly rollout whitelist; explicit setup and interpreted tests
+still execute. Backend branch supersession stops work admission and attempts
+bounded native retirement; forceful runner termination is never reported clean.
 
 Portable structural and mutation tests do not demonstrate hosted cache storage,
 Windows rename/share behavior, Linux/macOS cold/warm native operation, or measured

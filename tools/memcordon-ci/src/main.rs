@@ -5,7 +5,8 @@ mod suites;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+use memcordon_ci::suite::Suite;
 use memcordon_ci::{CiError, Result, command, config, native_acceptance_catalogue, policy};
 pub use memcordon_ci::{bootstrap_profile, failure_mode, performance_plan, preparation};
 
@@ -192,76 +193,6 @@ enum CiCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Suite {
-    WorkspaceFetch,
-    FuzzFetch,
-    PrepareTools,
-    PrepareFuzz,
-    PrepareMiriComponents,
-    MiriSetup,
-    ReleaseBuild,
-    ReleaseCompile,
-    ReleaseValidatePackage,
-    ReleaseReadiness,
-    WorkingWindowsPrepare,
-    RehearsalToolBuild,
-    Policy,
-    Quality,
-    QualityCompile,
-    QualityCompiler,
-    ReleaseQualityCompiler,
-    QualityDocumentation,
-    Msrv,
-    Native,
-    NativeCompile,
-    NativeExecute,
-    SupplyChain,
-    SupplyAuditPrepare,
-    SupplyAuditCheck,
-    SupplyDenyPrepare,
-    SupplyDenyCheck,
-    Miri,
-    MiriFirst,
-    MiriSecond,
-    MiriQuarterOne,
-    MiriQuarterTwo,
-    MiriQuarterThree,
-    MiriQuarterFour,
-    Fuzz,
-    FuzzFirst,
-    FuzzSecond,
-    FuzzQuarterOne,
-    FuzzQuarterTwo,
-    FuzzQuarterThree,
-    FuzzQuarterFour,
-    FuzzCompileFirst,
-    FuzzCompileSecond,
-    FuzzCompileQuarterOne,
-    FuzzCompileQuarterTwo,
-    FuzzCompileQuarterThree,
-    FuzzCompileQuarterFour,
-    FuzzExecuteFirst,
-    FuzzExecuteSecond,
-    FuzzExecuteQuarterOne,
-    FuzzExecuteQuarterTwo,
-    FuzzExecuteQuarterThree,
-    FuzzExecuteQuarterFour,
-    Stress,
-    StressPackages,
-    StressLifecycle,
-    BackendLinuxCgroup,
-    BackendLinuxPrivate,
-    BackendLinuxPrivatePrepare,
-    BackendLinuxPrivateRuntime,
-    BackendWindowsJob,
-    BackendWindowsSealed,
-    BackendMacosWatchdog,
-    ReleaseMacosNative,
-    ReleaseMacosAcceptance,
-    MacosDeadline,
-}
-
 fn workspace_root(start: &Path) -> Result<PathBuf> {
     let mut current = Some(start);
     while let Some(path) = current {
@@ -277,6 +208,37 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let backend = |suite: &Suite| {
+        matches!(
+            suite,
+            Suite::BackendLinuxCgroup
+                | Suite::BackendLinuxPrivate
+                | Suite::BackendLinuxPrivatePrepare
+                | Suite::BackendLinuxPrivateRuntime
+                | Suite::BackendWindowsJob
+                | Suite::BackendWindowsSealed
+                | Suite::BackendMacosWatchdog
+                | Suite::ReleaseMacosNative
+                | Suite::ReleaseMacosAcceptance
+        )
+    };
+    let interruptible = match &cli.command {
+        Some(TopLevel::Suite { suite, .. }) => backend(suite),
+        Some(TopLevel::DelegatedLinuxBackend { .. }) => true,
+        Some(TopLevel::Ci {
+            command: CiCommand::Segment { recipe },
+        }) => backend(recipe),
+        Some(TopLevel::Release { command }) => matches!(
+            command,
+            memcordon_ci::release::ReleaseCommand::WorkingWindowsPrepare { .. }
+                | memcordon_ci::release::ReleaseCommand::WorkingWindowsConsumer { .. }
+                | memcordon_ci::release::ReleaseCommand::CleanupInstalledLoaderSupport { .. }
+        ),
+        _ => false,
+    };
+    let interrupt = interruptible
+        .then(memcordon_ci::cancellation::Scope::install)
+        .transpose()?;
     let current = std::env::current_dir()?;
     let root = match &cli.command {
         Some(TopLevel::ExternalConsumer { .. }) => current,
@@ -451,14 +413,16 @@ fn run() -> Result<()> {
                 ..
             } = &mut command
             {
-                if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
-                    *failure_mode = ci_segments::event_mode()?;
-                }
                 let recipe = if *consumer_readiness {
                     Suite::ReleaseReadiness
                 } else {
                     Suite::ReleaseBuild
                 };
+                if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
+                    *failure_mode = recipe.resolve_failure_mode(
+                        memcordon_ci::suite::ModeRequest::Workflow(ci_segments::event_mode()?),
+                    )?;
+                }
                 let session = memcordon_ci::segment_cache::Session::begin_selected(
                     &root,
                     ci_segments::scopes(recipe),
@@ -504,9 +468,13 @@ fn run() -> Result<()> {
             "exactly one CI command is required".to_owned(),
         )),
     })();
-    memcordon_ci::workflow_output::finalize(memcordon_ci::work_outcome::WorkOutcome::from_result(
-        result,
-    ))
+    let result = memcordon_ci::workflow_output::finalize(
+        memcordon_ci::work_outcome::WorkOutcome::from_result(result),
+    );
+    match interrupt.as_ref() {
+        Some(scope) => scope.finish(result),
+        None => result,
+    }
 }
 
 fn main() {

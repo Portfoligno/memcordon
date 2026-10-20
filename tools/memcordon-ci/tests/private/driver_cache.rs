@@ -11,8 +11,50 @@ fn recipe() -> Recipe {
         features: Vec::new(),
         companions: Vec::new(),
         hosts: vec![host_name().into()],
-        enabled_hosts: vec![host_name().into()],
     }
+}
+
+#[test]
+fn image_miss_still_discovers_and_emits_both_compilation_requests() {
+    let mut requests = Vec::new();
+    let mut outputs = std::collections::BTreeMap::new();
+    context_requests(
+        || Ok(None),
+        |complete| {
+            requests.push(complete);
+            Ok(crate::cache_snapshot::TransferRequest {
+                key: if complete {
+                    "complete-key"
+                } else {
+                    "partial-key"
+                }
+                .into(),
+                prefix: "compatible-prefix".into(),
+                path: PathBuf::from(if complete {
+                    "target/complete-inbox"
+                } else {
+                    "target/partial-inbox"
+                }),
+            })
+        },
+        |values| {
+            outputs.extend(
+                values
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), value.clone())),
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(requests, [true, false]);
+    assert_eq!(outputs["image-restore"], "false");
+    assert_eq!(outputs["compiled-complete-restore"], "true");
+    assert_eq!(outputs["compiled-partial-restore"], "true");
+    assert_eq!(outputs["compiled-complete-key"], "complete-key");
+    assert_eq!(outputs["compiled-partial-key"], "partial-key");
+    assert_eq!(outputs["compiled-complete-inbox"], "target/complete-inbox");
+    assert_eq!(outputs["compiled-partial-inbox"], "target/partial-inbox");
 }
 
 fn fixture(root: &Path, class: ImageClass, key: &str) -> Result<()> {

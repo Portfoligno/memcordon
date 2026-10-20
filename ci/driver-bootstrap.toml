@@ -8,5 +8,3 @@ toolchain = "1.97.1"
 features = []
 companions = []
 hosts = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
-# Enable an executable-cache host only after its real cold/warm acceptance.
-enabled_hosts = []

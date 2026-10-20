@@ -58,6 +58,7 @@ fn recipe(command: &str) -> Option<&str> {
 }
 
 pub fn validate(document: &Value) -> Result<()> {
+    super::source_seed::validate(document)?;
     super::concurrency::validate(document)?;
     if document["name"].as_str() == Some("Release") {
         super::release_fuzz::validate(document)?;
@@ -149,6 +150,11 @@ pub fn validate(document: &Value) -> Result<()> {
             }
             if !field(step, "uses").starts_with("actions/cache/save@") {
                 continue;
+            }
+            if job_name.as_str() == Some("source-seed")
+                && field(step, "id") == "public-source-seed-save"
+            {
+                continue; // Complete finite source job was independently validated above.
             }
             let Some((owner, slot)) = key_reference(field(&step["with"], "key")) else {
                 return Err(reject(

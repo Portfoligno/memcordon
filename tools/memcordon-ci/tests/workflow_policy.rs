@@ -258,7 +258,7 @@ fn dependabot_requires_each_independent_dependency_surface() {
 }
 
 #[test]
-fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
+fn public_bootstrap_seed_rejects_fuzz_manifest_without_its_lockfile() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
     let relative = ".github/workflows/deep-ci.yml";
@@ -271,9 +271,15 @@ fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
         exact.as_bytes(),
         &repository_policy,
     )
-    .expect("the exact workflow with its fuzz lockfile guard should pass");
-    let invalid = exact.replacen(" && hashFiles('fuzz/Cargo.lock') != ''", "", 1);
-    assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
+    .expect("the exact finite public source workflow should pass");
+    // The orphaned fuzz bootstrap seed was removed. Adding fuzz inputs to the
+    // workspace-only public seed must not create an unmodeled source contract.
+    let invalid = exact.replacen(
+        "hashFiles('Cargo.lock', 'Cargo.toml',",
+        "hashFiles('Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.toml',",
+        1,
+    );
+    assert!(invalid != exact, "fuzz source mutation must apply");
     let error = policy::validate_workflow_bytes(
         &root,
         Path::new(relative),
@@ -284,7 +290,7 @@ fn fuzz_bootstrap_seed_requires_the_fuzz_lockfile_guard() {
     assert!(
         error
             .to_string()
-            .contains("new workflow phase differs from its Rust step adapters"),
+            .contains("public source reader path/key/home contract changed"),
         "unexpected policy error: {error}"
     );
 }
@@ -624,8 +630,8 @@ fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
         (
             Path::new(".github/workflows/backend-certification.yml"),
             backend.as_str(),
+            "  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}\n",
             "  cancel-in-progress: false\n",
-            "  cancel-in-progress: true\n",
         ),
     ];
     for (path, fixture, exact, replacement) in concurrency_cases {

@@ -191,7 +191,7 @@ fn actual_peer_cancellation_is_failed_after_owned_settlement() {
                 let writers = outcome.writers();
                 let error = outcome.into_result().unwrap_err();
                 assert_eq!(writers, WriterSettlement::Settled, "{error}");
-                assert!(error.to_string().contains("cancelled by peer"));
+                assert!(error.to_string().contains("cause=peer-failure"));
             });
             Ok(())
         },

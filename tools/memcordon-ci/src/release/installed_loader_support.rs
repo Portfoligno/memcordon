@@ -495,6 +495,7 @@ pub(super) fn cleanup(root: &std::path::Path, destination: &std::path::Path) -> 
         .clock
         .remaining(crate::ci_operation_time::clock_reading()?, unix)?;
     let deadline = std::time::Instant::now() + remaining;
+    let _retirement = crate::cancellation::retirement_scope(deadline);
     let attempt = (0..64)
         .find(|attempt| {
             !owner

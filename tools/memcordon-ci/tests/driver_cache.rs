@@ -16,15 +16,6 @@ fn fixture() -> tempfile::TempDir {
         )
         .unwrap();
     }
-    // This disposable native test enables only its actual host. The shipped
-    // rollout stays disabled pending complete native cold/warm acceptance.
-    let recipe_path = fixture.path().join("ci/driver-bootstrap.toml");
-    let recipe = fs::read_to_string(&recipe_path).unwrap();
-    let enabled = format!(
-        "enabled_hosts = [\"{}\"]",
-        memcordon_ci::release::distribution::native_target().unwrap()
-    );
-    fs::write(recipe_path, recipe.replace("enabled_hosts = []", &enabled)).unwrap();
     fs::write(
         fixture.path().join("Cargo.toml"),
         "[workspace]\nmembers=[]\nresolver=\"2\"\n",
@@ -163,13 +154,6 @@ fn cold_adoption_never_uses_untrusted_events_to_publish_an_executable() {
 fn failed_managed_source_build_retains_sources_when_driver_reuse_is_unavailable() {
     let fixture = fixture();
     let root = fixture.path();
-    let recipe_path = root.join("ci/driver-bootstrap.toml");
-    let recipe = fs::read_to_string(&recipe_path).unwrap();
-    let enabled = format!(
-        "enabled_hosts = [\"{}\"]",
-        memcordon_ci::release::distribution::native_target().unwrap()
-    );
-    fs::write(recipe_path, recipe.replace(&enabled, "enabled_hosts = []")).unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(
         root.join("Cargo.toml"),

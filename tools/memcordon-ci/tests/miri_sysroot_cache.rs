@@ -41,6 +41,24 @@ fn libraries(root: &Path) -> BTreeMap<PathBuf, (u64, String, SystemTime)> {
 }
 
 fn setup(root: &Path, nightly: &str, sysroot: &Path) -> String {
+    let before = memcordon_ci::miri_cache::identity(root)
+        .unwrap()
+        .expect("production Miri identity must be eligible");
+    assert_eq!(before.1, sysroot);
+    assert_eq!(
+        memcordon_ci::miri_cache::ensure(
+            root,
+            nightly,
+            std::time::Instant::now() + Duration::from_secs(900)
+        )
+        .unwrap()
+        .as_deref(),
+        Some(sysroot)
+    );
+    assert_eq!(
+        memcordon_ci::miri_cache::identity(root).unwrap().as_ref(),
+        Some(&before)
+    );
     let output = CommandSpec::new("rustup", root, Duration::from_secs(900))
         .args(["run", nightly, "cargo", "miri", "setup", "--print-sysroot"])
         .miri_sysroot(sysroot)
@@ -86,6 +104,17 @@ fn actual_pinned_sysroot_round_trip_reuses_generated_libraries_and_interprets() 
     let root = directory.path().canonicalize().unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::create_dir(root.join("tests")).unwrap();
+    fs::create_dir(root.join("ci")).unwrap();
+    fs::copy(
+        checkout.join("ci/toolchains.toml"),
+        root.join("ci/toolchains.toml"),
+    )
+    .unwrap();
+    memcordon_ci::miri_cache::components_only(
+        &root,
+        std::time::Instant::now() + Duration::from_secs(900),
+    )
+    .unwrap();
     fs::write(
         root.join("Cargo.toml"),
         "[package]\nname='miri-cache-acceptance'\nversion='0.0.0'\nedition='2021'\n[workspace]\n",
@@ -93,7 +122,9 @@ fn actual_pinned_sysroot_round_trip_reuses_generated_libraries_and_interprets() 
     .unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
     fs::write(root.join("tests/smoke.rs"), "#[test]\nfn actual_interpretation() { assert_eq!(miri_cache_acceptance::answer(), 42); }\n").unwrap();
-    let sysroot = root.join("target/ci-miri-sysroot");
+    let sysroot = memcordon_ci::miri_cache::managed_root(&root)
+        .unwrap()
+        .expect("ordinary native setup remains enabled");
     let first = setup(&root, &nightly, &sysroot);
     let produced = libraries(&sysroot);
     let archive_path = root.join("sysroot.tar");

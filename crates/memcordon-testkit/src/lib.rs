@@ -78,6 +78,7 @@ struct ProcessControl {
     cancelled: Option<Arc<AtomicBool>>,
     progress: Option<ProgressOutput>,
     failure: Option<Arc<dyn Fn(NativeFailureNotice) + Send + Sync>>,
+    external_stop: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,7 @@ pub struct CancellationObservation {
     pub child_id: u32,
     pub observed_status: Option<ExitStatus>,
     pub cancellation_observed: Duration,
+    pub external_interruption: bool,
     pub callback_completed: bool,
     pub stdout_reader_finished: bool,
     pub stderr_reader_finished: bool,
@@ -384,6 +386,21 @@ pub fn run_with_deadline_failure_notice_output_limit(
     progress: Option<ProgressOutput>,
     failure: Option<Arc<dyn Fn(NativeFailureNotice) + Send + Sync>>,
 ) -> Result<ObservedOutput, ProcessTestError> {
+    run_with_deadline_external_stop_output_limit(
+        command, deadline, limit, cancelled, progress, failure, None,
+    )
+}
+
+/// Observe external interruption separately from a peer workload failure.
+pub fn run_with_deadline_external_stop_output_limit(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+    cancelled: Option<Arc<AtomicBool>>,
+    progress: Option<ProgressOutput>,
+    failure: Option<Arc<dyn Fn(NativeFailureNotice) + Send + Sync>>,
+    external_stop: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<ObservedOutput, ProcessTestError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let notify = || {
         if let Some(notify) = &failure {
@@ -414,6 +431,7 @@ pub fn run_with_deadline_failure_notice_output_limit(
             cancelled,
             progress,
             failure,
+            external_stop,
         },
     )
 }
@@ -485,6 +503,7 @@ fn observe_deadline_child(
         cancelled,
         progress,
         failure,
+        external_stop,
     } = control;
     let notified = std::cell::Cell::new(false);
     let notify = |cause, status| {
@@ -667,14 +686,16 @@ fn observe_deadline_child(
         }
         if started.elapsed() < deadline
             && observed_status.is_none_or(|status| status.success())
-            && cancelled
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            && (external_stop.as_ref().is_some_and(|stop| stop())
+                || cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire)))
         {
             let mut observation = CancellationObservation {
                 child_id,
                 observed_status,
                 cancellation_observed: started.elapsed(),
+                external_interruption: external_stop.as_ref().is_some_and(|stop| stop()),
                 callback_completed: callback_result.is_some(),
                 stdout_reader_finished: false,
                 stderr_reader_finished: false,

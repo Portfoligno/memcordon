@@ -8,6 +8,7 @@ pub mod cache_inputs;
 pub mod cache_restore;
 pub mod cache_snapshot;
 pub mod caller_observation;
+pub mod cancellation;
 pub mod capability;
 pub mod cargo_progress;
 pub mod ci_operation_time;
@@ -43,6 +44,7 @@ pub mod segment_cache;
 pub mod standard_contract;
 pub mod standard_runner;
 pub mod stress;
+pub mod suite;
 pub mod support_loader_producer;
 pub mod target_shard;
 #[cfg(windows)]
@@ -90,9 +92,9 @@ pub enum CiError {
     },
     #[error("{0}")]
     Message(String),
-    #[error("subprocess cancelled by peer: {0}")]
+    #[error("subprocess cancelled: {0}")]
     Cancelled(String),
-    #[error("subprocess cancelled by peer after settlement: {0}")]
+    #[error("subprocess cancelled after settlement: {0}")]
     SettledCancellation(String),
     #[error("{0}")]
     SettledCommandFailure(String),

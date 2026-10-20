@@ -13,7 +13,14 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
             ..
         } => {
             if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
-                *failure_mode = super::event_mode()?;
+                let recipe = if *consumer_readiness {
+                    Suite::ReleaseReadiness
+                } else {
+                    Suite::ReleaseCompile
+                };
+                *failure_mode = recipe.resolve_failure_mode(
+                    memcordon_ci::suite::ModeRequest::Workflow(super::event_mode()?),
+                )?;
             }
             let selected = release::preparation::read_build_source(
                 source.as_deref(),
@@ -62,7 +69,9 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
         }
         ReleaseCommand::ValidatePackage { failure_mode, .. } => {
             if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
-                *failure_mode = super::event_mode()?;
+                *failure_mode = Suite::ReleaseValidatePackage.resolve_failure_mode(
+                    memcordon_ci::suite::ModeRequest::Workflow(super::event_mode()?),
+                )?;
             }
             release::run(root, command)
         }

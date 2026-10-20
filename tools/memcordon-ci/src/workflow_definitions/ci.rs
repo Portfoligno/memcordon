@@ -78,7 +78,7 @@ fn node_10() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("description"),
-        text("Stop quickly or collect all native test failures"),
+        text("Stop after failure, or collect independent failures in supported suites."),
     );
     values.insert(text("type"), text("choice"));
     values.insert(text("default"), text("stop-after-failure"));

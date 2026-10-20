@@ -40,7 +40,7 @@ fn node_4() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("description"),
-        text("Stop independent work after a failure or collect applicable diagnostics"),
+        text("Stop after failure, or collect independent failures in supported suites."),
     );
     values.insert(text("type"), text("choice"));
     values.insert(text("default"), text("collect-all"));

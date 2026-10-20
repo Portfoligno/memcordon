@@ -1513,6 +1513,7 @@ mod native {
         })();
         // Ordinary uninstall owns cleanup even if installation, collection or a
         // causal assertion failed; its success never rewrites the case behavior.
+        let _retirement = crate::cancellation::retirement_scope(deadlines.cleanup);
         let probe_cleanup = crate::windows_consumer_readiness::cleanup_provider_probe(config)
             .map_err(|error| error.to_string());
         let cleanup_subject = if current_upgrade_started {

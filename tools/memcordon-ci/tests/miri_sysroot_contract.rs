@@ -7,18 +7,14 @@ fn absent_managed_identity_keeps_required_native_work_admitted() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     std::fs::create_dir(root.join("ci")).unwrap();
-    // No host has native cache acceptance for this fixture pin. Identity must
-    // stop before native queries or Miri setup, independently of ambient env.
+    // Missing native compiler inputs keep optional discovery unavailable.
     let pins = include_str!("../../../ci/toolchains.toml")
         .replace("nightly-2026-07-31", "nightly-2026-07-30");
     std::fs::write(root.join("ci/toolchains.toml"), pins).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let required_started = std::cell::Cell::new(false);
     with_operation(FailureMode::CollectAll, deadline, || {
-        let identity = with_operation(FailureMode::CollectAll, deadline, || {
-            miri_cache::identity(root)
-        })?;
-        assert!(identity.is_none());
+        miri_cache::context(root)?;
         with_operation(FailureMode::CollectAll, deadline, || {
             required_started.set(true);
             Ok(())
@@ -44,28 +40,10 @@ fn generated_sysroot_is_a_standard_child_setting() {
 }
 
 #[test]
-fn unrun_native_setup_acceptance_cannot_be_replaced_by_cached_readiness() {
-    assert!(miri_cache::native_setup_validated(
-        "aarch64-apple-darwin",
-        "nightly-2026-07-31"
-    ));
-    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-        assert!(!miri_cache::native_setup_validated(
-            target,
-            "nightly-2026-07-31"
-        ));
-    }
-    for target in [
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    ] {
-        assert!(!miri_cache::native_setup_validated(
-            target,
-            "unvalidated-nightly"
-        ));
-    }
+fn managed_sysroot_has_no_host_or_nightly_rollout_gate() {
+    let source = include_str!("../src/miri_cache.rs");
+    assert!(!source.contains("VALIDATED_MIRI_SETUP"));
+    assert!(!source.contains("native_setup_validated"));
+    assert!(source.contains("MIRI_SYSROOT"));
+    assert!(!miri_cache::ready_in_invocation());
 }

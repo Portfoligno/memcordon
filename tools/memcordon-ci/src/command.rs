@@ -215,13 +215,24 @@ impl CommandSpec {
     }
 
     fn available_budget(&self) -> Result<Duration> {
-        if crate::preparation::active_group().is_some_and(|group| !group.may_start()) {
+        crate::cancellation::check_admission()?;
+        let retirement = crate::cancellation::retirement_deadline();
+        if retirement.is_none()
+            && crate::preparation::active_group().is_some_and(|group| !group.may_start())
+        {
             return Err(CiError::NotStartedAfterFailure);
         }
-        let deadline = match (self.operation_deadline, crate::preparation::active_group()) {
-            (Some(deadline), Some(group)) => Some(deadline.min(group.deadline())),
-            (None, Some(group)) => Some(group.deadline()),
-            (deadline, None) => deadline,
+        let deadline = if let Some(retirement) = retirement {
+            Some(
+                self.operation_deadline
+                    .map_or(retirement, |own| own.min(retirement)),
+            )
+        } else {
+            match (self.operation_deadline, crate::preparation::active_group()) {
+                (Some(deadline), Some(group)) => Some(deadline.min(group.deadline())),
+                (None, Some(group)) => Some(group.deadline()),
+                (deadline, None) => deadline,
+            }
         };
         match deadline {
             Some(deadline) => remaining_budget(
@@ -335,6 +346,7 @@ impl CommandSpec {
     }
 
     pub fn materialize(&self) -> Result<Command> {
+        crate::cancellation::check_admission()?;
         if let Some(home) = &self.isolated_cargo_home {
             for ancestor in self.current_dir.ancestors() {
                 for name in ["config", "config.toml"] {
@@ -656,7 +668,9 @@ impl CommandSpec {
         progress: bool,
     ) -> Result<ObservedOutput> {
         let group = crate::preparation::active_group();
-        if group.as_ref().is_some_and(|group| !group.may_start()) {
+        if crate::cancellation::retirement_deadline().is_none()
+            && group.as_ref().is_some_and(|group| !group.may_start())
+        {
             return Err(CiError::NotStartedAfterFailure);
         }
         let budget = crate::work_outcome::WorkOutcome::before_start(self.available_budget())?;
@@ -732,7 +746,10 @@ impl CommandSpec {
                         termination,
                         observation,
                     }) => {
-                        value["cancelled-by-peer"] = serde_json::json!(true);
+                        value["cancelled-by-peer"] =
+                            serde_json::json!(!observation.external_interruption);
+                        value["external-interruption"] =
+                            serde_json::json!(observation.external_interruption);
                         value["cleanup"] = serde_json::json!(if cleanup.is_ok()
                             && observation.callback_completed
                             && observation.stdout_reader_finished
@@ -814,7 +831,7 @@ impl CommandSpec {
             Some(PeerStopPolicy::FinishOwnedPhase) => false,
             None => ordinary,
         };
-        let cancellation = if cancel_safe {
+        let cancellation = if cancel_safe && crate::cancellation::retirement_deadline().is_none() {
             group.as_ref().map(|group| group.requested.clone())
         } else {
             None
@@ -946,13 +963,19 @@ impl CommandSpec {
                         >
                 })
             };
-            let result = memcordon_testkit::run_with_deadline_failure_notice_output_limit(
+            let external_stop =
+                (cancel_safe && crate::cancellation::retirement_deadline().is_none()).then(|| {
+                    std::sync::Arc::new(|| crate::cancellation::observed().is_some())
+                        as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
+                });
+            let result = memcordon_testkit::run_with_deadline_external_stop_output_limit(
                 command,
                 budget,
                 self.output_limit,
                 cancellation,
                 progress,
                 failure,
+                external_stop,
             );
             done.store(true, std::sync::atomic::Ordering::Release);
             // Incomplete reader settlement cannot keep the logger waiting for
@@ -1038,7 +1061,8 @@ fn finish_native_observation(
             memcordon_testkit::ProcessTestError::Timeout { deadline, stdout, stderr, cleanup, observation } => CiError::Message(format!("subprocess exceeded {deadline:?}; cleanup={cleanup:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr))),
             memcordon_testkit::ProcessTestError::Cancelled { stdout, stderr, cleanup, termination, observation } => {
                 let settled = cleanup.is_ok() && observation.callback_completed && observation.stdout_reader_finished && observation.stderr_reader_finished;
-                let details = format!("cleanup={cleanup:?}; termination={termination:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr));
+                let cause = if observation.external_interruption { "external-interruption" } else { "peer-failure" };
+                let details = format!("cause={cause}; cleanup={cleanup:?}; termination={termination:?}; observation={observation:?}; stdout={:?}; stderr={:?}", bounded_excerpt(&stdout), bounded_excerpt(&stderr));
                 if settled { CiError::SettledCancellation(details) } else { CiError::Cancelled(details) }
             },
             error => CiError::Message(bounded_excerpt(error.to_string().as_bytes())),

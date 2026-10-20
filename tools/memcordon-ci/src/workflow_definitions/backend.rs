@@ -36,7 +36,10 @@ fn node_3() -> Value {
         text("group"),
         text("backend-certification-${{ github.ref }}"),
     );
-    values.insert(text("cancel-in-progress"), Value::Bool(false));
+    values.insert(
+        text("cancel-in-progress"),
+        text("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}"),
+    );
     Value::Mapping(values)
 }
 
@@ -2452,7 +2455,7 @@ fn node_208() -> Value {
 
 fn node_209() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("if"),text("always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'"));
+    values.insert(text("if"),text("!cancelled() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'"));
     values.insert(text("needs"), node_210());
     values.insert(text("runs-on"), text("ubuntu-24.04"));
     values.insert(text("timeout-minutes"), number("20"));

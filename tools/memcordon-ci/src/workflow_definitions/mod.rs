@@ -18,6 +18,7 @@ mod native_invocations;
 mod release;
 mod release_fuzz;
 mod semantics;
+mod source_seed;
 mod translations;
 
 use crate::{CiError, Result};
@@ -44,6 +45,10 @@ pub const FILES: [&str; 4] = [
 
 pub fn validate_semantics(document: &Value) -> Result<()> {
     semantics::validate(document)
+}
+
+pub fn validate_public_source_model(root: &Path) -> Result<()> {
+    source_seed::validate_source_model(root)
 }
 
 pub(crate) fn original(name: &str) -> Option<Value> {
@@ -172,7 +177,11 @@ pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Map
         .get_mut(text("jobs"))
         .and_then(Value::as_mapping_mut)
     {
+        jobs.remove(text("source-seed")); // Independently validated above; no legacy equivalent.
         for (job_name, job) in jobs.iter_mut() {
+            if job["env"]["CARGO_HOME"].as_str() == Some(source_seed::CARGO_HOME_VALUE) {
+                job.as_mapping_mut().expect("job map").remove(text("env"));
+            }
             if name == "release.yml" && job_name.as_str() == Some("fuzz") {
                 continue; // The complete actual fuzz phases were checked above.
             }

@@ -505,6 +505,7 @@ pub fn recover(
     key: &ProductKey,
     deadline: Instant,
 ) -> Result<()> {
+    let _retirement = crate::cancellation::retirement_scope(deadline);
     let owner_custody = crate::windows_readiness_adapter::hold_artifact(
         &output.join("windows-lease-owner.json"),
         None,

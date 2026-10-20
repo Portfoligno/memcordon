@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CacheContext {
     pub revision: u32,
     pub usable: bool,
@@ -214,6 +214,20 @@ pub fn context_partition(
     external: &[PathBuf],
     partition: Option<crate::cache_restore::CompiledPartition>,
 ) -> Result<CacheContext> {
+    if purpose == "ci-driver-build"
+        && shard == "complete"
+        && external.is_empty()
+        && partition.is_none()
+    {
+        if let Some(context) = DRIVER_CONTEXT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(owner, _)| owner == root)
+                .map(|(_, context)| context.clone())
+        }) {
+            return Ok(context);
+        }
+    }
     let mode = crate::preparation::active_group().map_or(
         crate::failure_mode::FailureMode::StopAfterFailure,
         |group| group.mode(),
@@ -223,6 +237,40 @@ pub fn context_partition(
         std::time::Instant::now() + Duration::from_secs(240),
         || context_partition_inner(root, purpose, shard, external, partition),
     )
+}
+
+thread_local! {
+    static DRIVER_CONTEXT: std::cell::RefCell<Option<(PathBuf,CacheContext)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Share current compilation observations across the image and transfer models.
+/// Scope exit discards them before any compiler can change the actual inputs.
+pub(crate) fn with_driver_context<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let context = match context(root, "ci-driver-build", "complete", &[]) {
+        Ok(context) => context,
+        Err(error)
+            if crate::segment_cache::cache_safety_error(&error)
+                || crate::work_outcome::has_unresolved_owner(&error) =>
+        {
+            return Err(error);
+        }
+        Err(error) => {
+            eprintln!("optional shared driver context unavailable: {error}");
+            return operation();
+        }
+    };
+    struct Restore(Option<(PathBuf, CacheContext)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DRIVER_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(DRIVER_CONTEXT.with(|slot| slot.replace(Some((root.to_path_buf(), context)))));
+    operation()
 }
 
 fn context_partition_inner(

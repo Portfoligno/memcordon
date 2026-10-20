@@ -453,6 +453,13 @@ pub fn diagnose_then_cleanup<T>(
     diagnose: impl FnOnce() -> Result<()>,
     cleanup: impl FnOnce() -> Result<T>,
 ) -> (Result<()>, Result<T>, Result<()>) {
+    if crate::cancellation::observed().is_some() {
+        // Preserve the primary failure, and give required cleanup priority over
+        // optional journal acquisition during the runner's termination window.
+        let cleanup = cleanup();
+        let diagnostics = if body.is_err() { diagnose() } else { Ok(()) };
+        return (body, cleanup, diagnostics);
+    }
     let diagnostics = if body.is_err() { diagnose() } else { Ok(()) };
     let cleanup = cleanup();
     (body, cleanup, diagnostics)
@@ -473,10 +480,16 @@ fn capture_private_unit_diagnostics(
     ] {
         let command = private_unit_diagnostic_command(cwd, kind).materialize();
         let observed = match command {
-            Ok(mut command) => memcordon_testkit::run_with_deadline_output_limit(
+            Ok(mut command) => memcordon_testkit::run_with_deadline_external_stop_output_limit(
                 &mut command,
                 PRIVATE_UNIT_DIAGNOSTIC_DEADLINE,
                 PRIVATE_UNIT_DIAGNOSTIC_BYTES,
+                None,
+                None,
+                None,
+                Some(std::sync::Arc::new(|| {
+                    crate::cancellation::observed().is_some()
+                })),
             ),
             Err(error) => Err(memcordon_testkit::ProcessTestError::Spawn(
                 std::io::Error::other(error.to_string()),
@@ -3083,10 +3096,18 @@ fn run_owned(
         Ok(())
     })();
     let mut original_journal_diagnostic = None;
+    let cleanup_cutoff = extension
+        .as_ref()
+        .map(|owner| owner.package_cleanup_deadline())
+        .or_else(|| crate::preparation::active_group().map(|group| group.deadline()))
+        // Baseline cleanup previously owned a relative 90s sudo bound. Select
+        // that bound once for the whole finalizer; retries cannot renew it.
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(90));
     let (body, cleanup, unit_diagnostics) = diagnose_then_cleanup(
         body,
         || capture_private_unit_diagnostics(work.path(), output, &mut original_journal_diagnostic),
         || {
+            let _retirement = crate::cancellation::retirement_scope(cleanup_cutoff);
             let finalization = if let Some(extension) = extension.as_mut() {
                 extension.finalize_before_uninstall(payload, output)
             } else {

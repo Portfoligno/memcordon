@@ -68,6 +68,12 @@ pub(crate) fn with_finalization<T>(
     deadline: Instant,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    // Optional cache copying must not spend time reserved for native retirement.
+    if let Some(signal) = crate::cancellation::observed() {
+        return Err(CiError::SettledCancellation(format!(
+            "optional retention omitted after external interruption: {signal:?}"
+        )));
+    }
     let previous = ACTIVE_GROUP.with(|group| group.replace(None));
     let inherited_jobs = previous.as_ref().map(GroupStop::compiler_jobs);
     let inherited_parallel_lane = previous
@@ -317,6 +323,7 @@ pub fn with_operation<T>(
     deadline: Instant,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    crate::cancellation::check_admission()?;
     if active_group().is_none() {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<FailureNotice>(1);
         let done = std::sync::atomic::AtomicBool::new(false);
@@ -797,7 +804,12 @@ fn complete_lanes_observed(
 }
 
 pub fn remaining(deadline: Instant, limit: Duration) -> Result<Duration> {
-    let deadline = active_group().map_or(deadline, |group| deadline.min(group.deadline));
+    crate::cancellation::check_admission()?;
+    let deadline = if let Some(retirement) = crate::cancellation::retirement_deadline() {
+        deadline.min(retirement)
+    } else {
+        active_group().map_or(deadline, |group| deadline.min(group.deadline))
+    };
     let budget = deadline.saturating_duration_since(Instant::now());
     if budget.is_zero() {
         return crate::work_outcome::WorkOutcome::before_start(Err(CiError::Message(
@@ -813,6 +825,8 @@ thread_local! {
 }
 
 fn owner_spawn_admission(_lane: usize) -> std::io::Result<()> {
+    crate::cancellation::check_admission()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string()))?;
     #[cfg(test)]
     if FAILED_OWNER_SPAWN.with(|slot| slot.get() == Some(_lane)) {
         return Err(std::io::Error::other("injected owner spawn failure"));

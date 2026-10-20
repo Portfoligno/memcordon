@@ -448,7 +448,7 @@ fn obsolete_cache_step(step: &Value) -> bool {
     if uses == SAVE {
         return true;
     }
-    uses == RESTORE && !field(&step["with"], "key").starts_with("mc-download-bootstrap-")
+    uses == RESTORE
 }
 
 #[derive(Clone, Copy)]
@@ -611,12 +611,18 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
             4,
             false,
         ));
-        for name in ["compiled-complete", "compiled-partial"] {
+        for name in [
+            "source",
+            "archives-partial",
+            "index-partial",
+            "compiled-complete",
+            "compiled-partial",
+        ] {
             let mut restore = CacheSlot {
                 owner: &context,
                 name,
             }
-            .restore("inbox");
+            .restore(if name == "source" { "path" } else { "inbox" });
             set(
                 &mut restore,
                 "if",
@@ -769,6 +775,12 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
                 continue;
             }
             let command = field(&step, "run").to_owned();
+            if name == "ci.yml"
+                && job_name.as_str() == Some("policy")
+                && segment_recipe(&command).is_some_and(|(recipe, _)| recipe == "workspace-fetch")
+            {
+                continue;
+            }
             if field(&step, "uses") == RESTORE {
                 set(&mut step, "timeout-minutes", number("2"));
             }
@@ -979,6 +991,7 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     if name == "backend-certification.yml" {
         super::backend_private::apply(workflow)?;
     }
+    super::source_seed::apply(workflow, name)?;
     apply_budgets(workflow, name)?;
     Ok(())
 }

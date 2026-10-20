@@ -2810,7 +2810,7 @@ fn check_selected_native_forms(jobs: &Mapping) -> Result<()> {
     )?;
     if scalar(assessment, "if")
         != Some(
-            "always() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'",
+            "!cancelled() && github.event.deleted != true && needs.macos-performance-plan.result == 'success' && needs.macos-performance-plan.outputs.standalone-common == 'true'",
         )
     {
         return Err(failure("Mac selected assessment must run after failure"));
@@ -2986,13 +2986,11 @@ fn check_standard_native_jobs(workflow: &Mapping, jobs: &Mapping) -> Result<()> 
         "native backend concurrency",
     )?;
     if scalar(concurrency, "group") != Some("backend-certification-${{ github.ref }}")
-        || concurrency
-            .get(key("cancel-in-progress"))
-            .and_then(Value::as_bool)
-            != Some(false)
+        || scalar(concurrency, "cancel-in-progress")
+            != Some("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}")
     {
         return Err(failure(
-            "destructive native jobs may not cancel active cleanup",
+            "backend must cancel superseded branch pushes while retaining cleanup ownership",
         ));
     }
     for (name, runner, invocation) in [
@@ -4710,7 +4708,21 @@ fn validate_workflow_bytes_into(
             .as_str()
             .ok_or_else(|| failure("job name must be a string"))?;
         let job = mapping(job_value, "job")?;
-        if job.contains_key(key("shell")) || job.contains_key(key("env")) {
+        let modeled_cargo_home = projection.is_some()
+            && job_value["env"]
+                .as_mapping()
+                .is_some_and(|env| env.len() == 1)
+            && job_value["env"]["CARGO_HOME"].as_str()
+                == Some("${{ github.workspace }}/target/ci-cargo-home")
+            && (job_name == "source-seed"
+                || job_value["steps"].as_sequence().is_some_and(|steps| {
+                    steps.iter().any(|step| {
+                        step["run"].as_str().is_some_and(|command| {
+                            command.contains("--target-dir target/ci-driver-cold")
+                        })
+                    })
+                }));
+        if job.contains_key(key("shell")) || job.contains_key(key("env")) && !modeled_cargo_home {
             return Err(failure(format!(
                 "job-level shell/env is forbidden: {job_name}"
             )));
@@ -5895,6 +5907,7 @@ fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) 
     [
         Path::new("tools/memcordon-ci/tests/cache_download_families.rs"),
         Path::new("tools/memcordon-ci/tests/cache_snapshot_transport.rs"),
+        Path::new("tools/memcordon-ci/tests/job_cargo_home.rs"),
         Path::new("tools/memcordon-ci/tests/tool_download_roundtrip.rs"),
     ]
     .contains(&relative)
@@ -6548,6 +6561,7 @@ pub fn validate_legacy_registry_token_source(relative: &Path, source: &str) -> R
 }
 
 pub fn run(root: &Path) -> Result<()> {
+    crate::workflow_definitions::validate_public_source_model(root)?;
     let policy = config::policy(root)?;
     for command in &policy.workflow.allowed_run_commands {
         if !static_run_command(command) {
