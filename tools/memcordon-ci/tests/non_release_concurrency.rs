@@ -291,6 +291,27 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
     }
 
     let baseline = &deep["jobs"]["miri"];
+    for slot in ["source", "archives-partial", "index-partial"] {
+        let id = format!("driver-context-{slot}-restore");
+        for mutation in ["path", "restore-keys", "guard", "missing"] {
+            let mut job = baseline.clone();
+            let steps = job["steps"].as_sequence_mut().unwrap();
+            let index = steps.iter().position(|step| step["id"] == id).unwrap();
+            match mutation {
+                "path" => steps[index]["with"]["path"] = "target/ci/reports".into(),
+                "restore-keys" => steps[index]["with"]["restore-keys"] = "unowned-source".into(),
+                "guard" => steps[index]["if"] = "always()".into(),
+                "missing" => {
+                    steps.remove(index);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                finite_cache_paths(&job, "miri").is_err(),
+                "managed source {slot} {mutation}"
+            );
+        }
+    }
     for (field, replacement) in [
         ("path", "~/.cargo"),
         ("path", "~/.cargo/credentials.toml"),
@@ -342,10 +363,57 @@ fn source_cache_paths_select_real_cargo_inputs_without_report_or_credential_cust
             .as_sequence_mut()
             .unwrap()
             .iter_mut()
-            .find(|step| step["id"] == "miri-deps")
+            .find(|step| step["id"] == "public-source-seed-restore")
             .unwrap()["with"]["path"] = replacement.into();
         assert_ne!(&job, baseline);
         assert!(finite_cache_paths(&job, "miri").is_err());
+    }
+    for (field, replacement) in [
+        ("key", "unowned-public-source"),
+        ("restore-keys", "mc-ci-public-source-"),
+        ("lookup-only", "true"),
+    ] {
+        let mut job = baseline.clone();
+        job["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["id"] == "public-source-seed-restore")
+            .unwrap()["with"][field] = replacement.into();
+        assert!(finite_cache_paths(&job, "miri").is_err(), "source {field}");
+    }
+    for mutation in ["id", "missing", "duplicate", "late", "home", "legacy"] {
+        let mut job = baseline.clone();
+        let steps = job["steps"].as_sequence_mut().unwrap();
+        let index = steps
+            .iter()
+            .position(|step| step["id"] == "public-source-seed-restore")
+            .unwrap();
+        match mutation {
+            "id" => steps[index]["id"] = "unowned-public-source-restore".into(),
+            "missing" => {
+                steps.remove(index);
+            }
+            "duplicate" => {
+                let duplicate = steps[index].clone();
+                steps.push(duplicate);
+            }
+            "late" => {
+                let restore = steps.remove(index);
+                steps.push(restore);
+            }
+            "home" => job["env"]["CARGO_HOME"] = "~/.cargo".into(),
+            "legacy" => {
+                steps[index]["id"] = "miri-deps".into();
+                steps[index]["with"]["key"] = "mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}".into();
+                steps[index]["with"]["path"] = "~/.cargo/registry/cache\n~/.cargo/git/db".into();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            finite_cache_paths(&job, "miri").is_err(),
+            "source {mutation}"
+        );
     }
     for replacement in [
         "target/ci/reports",
@@ -467,9 +535,16 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
                     .map(str::to_owned)
                     .into()
             }
-            "driver-context" if request => ["image", "compiled-complete", "compiled-partial"]
-                .map(str::to_owned)
-                .into(),
+            "driver-context" if request => [
+                "image",
+                "source",
+                "archives-partial",
+                "index-partial",
+                "compiled-complete",
+                "compiled-partial",
+            ]
+            .map(str::to_owned)
+            .into(),
             "driver-build" if !request => [
                 "bootstrap",
                 "image",
@@ -622,7 +697,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
                     &format!("{slot}-{}", if direct { "path" } else { "inbox" }),
                 );
                 let mut guard = format!("{ready} == 'true'");
-                if recipe == "driver-context" && slot.starts_with("compiled-") {
+                if recipe == "driver-context" && slot != "image" {
                     let selection = match owner {
                         "driver-context" => "driver-selection",
                         "driver-context-windows" => "driver-selection-windows",
@@ -726,7 +801,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         )?;
         require(!repository.join("target/ci/reports").starts_with(&root))?;
     }
-    let mut downloads = 0;
+    let mut public_sources = 0;
     let mut bootstraps = 0;
     let mut seen = BTreeSet::new();
     for (ordinal, step) in steps.iter().enumerate() {
@@ -741,21 +816,39 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
         require(seen.insert(id))?;
         let key = step["with"]["key"].as_str().ok_or("cache key absent")?;
         let path = step["with"]["path"].as_str().ok_or("cache path absent")?;
-        if key.starts_with("mc-download-bootstrap-v5-") {
-            downloads += 1;
+        if id == "public-source-seed-restore" {
+            public_sources += 1;
             require(
                 !save
+                    && uses == "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
                     && path.lines().collect::<Vec<_>>()
-                        == ["~/.cargo/registry/cache", "~/.cargo/git/db"],
+                        == [
+                            "target/ci-cargo-home/registry/cache/index.crates.io-1949cf8c6b5b557f/*.crate",
+                            "target/ci-cargo-home/registry/cache/index.crates.io-6f17d22bba15001f/*.crate",
+                            "target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache",
+                            "target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json",
+                        ],
             )?;
             require(
-                key == "mc-download-bootstrap-v5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}",
+                key == "mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'tools/*/Cargo.toml', '.cargo/**') }}",
             )?;
-            let guard = step["if"].as_str().ok_or("download guard absent")?;
-            require(guard.contains("hashFiles('Cargo.lock') != ''"))?;
-            if family.starts_with("fuzz") {
-                require(guard.contains("hashFiles('fuzz/Cargo.lock') != ''"))?;
-            }
+            require(
+                step["with"]["restore-keys"]
+                    == "mc-ci-public-source-v1-${{ runner.os }}-${{ hashFiles('ci/toolchains.toml') }}-",
+            )?;
+            require(step["with"]["lookup-only"].is_null() && step["if"].is_null())?;
+            require(step["continue-on-error"].as_bool() == Some(true))?;
+            require(step["timeout-minutes"].as_u64() == Some(2))?;
+            require(job["env"]["CARGO_HOME"] == "${{ github.workspace }}/target/ci-cargo-home")?;
+            let first_driver = steps
+                .iter()
+                .position(|candidate| {
+                    candidate["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("driver-"))
+                })
+                .ok_or("public source restore requires a driver consumer")?;
+            require(ordinal < first_driver)?;
             continue;
         }
         if key.starts_with("mc-ci-bootstrap-v1-") {
@@ -804,7 +897,7 @@ fn finite_cache_paths(job: &Value, family: &str) -> Result<(), String> {
             Some(true),
         )?;
     }
-    require(downloads == usize::from(family != "fuzz"))?;
+    require(public_sources == usize::from(family != "fuzz"))?;
     require(
         bootstraps
             == if family == "fuzz" {

@@ -8,7 +8,15 @@ use serde_json::json;
 
 /// Persisted decoder graph, not a native installation or custody claim.
 pub fn excluded() -> PersistedCase {
-    let mut case = baseline("input-socket");
+    installed_projection("input-socket", "excluded")
+}
+
+pub fn projected() -> PersistedCase {
+    installed_projection("caller-writable-tree", "projected")
+}
+
+fn installed_projection(scenario: &str, outcome: &str) -> PersistedCase {
+    let mut case = baseline(scenario);
     let definition = installed::read(&case, "import-definition.json");
     let intent = installed::read(&case, "import-intent.json");
     let command = installed::read(&case, "import/invocation.json");
@@ -78,7 +86,7 @@ pub fn excluded() -> PersistedCase {
     case.mutate("case-evidence.json", |e| {
         e["format"] = json!("memcordon.consumer-readiness.linux-isolation-import");
         e["revision"] = json!(2);
-        e["outcome"] = json!({"outcome":"excluded","invocation":"exclusion-inspection/invocation.json",
+        e["outcome"] = json!({"outcome":outcome,"invocation":"exclusion-inspection/invocation.json",
             "native_creation":"exclusion-inspection/native-creation.json","native_process":"exclusion-inspection/native-process.json",
             "exit":"exclusion-inspection/exit.json","stdout":"exclusion-inspection/stdout.json",
             "stderr":"exclusion-inspection/stderr.bin","source_after":"exclusion-source-after.json"});

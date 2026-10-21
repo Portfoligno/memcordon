@@ -331,6 +331,10 @@ pub fn uninstall_until(deadline: &OsStr) -> Result<(), String> {
     linux_mutation(OsStr::new("uninstall"), Some(cutoff))
 }
 
+#[cfg(target_os = "linux")]
+#[path = "package_uninstall.rs"]
+mod uninstall_transaction;
+
 pub(crate) fn verify() -> Result<(), String> {
     verify_compiled_metadata()?;
     #[cfg(target_os = "linux")]
@@ -1738,6 +1742,13 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
         ensure_recovery_idle("uninstall")?;
+        // Unknown runtime outputs must refuse uninstall while the complete
+        // installed provider is still available for their original recovery.
+        remove_uninstalled_file(LEGACY_PACKAGE_LEASE)?;
+        crate::linux::startup::clear()?;
+        for path in [crate::linux::CGROUP_ROOT, RUNTIME_DIRECTORY] {
+            remove_uninstalled_directory(path)?;
+        }
         let mut removals = Vec::new();
         for path in [
             SOCKET_UNIT,
@@ -1762,35 +1773,41 @@ fn linux_mutation(operation: &OsStr, lease_deadline: Option<u64>) -> Result<(), 
                 Err(error) => return Err(format!("could not inspect {path}: {error}")),
             }
         }
-        if !removals.is_empty() {
-            let transaction = PackageFileTransaction::apply(removals)?;
-            if let Err(error) = systemctl(["daemon-reload"]) {
-                return match transaction.rollback() {
-                    Ok(()) => Err(error),
-                    Err(rollback) => Err(format!(
-                        "{error}; package uninstall rollback failed: {rollback}"
-                    )),
-                };
-            }
-            transaction.commit()?;
+        let transaction = if !removals.is_empty() {
+            Some(PackageFileTransaction::apply(removals)?)
         } else {
-            systemctl(["daemon-reload"])?;
-        }
-        remove_uninstalled_file(LEGACY_PACKAGE_LEASE)?;
-        crate::linux::startup::clear()?;
-        for path in [crate::linux::CGROUP_ROOT, RUNTIME_DIRECTORY] {
-            remove_uninstalled_directory(path)?;
-        }
-        // Retain unrelated state rather than deleting nonempty directories.
-        match fs::read_dir(crate::linux::STATE_ROOT) {
-            Ok(mut entries) => {
-                if entries.next().is_none() {
-                    remove_uninstalled_directory(crate::linux::STATE_ROOT)?;
+            None
+        };
+        uninstall_transaction::finish(
+            transaction,
+            || {
+                systemctl(["daemon-reload"])?;
+                // Retain unrelated state rather than deleting nonempty directories.
+                match fs::read_dir(crate::linux::STATE_ROOT) {
+                    Ok(mut entries) => {
+                        if entries.next().is_none() {
+                            remove_uninstalled_directory(crate::linux::STATE_ROOT)?;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
                 }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
-        }
+                Ok(())
+            },
+            |transaction| {
+                transaction
+                    .map(PackageFileTransaction::commit)
+                    .transpose()
+                    .map(|_| ())
+            },
+            |transaction| {
+                transaction
+                    .map(PackageFileTransaction::rollback)
+                    .transpose()
+                    .map(|_| ())
+            },
+            || systemctl(["daemon-reload"]),
+        )?;
         // This is the final uninstall mutation. The open exclusive lease remains locked until
         // return, while unlinking prevents the package lock itself becoming residual state.
         remove_uninstalled_file(crate::linux::service::PACKAGE_LEASE)?;

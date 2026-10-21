@@ -1,7 +1,10 @@
 #[path = "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl/bootstrap_probe_policy.rs"]
 mod probe_policy;
 
-use probe_policy::{ConsolelessProbePolicyV1, binding_domain};
+use probe_policy::{
+    ConsolelessProbePolicyV1, binding_domain, validate_admission_capability,
+    validate_image_capability,
+};
 
 #[test]
 fn probe_policy_round_trips_only_the_fixed_creation_contract() {
@@ -58,7 +61,7 @@ fn binding_versions_join_exact_role_and_policy_without_changing_legacy_domain() 
         Some(&policy),
     )
     .unwrap();
-    assert_eq!(current, b"memcordon-target-desktop-binding-v9\0");
+    assert_eq!(current, b"memcordon-target-desktop-binding-v11\0");
     for role in ["holder", "loader-control"] {
         assert_eq!(
             binding_domain(19, role, None).unwrap(),
@@ -71,6 +74,53 @@ fn binding_versions_join_exact_role_and_policy_without_changing_legacy_domain() 
     assert!(binding_domain(3, "probe", None).is_err());
     assert!(binding_domain(3, "probe", Some(&policy)).is_err());
     assert!(binding_domain(4, "probe", None).is_err());
+    assert!(binding_domain(4, "probe", Some(&policy)).is_err());
+    assert!(binding_domain(5, "probe", None).is_err());
     assert!(binding_domain(5, "probe", Some(&policy)).is_err());
     assert!(binding_domain(4, "target", Some(&policy)).is_err());
+}
+
+#[test]
+fn admission_requires_explicit_capability_for_holder_and_probe_only() {
+    let policy = ConsolelessProbePolicyV1::new();
+    for (version, role, selected) in [(19, "holder", None), (6, "probe", Some(&policy))] {
+        assert!(validate_admission_capability(version, role, selected, true).is_ok());
+        assert!(validate_admission_capability(version, role, selected, false).is_err());
+    }
+    for role in ["loader-control", "target", "", "Probe"] {
+        for present in [true, false] {
+            assert!(validate_admission_capability(19, role, None, present).is_err());
+            assert!(validate_admission_capability(6, role, Some(&policy), present).is_err());
+        }
+    }
+    for (version, role, selected) in [
+        (4, "probe", Some(&policy)),
+        (19, "probe", None),
+        (5, "holder", Some(&policy)),
+        (5, "probe", None),
+        (5, "probe", Some(&policy)),
+        (19, "holder", Some(&policy)),
+    ] {
+        assert!(validate_admission_capability(version, role, selected, true).is_err());
+    }
+}
+
+#[test]
+fn image_identity_and_handle_are_required_together_for_probe_only() {
+    for role in ["probe", "holder", "loader-control", "target", "", "Probe"] {
+        for claim in [false, true] {
+            for handle in [false, true] {
+                let expected = match role {
+                    "probe" => claim && handle,
+                    "holder" | "loader-control" => !claim && !handle,
+                    _ => false,
+                };
+                assert_eq!(
+                    validate_image_capability(role, claim, handle).is_ok(),
+                    expected,
+                    "{role} claim={claim} handle={handle}",
+                );
+            }
+        }
+    }
 }

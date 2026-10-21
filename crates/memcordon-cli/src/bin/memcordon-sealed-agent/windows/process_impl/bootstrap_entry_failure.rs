@@ -1,4 +1,4 @@
-//! Bootstrap failure observation; only authenticated support receivers retain it.
+//! Bootstrap failure observation; only authenticated receivers retain it.
 use serde::{Deserialize, Serialize};
 
 const DETAIL_MAX_BYTES: usize = 1024;
@@ -16,6 +16,7 @@ pub enum EntryStage {
 #[serde(rename_all = "kebab-case")]
 pub enum EntryRole {
     LoaderControl,
+    Probe,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,11 +40,11 @@ fn bounded(value: &str) -> String {
 }
 
 impl EntryFailureV1 {
-    pub fn new(nonce: &str, stage: EntryStage, detail: &str) -> Self {
+    pub fn new(nonce: &str, role: EntryRole, stage: EntryStage, detail: &str) -> Self {
         Self {
             schema_version: memcordon_windows_launch_core::PRODUCTION_LOADER_READY_SCHEMA_VERSION,
             nonce: nonce.to_owned(),
-            role: EntryRole::LoaderControl,
+            role,
             stage,
             detail: bounded(detail),
             // These sources return String, not a captured native error code.
@@ -52,10 +53,15 @@ impl EntryFailureV1 {
         }
     }
 
-    pub fn validate_for(&self, expected_nonce: &str) -> Result<(), String> {
+    pub fn validate_for(
+        &self,
+        expected_nonce: &str,
+        expected_role: EntryRole,
+    ) -> Result<(), String> {
         if self.schema_version
             != memcordon_windows_launch_core::PRODUCTION_LOADER_READY_SCHEMA_VERSION
             || self.nonce != expected_nonce
+            || self.role != expected_role
             || self.nonce.len() != 64
             || !self
                 .nonce
@@ -71,8 +77,8 @@ impl EntryFailureV1 {
 
     pub fn diagnostic_detail(&self) -> String {
         bounded(&format!(
-            "bootstrap entry failure stage={:?}; native_code=unavailable; detail_truncated={}; detail={:?}",
-            self.stage, self.detail_truncated, self.detail
+            "bootstrap entry failure role={:?} stage={:?}; native_code=unavailable; detail_truncated={}; detail={:?}",
+            self.role, self.stage, self.detail_truncated, self.detail
         ))
     }
 }

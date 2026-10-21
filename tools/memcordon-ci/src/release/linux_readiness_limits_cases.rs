@@ -14,6 +14,9 @@ use super::linux_fixture_memory_budget::FrozenImageMemoryBudget;
 #[path = "linux_memory_event_counters.rs"]
 mod memory_event_counters;
 
+#[path = "linux_owner_cutoffs.rs"]
+mod owner_cutoffs;
+
 #[allow(unsafe_code)] // Query only the native page-size scalar used to size the admitted fixture images.
 fn native_fixture_page_bytes() -> Result<u64> {
     // SAFETY: sysconf has no pointer arguments and returns the page size or a negative failure.
@@ -541,6 +544,16 @@ pub fn observe_memory_oom(
 }
 
 impl LimitsReport {
+    pub(super) fn bind_original_cutoffs(&mut self, work: Instant, cleanup: Instant) -> Result<()> {
+        owner_cutoffs::bind(
+            &mut self.original_work_deadline,
+            &mut self.original_cleanup_deadline,
+            work,
+            cleanup,
+        )
+        .map_err(|error| CiError::Message(error.into()))
+    }
+
     /// Persist original controller observations while their native owners are
     /// still held. These factual bytes supply no runtime authority.
     fn persist_controller_actions(&mut self, directory: &Path, deadline: Instant) -> Result<()> {
@@ -1268,6 +1281,7 @@ pub fn run_case(
                 prefix.to_owned(),
                 context.contract_path,
                 context.artifact_root,
+                context.cleanup_deadline,
                 remaining(context.work_deadline)?,
             )?;
             collected.prepared_native_receipt = owner

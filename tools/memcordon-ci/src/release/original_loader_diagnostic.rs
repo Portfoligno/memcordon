@@ -1,6 +1,10 @@
 //! Separate measured support operation. Nothing here emits readiness rows.
 use super::*;
 
+#[cfg(windows)]
+#[path = "original_loader_publication.rs"]
+mod publication;
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct Args {
     #[arg(long)]
@@ -325,12 +329,7 @@ fn execute(
     )?;
     let requested = artifacts_directory.join("requested-contract.json");
     let contract_bytes = serde_json::to_vec(&contract)?;
-    let mut requested_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&requested)?;
-    requested_file.write_all(&contract_bytes)?;
-    requested_file.sync_all()?;
+    publication::publish(&requested, &contract_bytes)?;
     if OwnedRecord::read(&requested)?.bytes != contract_bytes {
         return Err(CiError::Message(
             "diagnostic activated contract readback differs".into(),

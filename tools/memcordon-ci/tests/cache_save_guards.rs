@@ -7,6 +7,88 @@ use serde_yaml::Value;
 use std::path::Path;
 
 #[test]
+fn source_producer_ownership_matches_event_truth_table_and_shared_writers() {
+    for file in workflow_definitions::FILES {
+        let document = workflow_definitions::definition(file).unwrap();
+        let condition = document["jobs"]["source-seed"]["if"].as_str().unwrap();
+        for (event, reference, deleted, recovery) in [
+            ("push", "refs/heads/main", false, "reprepare"),
+            ("push", "refs/tags/0.5.8", false, "reprepare"),
+            ("push", "refs/tags/uncovered", false, "reprepare"),
+            ("workflow_dispatch", "refs/heads/main", false, "reprepare"),
+            (
+                "workflow_dispatch",
+                "refs/heads/main",
+                false,
+                "publication-only",
+            ),
+            ("workflow_dispatch", "refs/tags/0.5.8", false, "reprepare"),
+            ("pull_request", "refs/heads/main", false, "reprepare"),
+            ("merge_group", "refs/heads/main", false, "reprepare"),
+            ("push", "refs/heads/main", true, "reprepare"),
+            ("push", "refs/heads/", false, "reprepare"),
+            ("push", "refs/tags/", false, "reprepare"),
+            ("push", "", false, "reprepare"),
+        ] {
+            let branch = reference
+                .strip_prefix("refs/heads/")
+                .is_some_and(|name| !name.is_empty());
+            let tag = reference
+                .strip_prefix("refs/tags/")
+                .is_some_and(|name| !name.is_empty());
+            let expected = !deleted
+                && match event {
+                    "push" => (branch && file == "release.yml") || (tag && file == "deep-ci.yml"),
+                    "workflow_dispatch" => {
+                        branch && (file != "release.yml" || recovery == "reprepare")
+                    }
+                    _ => false,
+                };
+            let expression = condition
+                .replace(
+                    "startsWith(github.ref, 'refs/heads/')",
+                    if reference.starts_with("refs/heads/") {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .replace(
+                    "startsWith(github.ref, 'refs/tags/')",
+                    if reference.starts_with("refs/tags/") {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .replace(
+                    "github.event.deleted",
+                    if deleted { "true" } else { "false" },
+                );
+            let actual = cache_guard::parse(&expression).unwrap().evaluate(
+                &|name| match name {
+                    "github.event_name" => event.into(),
+                    "github.ref" => reference.into(),
+                    "inputs.recovery-mode" => recovery.into(),
+                    _ => panic!("unexpected owner field {name}"),
+                },
+                &|name| panic!("unexpected status {name}"),
+            );
+            assert_eq!(
+                actual, expected,
+                "{file} {event} {reference} deleted={deleted} recovery={recovery}"
+            );
+            if actual {
+                assert!(memcordon_ci::segment_cache::write_event_for(
+                    Some(event),
+                    Some(reference)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn every_fetch_family_retains_partial_sources_after_settled_failed_fetch() {
     let mut families = std::collections::BTreeSet::new();
     let mut checked = 0;
@@ -177,6 +259,7 @@ fn actual_save_blocks_reject_aggregate_status_and_missing_owner_facts() {
     let root = root();
     let configuration = config::policy(&root).unwrap();
     let mut checked = 0;
+    let mut source_producers_checked = 0;
     for file in [
         "ci.yml",
         "deep-ci.yml",
@@ -200,7 +283,16 @@ fn actual_save_blocks_reject_aggregate_status_and_missing_owner_facts() {
                     continue;
                 }
                 let original = step["if"].as_str().unwrap();
-                assert!(!parse(original).unwrap().contains_status("success"));
+                let source_producer = job_name.as_str() == Some("source-seed")
+                    && step["id"].as_str() == Some("public-source-seed-save");
+                // The source producer has its own complete finite contract,
+                // including ref predicates outside the runtime-owner grammar.
+                let diagnostic = if source_producer {
+                    "source acquisition must be independent with finite event ownership"
+                } else {
+                    assert!(!parse(original).unwrap().contains_status("success"));
+                    "invalid Rust-owned cache save adapter"
+                };
                 let mut changed = document.clone();
                 changed["jobs"][job_name]["steps"][ordinal]["if"] =
                     format!("({original}) && success()").into();
@@ -213,9 +305,7 @@ fn actual_save_blocks_reject_aggregate_status_and_missing_owner_facts() {
                 )
                 .unwrap_err();
                 assert!(
-                    error
-                        .to_string()
-                        .contains("invalid Rust-owned cache save adapter"),
+                    error.to_string().contains(diagnostic),
                     "{file}/{job_name:?}/{ordinal}: {error}"
                 );
                 let mut changed = document.clone();
@@ -229,15 +319,18 @@ fn actual_save_blocks_reject_aggregate_status_and_missing_owner_facts() {
                 )
                 .unwrap_err();
                 assert!(
-                    error
-                        .to_string()
-                        .contains("invalid Rust-owned cache save adapter"),
+                    error.to_string().contains(diagnostic),
                     "missing owner fact {file}/{job_name:?}/{ordinal}: {error}"
                 );
-                checked += 1;
+                if source_producer {
+                    source_producers_checked += 1;
+                } else {
+                    checked += 1;
+                }
             }
         }
     }
+    assert_eq!(source_producers_checked, workflow_definitions::FILES.len());
     assert!(
         checked > 100,
         "whole-workflow save inventory unexpectedly shrank: {checked}"

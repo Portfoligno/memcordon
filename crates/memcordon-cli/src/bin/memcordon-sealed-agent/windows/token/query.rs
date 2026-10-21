@@ -168,6 +168,29 @@ pub(super) fn current_process_token_with_access(access: u32) -> Result<OwnedHand
     OwnedHandle::new(raw_process_token)
 }
 
+/// Opens the actual held process primary for authenticated source inspection
+/// and derivation of its query-only AccessCheck impersonation token.
+pub(crate) fn process_primary_token_for_probe(process: HANDLE) -> Result<OwnedHandle, String> {
+    let mut raw = ptr::null_mut();
+    // SAFETY: caller retains the actual process handle; output is owned below.
+    if unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_ATTESTATION_ACCESS | TOKEN_DUPLICATE,
+            &raw mut raw,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "open actual process primary capability: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let token = OwnedHandle::new(raw)?;
+    validate_probe_primary_token_capability(token.raw())?;
+    Ok(token)
+}
+
 pub(super) fn allocated_sid(value: &str) -> Result<*mut c_void, String> {
     let value = super::pipe::wide_null(value);
     let mut sid = ptr::null_mut();

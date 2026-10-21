@@ -312,10 +312,10 @@ pub fn validate_source_model(root: &std::path::Path) -> Result<()> {
     let lock: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("Cargo.lock"))?)?;
     let packages = lock["package"].as_array().ok_or_else(invalid)?;
     for package in packages {
-        if let Some(source) = package.get("source") {
-            if source.as_str() != Some("registry+https://github.com/rust-lang/crates.io-index") {
-                return Err(invalid());
-            }
+        if let Some(source) = package.get("source")
+            && source.as_str() != Some("registry+https://github.com/rust-lang/crates.io-index")
+        {
+            return Err(invalid());
         }
     }
     Ok(())

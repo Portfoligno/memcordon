@@ -5,6 +5,10 @@ pub mod compatibility;
 pub mod consumer_readiness_cell;
 pub mod distribution;
 pub mod finalize;
+#[cfg(target_os = "linux")]
+mod fixture_export_retirement;
+#[cfg(target_os = "linux")]
+mod frontend_invocation_custody;
 pub mod git;
 pub mod http;
 pub mod installed_consumer;

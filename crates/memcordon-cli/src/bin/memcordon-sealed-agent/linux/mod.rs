@@ -27,6 +27,7 @@ pub(crate) mod operational_admission;
 pub(crate) mod private_attempt;
 pub(crate) mod private_cancellation;
 pub(crate) mod private_guardian;
+pub(crate) mod private_init_diagnostic;
 pub(crate) mod private_lifecycle;
 pub(crate) mod private_lifetime;
 pub(crate) mod private_namespace_init;

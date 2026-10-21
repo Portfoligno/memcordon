@@ -62,6 +62,15 @@ pub enum LinuxIsolationImportOutcome {
         stderr: String,
         source_after: String,
     },
+    Projected {
+        invocation: String,
+        native_creation: String,
+        native_process: String,
+        exit: String,
+        stdout: String,
+        stderr: String,
+        source_after: String,
+    },
 }
 impl LinuxIsolationImportEvidence {
     pub(crate) fn artifact_paths(&self) -> Vec<&str> {
@@ -100,6 +109,15 @@ impl LinuxIsolationImportEvidence {
             paths.push(path);
         }
         if let LinuxIsolationImportOutcome::Excluded {
+            invocation,
+            native_creation,
+            native_process,
+            exit,
+            stdout,
+            stderr,
+            source_after,
+        }
+        | LinuxIsolationImportOutcome::Projected {
             invocation,
             native_creation,
             native_process,
@@ -669,9 +687,17 @@ pub(crate) fn verify(
         &agent.installed_sha256,
     )?;
     let excluded = matches!(e.outcome, LinuxIsolationImportOutcome::Excluded { .. });
+    let projected = matches!(e.outcome, LinuxIsolationImportOutcome::Projected { .. });
+    let installed = excluded || projected;
     if (excluded && (status != 0 || e.key.scenario != "input-socket"))
-        || (!excluded && status == 0)
-        || (!excluded && e.revision == 2 && e.key.scenario == "input-socket")
+        || (projected && (status != 0 || e.key.scenario != "caller-writable-tree"))
+        || (!installed && status == 0)
+        || (!installed
+            && e.revision == 2
+            && matches!(
+                e.key.scenario.as_str(),
+                "input-socket" | "caller-writable-tree"
+            ))
         || command["identity"] != identity
         || command["cell"] != cell
         || command["lease_id"] != e.lease_id
@@ -856,20 +882,20 @@ pub(crate) fn verify(
         &decode(&e.source_closure)?,
         custody,
     )?;
-    if excluded {
-        validate_exclusion(e, custody, &command, &source, &agent.installed_sha256)?;
+    if installed {
+        validate_projection(e, custody, &command, &source, &agent.installed_sha256)?;
     }
     Ok(())
 }
 
-fn validate_exclusion(
+fn validate_projection(
     e: &LinuxIsolationImportEvidence,
     custody: &custody::Custody,
     original_command: &Value,
     source: &Value,
     agent_sha: &str,
 ) -> VerificationResult<()> {
-    let LinuxIsolationImportOutcome::Excluded {
+    let (LinuxIsolationImportOutcome::Excluded {
         invocation,
         native_creation,
         native_process,
@@ -877,13 +903,25 @@ fn validate_exclusion(
         stdout,
         stderr,
         source_after,
-    } = &e.outcome
+    }
+    | LinuxIsolationImportOutcome::Projected {
+        invocation,
+        native_creation,
+        native_process,
+        exit,
+        stdout,
+        stderr,
+        source_after,
+    }) = &e.outcome
     else {
         return Err("installed exclusion observation absent".into());
     };
     if e.format != "memcordon.consumer-readiness.linux-isolation-import"
         || e.revision != 2
-        || e.key.scenario != "input-socket"
+        || !matches!(
+            e.key.scenario.as_str(),
+            "input-socket" | "caller-writable-tree"
+        )
     {
         return Err("installed exclusion crosses explicit scenario/version".into());
     }
@@ -1020,17 +1058,26 @@ fn validate_exclusion(
             .as_u64()
             .ok_or("source parent inode absent")?,
     ));
-    source_identities.insert((
-        after["listener"]["device"]
-            .as_u64()
-            .ok_or("socket listener device absent")?,
-        after["listener"]["inode"]
-            .as_u64()
-            .ok_or("socket listener inode absent")?,
-    ));
-    let excluded_path = source["mutation"]["path"]
-        .as_str()
-        .ok_or("excluded source path absent")?;
+    let excluded_path = if e.key.scenario == "input-socket" {
+        source_identities.insert((
+            after["listener"]["device"]
+                .as_u64()
+                .ok_or("socket listener device absent")?,
+            after["listener"]["inode"]
+                .as_u64()
+                .ok_or("socket listener inode absent")?,
+        ));
+        Some(
+            source["mutation"]["path"]
+                .as_str()
+                .ok_or("excluded source path absent")?,
+        )
+    } else {
+        if !after["listener"].is_null() {
+            return Err("projected caller source invents socket listener authority".into());
+        }
+        None
+    };
     if source_identities.contains(&crate::linux_image_census::identity(&census["root"])?)
         || source_identities.contains(&crate::linux_image_census::identity(&census["store"])?)
         || census["members"]
@@ -1038,7 +1085,7 @@ fn validate_exclusion(
             .ok_or("excluded installed population absent")?
             .iter()
             .any(|member| {
-                member["path"] == excluded_path
+                excluded_path.is_some_and(|path| member["path"] == path)
                     || crate::linux_image_census::identity(&member["identity"])
                         .is_ok_and(|identity| source_identities.contains(&identity))
             })

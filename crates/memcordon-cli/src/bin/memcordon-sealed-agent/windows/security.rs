@@ -5,9 +5,11 @@ use std::ptr;
 
 use serde::{Deserialize, Serialize};
 
+#[path = "kernel_descriptor_length.rs"]
+mod kernel_descriptor_length;
+
 use super::user_api::get_user_object_security as GetUserObjectSecurity;
 use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
-#[cfg(test)]
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree, UNICODE_STRING};
 use windows_sys::Win32::Security::Authorization::{
@@ -59,6 +61,9 @@ use super::pipe::{OwnedHandle, wide_null};
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
 const MAX_SDDL_UTF16_UNITS: usize = 1_048_576;
+const PIPE_ATTEST_INFORMATION: u32 =
+    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+const MAX_PIPE_DESCRIPTOR_BYTES: u32 = 64 * 1024;
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
 const PROTECTED_KERNEL_DACL_INFORMATION: u32 =
@@ -2937,16 +2942,18 @@ impl SecurityDescriptor {
             )
             .to_string());
         }
-        if needed == 0 || needed > allocated_bytes {
-            return Err(LiveKernelAccessCheckError::semantic(
-                "descriptor-read",
-                "GetKernelObjectSecurity",
-                policy_information,
-                access_check_information,
-                format!("allocated_bytes={allocated_bytes} returned_bytes={needed}"),
-            )
-            .to_string());
-        }
+        validate_kernel_descriptor_readback(&mut descriptor, allocated_bytes, needed).map_err(
+            |error| {
+                LiveKernelAccessCheckError::semantic(
+                    "descriptor-read",
+                    "validate_kernel_descriptor_readback",
+                    policy_information,
+                    access_check_information,
+                    error,
+                )
+                .to_string()
+            },
+        )?;
         let actual = descriptor.as_mut_ptr().cast();
         require_live_access_check_descriptor_shape(
             actual,
@@ -3323,8 +3330,6 @@ impl SecurityDescriptor {
                 &raw mut needed,
             )
         } == 0
-            || needed == 0
-            || needed > allocated
         {
             return Err(format!(
                 "read live {:?} security descriptor: {}",
@@ -3332,6 +3337,8 @@ impl SecurityDescriptor {
                 io::Error::last_os_error()
             ));
         }
+        validate_kernel_descriptor_readback(&mut descriptor, allocated, needed)
+            .map_err(|error| format!("read live {kind:?} security descriptor bounds: {error}"))?;
         let actual = descriptor.as_mut_ptr().cast();
         let equality_sha256 = super::record::digest(
             normalized_descriptor_sddl(actual, information, kind)?.as_bytes(),
@@ -3578,43 +3585,25 @@ impl SecurityDescriptor {
         &self,
         handle: windows_sys::Win32::Foundation::HANDLE,
     ) -> Result<(), NamedPipeSecurityError> {
-        const PIPE_ATTEST_INFORMATION: u32 =
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
-        let mut owner = ptr::null_mut();
-        let mut dacl: *mut ACL = ptr::null_mut();
-        let mut label: *mut ACL = ptr::null_mut();
-        let mut descriptor = ptr::null_mut();
-        // SAFETY: a named-pipe endpoint is an NPFS file object. Each component
-        // output points into the one LocalAlloc descriptor owned below.
-        let status = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                PIPE_ATTEST_INFORMATION,
-                &raw mut owner,
-                ptr::null_mut(),
-                &raw mut dacl,
-                &raw mut label,
-                &raw mut descriptor,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(NamedPipeSecurityError::Readback(
-                io::Error::from_raw_os_error(status as i32).to_string(),
-            ));
-        }
-        let descriptor =
-            LocalSecurityDescriptor::new(descriptor).map_err(NamedPipeSecurityError::Readback)?;
-        let expected = pipe_security_components(self.0, None, None, None, self.1)
-            .map_err(NamedPipeSecurityError::Readback)?;
+        // Query the held NPFS object directly. No pathname/provider dispatch or
+        // additional authority is needed to read the same security information.
+        let mut descriptor =
+            read_named_pipe_descriptor(handle).map_err(NamedPipeSecurityError::Readback)?;
+        let expected =
+            pipe_security_components(self.0, None, None, None, self.1).map_err(|error| {
+                NamedPipeSecurityError::Readback(format!(
+                    "readback-stage=expected-descriptor security_information={:#x} detail={error}",
+                    self.1
+                ))
+            })?;
         let actual = pipe_security_components(
-            descriptor.0,
-            Some(owner),
-            Some(dacl),
-            Some(label),
+            descriptor.as_mut_ptr().cast(),
+            None,
+            None,
+            None,
             PIPE_ATTEST_INFORMATION,
         )
-        .map_err(NamedPipeSecurityError::Readback)?;
+        .map_err(|error| NamedPipeSecurityError::Readback(format!("readback-stage=actual-endpoint security_information={PIPE_ATTEST_INFORMATION:#x} detail={error}")))?;
         compare_pipe_security(&expected, &actual).map_err(NamedPipeSecurityError::Mismatch)
     }
 }
@@ -3940,6 +3929,121 @@ pub(crate) fn user_object_resultant_fingerprint_for_test(
     Ok(super::record::digest(canonical.as_bytes()))
 }
 
+fn read_named_pipe_descriptor(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<Vec<u32>, String> {
+    let mut needed = 0_u32;
+    // SAFETY: the sizing call writes only the required length for this held object.
+    let sized = unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            PIPE_ATTEST_INFORMATION,
+            ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    if sized != 0 {
+        return Err(
+            "readback-stage=size-query: zero-capacity descriptor query unexpectedly succeeded"
+                .into(),
+        );
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(format!(
+            "readback-stage=size-query security_information={PIPE_ATTEST_INFORMATION:#x} {}",
+            pipe_native_error("GetKernelObjectSecurity", "last-error", error),
+        ));
+    }
+    if needed == 0 || needed > MAX_PIPE_DESCRIPTOR_BYTES {
+        return Err(format!(
+            "readback-stage=size-query: descriptor length outside finite pipe policy bound: {needed}"
+        ));
+    }
+    let allocated = needed;
+    let mut descriptor = descriptor_buffer(allocated)?;
+    // SAFETY: aligned owned storage has at least allocated bytes; no pointer
+    // into this self-relative descriptor outlives the returned owner.
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            PIPE_ATTEST_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            allocated,
+            &raw mut needed,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "readback-stage=read-endpoint security_information={PIPE_ATTEST_INFORMATION:#x} {}",
+            pipe_native_error(
+                "GetKernelObjectSecurity",
+                "last-error",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    validate_kernel_descriptor_readback(&mut descriptor, allocated, needed)
+        .map_err(|error| format!("readback-stage=validate-endpoint: {error}"))?;
+    Ok(descriptor)
+}
+
+fn validate_kernel_descriptor_readback(
+    descriptor: &mut [u32],
+    allocated: u32,
+    reported: u32,
+) -> Result<(), String> {
+    let storage_bytes = descriptor
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| "kernel descriptor owned storage size overflowed".to_owned())?;
+    if allocated == 0
+        || usize::try_from(allocated).map_or(true, |bytes| bytes > storage_bytes)
+        || reported > allocated
+    {
+        return Err(format!(
+            "kernel descriptor capacity differs: allocated={allocated} reported={reported} storage={storage_bytes}"
+        ));
+    }
+    let raw = descriptor.as_mut_ptr().cast();
+    // SAFETY: successful native query initialized the bounded owned descriptor.
+    if unsafe { IsValidSecurityDescriptor(raw) } == 0 {
+        return Err("native kernel descriptor is invalid".into());
+    }
+    // SAFETY: validity was checked above and the descriptor remains owned.
+    let length = unsafe { GetSecurityDescriptorLength(raw) };
+    // A successful copy may report zero required bytes. The valid descriptor's
+    // own length, not that auxiliary output, must fit the original allocation.
+    kernel_descriptor_length::validate_lengths(allocated, reported, length).map_err(|detail| {
+        format!("{detail}: allocated={allocated} reported={reported} actual={length}")
+    })?;
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: descriptor is valid and outputs are initialized scalar storage.
+    if unsafe { GetSecurityDescriptorControl(raw, &raw mut control, &raw mut revision) } == 0 {
+        return Err(format!(
+            "validate-kernel-descriptor {}",
+            pipe_native_error(
+                "GetSecurityDescriptorControl",
+                "last-error",
+                io::Error::last_os_error()
+            )
+        ));
+    }
+    if control & SE_SELF_RELATIVE == 0 {
+        return Err("native kernel descriptor is not self-relative".into());
+    }
+    Ok(())
+}
+
+fn pipe_native_error(api: &str, status_source: &str, error: io::Error) -> String {
+    let native_code = error
+        .raw_os_error()
+        .map_or_else(|| "none".to_owned(), |code| code.to_string());
+    format!("api={api} status_source={status_source} native_code={native_code} detail={error}")
+}
+
 fn pipe_security_components(
     descriptor: *mut c_void,
     owner: Option<*mut c_void>,
@@ -3956,7 +4060,11 @@ fn pipe_security_components(
             if unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) }
                 == 0
             {
-                return Err(io::Error::last_os_error().to_string());
+                return Err(pipe_native_error(
+                    "GetSecurityDescriptorOwner",
+                    "last-error",
+                    io::Error::last_os_error(),
+                ));
             }
             owner
         }
@@ -3981,7 +4089,11 @@ fn pipe_security_components(
                 )
             } == 0
             {
-                return Err(io::Error::last_os_error().to_string());
+                return Err(pipe_native_error(
+                    "GetSecurityDescriptorDacl",
+                    "last-error",
+                    io::Error::last_os_error(),
+                ));
             }
             (present != 0 && !dacl.is_null()).then_some(dacl)
         }
@@ -4006,7 +4118,11 @@ fn pipe_security_components(
                     )
                 } == 0
                 {
-                    return Err(io::Error::last_os_error().to_string());
+                    return Err(pipe_native_error(
+                        "GetSecurityDescriptorSacl",
+                        "last-error",
+                        io::Error::last_os_error(),
+                    ));
                 }
                 (present != 0 && !label.is_null()).then_some(label)
             }
@@ -4018,17 +4134,28 @@ fn pipe_security_components(
     // SAFETY: descriptor is live and outputs point to initialized storage.
     if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(pipe_native_error(
+            "GetSecurityDescriptorControl",
+            "last-error",
+            io::Error::last_os_error(),
+        ));
     }
 
     Ok(PipeSecurityComponents {
-        owner: super::token::sid_string(owner)?,
+        owner: super::token::sid_string(owner)
+            .map_err(|error| format!("component=owner detail={error}"))?,
         dacl_protected: control & SE_DACL_PROTECTED != 0,
         dacl: dacl
-            .map(|acl| pipe_acl(acl, SecurityObjectKind::NamedPipe))
+            .map(|acl| {
+                pipe_acl(acl, SecurityObjectKind::NamedPipe)
+                    .map_err(|error| format!("component=dacl detail={error}"))
+            })
             .transpose()?,
         label: label
-            .map(|acl| pipe_acl(acl, SecurityObjectKind::NamedPipe))
+            .map(|acl| {
+                pipe_acl(acl, SecurityObjectKind::NamedPipe)
+                    .map_err(|error| format!("component=mandatory-label detail={error}"))
+            })
             .transpose()?,
     })
 }
@@ -4046,14 +4173,21 @@ fn pipe_acl(acl: *mut ACL, kind: SecurityObjectKind) -> Result<Vec<PipeAce>, Str
         )
     } == 0
     {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(pipe_native_error(
+            "GetAclInformation",
+            "last-error",
+            io::Error::last_os_error(),
+        ));
     }
     let mut entries = Vec::with_capacity(information.AceCount as usize);
     for index in 0..information.AceCount {
         let mut ace = ptr::null_mut();
         // SAFETY: index is bounded by the queried ACE count.
         if unsafe { GetAce(acl, index, &raw mut ace) } == 0 {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(format!(
+                "ace_index={index} {}",
+                pipe_native_error("GetAce", "last-error", io::Error::last_os_error())
+            ));
         }
         let bytes = ace.cast::<u8>();
         // SAFETY: GetAce returned a live ACE_HEADER.
@@ -4093,7 +4227,8 @@ fn pipe_acl(acl: *mut ACL, kind: SecurityObjectKind) -> Result<Vec<PipeAce>, Str
                     "named-pipe ACE {index} SID extends beyond the ACE boundary"
                 ));
             }
-            super::token::sid_string(sid)?
+            super::token::sid_string(sid)
+                .map_err(|error| format!("ace_index={index} component=trustee detail={error}"))?
         } else {
             String::new()
         };

@@ -23,6 +23,119 @@ fn undeclared_socket_exclusion_requires_complete_persisted_observation() {
 }
 
 #[test]
+fn caller_writable_source_requires_fresh_protected_installed_projection() {
+    let case = linux_import_exclusion_case::projected();
+    case.validate().unwrap();
+    for mutation in [
+        "source-root",
+        "source-member",
+        "caller-owned",
+        "writable",
+        "digest",
+        "population",
+        "cutoff",
+    ] {
+        let mut case = linux_import_exclusion_case::projected();
+        case.validate().unwrap();
+        let source = linux_installed_case::read(&case, "import-inventory.json");
+        case.mutate("exclusion-inspection/stdout.json", |c| match mutation {
+            "source-root" => {
+                c["root"]["device"] = source["root"]["device"].clone();
+                c["root"]["inode"] = source["root"]["inode"].clone();
+            }
+            "source-member" => {
+                c["members"][2]["identity"]["device"] = source["members"][0]["device"].clone();
+                c["members"][2]["identity"]["inode"] = source["members"][0]["inode"].clone();
+            }
+            "caller-owned" => c["members"][2]["identity"]["uid"] = json!(65534),
+            "writable" => c["members"][2]["identity"]["mode"] = json!(0o100644),
+            "digest" => c["members"][2]["object"]["sha256"] = json!("00".repeat(32)),
+            "population" => {
+                c["members"].as_array_mut().unwrap().pop();
+            }
+            "cutoff" => c["cutoff_unix_millis"] = json!(101),
+            _ => unreachable!(),
+        });
+        rebind_inspection(&mut case);
+        assert!(case.validate().is_err(), "caller projection {mutation}");
+    }
+    for mutation in [
+        "excluded",
+        "refused",
+        "listener",
+        "source-after",
+        "retirement",
+    ] {
+        let mut case = linux_import_exclusion_case::projected();
+        match mutation {
+            "excluded" => case.mutate("case-evidence.json", |e| {
+                e["outcome"]["outcome"] = json!(mutation)
+            }),
+            "refused" => case.mutate("case-evidence.json", |e| {
+                e["outcome"] = json!({"outcome":"refused"})
+            }),
+            "listener" => case.mutate("exclusion-source-after.json", |a| {
+                a["listener"] = json!({"device":7,"inode":999,"mode":0o140755})
+            }),
+            "source-after" => case.mutate("exclusion-source-after.json", |a| {
+                a["inventory"]["root"]["inode"] = json!(999)
+            }),
+            "retirement" => case.mutate("import-retirement/stdout.json", |r| {
+                r["storage_absent"] = json!(false)
+            }),
+            _ => unreachable!(),
+        }
+        if mutation == "retirement" {
+            let command = linux_installed_case::read(&case, "import-retirement/invocation.json");
+            let receipt = linux_installed_case::read(&case, "import-retirement/stdout.json");
+            linux_import_case::command_graph(
+                &mut case,
+                "import-retirement",
+                command,
+                801,
+                901,
+                0,
+                receipt,
+            );
+        }
+        assert!(case.validate().is_err(), "caller projection {mutation}");
+    }
+    let mut case = linux_import_exclusion_case::excluded();
+    case.mutate("case-evidence.json", |e| {
+        e["outcome"]["outcome"] = json!("projected")
+    });
+    assert!(
+        case.validate().is_err(),
+        "socket exclusion cannot claim caller projection"
+    );
+    let mut case = linux_import_exclusion_case::projected();
+    case.mutate("case-evidence.json", |e| {
+        e["outcome"] = json!({"outcome":"refused"})
+    });
+    let command = linux_installed_case::read(&case, "import/invocation.json");
+    linux_import_case::command_graph(
+        &mut case,
+        "import",
+        command,
+        800,
+        900,
+        1,
+        json!({"error":"caller import refused"}),
+    );
+    let hash = memcordon_readiness_verifier::sha256(
+        &std::fs::read(case.root.path().join("import/stdout.json")).unwrap(),
+    );
+    case.mutate("import-census.json", |c| {
+        c["stdout_sha256"] = json!(hash);
+        c["native_census"]["result_sha256"] = json!(hash);
+    });
+    assert_eq!(
+        case.validate().unwrap_err(),
+        "isolation importer original command/native refusal differs"
+    );
+}
+
+#[test]
 fn exclusion_rejects_rehashed_installed_census_and_source_authority_substitutions() {
     for mutation in 0..12 {
         let mut case = linux_import_exclusion_case::excluded();

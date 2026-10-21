@@ -60,6 +60,17 @@ fn signal_admission_child() {
                 .unwrap()
                 .success()
         );
+        let signal_cutoff = Instant::now() + Duration::from_secs(1);
+        while crate::cancellation::observed()
+            != Some(memcordon_platform::test_support::CiInterrupt::UnixInterrupt)
+        {
+            assert!(
+                Instant::now() < signal_cutoff,
+                "real SIGINT was not observed before the signal synchronization cutoff: {:?}",
+                crate::cancellation::observed()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         while Instant::now() < expired_work {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -80,12 +91,10 @@ fn signal_admission_child() {
                 "--ignored",
             ])
         };
+        let refusal = command().output_quiet().unwrap_err();
         assert!(
-            command()
-                .output_quiet()
-                .unwrap_err()
-                .to_string()
-                .contains("external interruption")
+            refusal.to_string().contains("external interruption"),
+            "{refusal}"
         );
         {
             let _retirement = retirement_scope(owner_cutoff);

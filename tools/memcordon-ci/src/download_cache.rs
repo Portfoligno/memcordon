@@ -77,7 +77,22 @@ pub fn cargo_home(cwd: &Path) -> Result<PathBuf> {
 /// Initialize only the repository-owned home selected by the workflow.
 pub fn prepare_job_home(root: &Path) -> Result<()> {
     let expected = root.join("target").join("ci-cargo-home");
-    if cargo_home(root)? != expected {
+    let selected = cargo_home(root)?;
+    let repository = root.canonicalize()?;
+    // Windows current_dir and canonicalize can spell the same workspace with
+    // different namespace prefixes. Resolve only its existing workspace parent;
+    // the absent home and its target parent still require safe_root validation.
+    let selected_workspace = selected
+        .ends_with(Path::new("target/ci-cargo-home"))
+        .then(|| selected.parent().and_then(Path::parent))
+        .flatten();
+    if selected != expected
+        && !selected_workspace.is_some_and(|workspace| {
+            workspace
+                .canonicalize()
+                .is_ok_and(|path| path == repository)
+        })
+    {
         return Ok(());
     }
     let owned = crate::cache_restore::safe_root(root, Path::new("target/ci-cargo-home"))

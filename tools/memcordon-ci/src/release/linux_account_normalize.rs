@@ -22,6 +22,167 @@ impl AccountRefusalReport {
         acquisition: &Path,
         artifacts: &mut BTreeMap<String, Artifact>,
     ) -> Result<String> {
+        if key.scenario == "account-alias" {
+            if !self.native_owners_settled()
+                || !self.launches.is_empty()
+                || key.family != "L-ISO-06"
+            {
+                return Err(CiError::Message(
+                    "alias policy refusal has foreign frontend/native owners".into(),
+                ));
+            }
+            let directory = self.alias_policy_directory.as_ref().ok_or_else(|| {
+                CiError::Message("alias native policy refusal has not completed".into())
+            })?;
+            let prefix = Path::new(&key.target)
+                .join(
+                    key.channel
+                        .as_deref()
+                        .ok_or_else(|| CiError::Message("alias installed channel absent".into()))?,
+                )
+                .join("account-refusals")
+                .join("account-alias");
+            std::fs::create_dir_all(artifact_root.join(&prefix))?;
+            let mut persist = |name: &str, bytes: &[u8]| -> Result<String> {
+                let relative = prefix
+                    .join(name)
+                    .to_str()
+                    .ok_or_else(|| CiError::Message("alias archive path nonUTF8".into()))?
+                    .to_owned();
+                retain(&artifact_root.join(&relative), bytes)?;
+                let artifact = Artifact {
+                    path: relative.clone(),
+                    length: bytes.len() as u64,
+                    sha256: super::artifacts::checksum(bytes),
+                };
+                if artifacts
+                    .insert(relative.clone(), artifact.clone())
+                    .is_some_and(|prior| {
+                        prior.length != artifact.length || prior.sha256 != artifact.sha256
+                    })
+                {
+                    return Err(CiError::Message("alias archive custody conflict".into()));
+                }
+                Ok(relative)
+            };
+            let mut capture = |name: &str, path: &Path| {
+                persist(name, &read_policy_observation_file(path, 32 * 1024 * 1024)?)
+            };
+            let baseline_contract = capture("baseline-contract.json", baseline_contract)?;
+            let baseline_activation = capture(
+                "baseline-activation.json",
+                &directory.join("mixed.activation.json"),
+            )?;
+            let candidate_policy = capture(
+                "alias-rejection.policy.json",
+                &directory.join("alias-rejection.policy.json"),
+            )?;
+            let mut command =
+                |stem: &str| -> Result<memcordon_readiness_verifier::NativeAliasPolicyCommand> {
+                    Ok(memcordon_readiness_verifier::NativeAliasPolicyCommand {
+                        invocation: capture(
+                            &format!("{stem}.invocation.json"),
+                            &directory.join(stem).with_extension("invocation.json"),
+                        )?,
+                        exit: capture(
+                            &format!("{stem}.exit.json"),
+                            &directory.join(stem).with_extension("exit.json"),
+                        )?,
+                        stdout: capture(
+                            &format!("{stem}.json"),
+                            &directory.join(stem).with_extension("json"),
+                        )?,
+                        stderr: capture(
+                            &format!("{stem}.stderr.bin"),
+                            &directory.join(stem).with_extension("stderr.bin"),
+                        )?,
+                    })
+                };
+            let before = command("alias-before")?;
+            let rejected = command("alias-rejection")?;
+            let after = command("alias-after")?;
+            let original_acquired: serde_json::Value = serde_json::from_slice(
+                &read_policy_observation_file(acquisition, 32 * 1024 * 1024)?,
+            )?;
+            let mut account =
+                |field: &str, name: &str| -> Result<String> {
+                    capture(
+                        name,
+                        Path::new(original_acquired["account"][field].as_str().ok_or_else(
+                            || CiError::Message("alias original account readback absent".into()),
+                        )?),
+                    )
+                };
+            let account_intent = account("intent", "account-intent.json")?;
+            let account_readback = account("native_readback", "account-getent.bin")?;
+            let group_readback = account("group_readback", "group-getent.bin")?;
+            let owner_path = persist("owner.json", &serde_json::to_vec(owner)?)?;
+            let mut original_path = |path: &Path| -> Result<String> {
+                let relative = path
+                    .strip_prefix(artifact_root)
+                    .map_err(|_| CiError::Message("alias original source outside archive".into()))?
+                    .to_str()
+                    .ok_or_else(|| CiError::Message("alias original source nonUTF8".into()))?
+                    .to_owned();
+                let bytes = read_policy_observation_file(path, 32 * 1024 * 1024)?;
+                let artifact = Artifact {
+                    path: relative.clone(),
+                    length: bytes.len() as u64,
+                    sha256: super::artifacts::checksum(&bytes),
+                };
+                if artifacts
+                    .insert(relative.clone(), artifact.clone())
+                    .is_some_and(|prior| {
+                        prior.length != artifact.length || prior.sha256 != artifact.sha256
+                    })
+                {
+                    return Err(CiError::Message(
+                        "alias original source custody conflict".into(),
+                    ));
+                }
+                Ok(relative)
+            };
+            let evidence = memcordon_readiness_verifier::LinuxAccountAliasPolicyEvidence {
+                format: "memcordon.consumer-readiness.linux-account-alias-policy-refusal".into(),
+                revision: 1,
+                key: key.clone(),
+                run_id: identity.run_id.clone(),
+                source_commit: identity.source_commit.clone(),
+                source_tree_sha256: identity.source_tree_sha256.clone(),
+                lease_id: owner["lease_id"]
+                    .as_str()
+                    .ok_or_else(|| CiError::Message("alias original lease absent".into()))?
+                    .into(),
+                owner: owner_path,
+                original_lease: original_path(original_lease)?,
+                acquisition: original_path(acquisition)?,
+                baseline_contract,
+                baseline_activation,
+                account_intent,
+                account_readback,
+                group_readback,
+                candidate_policy,
+                before,
+                rejected,
+                after,
+            };
+            let relative = prefix
+                .join("case-evidence.json")
+                .to_str()
+                .ok_or_else(|| CiError::Message("alias evidence archive path nonUTF8".into()))?
+                .to_owned();
+            let bytes = serde_json::to_vec(&evidence)?;
+            retain(&artifact_root.join(&relative), &bytes)?;
+            artifacts.insert(
+                relative.clone(),
+                Artifact {
+                    path: relative.clone(),
+                    length: bytes.len() as u64,
+                    sha256: super::artifacts::checksum(&bytes),
+                },
+            );
+            return Ok(relative);
+        }
         if !self.native_owners_settled()
             || self.launches.len() != 1
             || key.family != "L-ISO-06"

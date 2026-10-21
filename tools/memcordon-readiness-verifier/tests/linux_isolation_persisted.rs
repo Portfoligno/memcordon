@@ -233,8 +233,8 @@ fn complete_original_path_sockets_and_hostile_descriptor_handoffs() {
 }
 
 #[test]
-fn complete_original_three_account_admission_refusals() {
-    for scenario in ["same-uid-process", "account-alias", "stale-reservation"] {
+fn complete_original_account_occupation_refusals() {
+    for scenario in ["same-uid-process", "stale-reservation"] {
         let mut case = linux_account_case::baseline(scenario);
         case.validate().unwrap();
         case.mutate("account-exit.json", |raw| raw["process_birth"] = json!(0));
@@ -281,6 +281,172 @@ fn complete_original_three_account_admission_refusals() {
             );
         }
     }
+}
+
+#[test]
+fn account_alias_requires_actual_policy_rejection_and_unchanged_inspections() {
+    let case = linux_account_case::baseline("account-alias");
+    case.validate().unwrap();
+    for (path, field, value) in [
+        ("alias-rejection.exit.json", "native_exit", json!(0)),
+        ("alias-rejection.exit.json", "success", json!(true)),
+        ("alias-before.exit.json", "native_exit", json!(125)),
+        ("alias-after.exit.json", "success", json!(false)),
+        ("case-evidence.json", "lease_id", json!("foreign-lease")),
+        (
+            "case-evidence.json",
+            "format",
+            json!("memcordon.consumer-readiness.linux-account-refusal"),
+        ),
+        (
+            "case-evidence.json",
+            "public_invocation",
+            json!("fabricated-frontend.json"),
+        ),
+    ] {
+        let mut case = linux_account_case::baseline("account-alias");
+        case.mutate(path, |raw| raw[field] = value);
+        assert!(case.validate().is_err(), "{path}/{field}");
+    }
+    for (path, field) in [
+        ("alias-after.json", "epoch"),
+        ("alias-after.json", "registry"),
+    ] {
+        let mut case = linux_account_case::baseline("account-alias");
+        case.mutate(path, |raw| raw[field] = json!(null));
+        let digest = memcordon_readiness_verifier::sha256(
+            &std::fs::read(case.root.path().join(path)).unwrap(),
+        );
+        case.mutate("alias-after.exit.json", |raw| {
+            raw["stdout_sha256"] = json!(digest)
+        });
+        assert!(case.validate().is_err(), "rehashed changed {field}");
+    }
+    let mut case = linux_account_case::baseline("account-alias");
+    case.write("alias-rejection.stderr.bin", b"permission denied\n");
+    let digest = memcordon_readiness_verifier::sha256(b"permission denied\n");
+    case.mutate("alias-rejection.exit.json", |raw| {
+        raw["stderr_sha256"] = json!(digest)
+    });
+    assert!(case.validate().is_err(), "rehashed wrong refusal reason");
+
+    let mut case = linux_account_case::baseline("account-alias");
+    case.mutate("alias-rejection.invocation.json", |raw| {
+        raw["arguments"][4] = json!(b"/tmp/foreign-policy.json".as_slice())
+    });
+    let digest = memcordon_readiness_verifier::sha256(
+        &std::fs::read(case.root.path().join("alias-rejection.invocation.json")).unwrap(),
+    );
+    case.mutate("alias-rejection.exit.json", |raw| {
+        raw["invocation_sha256"] = json!(digest)
+    });
+    assert!(
+        case.validate().is_err(),
+        "rehashed unprotected candidate source"
+    );
+
+    let mut case = linux_account_case::baseline("account-alias");
+    case.mutate("alias-candidate.json", |raw| {
+        raw["grants"][0]["enabled"] = json!(false)
+    });
+    let digest = memcordon_readiness_verifier::sha256(
+        &std::fs::read(case.root.path().join("alias-candidate.json")).unwrap(),
+    );
+    case.mutate("alias-rejection.invocation.json", |raw| {
+        raw["policy_sha256"] = json!(digest)
+    });
+    let digest = memcordon_readiness_verifier::sha256(
+        &std::fs::read(case.root.path().join("alias-rejection.invocation.json")).unwrap(),
+    );
+    case.mutate("alias-rejection.exit.json", |raw| {
+        raw["invocation_sha256"] = json!(digest)
+    });
+    assert!(
+        case.validate().is_err(),
+        "rehashed unrelated policy mutation"
+    );
+
+    let mut case = linux_account_case::baseline("account-alias");
+    let evidence: memcordon_readiness_verifier::LinuxAccountAliasPolicyEvidence =
+        serde_json::from_slice(
+            &std::fs::read(case.root.path().join("case-evidence.json")).unwrap(),
+        )
+        .unwrap();
+    for path in [
+        &evidence.baseline_activation,
+        &evidence.before.stdout,
+        &evidence.after.stdout,
+    ] {
+        case.mutate(path, |raw| raw["registry_digest"] = json!("00".repeat(32)));
+    }
+    for command in [&evidence.before, &evidence.after] {
+        let digest = memcordon_readiness_verifier::sha256(
+            &std::fs::read(case.root.path().join(&command.stdout)).unwrap(),
+        );
+        case.mutate(&command.exit, |raw| raw["stdout_sha256"] = json!(digest));
+    }
+    assert!(
+        case.validate().is_err(),
+        "rehashed consistently false native registry digest"
+    );
+}
+
+#[test]
+fn account_alias_uses_linux_operand_grammar_on_every_verifier_host() {
+    linux_account_case::baseline("account-alias")
+        .validate()
+        .unwrap();
+    let mut bad_paths = vec![
+        "owned/account".to_owned(),
+        "C:/owned/account".to_owned(),
+        "C:\\owned\\account".to_owned(),
+        "\\\\server\\share\\account".to_owned(),
+        "//server/share/account".to_owned(),
+        "/owned\\account".to_owned(),
+        "/owned/../account".to_owned(),
+        "/owned/./account".to_owned(),
+        "/owned//account".to_owned(),
+        "/owned/account/".to_owned(),
+        "/owned/\0account".to_owned(),
+    ];
+    bad_paths.push(format!("/{}", "a".repeat(4096)));
+    for cwd in bad_paths {
+        let mut case = linux_account_case::baseline("account-alias");
+        for stem in ["alias-before", "alias-rejection", "alias-after"] {
+            let invocation = format!("{stem}.invocation.json");
+            case.mutate(&invocation, |raw| raw["cwd"] = json!(cwd.as_bytes()));
+            let hash = memcordon_readiness_verifier::sha256(
+                &std::fs::read(case.root.path().join(&invocation)).unwrap(),
+            );
+            case.mutate(&format!("{stem}.exit.json"), |raw| {
+                raw["invocation_sha256"] = json!(hash)
+            });
+        }
+        assert!(
+            case.validate().is_err(),
+            "rehashed noncanonical Linux cwd {cwd:?}"
+        );
+    }
+    let mut case = linux_account_case::baseline("account-alias");
+    case.mutate("alias-rejection.invocation.json", |raw| {
+        let mut args: Vec<Vec<u8>> = serde_json::from_value(raw["arguments"].clone()).unwrap();
+        for byte in &mut args[4] {
+            if *byte == b'/' {
+                *byte = b'\\';
+            }
+        }
+        raw["arguments"] = json!(args);
+    });
+    let hash = memcordon_readiness_verifier::sha256(
+        &std::fs::read(case.root.path().join("alias-rejection.invocation.json")).unwrap(),
+    );
+    case.mutate("alias-rejection.exit.json", |raw| {
+        raw["invocation_sha256"] = json!(hash)
+    });
+    assert!(
+        case.validate().is_err(),
+        "rehashed Windows separators cannot alias protected Linux source"
+    );
 }
 
 #[test]

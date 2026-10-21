@@ -429,6 +429,12 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             .expect("startup was stored")
             .as_fd()
             .as_raw_fd();
+        let diagnostic_fd = self
+            .startup
+            .as_ref()
+            .expect("startup was stored")
+            .diagnostic_fd()
+            .as_raw_fd();
         let control_fd = self
             .control
             .as_ref()
@@ -450,6 +456,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 // clone child; the parent retains its owned descriptors.
                 unsafe {
                     libc::close(status_read_fd);
+                    libc::close(diagnostic_fd);
                     for fd in provider_pipe_fds {
                         libc::close(fd);
                     }
@@ -517,6 +524,12 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             .expect("stored mixed startup")
             .as_fd()
             .as_raw_fd();
+        let diagnostic_fd = self
+            .startup
+            .as_ref()
+            .expect("stored mixed startup")
+            .diagnostic_fd()
+            .as_raw_fd();
         let control_fd = self
             .control
             .as_ref()
@@ -541,6 +554,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 unsafe {
                     libc::close(status_read_fd);
                     libc::close(provider_root_fd);
+                    libc::close(diagnostic_fd);
                     for fd in provider_pipe_fds {
                         libc::close(fd);
                     }

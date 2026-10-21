@@ -11,8 +11,11 @@ activates its grants with `package policy apply --file FILE`. Imports copy
 regular files into fresh protected inodes, check their declared bytes and native
 target, reconstruct declared links, and durably publish the immutable image.
 Only manifest-declared objects enter that image; an undeclared source object
-does not acquire installed path or descriptor authority. Root may observe the
-complete protected image using `package policy image inspect --definition FILE
+does not acquire installed path or descriptor authority. An administrator may
+select a caller-writable source tree: authenticated declared bytes are copied
+into fresh protected inodes, and source ownership grants no authority over the
+installed image. Root may observe the complete protected image using
+`package policy image inspect --definition FILE
 --cutoff-unix-millis ORIGINAL_CUTOFF --json`. This read-only census binds the
 published manifest, declared members and implicit directories under the supplied
 absolute cutoff; it grants no workload admission or execution authority.

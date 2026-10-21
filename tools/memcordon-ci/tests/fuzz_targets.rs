@@ -71,14 +71,19 @@ fn malformed_or_empty_inventory_cannot_silently_lose_coverage() {
 }
 
 #[test]
-fn typed_fuzz_cache_write_permission_requires_trusted_branch_events() {
+fn typed_fuzz_cache_write_permission_requires_trusted_events_and_refs() {
     use memcordon_ci::segment_cache::write_event_for;
     for event in ["push", "workflow_dispatch"] {
         assert!(write_event_for(Some(event), Some("refs/heads/main")));
+        assert_eq!(
+            write_event_for(Some(event), Some("refs/tags/release")),
+            event == "push"
+        );
         for reference in [
             None,
             Some(""),
-            Some("refs/tags/release"),
+            Some("refs/heads/"),
+            Some("refs/tags/"),
             Some("refs/pull/1/merge"),
         ] {
             assert!(!write_event_for(Some(event), reference));
@@ -91,7 +96,9 @@ fn typed_fuzz_cache_write_permission_requires_trusted_branch_events() {
         Some("merge_group"),
         Some("schedule"),
     ] {
-        assert!(!write_event_for(event, Some("refs/heads/main")));
+        for reference in ["refs/heads/main", "refs/tags/release"] {
+            assert!(!write_event_for(event, Some(reference)));
+        }
     }
 }
 

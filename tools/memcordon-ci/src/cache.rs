@@ -218,15 +218,14 @@ pub fn context_partition(
         && shard == "complete"
         && external.is_empty()
         && partition.is_none()
-    {
-        if let Some(context) = DRIVER_CONTEXT.with(|slot| {
+        && let Some(context) = DRIVER_CONTEXT.with(|slot| {
             slot.borrow()
                 .as_ref()
                 .filter(|(owner, _)| owner == root)
                 .map(|(_, context)| context.clone())
-        }) {
-            return Ok(context);
-        }
+        })
+    {
+        return Ok(context);
     }
     let mode = crate::preparation::active_group().map_or(
         crate::failure_mode::FailureMode::StopAfterFailure,

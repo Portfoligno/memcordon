@@ -449,6 +449,82 @@ fn borrowed_current_process_query_token_matches_owned_attestation_across_scopes(
 }
 
 #[test]
+fn actual_probe_primary_capability_preserves_identity_and_rejects_wrong_authority() {
+    use crate::windows::token::{
+        process_primary_token_for_probe, validate_probe_primary_token_capability,
+    };
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    // SAFETY: the SDK current process pseudo-handle remains live for this call.
+    let token = process_primary_token_for_probe(unsafe { GetCurrentProcess() }).unwrap();
+    assert_eq!(
+        granted_handle_access(token.raw()).unwrap(),
+        TOKEN_QUERY | TOKEN_QUERY_SOURCE | TOKEN_DUPLICATE
+    );
+    let full = token_attestation_snapshot(token.raw()).unwrap();
+    let current = crate::windows::token::current_process_query_token();
+    assert_eq!(
+        full.query_evidence(),
+        token_query_attestation_snapshot(current.raw()).unwrap()
+    );
+    validate_probe_primary_token_capability(token.raw()).unwrap();
+
+    let incomplete = current_process_token_for_access_check().unwrap();
+    assert!(
+        validate_probe_primary_token_capability(incomplete.raw())
+            .unwrap_err()
+            .contains("wrong granted access")
+    );
+    let nonduplicable = current_process_token_for_attestation().unwrap();
+    assert!(
+        validate_probe_primary_token_capability(nonduplicable.raw())
+            .unwrap_err()
+            .contains("wrong granted access")
+    );
+
+    // SAFETY: this test owns the live handle; marking it inheritable changes
+    // only this table entry and must be rejected before any capability use.
+    assert_ne!(
+        unsafe { SetHandleInformation(token.raw(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) },
+        0
+    );
+    assert!(
+        validate_probe_primary_token_capability(token.raw())
+            .unwrap_err()
+            .contains("inheritable")
+    );
+    // SAFETY: restore the exact owned handle before continuing the test.
+    assert_ne!(
+        unsafe { SetHandleInformation(token.raw(), HANDLE_FLAG_INHERIT, 0) },
+        0
+    );
+    validate_probe_primary_token_capability(token.raw()).unwrap();
+    assert_eq!(full, token_attestation_snapshot(token.raw()).unwrap());
+
+    let mut impersonation = ptr::null_mut();
+    // SAFETY: token is the owned duplicable primary, output is adopted below.
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::Security::DuplicateTokenEx(
+                token.raw(),
+                TOKEN_QUERY | TOKEN_QUERY_SOURCE | TOKEN_DUPLICATE,
+                ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &raw mut impersonation,
+            )
+        },
+        0
+    );
+    let impersonation = crate::windows::pipe::OwnedHandle::new(impersonation).unwrap();
+    assert!(
+        validate_probe_primary_token_capability(impersonation.raw())
+            .unwrap_err()
+            .contains("not a primary token")
+    );
+}
+
+#[test]
 fn assigned_process_authority_ignores_only_token_id_and_types_every_other_difference() {
     let token = restricted_current_primary().unwrap();
     let source = token_attestation_snapshot(token.raw()).unwrap();

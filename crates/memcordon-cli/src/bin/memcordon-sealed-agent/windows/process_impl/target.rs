@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "target_readback.rs"]
+mod target_readback;
+
 pub(super) fn target_desktop_nonce() -> Result<String, String> {
     let mut bytes = [0_u8; TARGET_DESKTOP_NONCE_BYTES];
     // SAFETY: system-preferred CNG fills the exact mutable byte array.
@@ -471,15 +474,8 @@ impl SuspendedTarget {
         let process_handle = OwnedHandle::new(process.hProcess).map_err(TargetCreateError::from)?;
         let thread_handle = OwnedHandle::new(process.hThread).map_err(TargetCreateError::from)?;
         let mut observed_process_snapshot = None;
-        if !matches!(
-            certification_mutant,
-            Some(
-                WindowsSealedMutant::UseCreateProcessW
-                    | WindowsSealedMutant::CreateUnderServiceToken
-                    | WindowsSealedMutant::TrustClientToken
-                    | WindowsSealedMutant::SkipTargetTokenReadback
-            )
-        ) {
+        let readback = target_readback::readback(certification_mutant);
+        if readback != target_readback::Readback::SelectedSkip {
             let observed_snapshot =
                 super::token::process_token_query_attestation(process_handle.raw())
                     .map_err(TargetCreateError::from)?;
@@ -491,12 +487,18 @@ impl SuspendedTarget {
                 &process_source_after,
             )
             .and_then(|()| {
-                super::token::require_assigned_process_authority(
-                    "target-request-to-real-process",
-                    &process_source_before,
-                    &observed_snapshot,
-                )
-                .map(|_| ())
+                if readback == target_readback::Readback::VerifyAssignment {
+                    super::token::require_assigned_process_authority(
+                        "target-request-to-real-process",
+                        &process_source_before,
+                        &observed_snapshot,
+                    )
+                    .map(|_| ())
+                } else {
+                    // The selected mutant still needs its actual created-token
+                    // measurement for live attestation and the mismatch witness.
+                    Ok(())
+                }
             });
             if let Err(error) = relation {
                 unsafe {

@@ -946,10 +946,11 @@ impl CommandSpec {
                 }
                 (cargo_progress, omitted_lines)
             });
-            let progress = progress.then(|| memcordon_testkit::ProgressOutput {
-                sender,
-                omitted: omitted.clone(),
-            });
+            let progress =
+                (progress || observe_cargo_progress).then(|| memcordon_testkit::ProgressOutput {
+                    sender,
+                    omitted: omitted.clone(),
+                });
             let failure = if self.defer_group_failure {
                 None
             } else {

@@ -1252,6 +1252,7 @@ pub fn restart_fresh_admission(
             prefix,
             &request,
             context.artifact_root,
+            context.cleanup_deadline,
             budget(context.cleanup_deadline, Duration::from_secs(30))?,
         )?;
         report.completed.push(collected);
@@ -1878,6 +1879,7 @@ fn execute_transition(
                 prefix,
                 &request,
                 context.artifact_root,
+                context.cleanup_deadline,
                 budget(context.cleanup_deadline, Duration::from_secs(30))?,
             )?;
             report.completed.push(collected);
@@ -2355,24 +2357,63 @@ pub(super) fn apply_policy(
     deadline: Instant,
 ) -> Result<(PolicyEpoch, PathBuf)> {
     registry.validate().map_err(CiError::Message)?;
-    let input = directory.join(stem).with_extension("policy.json");
-    let bytes = serde_json::to_vec(registry)?;
-    retain(&input, &bytes)?;
-    let privileged_input = privileged.join(stem).with_extension("policy.json");
-    retain(&privileged_input, &bytes)?;
-    let policy_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&privileged_input)?;
-    let selected = policy_file.metadata()?;
-    if selected.uid() != 0
-        || selected.mode() & 0o022 != 0
-        || read_named(&privileged_input, bytes.len() as u64)? != bytes
-    {
+    let output = observe_policy_command(Some(registry), directory, privileged, stem, deadline)?;
+    if !output.status.success() {
         return Err(CiError::Message(
-            "privileged policy source custody differs".into(),
+            "actual policy apply failed; raw products retained".into(),
         ));
     }
+    memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
+        .map_err(CiError::Message)?;
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if actual["format"] != "memcordon.local-private-activation"
+        || actual["revision"] != 2
+        || actual["registry"] != serde_json::to_value(registry)?
+        || actual["registry_digest"]
+            != serde_json::to_value(registry.canonical_digest().map_err(CiError::Message)?)?
+    {
+        return Err(CiError::Message(
+            "actual activation differs from exact requested registry".into(),
+        ));
+    }
+    Ok((
+        serde_json::from_value(actual["epoch"].clone())?,
+        directory.join(stem).with_extension("json"),
+    ))
+}
+
+/// Execute only the installed policy apply/inspect operations, retaining their
+/// real command products even when the candidate is deliberately invalid.
+pub(super) fn observe_policy_command(
+    registry: Option<&RuntimePrivatePolicyRegistryV3>,
+    directory: &Path,
+    privileged: &Path,
+    stem: &str,
+    deadline: Instant,
+) -> Result<memcordon_testkit::ObservedOutput> {
+    let policy = if let Some(registry) = registry {
+        let bytes = serde_json::to_vec(registry)?;
+        retain(&directory.join(stem).with_extension("policy.json"), &bytes)?;
+        let path = privileged.join(stem).with_extension("policy.json");
+        retain(&path, &bytes)?;
+        let held = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let metadata = held.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || read_named(&path, bytes.len() as u64)? != bytes
+        {
+            return Err(CiError::Message(
+                "privileged policy source custody differs".into(),
+            ));
+        }
+        Some((path, held, metadata, bytes))
+    } else {
+        None
+    };
     let agent_path = Path::new("/usr/libexec/memcordon-sealed-agent");
     let agent_ancestors = [Path::new("/"), Path::new("/usr"), Path::new("/usr/libexec")]
         .into_iter()
@@ -2390,24 +2431,36 @@ pub(super) fn apply_policy(
         ));
     }
     let agent_bytes = read_named(agent_path, 512 * 1024 * 1024)?;
-    let arguments = [
-        OsString::from("package"),
-        OsString::from("policy"),
-        OsString::from("apply"),
-        OsString::from("--file"),
-        privileged_input.clone().into_os_string(),
-    ];
+    let arguments = if let Some((path, _, _, _)) = &policy {
+        vec![
+            "package".into(),
+            "policy".into(),
+            "apply".into(),
+            "--file".into(),
+            path.clone().into_os_string(),
+        ]
+    } else {
+        vec![
+            OsString::from("package"),
+            "policy".into(),
+            "inspect".into(),
+            "--json".into(),
+        ]
+    };
     let invocation_path = directory.join(stem).with_extension("invocation.json");
     let available = budget(deadline, Duration::from_secs(60))?;
-    let invocation = serde_json::to_vec(&serde_json::json!({
-        "format":"memcordon.linux-policy-activation-command","revision":1,
+    let mut invocation = serde_json::json!({
+        "format":if policy.is_some() { "memcordon.linux-policy-activation-command" } else { "memcordon.linux-policy-inspection-command" },"revision":1,
         "agent_sha256":hex::encode(Sha256::digest(&agent_bytes)),
         "program":agent_path.as_os_str().as_bytes(),
         "arguments":arguments.iter().map(|argument| argument.as_os_str().as_bytes()).collect::<Vec<_>>(),
         "cwd":directory.as_os_str().as_bytes(),
-        "environment_cleared":true,"budget_millis":available.as_millis(),
-        "policy_sha256":hex::encode(Sha256::digest(&bytes))
-    }))?;
+        "environment_cleared":true,"budget_millis":available.as_millis()
+    });
+    if let Some((_, _, _, bytes)) = &policy {
+        invocation["policy_sha256"] = hex::encode(Sha256::digest(bytes)).into();
+    }
+    let invocation = serde_json::to_vec(&invocation)?;
     retain(&invocation_path, &invocation)?;
     let mut command = CommandSpec::new(agent_path, directory, available)
         .bounded_until(deadline)
@@ -2441,13 +2494,17 @@ pub(super) fn apply_policy(
             "selected policy agent changed during native apply".into(),
         ));
     }
-    let named = std::fs::symlink_metadata(&privileged_input)?;
-    if (named.dev(), named.ino()) != (selected.dev(), selected.ino())
-        || read_named(&privileged_input, bytes.len() as u64)? != bytes
-    {
-        return Err(CiError::Message(
-            "privileged policy input changed during actual apply".into(),
-        ));
+    if let Some((path, held, selected, bytes)) = &policy {
+        let named = std::fs::symlink_metadata(path)?;
+        let current = held.metadata()?;
+        if (named.dev(), named.ino()) != (selected.dev(), selected.ino())
+            || (current.dev(), current.ino()) != (selected.dev(), selected.ino())
+            || read_named(path, bytes.len() as u64)? != *bytes
+        {
+            return Err(CiError::Message(
+                "privileged policy input changed during actual apply".into(),
+            ));
+        }
     }
     retain(
         &directory.join(stem).with_extension("stderr.bin"),
@@ -2458,31 +2515,13 @@ pub(super) fn apply_policy(
     retain(
         &directory.join(stem).with_extension("exit.json"),
         &serde_json::to_vec(&serde_json::json!({
-        "format":"memcordon.linux-policy-activation-exit","revision":1,
+        "format":if policy.is_some() { "memcordon.linux-policy-activation-exit" } else { "memcordon.linux-policy-inspection-exit" },"revision":1,
         "native_exit":output.status.code(),"success":output.status.success(),
         "invocation_sha256":hex::encode(Sha256::digest(&invocation)),
         "stdout_sha256":hex::encode(Sha256::digest(&output.stdout)),
         "stderr_sha256":hex::encode(Sha256::digest(&output.stderr))}))?,
     )?;
-    if !output.status.success() {
-        return Err(CiError::Message(
-            "actual policy apply failed; raw products retained".into(),
-        ));
-    }
-    memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
-        .map_err(CiError::Message)?;
-    let actual: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    if actual["format"] != "memcordon.local-private-activation"
-        || actual["revision"] != 2
-        || actual["registry"] != serde_json::to_value(registry)?
-        || actual["registry_digest"]
-            != serde_json::to_value(registry.canonical_digest().map_err(CiError::Message)?)?
-    {
-        return Err(CiError::Message(
-            "actual activation differs from exact requested registry".into(),
-        ));
-    }
-    Ok((serde_json::from_value(actual["epoch"].clone())?, path))
+    Ok(output)
 }
 
 fn budget(deadline: Instant, cap: Duration) -> Result<Duration> {

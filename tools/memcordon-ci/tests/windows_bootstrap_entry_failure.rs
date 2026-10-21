@@ -6,26 +6,39 @@ use entry::{EntryFailureV1, EntryRole, EntryStage, preserve_primary};
 #[test]
 fn entry_failure_wire_is_bound_to_original_nonce_and_truthful_stage() {
     let nonce = "ab".repeat(32);
-    for stage in [
-        EntryStage::SelfToken,
-        EntryStage::ProcessIdentity,
-        EntryStage::TokenEnvelope,
-        EntryStage::TokenSnapshot,
-    ] {
-        let failure = EntryFailureV1::new(&nonce, stage, "original token operation failed");
-        let decoded: EntryFailureV1 =
-            serde_json::from_slice(&serde_json::to_vec(&failure).unwrap()).unwrap();
-        assert_eq!(decoded, failure);
-        assert_eq!(decoded.role, EntryRole::LoaderControl);
-        assert_eq!(decoded.stage, stage);
-        assert_eq!(
-            decoded.native_code, None,
-            "String errors cannot supply native status"
-        );
-        assert!(decoded.validate_for(&nonce).is_ok());
-        assert!(decoded.validate_for(&"cd".repeat(32)).is_err());
+    for role in [EntryRole::LoaderControl, EntryRole::Probe] {
+        for stage in [
+            EntryStage::SelfToken,
+            EntryStage::ProcessIdentity,
+            EntryStage::TokenEnvelope,
+            EntryStage::TokenSnapshot,
+        ] {
+            let failure =
+                EntryFailureV1::new(&nonce, role, stage, "original token operation failed");
+            let decoded: EntryFailureV1 =
+                serde_json::from_slice(&serde_json::to_vec(&failure).unwrap()).unwrap();
+            assert_eq!(decoded, failure);
+            assert_eq!(decoded.role, role);
+            assert_eq!(decoded.stage, stage);
+            assert_eq!(
+                decoded.native_code, None,
+                "String errors cannot supply native status"
+            );
+            assert!(decoded.validate_for(&nonce, role).is_ok());
+            assert!(decoded.validate_for(&"cd".repeat(32), role).is_err());
+            let other_role = match role {
+                EntryRole::LoaderControl => EntryRole::Probe,
+                EntryRole::Probe => EntryRole::LoaderControl,
+            };
+            assert!(decoded.validate_for(&nonce, other_role).is_err());
+        }
     }
-    let failure = EntryFailureV1::new(&nonce, EntryStage::SelfToken, "operation failed");
+    let failure = EntryFailureV1::new(
+        &nonce,
+        EntryRole::LoaderControl,
+        EntryStage::SelfToken,
+        "operation failed",
+    );
     for mutate in [
         |value: &mut EntryFailureV1| value.schema_version += 1,
         |value: &mut EntryFailureV1| value.nonce = "short".into(),
@@ -35,7 +48,11 @@ fn entry_failure_wire_is_bound_to_original_nonce_and_truthful_stage() {
     ] {
         let mut changed = failure.clone();
         mutate(&mut changed);
-        assert!(changed.validate_for(&nonce).is_err());
+        assert!(
+            changed
+                .validate_for(&nonce, EntryRole::LoaderControl)
+                .is_err()
+        );
     }
     for (field, value) in [("role", "holder"), ("stage", "loader-ready")] {
         let mut changed = serde_json::to_value(&failure).unwrap();
@@ -50,8 +67,13 @@ fn entry_failure_wire_is_bound_to_original_nonce_and_truthful_stage() {
 #[test]
 fn entry_failure_detail_is_utf8_bounded_without_invented_native_code() {
     let nonce = "ab".repeat(32);
-    let failure = EntryFailureV1::new(&nonce, EntryStage::TokenSnapshot, &"界".repeat(1024));
-    assert!(failure.validate_for(&nonce).is_ok());
+    let failure = EntryFailureV1::new(
+        &nonce,
+        EntryRole::Probe,
+        EntryStage::TokenSnapshot,
+        &"界".repeat(1024),
+    );
+    assert!(failure.validate_for(&nonce, EntryRole::Probe).is_ok());
     assert!(failure.detail.len() <= 1024);
     assert!(failure.detail.chars().all(|character| character == '界'));
     assert!(failure.detail_truncated);
@@ -60,7 +82,12 @@ fn entry_failure_detail_is_utf8_bounded_without_invented_native_code() {
     assert!(diagnostic.len() <= 1024);
     assert!(diagnostic.contains("TokenSnapshot"));
     assert!(diagnostic.contains("native_code=unavailable"));
-    let exact = EntryFailureV1::new(&nonce, EntryStage::SelfToken, &"x".repeat(1024));
+    let exact = EntryFailureV1::new(
+        &nonce,
+        EntryRole::Probe,
+        EntryStage::SelfToken,
+        &"x".repeat(1024),
+    );
     assert_eq!(exact.detail.len(), 1024);
     assert!(!exact.detail_truncated);
 }

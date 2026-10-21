@@ -651,6 +651,11 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
         .run()
         .map(|_| ());
     }
+    let bound_arguments = CellArguments {
+        destination: std::path::absolute(&arguments.destination)?,
+        ..arguments.clone()
+    };
+    let arguments = &bound_arguments;
     let path = arguments
         .destination
         .join(&key.target)

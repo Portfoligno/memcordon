@@ -95,6 +95,62 @@ pub fn binary_path(directory: &Path, binary: &str, target: &str) -> PathBuf {
     path
 }
 
+/// Selects the measured executable, independently of the channel archive inventory.
+pub fn materialized_windows_agent(
+    source: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    directory: &Path,
+) -> Result<SelectedArtifact> {
+    let (_, components) = materialized_windows_components(source, distribution, directory)?;
+    components
+        .into_iter()
+        .find(|component| {
+            component
+                .path
+                .file_name()
+                .is_some_and(|name| name == "memcordon-sealed-agent.exe")
+        })
+        .ok_or_else(|| CiError::Message("selected Windows agent absent from manifest".into()))
+}
+
+/// Binds the original manifest and every measured executable before retention.
+pub fn materialized_windows_components(
+    source: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    directory: &Path,
+) -> Result<(SelectedArtifact, Vec<SelectedArtifact>)> {
+    if !distribution.target.ends_with("-pc-windows-msvc") {
+        return Err(CiError::Message(
+            "selected agent requires Windows distribution".into(),
+        ));
+    }
+    let manifest_path = std::path::absolute(directory.join("runtime-manifest.json"))?;
+    let bytes = artifacts::read_file(&manifest_path)?;
+    let manifest = RuntimeManifest::parse(&bytes).map_err(CiError::Message)?;
+    if manifest != measured_manifest(source, distribution, directory)? {
+        return Err(CiError::Message(
+            "selected agent manifest differs from measured payload".into(),
+        ));
+    }
+    let components = manifest
+        .components
+        .into_iter()
+        .map(|component| {
+            Ok(SelectedArtifact {
+                path: std::path::absolute(directory.join(component.path))?,
+                sha256: component.sha256,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        SelectedArtifact {
+            path: manifest_path,
+            sha256: artifacts::checksum(&bytes),
+        },
+        components,
+    ))
+}
+
 fn executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

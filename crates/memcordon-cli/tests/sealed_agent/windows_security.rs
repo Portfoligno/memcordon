@@ -6306,6 +6306,221 @@ fn named_pipe_preparation_supports_security_readback() {
         .unwrap();
 }
 
+#[test]
+fn successful_named_pipe_query_bounds_the_actual_self_relative_descriptor() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetSecurityDescriptorControl,
+        GetSecurityDescriptorLength, IsValidSecurityDescriptor, LABEL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, SE_SELF_RELATIVE,
+    };
+    let name = format!(r"\\.\pipe\memcordon-query-length-{}", std::process::id());
+    let sddl = test_public_pipe_sddl();
+    let listener = PipeListener::new(&name, SecurityDescriptor::from_sddl(&sddl).unwrap());
+    let pipe = listener.prepare().unwrap();
+    let information =
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    let mut needed = 0;
+    // SAFETY: the live pipe is retained and only the required length is written.
+    let sized = unsafe {
+        GetKernelObjectSecurity(pipe.raw(), information, ptr::null_mut(), 0, &mut needed)
+    };
+    let sizing_error = std::io::Error::last_os_error();
+    assert_eq!(sized, 0);
+    assert_eq!(
+        sizing_error.raw_os_error(),
+        Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    );
+    assert!(needed > 0 && needed <= 64 * 1024);
+    let allocated = needed;
+    let mut storage = vec![0_u32; (allocated as usize).div_ceil(std::mem::size_of::<u32>())];
+    // SAFETY: aligned storage owns at least allocated bytes and the pipe remains live.
+    let copied = unsafe {
+        GetKernelObjectSecurity(
+            pipe.raw(),
+            information,
+            storage.as_mut_ptr().cast(),
+            allocated,
+            &mut needed,
+        )
+    };
+    assert_ne!(copied, 0, "{}", std::io::Error::last_os_error());
+    assert!(needed <= allocated);
+    let descriptor = storage.as_mut_ptr().cast();
+    // SAFETY: the successful query initialized the owned descriptor storage.
+    assert_ne!(unsafe { IsValidSecurityDescriptor(descriptor) }, 0);
+    // SAFETY: the native descriptor was validated and its storage remains live.
+    let actual = unsafe { GetSecurityDescriptorLength(descriptor) };
+    assert!(actual > 0 && actual <= allocated);
+    assert!(needed == 0 || actual <= needed);
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is valid and both output scalars are writable.
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+        0
+    );
+    assert_ne!(control & SE_SELF_RELATIVE, 0);
+    SecurityDescriptor::from_sddl(&sddl)
+        .unwrap()
+        .verify_named_pipe(pipe.raw())
+        .unwrap();
+}
+
+#[test]
+fn invalid_named_pipe_readback_preserves_native_last_error_and_query_mask() {
+    use windows_sys::Win32::Foundation::SetLastError;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, LABEL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION,
+    };
+    let information =
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    let mut needed = 0;
+    // SAFETY: the null handle deliberately exercises native readback refusal;
+    // all outputs match production and point to initialized writable storage.
+    let result = unsafe {
+        GetKernelObjectSecurity(
+            ptr::null_mut(),
+            information,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let expected_status = std::io::Error::last_os_error().raw_os_error().unwrap();
+    assert_eq!(result, 0);
+    let descriptor = SecurityDescriptor::from_sddl(&test_public_pipe_sddl()).unwrap();
+    // SAFETY: a stale last-error value must be replaced by the failing BOOL API.
+    unsafe { SetLastError(0x1234) };
+    let error = descriptor.verify_named_pipe(ptr::null_mut()).unwrap_err();
+    let detail = error.to_string();
+    assert!(detail.contains("readback-stage=size-query"));
+    assert!(detail.contains("api=GetKernelObjectSecurity status_source=last-error"));
+    assert!(detail.contains(&format!("native_code={expected_status} ")));
+    assert!(detail.contains(&format!("security_information={information:#x}")));
+}
+
+fn assert_named_pipe_native_query_equivalence(handle: HANDLE, expected: &str) {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
+    let information =
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    SecurityDescriptor::from_sddl(expected)
+        .unwrap()
+        .verify_named_pipe(handle)
+        .unwrap();
+    let mut owner = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut label = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the live endpoint is retained by the caller and outputs are writable.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            information,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            &mut label,
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, 0);
+    let mut text = ptr::null_mut();
+    let mut length = 0;
+    // SAFETY: GetSecurityInfo returned a live allocated descriptor; conversion owns its output.
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            information,
+            &mut text,
+            &mut length,
+        )
+    };
+    // SAFETY: descriptor belongs to LocalAlloc and is no longer needed.
+    unsafe { LocalFree(descriptor) };
+    assert_ne!(converted, 0);
+    // SAFETY: the successful conversion supplies length UTF-16 units including its terminator.
+    let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    let actual = String::from_utf16(&units[..end]);
+    // SAFETY: text is the LocalAlloc conversion output and is freed exactly once.
+    unsafe { LocalFree(text.cast()) };
+    SecurityDescriptor::from_sddl(&actual.unwrap())
+        .unwrap()
+        .verify_named_pipe(handle)
+        .unwrap();
+}
+
+#[test]
+fn connected_named_pipe_queries_agree_and_require_read_control() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let name = format!(
+        r"\\.\pipe\memcordon-query-equivalence-{}",
+        std::process::id()
+    );
+    let expected = test_public_pipe_sddl();
+    let listener = PipeListener::new(&name, SecurityDescriptor::from_sddl(&expected).unwrap());
+    let server_expected = expected.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let connection = listener.accept().unwrap();
+        assert_named_pipe_native_query_equivalence(connection.raw(), &server_expected);
+        ready_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let client = crate::windows::pipe::connect(&name).unwrap();
+    assert_named_pipe_native_query_equivalence(client.raw(), &expected);
+    let unprotected = expected.replacen("D:P", "D:", 1);
+    assert_ne!(unprotected, expected);
+    // NPFS policy compares the exact ACEs, owner and label; this inheritance
+    // representation bit is intentionally not a named-pipe authority boundary.
+    SecurityDescriptor::from_sddl(&unprotected)
+        .unwrap()
+        .verify_named_pipe(client.raw())
+        .unwrap();
+    let mut limited = ptr::null_mut();
+    // SAFETY: duplicate a live endpoint into this process with only data-read access.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            client.raw(),
+            GetCurrentProcess(),
+            &mut limited,
+            FILE_READ_DATA,
+            0,
+            0,
+        )
+    };
+    assert_ne!(duplicated, 0);
+    let limited = crate::windows::pipe::OwnedHandle::new(limited).unwrap();
+    let error = SecurityDescriptor::from_sddl(&expected)
+        .unwrap()
+        .verify_named_pipe(limited.raw())
+        .unwrap_err();
+    assert!(matches!(error, NamedPipeSecurityError::Readback(_)));
+    assert!(error.to_string().contains("native_code=5 "));
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+}
+
 fn assert_server_response_is_drained_before_disconnect(payload: String) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};

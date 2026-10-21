@@ -1,11 +1,15 @@
 use std::{fs, path::Path, process::Command, time::Duration};
 
 fn context(root: &Path) -> memcordon_testkit::ObservedOutput {
+    context_with_home(root, &root.join("target/ci-cargo-home"))
+}
+
+fn context_with_home(root: &Path, home: &Path) -> memcordon_testkit::ObservedOutput {
     let mut child = Command::new(env!("CARGO_BIN_EXE_memcordon-ci"));
     child
         .current_dir(root)
         .args(["ci", "driver-context"])
-        .env("CARGO_HOME", root.join("target/ci-cargo-home"));
+        .env("CARGO_HOME", home);
     memcordon_testkit::run_with_deadline_output_limit(
         &mut child,
         Duration::from_secs(60),
@@ -41,8 +45,38 @@ fn bootstrap_context_initializes_absent_owned_cargo_home_before_optional_discove
     let fixture = fixture();
     let root = fixture.path().canonicalize().unwrap();
     assert!(!root.join("target/ci-cargo-home").exists());
-    let _result = context(&root); // This intentionally incomplete repository can miss optional identity.
-    assert!(root.join("target/ci-cargo-home").is_dir());
+    let result = context(&root); // This intentionally incomplete repository can miss optional identity.
+    assert!(
+        root.join("target/ci-cargo-home").is_dir(),
+        "status: {}; stdout: {}; stderr: {}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn relative_owned_cargo_home_is_initialized_before_optional_discovery() {
+    let fixture = fixture();
+    let root = fixture.path().canonicalize().unwrap();
+    let result = context_with_home(&root, Path::new("target/ci-cargo-home"));
+    assert!(
+        root.join("target/ci-cargo-home").is_dir(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn matching_owned_suffix_in_another_workspace_is_not_initialized() {
+    let fixture = fixture();
+    let root = fixture.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let selected = outside.path().join("target/ci-cargo-home");
+    let _result = context_with_home(&root, &selected);
+    assert!(!selected.exists());
+    assert!(!root.join("target/ci-cargo-home").exists());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
 #[cfg(unix)]

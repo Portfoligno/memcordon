@@ -128,8 +128,9 @@ pub(crate) use derivation::{
     current_process_token_for_attestation_and_access_check, derive_launcher_holder_primary,
     derive_session_broker_holder_primary, granted_handle_access,
     normalize_current_session_broker_source_privileges, validate_holder_session_derivation,
-    validate_normalized_session_broker_source_snapshot, with_scoped_loader_profile_privileges,
-    with_scoped_service_owner_restore_privilege, with_session_broker_launch_privileges,
+    validate_normalized_session_broker_source_snapshot, validate_probe_primary_token_capability,
+    with_scoped_loader_profile_privileges, with_scoped_service_owner_restore_privilege,
+    with_session_broker_launch_privileges,
 };
 pub(crate) use fixture_derivation::{
     NestedTargetTokens, RestrictedImpersonationGuard, TokenFixtureSnapshot,
@@ -143,13 +144,13 @@ pub(crate) use query::{
     attach_creation_carrier_to_thread, authenticate_pipe_client,
     current_creation_carrier_attestation, current_thread_envelope, current_thread_fixture_snapshot,
     enabled_group_entry_matches, envelope, envelope_mismatch_fields, groups_digest,
-    privileges_digest, process_token, process_token_detailed, process_token_query_attestation,
-    process_user_sid, require_thread_token_absent, restricted_sid_count,
-    restricting_sid_entry_matches, revert_creation_carrier_and_attest_absent, sid_string,
-    thread_token_attestation, token_appcontainer_sid, token_group_entries, token_has_enabled_group,
-    token_has_restricting_sid, token_is_restricted, token_logon_sid, token_privilege_entries,
-    token_restricting_sid_attributes, token_restricting_sid_inventory, token_restricting_sids,
-    token_user_sid,
+    privileges_digest, process_primary_token_for_probe, process_token, process_token_detailed,
+    process_token_query_attestation, process_user_sid, require_thread_token_absent,
+    restricted_sid_count, restricting_sid_entry_matches, revert_creation_carrier_and_attest_absent,
+    sid_string, thread_token_attestation, token_appcontainer_sid, token_group_entries,
+    token_has_enabled_group, token_has_restricting_sid, token_is_restricted, token_logon_sid,
+    token_privilege_entries, token_restricting_sid_attributes, token_restricting_sid_inventory,
+    token_restricting_sids, token_user_sid,
 };
 pub(crate) use service_attestation::{
     ServiceSelfAttestationError, current_service_self_attestation, pipe_client_is_elevated,

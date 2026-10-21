@@ -40,6 +40,12 @@ pub(crate) fn retain_payload(
     Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
 )> {
     let selected_count = payload.selected_case_artifacts()?.len();
+    let (manifest_selection, components) =
+        super::installed_consumer::materialized_windows_components(
+            &payload.source,
+            &payload.distribution,
+            &payload.directory,
+        )?;
     fs::create_dir(destination)?;
     let mut held = Vec::new();
     let mut copy = |source: &Path, destination: &Path, expected: Option<&str>| -> Result<String> {
@@ -70,14 +76,22 @@ pub(crate) fn retain_payload(
             });
         }
     }
-    let manifest = destination.join("runtime-manifest.json");
-    if !manifest.exists() {
+    for component in components {
+        let name = component
+            .path
+            .file_name()
+            .ok_or_else(|| CiError::Message("measured Windows component basename absent".into()))?;
         copy(
-            &payload.directory.join("runtime-manifest.json"),
-            &manifest,
-            None,
+            &component.path,
+            &destination.join(name),
+            Some(&component.sha256),
         )?;
     }
+    copy(
+        &manifest_selection.path,
+        &destination.join("runtime-manifest.json"),
+        Some(&manifest_selection.sha256),
+    )?;
     let path = destination.join("owned-fixture.exe");
     let sha256 = copy(&payload.fixture.path, &path, Some(&payload.fixture.sha256))?;
     Ok((
@@ -138,21 +152,16 @@ pub(crate) fn inspect_removal_plan(
     output: &Path,
     deadline: Instant,
 ) -> Result<WindowsRemovalPlan> {
-    let agent = payload
-        .artifacts
-        .iter()
-        .find(|artifact| {
-            artifact
-                .path
-                .file_name()
-                .is_some_and(|name| name == "memcordon-sealed-agent.exe")
-        })
-        .ok_or_else(|| CiError::Message("selected Windows agent absent".into()))?;
+    let agent = super::installed_consumer::materialized_windows_agent(
+        &payload.source,
+        &payload.distribution,
+        &payload.directory,
+    )?;
     inspect_removal_plan_for_agent(
         root,
         &crate::windows_installed_cases::SelectedArtifact {
-            path: agent.path.clone(),
-            sha256: agent.sha256.clone(),
+            path: agent.path,
+            sha256: agent.sha256,
         },
         identity,
         output,

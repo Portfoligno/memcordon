@@ -336,8 +336,8 @@ pub fn decode_private_namespace_startup(
     }
 }
 
-pub struct PrivateNamespaceStartupProvider(File);
-pub struct PrivateNamespaceStartupInit(File);
+pub struct PrivateNamespaceStartupProvider(File, super::private_init_diagnostic::Provider);
+pub struct PrivateNamespaceStartupInit(File, super::private_init_diagnostic::Init);
 
 pub fn private_namespace_startup_channel()
 -> Result<(PrivateNamespaceStartupProvider, PrivateNamespaceStartupInit), String> {
@@ -378,9 +378,10 @@ pub fn private_namespace_startup_channel()
             std::io::Error::last_os_error()
         ));
     }
+    let (diagnostic_provider, diagnostic_init) = super::private_init_diagnostic::channel()?;
     Ok((
-        PrivateNamespaceStartupProvider(provider),
-        PrivateNamespaceStartupInit(init),
+        PrivateNamespaceStartupProvider(provider, diagnostic_provider),
+        PrivateNamespaceStartupInit(init, diagnostic_init),
     ))
 }
 
@@ -389,9 +390,22 @@ impl PrivateNamespaceStartupProvider {
         self.0.as_fd()
     }
 
+    pub(super) fn diagnostic_fd(&self) -> BorrowedFd<'_> {
+        self.1.as_fd()
+    }
+
     /// Only a packet whose SCM_CREDENTIALS PID matches the exact clone result
     /// can be accepted. MSG_TRUNC/MSG_CTRUNC and deadline are fail-closed.
     pub fn receive(
+        &self,
+        expected_init_pid: libc::pid_t,
+        deadline: Instant,
+    ) -> Result<AuthenticatedPrivateNamespaceStartup, String> {
+        self.receive_authenticated(expected_init_pid, deadline)
+            .map_err(|error| format!("{error}; {}", self.1.context()))
+    }
+
+    fn receive_authenticated(
         &self,
         expected_init_pid: libc::pid_t,
         deadline: Instant,
@@ -561,53 +575,73 @@ impl PrivateNamespaceStartupInit {
         observation: &PrivateNamespaceStartupObservation,
         target_pidfd: Option<BorrowedFd<'_>>,
     ) -> Result<(), String> {
-        if matches!(
-            observation,
-            PrivateNamespaceStartupObservation::TargetForked { .. }
-        ) != target_pidfd.is_some()
-        {
-            return Err("MCSEALED-PRIVATE-INIT: target pidfd and record kind disagree".into());
-        }
-        let packet = encode_private_namespace_startup(observation)?;
-        let mut iov = libc::iovec {
-            iov_base: packet.as_ptr().cast_mut().cast(),
-            iov_len: packet.len(),
-        };
-        // SAFETY: zero is the documented default for unused msghdr fields.
-        let mut message: libc::msghdr = unsafe { zeroed() };
-        message.msg_iov = &raw mut iov;
-        message.msg_iovlen = 1;
-        // SAFETY: CMSG_SPACE computes a constant buffer size for one int.
-        let mut control = AlignedAncillary(
-            [0_u8; unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) } as usize],
-        );
-        if let Some(pidfd) = target_pidfd {
-            message.msg_control = control.0.as_mut_ptr().cast();
-            message.msg_controllen = control.0.len();
-            // SAFETY: the allocated control buffer fits exactly one SCM_RIGHTS
-            // int; sendmsg only borrows the pidfd and the encoded packet.
-            unsafe {
-                let header = libc::CMSG_FIRSTHDR(&raw const message);
-                (*header).cmsg_level = libc::SOL_SOCKET;
-                (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize;
-                std::ptr::write_unaligned(
-                    libc::CMSG_DATA(header).cast::<libc::c_int>(),
-                    pidfd.as_raw_fd(),
-                );
+        let phase = match observation {
+            PrivateNamespaceStartupObservation::Failed { phase, detail } => {
+                let value = match phase {
+                    PrivateNamespaceStartupPhase::NamespaceSetup => 1,
+                    PrivateNamespaceStartupPhase::TargetFork => 2,
+                    PrivateNamespaceStartupPhase::ExecObservation => 3,
+                };
+                let _ = self.1.record(1, value, detail);
+                value
             }
+            PrivateNamespaceStartupObservation::TargetForked { .. } => 2,
+            PrivateNamespaceStartupObservation::ExecObservedAndDetached { .. } => 3,
+        };
+        let result = (|| {
+            if matches!(
+                observation,
+                PrivateNamespaceStartupObservation::TargetForked { .. }
+            ) != target_pidfd.is_some()
+            {
+                return Err("MCSEALED-PRIVATE-INIT: target pidfd and record kind disagree".into());
+            }
+            let packet = encode_private_namespace_startup(observation)?;
+            let mut iov = libc::iovec {
+                iov_base: packet.as_ptr().cast_mut().cast(),
+                iov_len: packet.len(),
+            };
+            // SAFETY: zero is the documented default for unused msghdr fields.
+            let mut message: libc::msghdr = unsafe { zeroed() };
+            message.msg_iov = &raw mut iov;
+            message.msg_iovlen = 1;
+            // SAFETY: CMSG_SPACE computes a constant buffer size for one int.
+            let mut control = AlignedAncillary(
+                [0_u8; unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) } as usize],
+            );
+            if let Some(pidfd) = target_pidfd {
+                message.msg_control = control.0.as_mut_ptr().cast();
+                message.msg_controllen = control.0.len();
+                // SAFETY: the allocated control buffer fits exactly one SCM_RIGHTS
+                // int; sendmsg only borrows the pidfd and the encoded packet.
+                unsafe {
+                    let header = libc::CMSG_FIRSTHDR(&raw const message);
+                    (*header).cmsg_level = libc::SOL_SOCKET;
+                    (*header).cmsg_type = libc::SCM_RIGHTS;
+                    (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize;
+                    std::ptr::write_unaligned(
+                        libc::CMSG_DATA(header).cast::<libc::c_int>(),
+                        pidfd.as_raw_fd(),
+                    );
+                }
+            }
+            // SAFETY: sendmsg borrows the initialized iovec and optional single
+            // SCM_RIGHTS record from an owned seqpacket endpoint.
+            let count = unsafe {
+                libc::sendmsg(self.0.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL)
+            };
+            if count != packet.len() as isize {
+                return Err(format!(
+                    "MCSEALED-PRIVATE-INIT: startup send: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            let _ = self.1.record(2, phase, error);
         }
-        // SAFETY: sendmsg borrows the initialized iovec and optional single
-        // SCM_RIGHTS record from an owned seqpacket endpoint.
-        let count =
-            unsafe { libc::sendmsg(self.0.as_raw_fd(), &raw const message, libc::MSG_NOSIGNAL) };
-        if count != packet.len() as isize {
-            return Err(format!(
-                "MCSEALED-PRIVATE-INIT: startup send: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
+        result
     }
 }
 

@@ -23,6 +23,7 @@ fn binding_fixture() -> TargetDesktopBootstrapBindingV3 {
         nonce: "11".repeat(32),
         binding_sha256: String::new(),
         bootstrap_image_sha256: "22".repeat(32),
+        probe_image_identity: None,
         launcher_identity: identity.clone(),
         launcher_session_id: snapshot.lineage.session_id,
         launcher_envelope: snapshot.behavior.envelope.clone(),
@@ -38,6 +39,31 @@ fn binding_fixture() -> TargetDesktopBootstrapBindingV3 {
         target_envelope: snapshot.behavior.envelope.clone(),
         target_request_snapshot: snapshot,
     }
+}
+
+#[test]
+fn admission_validation_failure_stays_primary_when_bounded_publication_fails() {
+    let binding = binding_fixture().seal().unwrap();
+    let result = preserve_bootstrap_admission_result::<()>(
+        Err("original exact capability validation refusal".into()),
+        "target-primary-capability",
+        std::ptr::null_mut(),
+        &binding,
+        Instant::now(),
+    );
+    let error = result.unwrap_err();
+    assert!(error.contains("target-primary-capability"));
+    assert!(error.contains("original exact capability validation refusal"));
+    assert!(error.contains("failure-frame-publication-error="));
+    let preserved = preserve_bootstrap_admission_result(
+        Ok(17_u32),
+        "unreached",
+        std::ptr::null_mut(),
+        &binding,
+        Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(preserved, 17);
 }
 
 #[test]
@@ -113,12 +139,19 @@ fn full_binding_rejects_cross_role_schema_and_policy_mixtures() {
     }
     let mut probe = holder;
     probe.role = TargetDesktopBootstrapRoleV1::Probe;
-    probe.schema_version = 4;
+    probe.schema_version = 6;
     probe.probe_creation_policy = Some(bootstrap_probe_policy::ConsolelessProbePolicyV1::new());
+    probe.probe_image_identity = Some(
+        crate::windows::bootstrap_image_capability::ImageFileIdentity {
+            volume_serial: 1,
+            file_id: 2,
+            size: 3,
+        },
+    );
     let probe = probe.seal().unwrap();
     let mut claims = serde_json::to_value(&probe).unwrap();
     claims.as_object_mut().unwrap().remove("binding_sha256");
-    let mut canonical = b"memcordon-target-desktop-binding-v9\0".to_vec();
+    let mut canonical = b"memcordon-target-desktop-binding-v11\0".to_vec();
     canonical.extend(serde_json::to_vec(&claims).unwrap());
     let expected: String = Sha256::digest(canonical)
         .iter()
@@ -131,6 +164,15 @@ fn full_binding_rejects_cross_role_schema_and_policy_mixtures() {
     let mut changed = probe.clone();
     changed.nonce = "33".repeat(32);
     assert!(changed.verify_digest().is_err());
+    let mut changed = probe.clone();
+    changed.probe_image_identity.as_mut().unwrap().file_id += 1;
+    assert!(changed.verify_digest().is_err());
+    let mut changed = probe.clone();
+    changed.probe_image_identity = None;
+    assert!(changed.seal().is_err());
+    let mut changed = probe.clone();
+    changed.schema_version = 5;
+    assert!(changed.seal().is_err());
     let parsed: TargetDesktopBootstrapBindingV3 =
         serde_json::from_slice(&serde_json::to_vec(&probe).unwrap()).unwrap();
     parsed.verify_digest().unwrap();

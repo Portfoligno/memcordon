@@ -46,8 +46,7 @@ pub struct InstalledMixedLaunch {
     pub observation_directory: PathBuf,
     pub frontend_status: Option<std::process::ExitStatus>,
     frontend_birth: Option<u64>,
-    frontend_invocation_owner: File,
-    frontend_invocation_bytes: Vec<u8>,
+    frontend_invocation: super::frontend_invocation_custody::Invocation,
     file_access: FrontendFileAccess,
     capture_failures: Vec<String>,
     image_entrypoint_source: Option<serde_json::Value>,
@@ -57,6 +56,7 @@ pub struct InstalledMixedLaunch {
     build_file_owners: Vec<File>,
     outside_canary: Option<super::linux_isolation_cases::HostOutsideFile>,
     host_socket_descriptor: Option<super::linux_isolation_cases::HostSocketDescriptor>,
+    fixture_exports: Vec<super::fixture_export_retirement::Owner>,
 }
 
 pub struct InstalledMixedLaunchInput<'a> {
@@ -1940,10 +1940,6 @@ impl InstalledMixedDriver {
         let mut index = 0;
         while index < self.active.len() {
             let owned = &mut self.active[index];
-            #[expect(
-                clippy::redundant_closure_call,
-                reason = "Fallible cleanup is captured per owned attempt so later owners are still finalized"
-            )]
             let settled = (|| -> Result<()> {
                 let mut errors = Vec::new();
                 match owned.launch.frontend.try_wait() {
@@ -1986,6 +1982,9 @@ impl InstalledMixedDriver {
                     errors.push("mixed cleanup lacks preauthorization native observer; explicit native journal recovery required".into());
                 }
                 if errors.is_empty() {
+                    for export in &mut owned.launch.fixture_exports {
+                        export.retire()?;
+                    }
                     Ok(())
                 } else {
                     Err(CiError::Message(errors.join("; ")))
@@ -2838,6 +2837,7 @@ impl InstalledMixedDriver {
                         prefix.clone(),
                         &directory.join("mixed.contract.json"),
                         input.artifact_root,
+                        input.cleanup_deadline,
                         input
                             .deadline
                             .saturating_duration_since(std::time::Instant::now())
@@ -6416,67 +6416,19 @@ impl InstalledMixedLaunch {
         crate::linux_consumer_readiness::HeldLinuxProcess::acquire(self.frontend.id(), birth)
             .map_err(CiError::Message)
     }
-    /// Read the exact controller command retained before spawn. A replacement
-    /// with identical bytes still fails the named native identity check.
     pub fn retained_frontend_invocation(&self) -> Result<Vec<u8>> {
-        let access = self.file_access.observe()?;
-        let invocation: serde_json::Value =
-            serde_json::from_slice(&self.frontend_invocation_bytes)?;
-        if invocation["file_access"] != access
-            || invocation["endpoint_access"] != self.file_access.observe_endpoint()?
-        {
-            return Err(CiError::Message(
-                "retained frontend file access differs from original held objects".into(),
-            ));
-        }
-        let file = &self.frontend_invocation_owner;
-        let before = file.metadata()?;
-        if before.len() != self.frontend_invocation_bytes.len() as u64 || before.len() > 65536 {
-            return Err(CiError::Message(
-                "retained frontend command length differs".into(),
-            ));
-        }
-        let mut bytes = vec![0u8; before.len() as usize];
-        file.read_exact_at(&mut bytes, 0)?;
-        let path = self
-            .observation_directory
-            .parent()
-            .ok_or_else(|| CiError::Message("frontend command parent absent".into()))?
-            .join("frontend-invocation.json");
-        let named = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)?;
-        let named_metadata = named.metadata()?;
-        let after = file.metadata()?;
-        let stamp = |value: &std::fs::Metadata| {
-            (
-                value.dev(),
-                value.ino(),
-                value.len(),
-                value.ctime(),
-                value.ctime_nsec(),
-                value.nlink(),
-                value.uid(),
-                value.mode(),
-            )
-        };
-        let mut named_bytes = vec![0u8; self.frontend_invocation_bytes.len()];
-        named.read_exact_at(&mut named_bytes, 0)?;
-        if stamp(&before) != stamp(&after)
-            || stamp(&after) != stamp(&named_metadata)
-            || after.nlink() != 1
-            || after.uid() != 0
-            || after.mode() & 0o022 != 0
-            || bytes != self.frontend_invocation_bytes
-            || named_bytes != bytes
-            || stamp(&named_metadata) != stamp(&named.metadata()?)
-        {
-            return Err(CiError::Message(
-                "retained frontend command native identity/bytes changed".into(),
-            ));
-        }
-        Ok(bytes)
+        self.frontend_invocation
+            .verified(|| {
+                Ok((
+                    self.file_access
+                        .observe()
+                        .map_err(|error| error.to_string())?,
+                    self.file_access
+                        .observe_endpoint()
+                        .map_err(|error| error.to_string())?,
+                ))
+            })
+            .map_err(CiError::Message)
     }
     /// Selected installed CLI only. setpriv performs the supported native
     /// caller transition without a shell or inherited supplementary groups.
@@ -6840,8 +6792,12 @@ impl InstalledMixedLaunch {
             observation_directory,
             frontend_status: None,
             frontend_birth,
-            frontend_invocation_owner,
-            frontend_invocation_bytes,
+            frontend_invocation: super::frontend_invocation_custody::Invocation::new(
+                frontend_invocation_owner,
+                frontend_invocation_path,
+                frontend_invocation_bytes,
+                0,
+            ),
             file_access,
             capture_failures,
             image_entrypoint_source: None,
@@ -6851,6 +6807,7 @@ impl InstalledMixedLaunch {
             build_file_owners: Vec::new(),
             outside_canary: None,
             host_socket_descriptor: None,
+            fixture_exports: Vec::new(),
         })
     }
 
@@ -7626,6 +7583,7 @@ impl InstalledMixedLaunch {
         self.frontend_status.is_some()
             && self.stdout_worker.is_none()
             && self.stderr_worker.is_none()
+            && self.fixture_exports.iter().all(|owner| owner.settled())
     }
 
     pub fn wait_and_capture(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
@@ -7669,6 +7627,18 @@ impl InstalledMixedLaunch {
                 "capture worker remains owned after frontend retirement".into(),
             ));
         }
+        self.frontend_invocation
+            .seal(|| {
+                Ok((
+                    self.file_access
+                        .observe()
+                        .map_err(|error| error.to_string())?,
+                    self.file_access
+                        .observe_endpoint()
+                        .map_err(|error| error.to_string())?,
+                ))
+            })
+            .map_err(CiError::Message)?;
         if !self.build_file_owners.is_empty() {
             self.close_build_observers()?;
         }
@@ -7679,6 +7649,9 @@ impl InstalledMixedLaunch {
         }
         if let Some(canary) = self.host_socket_descriptor.take() {
             canary.settle(&self.observation_directory)?;
+        }
+        for export in &mut self.fixture_exports {
+            export.retire()?;
         }
         if !self.capture_failures.is_empty() {
             return Err(CiError::Message(self.capture_failures.join("; ")));
@@ -7701,6 +7674,7 @@ impl InstalledMixedLaunch {
         artifact_prefix: String,
         contract: &Path,
         destination: &Path,
+        cleanup_deadline: std::time::Instant,
         timeout: Duration,
     ) -> Result<CompletedMixedCollection> {
         let deadline = std::time::Instant::now()
@@ -8176,6 +8150,49 @@ impl InstalledMixedLaunch {
                 "completed collection lacks exact installed lease identity".into(),
             ));
         }
+        let export_owner = super::fixture_export_retirement::prepare(
+            export_path.parent().expect("authenticated export root"),
+            &export_bytes,
+            0,
+            cleanup_deadline,
+            &destination.join(format!(
+                "{artifact_prefix}/fixture-export-retirement-journal.jsonl"
+            )),
+            |name, bytes| {
+                let retained = read_owned_resource(
+                    &destination.join(format!("{artifact_prefix}/exported/{name}")),
+                    bytes.len() as u64,
+                )?;
+                if retained != bytes {
+                    return Err(CiError::Message(
+                        "fixture export product was not preserved before retirement".into(),
+                    ));
+                }
+                Ok(())
+            },
+        )?;
+        self.fixture_exports.push(export_owner);
+        let export_retirement = self
+            .fixture_exports
+            .last_mut()
+            .expect("original export owner")
+            .retire()?;
+        let retirement_bytes = serde_json::to_vec(&export_retirement)?;
+        let retirement_relative = format!("{artifact_prefix}/fixture-export-retirement.json");
+        retain(&destination.join(&retirement_relative), &retirement_bytes)?;
+        persisted.artifacts.push(Artifact {
+            path: retirement_relative,
+            length: retirement_bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(&retirement_bytes)),
+        });
+        let journal_relative = format!("{artifact_prefix}/fixture-export-retirement-journal.jsonl");
+        let journal_bytes =
+            read_owned_resource(&destination.join(&journal_relative), 64 * 1024 * 1024)?;
+        persisted.artifacts.push(Artifact {
+            path: journal_relative,
+            length: journal_bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(&journal_bytes)),
+        });
         Ok(CompletedMixedCollection {
             lease_id,
             persisted,

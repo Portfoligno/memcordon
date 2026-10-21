@@ -62,7 +62,10 @@ impl ImportRefusalReport {
             .join(&key.scenario);
         std::fs::create_dir_all(artifact_root.join(&prefix))?;
         std::fs::create_dir_all(artifact_root.join(&prefix).join("definition-retirement"))?;
-        if key.scenario == "input-socket" {
+        if matches!(
+            key.scenario.as_str(),
+            "input-socket" | "caller-writable-tree"
+        ) {
             std::fs::create_dir_all(
                 artifact_root
                     .join(&prefix)
@@ -122,7 +125,10 @@ impl ImportRefusalReport {
         } else {
             None
         };
-        let outcome = if key.scenario == "input-socket" {
+        let outcome = if matches!(
+            key.scenario.as_str(),
+            "input-socket" | "caller-writable-tree"
+        ) {
             let source_after = leaf("isolation-import-source-after.json")?;
             let mut inspected = |name: &str| {
                 capture(
@@ -135,14 +141,32 @@ impl ImportRefusalReport {
                     &directory.join("installed-image-inspection").join(name),
                 )
             };
-            LinuxIsolationImportOutcome::Excluded {
-                invocation: inspected("invocation.json")?,
-                native_creation: inspected("native-creation.json")?,
-                native_process: inspected("native-process.json")?,
-                exit: inspected("exit.json")?,
-                stdout: inspected("stdout.json")?,
-                stderr: inspected("stderr.bin")?,
-                source_after,
+            let invocation = inspected("invocation.json")?;
+            let native_creation = inspected("native-creation.json")?;
+            let native_process = inspected("native-process.json")?;
+            let exit = inspected("exit.json")?;
+            let stdout = inspected("stdout.json")?;
+            let stderr = inspected("stderr.bin")?;
+            if key.scenario == "caller-writable-tree" {
+                LinuxIsolationImportOutcome::Projected {
+                    invocation,
+                    native_creation,
+                    native_process,
+                    exit,
+                    stdout,
+                    stderr,
+                    source_after,
+                }
+            } else {
+                LinuxIsolationImportOutcome::Excluded {
+                    invocation,
+                    native_creation,
+                    native_process,
+                    exit,
+                    stdout,
+                    stderr,
+                    source_after,
+                }
             }
         } else {
             LinuxIsolationImportOutcome::Refused

@@ -1,5 +1,18 @@
 //! Lexical operations on retained Linux-native operands, independent of host OS.
 
+pub(crate) fn is_normalized_absolute(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    path.len() <= 4096
+        && !path.as_bytes().contains(&0)
+        && !path.contains('\\')
+        && (rest.is_empty()
+            || rest
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
+}
+
 fn components(path: &str) -> Vec<(usize, usize)> {
     let mut offset = 0;
     path.split('/')

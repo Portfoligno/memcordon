@@ -25,6 +25,27 @@ pub struct PackageBundle {
     pub files: Vec<FileRecord>,
 }
 
+/// Durably publishes a fresh lineage file using the platform's native boundary.
+pub fn publish_install_lineage_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        drop(crate::windows_readiness_adapter::publish_receipt(
+            path, bytes,
+        )?);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
 pub fn prepare(root: &Path, source_path: &Path, target: &Path, destination: &Path) -> Result<()> {
     let source: SelectedSource = source::read_json(source_path)?;
     prepare_build(
@@ -792,7 +813,6 @@ impl PackageConsumer {
         artifact_root: &Path,
         deadline: std::time::Instant,
     ) -> Result<PathBuf> {
-        use std::io::Write;
         self.verify_packaged_sources()?;
         let manifest = self.cli_source.join("Cargo.toml");
         let toolchain = crate::config::toolchains(root)?.stable;
@@ -829,12 +849,7 @@ impl PackageConsumer {
         fs::create_dir(destination)?;
         let persist = |name: &str, bytes: &[u8]| -> Result<PathBuf> {
             let path = destination.join(name);
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
+            publish_install_lineage_file(&path, bytes)?;
             Ok(path)
         };
         let relative = |path: &Path| -> Result<String> {
@@ -916,12 +931,7 @@ impl PackageConsumer {
                 super::artifacts::read_file(&matches[0])?
             };
             let archive = destination.join("crates").join(&filename);
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&archive)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+            publish_install_lineage_file(&archive, &bytes)?;
             let mut edges = Vec::new();
             for edge in &node.deps {
                 let dependency = metadata
@@ -943,12 +953,19 @@ impl PackageConsumer {
             graph.push(serde_json::json!({"name":package.name,"version":package.version,"crate_sha256":super::artifacts::checksum(&bytes),"crate_artifact":relative(&archive)?,"features":node.features,"dependencies":edges}));
         }
         let graph_path = destination.join("registry-graph.json");
-        super::source::write_json(
+        publish_install_lineage_file(
             &graph_path,
-            &serde_json::json!({"format":"memcordon.consumer-readiness.registry-graph","revision":1,"packages":graph,"raw_metadata":relative(&raw_metadata)?,"raw_lock":relative(&raw_lock)?}),
+            &serde_json::to_vec_pretty(
+                &serde_json::json!({"format":"memcordon.consumer-readiness.registry-graph","revision":1,"packages":graph,"raw_metadata":relative(&raw_metadata)?,"raw_lock":relative(&raw_lock)?}),
+            )?,
         )?;
-        fs::File::open(destination.join("crates"))?.sync_all()?;
-        fs::File::open(destination)?.sync_all()?;
+        // Windows publications above use checked native WRITE_THROUGH moves;
+        // Unix additionally flushes the containing directory entries.
+        #[cfg(unix)]
+        {
+            fs::File::open(destination.join("crates"))?.sync_all()?;
+            fs::File::open(destination)?.sync_all()?;
+        }
         self.verify_packaged_sources()?;
         Ok(graph_path)
     }

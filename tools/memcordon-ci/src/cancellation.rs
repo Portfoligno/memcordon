@@ -46,12 +46,12 @@ pub(crate) fn observed() -> Option<memcordon_platform::test_support::CiInterrupt
         .and_then(CiInterruptToken::observed)
 }
 pub(crate) fn check_admission() -> Result<()> {
-    if retirement_deadline().is_none() {
-        if let Some(signal) = observed() {
-            return Err(CiError::SettledCancellation(format!(
-                "external interruption before work admission: {signal:?}"
-            )));
-        }
+    if retirement_deadline().is_none()
+        && let Some(signal) = observed()
+    {
+        return Err(CiError::SettledCancellation(format!(
+            "external interruption before work admission: {signal:?}"
+        )));
     }
     Ok(())
 }

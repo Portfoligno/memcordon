@@ -64,9 +64,7 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
     };
     use memcordon_ci::windows_causal_acceptance::InstalledChannel;
     use memcordon_ci::windows_installed_cases::{InstalledWindowsPayload, SelectedArtifact};
-    use memcordon_core::runtime_manifest::{
-        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest,
-    };
+    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
 
     let directory = tempfile::tempdir().unwrap();
     let source = SelectedSource {
@@ -103,18 +101,9 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
     ]) {
         let name = format!("{binary}.exe");
         std::fs::write(directory.path().join(&name), &pe).unwrap();
-        components.push(RuntimeComponentRecord {
-            id: if role == RuntimeComponentRole::SealedAgent {
-                "sealed-agent".into()
-            } else {
-                binary.clone()
-            },
-            path: name,
-            role,
-            size: pe.len() as u64,
-            mode: 0o755,
-            sha256: artifacts::checksum(&pe),
-        });
+        components.push(memcordon_ci::release::target::runtime_component(
+            role, name, &pe,
+        ));
     }
     let manifest = RuntimeManifest::windows(
         source.version.to_string(),
@@ -161,6 +150,80 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
         )
     };
     let payload = construct(&source).unwrap();
+    let select_agent = |source: &SelectedSource| {
+        memcordon_ci::release::installed_consumer::materialized_windows_agent(
+            &BuildSourceIdentity::from(source.clone()),
+            &distribution,
+            directory.path(),
+        )
+    };
+    let agent = select_agent(&source).unwrap();
+    assert_eq!(
+        agent.path,
+        directory.path().join("memcordon-sealed-agent.exe")
+    );
+    assert_eq!(agent.sha256, artifacts::checksum(&pe));
+    assert_eq!(payload.artifacts.len(), 1);
+    assert_eq!(payload.artifacts[0].path, archive.path);
+    assert_eq!(payload.artifacts[0].sha256, archive.sha256);
+    let select_components = || {
+        memcordon_ci::release::installed_consumer::materialized_windows_components(
+            &BuildSourceIdentity::from(source.clone()),
+            &distribution,
+            directory.path(),
+        )
+    };
+    let (selected_manifest, components) = select_components().unwrap();
+    assert_eq!(
+        selected_manifest.path,
+        directory.path().join("runtime-manifest.json")
+    );
+    assert_eq!(
+        selected_manifest.sha256,
+        artifacts::checksum(&manifest_bytes)
+    );
+    assert_eq!(components.len(), distribution.binaries.len());
+    let actual_names: std::collections::BTreeSet<_> = components
+        .iter()
+        .map(|component| {
+            assert!(component.path.is_absolute());
+            assert_eq!(component.sha256, artifacts::checksum(&pe));
+            component.path.file_name().unwrap().to_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        actual_names,
+        [
+            "memcordon.exe",
+            "memcordon-sealed-agent.exe",
+            "memcordon-target-desktop-bootstrap.exe",
+            "memcordon-session-broker.exe"
+        ]
+        .into_iter()
+        .collect()
+    );
+    for field in ["role", "sha256"] {
+        let mut corrupt = serde_json::to_value(&manifest).unwrap();
+        corrupt["components"][1][field] = if field == "role" {
+            serde_json::json!("public-cli")
+        } else {
+            serde_json::json!("00".repeat(32))
+        };
+        std::fs::write(
+            &selected_manifest.path,
+            serde_json::to_vec(&corrupt).unwrap(),
+        )
+        .unwrap();
+        assert!(select_components().is_err(), "manifest component {field}");
+    }
+    std::fs::write(&selected_manifest.path, &manifest_bytes).unwrap();
+    let omitted = directory.path().join("memcordon-session-broker.exe");
+    std::fs::remove_file(&omitted).unwrap();
+    assert!(
+        select_components().is_err(),
+        "missing materialized production component"
+    );
+    std::fs::write(omitted, &pe).unwrap();
     assert_eq!(payload.output_directory, cwd.join(&relative_output));
     assert!(payload.output_directory.is_absolute());
     assert!(!payload.output_directory.exists());
@@ -210,9 +273,19 @@ fn materialized_windows_payload_binds_actual_bytes_and_rejects_source_or_binary_
     let mut foreign_source = source.clone();
     foreign_source.commit = "1123456789012345678901234567890123456789".into();
     assert!(construct(&foreign_source).is_err());
+    assert!(select_agent(&foreign_source).is_err());
+    assert!(
+        memcordon_ci::release::installed_consumer::materialized_windows_agent(
+            &BuildSourceIdentity::from(source.clone()),
+            &distribution,
+            &directory.path().join("absent"),
+        )
+        .is_err()
+    );
     pe.push(1);
     std::fs::write(directory.path().join("memcordon.exe"), &pe).unwrap();
     assert!(construct(&source).is_err());
+    assert!(select_agent(&source).is_err());
 }
 
 fn provider() -> PublicProviderBindingV1 {

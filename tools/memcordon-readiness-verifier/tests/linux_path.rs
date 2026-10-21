@@ -2,6 +2,33 @@
 mod linux_path;
 
 #[test]
+fn normalized_absolute_operands_use_linux_grammar_on_all_hosts() {
+    for value in ["/", "/owned/account", "/var/lib/case/policy.json"] {
+        assert!(linux_path::is_normalized_absolute(value), "{value}");
+    }
+    for value in [
+        "",
+        "owned/account",
+        "C:/owned/account",
+        "C:\\owned\\account",
+        "\\\\server\\share",
+        "//server/share",
+        "/owned\\account",
+        "/owned/../account",
+        "/owned/./account",
+        "/owned//account",
+        "/owned/account/",
+        "/owned/\0account",
+    ] {
+        assert!(!linux_path::is_normalized_absolute(value), "{value:?}");
+    }
+    assert!(!linux_path::is_normalized_absolute(&format!(
+        "/{}",
+        "a".repeat(4096)
+    )));
+}
+
+#[test]
 fn retained_linux_parents_and_leaves_preserve_native_lexical_spelling() {
     for (path, parent, name) in [
         (

@@ -706,9 +706,31 @@ pub(super) fn current_process_token_with_attested_access(
     purpose: &'static str,
 ) -> Result<OwnedHandle, String> {
     let token = current_process_token_with_access(access)?;
+    verify_token_capability_access(token.raw(), access, purpose)?;
+    Ok(token)
+}
+
+/// Verifies an explicit actual-primary capability before its authenticated use.
+pub(crate) fn validate_probe_primary_token_capability(token: HANDLE) -> Result<(), String> {
+    verify_token_capability_access(
+        token,
+        TOKEN_ATTESTATION_ACCESS | TOKEN_DUPLICATE,
+        "actual-process-primary",
+    )?;
+    if envelope(token)?.token_type != TokenPrimary as u32 {
+        return Err("actual process capability is not a primary token".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_token_capability_access(
+    token: HANDLE,
+    access: u32,
+    purpose: &'static str,
+) -> Result<(), String> {
     let mut flags = 0_u32;
     // SAFETY: token is live and flags is writable.
-    if unsafe { GetHandleInformation(token.raw(), &raw mut flags) } == 0 {
+    if unsafe { GetHandleInformation(token, &raw mut flags) } == 0 {
         return Err(format!(
             "cannot attest {purpose} token inheritability: {}",
             io::Error::last_os_error()
@@ -717,7 +739,7 @@ pub(super) fn current_process_token_with_attested_access(
     if flags & HANDLE_FLAG_INHERIT != 0 {
         return Err(format!("{purpose} token capability is inheritable"));
     }
-    let granted = handle_granted_access(token.raw()).map_err(|error| {
+    let granted = handle_granted_access(token).map_err(|error| {
         format!(
             "cannot attest {purpose} token granted access: api={} nt_status={:?} {}",
             error.api, error.nt_status, error.detail
@@ -728,7 +750,7 @@ pub(super) fn current_process_token_with_attested_access(
             "{purpose} token capability has wrong granted access: expected={access:#x} actual={granted:#x}"
         ));
     }
-    Ok(token)
+    Ok(())
 }
 
 pub(crate) struct LauncherHolderTokenDerivation {

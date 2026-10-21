@@ -9,7 +9,9 @@ pub use wire::{
 };
 mod behavior;
 mod filter_anchor;
+mod linux_account_alias_policy;
 mod linux_account_refusal;
+pub use linux_account_alias_policy::{LinuxAccountAliasPolicyEvidence, NativeAliasPolicyCommand};
 mod linux_build;
 mod linux_component;
 mod linux_cross_account;
@@ -422,6 +424,27 @@ fn validate_producer_bundle(
                     if !artifact_names.contains(path) {
                         return Err(
                             "isolation import references another original producer archive".into(),
+                        );
+                    }
+                }
+                continue;
+            }
+            if raw["format"] == "memcordon.consumer-readiness.linux-account-alias-policy-refusal" {
+                let evidence: LinuxAccountAliasPolicyEvidence =
+                    serde_json::from_value(raw).map_err(|error| error.to_string())?;
+                if evidence.key != record.key
+                    || evidence.run_id != origin.run_id
+                    || evidence.source_commit != index.source_commit
+                    || evidence.source_tree_sha256 != index.source_tree_sha256
+                {
+                    return Err("alias policy refusal crosses original producer row/source".into());
+                }
+                for path in evidence.artifact_paths() {
+                    custody::validate_path(path)?;
+                    if !artifact_names.contains(path) {
+                        return Err(
+                            "alias policy refusal references another original producer archive"
+                                .into(),
                         );
                     }
                 }
@@ -4776,6 +4799,11 @@ fn verify_record(
         let evidence: LinuxIsolationImportEvidence =
             serde_json::from_value(raw).map_err(|error| error.to_string())?;
         return linux_import_refusal::verify(index, record, &evidence, products, custody);
+    }
+    if raw["format"] == "memcordon.consumer-readiness.linux-account-alias-policy-refusal" {
+        let evidence: LinuxAccountAliasPolicyEvidence =
+            serde_json::from_value(raw).map_err(|error| error.to_string())?;
+        return linux_account_alias_policy::verify(index, record, &evidence, products, custody);
     }
     if raw["format"] == "memcordon.consumer-readiness.linux-account-refusal" {
         let evidence: LinuxAccountRefusalEvidence =

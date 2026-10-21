@@ -752,6 +752,7 @@ fn collect(
         owner.prefix.clone(),
         &owner.contract_path,
         context.artifact_root,
+        context.cleanup_deadline,
         bounded(context.deadline, Duration::from_secs(30))?,
     )?;
     let mut held = owner.budget_file.try_clone()?;

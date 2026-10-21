@@ -102,7 +102,7 @@ impl LinuxAccountRefusalEvidence {
     }
 }
 
-fn closed(value: &Value, fields: &[&str]) -> VerificationResult<()> {
+pub(super) fn closed(value: &Value, fields: &[&str]) -> VerificationResult<()> {
     if value.as_object().is_none_or(|object| {
         object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field))
     }) {
@@ -114,7 +114,7 @@ fn bytes(value: &Value) -> VerificationResult<Vec<u8>> {
     serde_json::from_value(value.clone()).map_err(|error| error.to_string())
 }
 
-fn alias_plan_digest(contract: &Value) -> VerificationResult<String> {
+pub(super) fn alias_plan_digest(contract: &Value) -> VerificationResult<String> {
     #[derive(Serialize)]
     struct Bound<'a> {
         id: &'a Value,
@@ -755,8 +755,7 @@ pub(crate) fn verify(
         || e.source_commit != index.source_commit
         || e.source_tree_sha256 != index.source_tree_sha256
         || e.key.family != "L-ISO-06"
-        || !["same-uid-process", "account-alias", "stale-reservation"]
-            .contains(&e.key.scenario.as_str())
+        || !["same-uid-process", "stale-reservation"].contains(&e.key.scenario.as_str())
         || e.key.evidence_class != EvidenceClass::InstalledProduct
         || !e.key.target.ends_with("linux-gnu")
     {

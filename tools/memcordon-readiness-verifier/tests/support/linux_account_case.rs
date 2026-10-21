@@ -53,11 +53,15 @@ fn external_graph(
 
 fn alias_graph(
     case: &mut PersistedCase,
-    contract: &mut Value,
-    activation: &mut Value,
+    contract: &Value,
+    activation: &Value,
     owner: &Value,
+    original: &LinuxMalformedIngressEvidence,
 ) {
     use sha2::{Digest, Sha256};
+    let baseline: memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3 =
+        serde_json::from_value(owner["baseline_registry"].clone()).unwrap();
+    baseline.validate().unwrap();
     let mut policy = owner["baseline_registry"].clone();
     policy["execution_identities"][0]["uid"] = 65534.into();
     policy["execution_identities"][0]["gid"] = 65534.into();
@@ -80,37 +84,86 @@ fn alias_graph(
         )
         .into(),
     );
-    typed.workload_plan_digest = digest.clone();
-    typed.authorization.approved_plan_digest = digest.clone();
-    activation["epoch"]["revision"] = json!(2);
-    typed.expected_epoch = serde_json::from_value(activation["epoch"].clone()).unwrap();
-    *contract = json!(typed);
     policy["grants"][0]["execution_identity"] = json!(reference);
     policy["grants"][0]["approved_plans"] = json!([digest]);
-    activation["registry"] = policy.clone();
-    activation["registry_digest"] =
-        json!(linux_registry_digest(&policy, &case.record.key.target).unwrap());
-    let mut restoration = activation.clone();
-    restoration["epoch"]["revision"] = json!(3);
-    restoration["registry"] = owner["baseline_registry"].clone();
-    restoration["registry_digest"] =
-        json!(linux_registry_digest(&restoration["registry"], &case.record.key.target).unwrap());
-    case.json("restoration.json", &restoration);
-    for (stem, policy, receipt) in [
-        ("alias", policy, activation.clone()),
-        (
-            "restoration",
-            owner["baseline_registry"].clone(),
-            restoration,
-        ),
+    let candidate: memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3 =
+        serde_json::from_value(policy.clone()).unwrap();
+    assert_eq!(
+        candidate.validate().unwrap_err(),
+        "exclusive account id/uid/reservation alias across current or legacy policy"
+    );
+    case.json("alias-candidate.json", &policy);
+    case.json("alias-baseline-contract.json", contract);
+    let rejection = b"exclusive account id/uid/reservation alias across current or legacy policy\n";
+    let mut commands = Vec::new();
+    for (stem, apply) in [
+        ("alias-before", false),
+        ("alias-rejection", true),
+        ("alias-after", false),
     ] {
-        let policy_path = format!("{stem}-policy.json");
-        case.json(&policy_path, &policy);
-        case.write(&format!("{stem}-stderr.bin"), b"");
-        let command = json!({"format":"memcordon.linux-policy-activation-command","revision":1,"agent_sha256":sha256(b"original agent image"),"program":b"/usr/libexec/memcordon-sealed-agent".as_slice(),"arguments":[b"package".as_slice(),b"policy",b"apply",b"--file",format!("/var/lib/memcordon-consumer-readiness/policies/{stem}.policy.json").as_bytes()],"cwd":b"/owned/account","environment_cleared":true,"budget_millis":1000,"policy_sha256":sha256(&std::fs::read(case.root.path().join(&policy_path)).unwrap())});
-        case.json(&format!("{stem}-command.json"), &command);
-        case.json(&format!("{stem}-exit.json"),&json!({"format":"memcordon.linux-policy-activation-exit","revision":1,"native_exit":0,"success":true,"invocation_sha256":sha256(&serde_json::to_vec(&command).unwrap()),"stdout_sha256":sha256(&serde_json::to_vec(&receipt).unwrap()),"stderr_sha256":sha256(b"")}));
+        let mut command = json!({"format":if apply {"memcordon.linux-policy-activation-command"}else{"memcordon.linux-policy-inspection-command"},"revision":1,"agent_sha256":sha256(b"original agent image"),"program":b"/usr/libexec/memcordon-sealed-agent".as_slice(),"arguments":[],"cwd":b"/owned/account","environment_cleared":true,"budget_millis":1000});
+        command["arguments"] = if apply {
+            let source = [
+                owner["admin_root"].as_str().unwrap(),
+                "isolation-alias-account",
+                "alias-rejection.policy.json",
+            ]
+            .join("/");
+            command["policy_sha256"] = json!(sha256(
+                &std::fs::read(case.root.path().join("alias-candidate.json")).unwrap()
+            ));
+            json!([
+                b"package".as_slice(),
+                b"policy",
+                b"apply",
+                b"--file",
+                source.as_bytes()
+            ])
+        } else {
+            json!([b"package".as_slice(), b"policy", b"inspect", b"--json"])
+        };
+        let invocation = format!("{stem}.invocation.json");
+        let exit = format!("{stem}.exit.json");
+        let stdout = format!("{stem}.json");
+        let stderr = format!("{stem}.stderr.bin");
+        case.json(&invocation, &command);
+        if apply {
+            case.write(&stdout, b"");
+            case.write(&stderr, rejection);
+        } else {
+            case.json(&stdout, activation);
+            case.write(&stderr, b"");
+        }
+        case.json(&exit,&json!({"format":if apply {"memcordon.linux-policy-activation-exit"}else{"memcordon.linux-policy-inspection-exit"},"revision":1,"native_exit":if apply {125}else{0},"success":!apply,"invocation_sha256":sha256(&std::fs::read(case.root.path().join(&invocation)).unwrap()),"stdout_sha256":sha256(&std::fs::read(case.root.path().join(&stdout)).unwrap()),"stderr_sha256":sha256(&std::fs::read(case.root.path().join(&stderr)).unwrap())}));
+        commands.push(NativeAliasPolicyCommand {
+            invocation,
+            exit,
+            stdout,
+            stderr,
+        });
     }
+    let evidence = LinuxAccountAliasPolicyEvidence {
+        format: "memcordon.consumer-readiness.linux-account-alias-policy-refusal".into(),
+        revision: 1,
+        key: case.record.key.clone(),
+        run_id: case.record.run_id.clone(),
+        source_commit: case.index.source_commit.clone(),
+        source_tree_sha256: case.index.source_tree_sha256.clone(),
+        lease_id: "original-lease".into(),
+        owner: original.owner.clone(),
+        original_lease: original.original_lease.clone(),
+        acquisition: original.acquisition.clone(),
+        baseline_contract: "alias-baseline-contract.json".into(),
+        baseline_activation: original.activation.clone(),
+        account_intent: original.account_intent.clone(),
+        account_readback: original.account_readback.clone(),
+        group_readback: original.group_readback.clone(),
+        candidate_policy: "alias-candidate.json".into(),
+        before: commands.remove(0),
+        rejected: commands.remove(0),
+        after: commands.remove(0),
+    };
+    case.json("case-evidence.json", &json!(evidence));
 }
 
 pub fn baseline(scenario: &str) -> PersistedCase {
@@ -124,12 +177,36 @@ pub fn baseline(scenario: &str) -> PersistedCase {
     let activation = installed::read(&case, &original.activation);
     let request = installed::read(&case, &original.original_request);
     let baseline_contract = request["contract"].clone();
-    let mut contract = baseline_contract.clone();
-    let mut active = activation.clone();
+    let contract = baseline_contract.clone();
+    let active = activation.clone();
     let alias = scenario == "account-alias";
     let stale = scenario == "stale-reservation";
     if alias {
-        alias_graph(&mut case, &mut contract, &mut active, &owner);
+        // Production retains legacy caller grants; the hostile fixture must
+        // reach the same cross-generation caller separation guard.
+        let profile = memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1;
+        let legacy = json!({"format":"memcordon.local-private-policy","revision":1,
+            "profiles":[{"profile":profile,"reference":profile.reference(),"enabled":true}],"execution_identities":[],
+            "grants":[{"id":"installed-preserved","revision":1,"profile":profile.reference(),"ceiling":profile.ceiling(),"enabled":true,"callers":[{"platform":"linux","uid":65534}],"approved_plans":[sha256(b"original installed fixture")],"execution_identity":{"kind":"preserve-caller"}}],"active_attempt_disposition":"drain-existing"});
+        let mut owner = owner;
+        owner["baseline_registry"]["legacy"] = legacy.clone();
+        let mut activation = activation;
+        activation["registry"] = owner["baseline_registry"].clone();
+        activation["registry_digest"] =
+            json!(linux_registry_digest(&activation["registry"], &case.record.key.target).unwrap());
+        case.json(&original.owner, &owner);
+        case.json(&original.activation, &activation);
+        for path in [&original.original_lease, &original.acquisition] {
+            case.mutate(path, |raw| raw["legacy"] = legacy.clone());
+        }
+        alias_graph(
+            &mut case,
+            &baseline_contract,
+            &activation,
+            &owner,
+            &original,
+        );
+        return case;
     }
     case.json("account-baseline.json", &baseline_contract);
     case.json("account-contract.json", &contract);

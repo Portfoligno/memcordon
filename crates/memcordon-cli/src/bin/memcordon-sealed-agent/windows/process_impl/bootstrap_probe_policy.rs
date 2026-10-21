@@ -21,7 +21,7 @@ struct Wire {
 }
 
 impl ConsolelessProbePolicyV1 {
-    pub const BINDING_SCHEMA_VERSION: u32 = 4;
+    pub const BINDING_SCHEMA_VERSION: u32 = 6;
 
     pub const fn new() -> Self {
         Self {
@@ -67,10 +67,35 @@ pub(super) fn binding_domain(
     policy: Option<&ConsolelessProbePolicyV1>,
 ) -> Result<&'static [u8], &'static str> {
     match (schema_version, role, policy) {
-        (4, "probe", Some(_)) => Ok(b"memcordon-target-desktop-binding-v9\0"),
+        (6, "probe", Some(_)) => Ok(b"memcordon-target-desktop-binding-v11\0"),
         // Legacy bindings used the Ready wire schema value 19, despite the V3 type name.
         // Keep that serialized representation and its original digest domain exact.
         (19, "holder" | "loader-control", None) => Ok(b"memcordon-target-desktop-binding-v8\0"),
         _ => Err("bootstrap role, schema and creation policy differ"),
+    }
+}
+
+pub(super) fn validate_admission_capability(
+    schema_version: u32,
+    role: &str,
+    policy: Option<&ConsolelessProbePolicyV1>,
+    present: bool,
+) -> Result<(), &'static str> {
+    binding_domain(schema_version, role, policy)?;
+    if matches!(role, "holder" | "probe") && present {
+        Ok(())
+    } else {
+        Err("bootstrap Admission capability is absent or has an invalid role")
+    }
+}
+
+pub(super) fn validate_image_capability(
+    role: &str,
+    has_claim: bool,
+    has_handle: bool,
+) -> Result<(), &'static str> {
+    match (role, has_claim, has_handle) {
+        ("probe", true, true) | ("holder" | "loader-control", false, false) => Ok(()),
+        _ => Err("bootstrap image capability and identity differ from the exact role"),
     }
 }

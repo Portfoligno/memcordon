@@ -11,6 +11,37 @@ use crate::request::NamespaceIdentity;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+#[test]
+fn original_init_failure_survives_authenticated_publication_failure_without_authority() {
+    let (provider, init) = private_namespace_startup_channel().unwrap();
+    // SAFETY: the owned init channel is deliberately shut down for this refusal fixture.
+    assert_eq!(
+        unsafe { libc::shutdown(init.as_fd().as_raw_fd(), libc::SHUT_WR) },
+        0
+    );
+    let original = "native setup fixture errno=13";
+    let error = init
+        .report(
+            &PrivateNamespaceStartupObservation::Failed {
+                phase: PrivateNamespaceStartupPhase::NamespaceSetup,
+                detail: original.into(),
+            },
+            None,
+        )
+        .unwrap_err();
+    assert!(error.contains("startup send"));
+    let refusal = provider
+        .receive(
+            std::process::id() as libc::pid_t,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(refusal.contains("diagnostic-only private-init"));
+    assert!(refusal.contains("original-failure phase=1"));
+    assert!(refusal.contains(original));
+    assert!(refusal.contains("publication-failure phase=1"));
+}
+
 fn ready() -> PrivateNamespaceStartupObservation {
     PrivateNamespaceStartupObservation::TargetForked {
         namespace: NamespaceIdentity {

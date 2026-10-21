@@ -1,4 +1,5 @@
 mod attempt_store;
+pub(crate) mod bootstrap_image_capability;
 pub mod control_service;
 mod diagnostics;
 pub mod guardian;

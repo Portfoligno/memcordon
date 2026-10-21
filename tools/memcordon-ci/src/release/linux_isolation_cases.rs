@@ -581,9 +581,11 @@ impl ImportRefusalReport {
         )?;
         self.artifacts
             .extend([census_path, directory.join("isolation-import-census.json")]);
-        if scenario == "input-socket" {
+        if matches!(scenario, "input-socket" | "caller-writable-tree") {
             if !output.status.success() {
-                return Err(CiError::Message("undeclared input socket manifest projection import failed; native evidence retained".into()));
+                return Err(CiError::Message(
+                    "manifest projection import failed; original native evidence retained".into(),
+                ));
             }
             let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)?;
             if receipt["format"] != "memcordon.runtime-image-installation"
@@ -595,15 +597,16 @@ impl ImportRefusalReport {
                 || receipt["member_count"] != definition.entries.as_slice().len()
             {
                 return Err(CiError::Message(
-                    "undeclared socket installation receipt differs".into(),
+                    "projected image installation receipt differs".into(),
                 ));
             }
-            self.observe_excluded_image(
+            self.observe_projected_image(
                 &context,
                 &definition,
                 &definition_path,
                 &definition_bytes,
                 &source,
+                scenario,
             )?;
         } else if output.status.success() {
             return Err(CiError::Message("unsafe actual isolation source unexpectedly imported; native definition intent retained".into()));
@@ -611,13 +614,14 @@ impl ImportRefusalReport {
         Ok((definition, definition_path))
     }
 
-    fn observe_excluded_image(
+    fn observe_projected_image(
         &mut self,
         context: &super::linux_readiness_image_cases::ImageCaseContext<'_>,
         definition: &memcordon_core::workload_registry_v3::RuntimeImageDefinitionV1,
         definition_path: &Path,
         definition_bytes: &[u8],
         source: &Path,
+        scenario: &str,
     ) -> Result<()> {
         let directory = context.output;
         let inspection = directory.join("installed-image-inspection");
@@ -639,7 +643,7 @@ impl ImportRefusalReport {
             &inspection.join("invocation.json"),
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.linux-isolation-image-inspection-command","revision":1,
-                "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"scenario":"input-socket",
+                "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"scenario":scenario,
                 "program":"/usr/libexec/memcordon-sealed-agent","executable_sha256":context.expected_agent_sha256,
                 "argv":argv.iter().map(|value|value.to_string_lossy()).collect::<Vec<_>>(),"cwd":inspection,"environment_cleared":true,
                 "definition_sha256":super::artifacts::checksum(definition_bytes),
@@ -705,7 +709,7 @@ impl ImportRefusalReport {
         let inventory = capture_import_source_inventory(
             definition,
             source,
-            Some("owned-source/input-socket"),
+            (scenario == "input-socket").then_some("owned-source/input-socket"),
             &mut self.files,
         )?;
         let owner = self
@@ -730,24 +734,38 @@ impl ImportRefusalReport {
                 "held exclusion source reassociated".into(),
             ));
         }
-        let listener = rustix::fs::fstat(
-            owner
-                .socket
-                .as_ref()
-                .ok_or_else(|| CiError::Message("held excluded socket absent".into()))?,
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?;
-        if Some((listener.st_dev, listener.st_ino, listener.st_mode)) != owner.listener_identity {
-            return Err(CiError::Message(
-                "original excluded listener changed".into(),
-            ));
-        }
+        let listener = if scenario == "input-socket" {
+            let listener = rustix::fs::fstat(
+                owner
+                    .socket
+                    .as_ref()
+                    .ok_or_else(|| CiError::Message("held excluded socket absent".into()))?,
+            )
+            .map_err(|error| CiError::Message(error.to_string()))?;
+            if Some((listener.st_dev, listener.st_ino, listener.st_mode)) != owner.listener_identity
+            {
+                return Err(CiError::Message(
+                    "original excluded listener changed".into(),
+                ));
+            }
+            serde_json::json!({"device":listener.st_dev,"inode":listener.st_ino,"mode":listener.st_mode})
+        } else {
+            if scenario != "caller-writable-tree"
+                || owner.socket.is_some()
+                || owner.listener_identity.is_some()
+            {
+                return Err(CiError::Message(
+                    "projected source listener custody differs".into(),
+                ));
+            }
+            serde_json::Value::Null
+        };
         let path = directory.join("isolation-import-source-after.json");
         super::linux_mixed_installed::retain(
             &path,
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.linux-isolation-import-source-after","revision":1,"inventory":inventory,
-                "listener":{"device":listener.st_dev,"inode":listener.st_ino,"mode":listener.st_mode}
+                "listener":listener
             }))?,
         )?;
         self.artifacts.push(path);
@@ -1145,6 +1163,7 @@ pub struct AccountRefusalReport {
     pub external: Option<ExternalAccountTask>,
     pub launches: Vec<super::linux_mixed_installed::InstalledMixedLaunch>,
     pub artifacts: Vec<PathBuf>,
+    pub(super) alias_policy_directory: Option<PathBuf>,
     restore: Option<(
         memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3,
         PathBuf,
@@ -1269,13 +1288,17 @@ impl AccountRefusalReport {
     pub fn run_alias(
         &mut self,
         input: &super::linux_mixed_installed::InstalledMixedDriverInput<'_>,
-        account: &crate::consumer_readiness_ledger::ExclusiveAccount,
+        _account: &crate::consumer_readiness_ledger::ExclusiveAccount,
         policy: &super::linux_mixed_installed::ActivatedMixedPolicy,
         directory: &Path,
-        challenge: &str,
+        _challenge: &str,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        if self.external.is_some() || !self.launches.is_empty() || self.restore.is_some() {
+        if self.external.is_some()
+            || !self.launches.is_empty()
+            || self.restore.is_some()
+            || self.alias_policy_directory.is_some()
+        {
             return Err(CiError::Message("account alias report reused".into()));
         }
         let mut value = serde_json::to_value(&policy.registry)?;
@@ -1304,7 +1327,11 @@ impl AccountRefusalReport {
         value["grants"][0]["approved_plans"] = serde_json::json!([digest]);
         let mutated: memcordon_core::workload_registry_v3::RuntimePrivatePolicyRegistryV3 =
             serde_json::from_value(value)?;
-        mutated.validate().map_err(CiError::Message)?;
+        const ALIAS_REFUSAL: &str =
+            "exclusive account id/uid/reservation alias across current or legacy policy";
+        if mutated.validate().err().as_deref() != Some(ALIAS_REFUSAL) {
+            return Err(CiError::Message("account alias candidate does not exercise the exact static caller separation guard".into()));
+        }
         let privileged = input.admin_root.join(format!(
             "isolation-alias-{}",
             directory
@@ -1313,50 +1340,72 @@ impl AccountRefusalReport {
                 .to_string_lossy()
         ));
         std::fs::create_dir(&privileged)?;
-        self.restore = Some((
-            policy.registry.clone(),
-            directory.to_owned(),
-            privileged.clone(),
-        ));
-        let (epoch, activation) = super::linux_readiness_policy_cases::apply_policy(
-            &mutated,
+        let before = super::linux_readiness_policy_cases::observe_policy_command(
+            None,
             directory,
             &privileged,
-            "alias-activation",
+            "alias-before",
             input.deadline,
         )?;
-        contract.expected_epoch = epoch;
-        contract.workload_plan_digest = digest.clone();
-        contract.authorization.approved_plan_digest = digest;
-        contract.validate().map_err(CiError::Message)?;
-        // The public copied contract remains readable by the actual caller;
-        // its protected mutation and native activation receipts are retained.
-        let path = directory.join("alias.contract.json");
-        super::linux_mixed_installed::retain(&path, &serde_json::to_vec(&contract)?)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
-        self.artifacts.extend([
-            path.clone(),
-            activation.clone(),
-            directory.join("alias-activation.policy.json"),
-        ]);
-        self.artifacts.extend(
-            ["invocation.json", "exit.json", "stderr.bin"]
-                .map(|extension| directory.join("alias-activation").with_extension(extension)),
-        );
-        let active = super::linux_mixed_installed::ActivatedMixedPolicy {
-            registry: mutated,
-            contract,
-            policy_path: directory.join("alias-activation.policy.json"),
-            activation_path: activation,
-        };
-        self.run_frontend(
-            input,
-            account,
-            &active,
+        let requested = super::linux_readiness_policy_cases::observe_policy_command(
+            Some(&mutated),
             directory,
-            challenge,
-            "account-alias",
-        )
+            &privileged,
+            "alias-rejection",
+            input.deadline,
+        )?;
+        let after = super::linux_readiness_policy_cases::observe_policy_command(
+            None,
+            directory,
+            &privileged,
+            "alias-after",
+            input.deadline,
+        )?;
+        if !before.status.success()
+            || !after.status.success()
+            || !before.stderr.is_empty()
+            || !after.stderr.is_empty()
+            || requested.status.code() != Some(125)
+            || !requested.stdout.is_empty()
+            || requested.stderr != format!("{ALIAS_REFUSAL}\n").as_bytes()
+            || before.stdout != after.stdout
+        {
+            return Err(CiError::Message(format!(
+                "actual account alias policy refusal or unchanged inspection differs: before={} apply={} after={} stderr={}",
+                before.status,
+                requested.status,
+                after.status,
+                String::from_utf8_lossy(&requested.stderr)
+            )));
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&before.stdout)
+            .map_err(CiError::Message)?;
+        let inspected: serde_json::Value = serde_json::from_slice(&before.stdout)?;
+        let baseline: serde_json::Value =
+            serde_json::from_slice(&super::linux_mixed_installed::read_policy_observation_file(
+                &policy.activation_path,
+                32 * 1024 * 1024,
+            )?)?;
+        if inspected["format"] != "memcordon.local-private-activation"
+            || inspected["revision"] != 2
+            || inspected["registry"] != serde_json::to_value(&policy.registry)?
+            || inspected["epoch"] != serde_json::to_value(&policy.contract.expected_epoch)?
+            || inspected["registry_digest"]
+                != serde_json::to_value(
+                    policy
+                        .registry
+                        .canonical_digest()
+                        .map_err(CiError::Message)?,
+                )?
+            || inspected != baseline
+        {
+            return Err(CiError::Message(
+                "account alias inspection differs from authenticated original activation".into(),
+            ));
+        }
+        self.alias_policy_directory = Some(directory.to_owned());
+        // No frontend/target is launched and the original valid policy was never replaced.
+        Ok(())
     }
     pub fn run_stale(
         &mut self,

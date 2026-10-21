@@ -231,6 +231,7 @@ fn require_live(
 
 #[derive(Default)]
 pub struct LifecycleReport {
+    fixture_exports: Vec<super::fixture_export_retirement::Owner>,
     original_work_deadline: Option<Instant>,
     original_cleanup_deadline: Option<Instant>,
     pub native: super::linux_readiness_limits_cases::LimitsReport,
@@ -248,6 +249,7 @@ pub struct LifecycleReport {
 impl LifecycleReport {
     pub fn native_owners_settled(&self) -> bool {
         self.native.native_owners_settled()
+            && self.fixture_exports.iter().all(|owner| owner.settled())
             && self.workers.is_empty()
             && self.actor_owners.is_empty()
             && self.controls.is_empty()
@@ -266,6 +268,9 @@ pub fn finalize_report(report: &mut LifecycleReport, deadline: Instant) -> Resul
         ));
     }
     super::linux_readiness_limits_cases::finalize_report(&mut report.native, deadline)?;
+    for owner in &mut report.fixture_exports {
+        owner.retire()?;
+    }
     for worker in report.workers.iter().chain(&report.actor_owners) {
         while !worker.exited().map_err(CiError::Message)? {
             if Instant::now() >= deadline {
@@ -352,6 +357,11 @@ pub fn begin_case(
     }
     report.original_work_deadline = Some(context.work_deadline);
     report.original_cleanup_deadline = Some(context.cleanup_deadline);
+    // The nested report retains the Child even if prepared authentication fails.
+    // Its cleanup authority must exist before that first owner is acquired.
+    report
+        .native
+        .bind_original_cutoffs(context.work_deadline, context.cleanup_deadline)?;
     if context.work_deadline_unix_millis == 0
         || context.cleanup_deadline_unix_millis <= context.work_deadline_unix_millis
     {
@@ -1068,6 +1078,44 @@ pub fn run_case(
                     retain_bytes(&root.join(name), &bytes, &mut report.files)?;
                 }
             }
+            let export_receipt: serde_json::Value = serde_json::from_slice(&exported)?;
+            if export_receipt["root_layout"]
+                != serde_json::to_value(&admission.request.root_layout)?
+                || export_receipt["identity"]
+                    != serde_json::to_value(&admission.request.execution_identity)?
+            {
+                return Err(CiError::Message(
+                    "lifecycle export receipt differs from original fixture authority".into(),
+                ));
+            }
+            let export_owner = super::fixture_export_retirement::prepare(
+                path.parent().expect("authenticated export root"),
+                &exported,
+                0,
+                context.cleanup_deadline,
+                &root.join("fixture-export-retirement-journal.jsonl"),
+                |name, bytes| {
+                    let destination = root.join("exported").join(name);
+                    std::fs::create_dir_all(destination.parent().expect("finite export parent"))?;
+                    retain_bytes(&destination, bytes, &mut report.files)
+                },
+            )?;
+            report.fixture_exports.push(export_owner);
+            let export_retirement = report
+                .fixture_exports
+                .last_mut()
+                .expect("original export owner")
+                .retire()?;
+            retain_bytes(
+                &root.join("fixture-export-retirement.json"),
+                &serde_json::to_vec(&export_retirement)?,
+                &mut report.files,
+            )?;
+            let journal = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root.join("fixture-export-retirement-journal.jsonl"))?;
+            report.files.push(journal);
         }
     }
     use super::linux_original_recovery::{contract, record};

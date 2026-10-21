@@ -323,7 +323,7 @@ fn native_pe_machine(role: &str) -> Result<u16, String> {
     ))
 }
 
-fn verify_native_target_desktop_bootstrap_pe(
+pub(super) fn verify_native_target_desktop_bootstrap_pe(
     bytes: &[u8],
 ) -> Result<memcordon_core::WindowsPeImports, String> {
     require_native_pe_machine(

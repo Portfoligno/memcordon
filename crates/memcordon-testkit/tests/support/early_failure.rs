@@ -63,6 +63,7 @@ fn observation_precedes_callback_settlement_and_preserves_original_status() {
             Some(64 * 1024),
             ProcessControl {
                 cancelled: None,
+                external_stop: None,
                 progress: None,
                 failure: Some(Arc::new(move |notice| {
                     assert_eq!(notice.cause, NativeFailureCause::ObservedFailureStatus);
