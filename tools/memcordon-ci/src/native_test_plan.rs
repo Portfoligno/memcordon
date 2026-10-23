@@ -94,6 +94,9 @@ pub fn commands_for_platform(
     }
 
     let mut build_arguments = arguments.clone();
+    if platform == NativePlatform::MacOs {
+        build_arguments.extend(["--verbose", "--message-format=json-render-diagnostics"]);
+    }
     build_arguments.push("--no-run");
     // Bound cold compilation separately from execution on every native lane.
     // Both phases select the same targets, features, profile, and lockfile.

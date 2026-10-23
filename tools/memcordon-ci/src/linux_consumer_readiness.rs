@@ -790,8 +790,23 @@ pub struct HeldLinuxProcess {
     pidfd: std::os::fd::OwnedFd,
     observed_parent: Option<(u32, u64)>,
     pub namespace_pid: Option<u32>,
-    observed_images: Vec<File>,
+    observed_images: Vec<(File, std::fs::Metadata)>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct InterventionHoldFailure {
+    pub stage: &'static str,
+    pub pid: u32,
+    pub expected_birth: u64,
+    pub observed_birth: Option<u64>,
+    pub retirement_observed: Option<bool>,
+    pub native_error: Option<i32>,
+    pub detail: String,
+}
+
+#[cfg(test)]
+#[path = "../tests/support/linux_intervention_capability.rs"]
+mod intervention_native_tests;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1194,6 +1209,73 @@ pub(crate) fn process_birth(pid: u32) -> Result<u64, String> {
 }
 
 impl HeldLinuxProcess {
+    /// Duplicate the original pidfd, never reacquire authority from a numeric PID.
+    pub fn duplicate_for_intervention(
+        &self,
+        cutoff: std::time::Instant,
+    ) -> Result<Self, InterventionHoldFailure> {
+        let mut failure = InterventionHoldFailure {
+            stage: "original-cutoff",
+            pid: self.process_id,
+            expected_birth: self.birth,
+            observed_birth: None,
+            retirement_observed: None,
+            native_error: None,
+            detail: String::new(),
+        };
+        let acquired = (|| -> Result<Self, String> {
+            if std::time::Instant::now() >= cutoff {
+                return Err("original intervention cutoff expired".into());
+            }
+            failure.stage = "original-pidfd-liveness";
+            let exited = self.exited()?;
+            failure.retirement_observed = Some(exited);
+            if exited {
+                return Err("original selected actor already retired".into());
+            }
+            failure.stage = "original-process-birth";
+            let observed = process_birth(self.process_id)?;
+            failure.observed_birth = Some(observed);
+            if observed != self.birth {
+                return Err("original selected actor birth differs".into());
+            }
+            failure.stage = "duplicate-original-pidfd";
+            let pidfd = self.pidfd.try_clone().map_err(|error| {
+                failure.native_error = error.raw_os_error();
+                error.to_string()
+            })?;
+            let value = Self {
+                process_id: self.process_id,
+                birth: self.birth,
+                pidfd,
+                observed_parent: self.observed_parent,
+                namespace_pid: self.namespace_pid,
+                observed_images: Vec::new(),
+            };
+            failure.stage = "duplicated-pidfd-readback";
+            let exited = value.exited()?;
+            failure.retirement_observed = Some(exited);
+            if exited {
+                return Err("original selected actor retired during pidfd duplication".into());
+            }
+            failure.observed_birth = None;
+            let observed = process_birth(value.process_id)?;
+            failure.observed_birth = Some(observed);
+            if observed != value.birth {
+                return Err(
+                    "original selected actor birth changed during pidfd duplication".into(),
+                );
+            }
+            if std::time::Instant::now() >= cutoff {
+                return Err("original intervention cutoff expired after pidfd duplication".into());
+            }
+            Ok(value)
+        })();
+        acquired.map_err(|detail| {
+            failure.detail = detail;
+            failure
+        })
+    }
     /// The outer result describes ownership/liveness checks; the inner result
     /// preserves the actual PIDFD syscall outcome and native errno.
     pub fn signal_interrupt(&self) -> Result<Result<(), i32>, String> {
@@ -1461,8 +1543,58 @@ impl HeldLinuxProcess {
             return Err("held executable/birth changed through native readback".into());
         }
         let receipt = serde_json::json!({"device":before.dev(),"inode":before.ino(),"length":length,"sha256":hex::encode(hash.finalize())});
-        self.observed_images.push(image);
+        self.observed_images.push((image, after));
         Ok(receipt)
+    }
+
+    /// Recheck current executable association without rehashing an unchanged pin.
+    pub fn verify_intervention_image(
+        &self,
+        cutoff: std::time::Instant,
+    ) -> Result<serde_json::Value, String> {
+        use std::os::unix::fs::MetadataExt;
+        if std::time::Instant::now() >= cutoff || self.exited()? {
+            return Err(
+                "original selected actor/cutoff is no longer live before image readback".into(),
+            );
+        }
+        if process_birth(self.process_id)? != self.birth {
+            return Err("original selected actor birth differs before image readback".into());
+        }
+        let (image, original) = self
+            .observed_images
+            .last()
+            .ok_or("selected actor has no originally measured executable pin")?;
+        let held = image
+            .metadata()
+            .map_err(|error| format!("held executable metadata: {error}"))?;
+        let current = File::open(format!("/proc/{}/exe", self.process_id))
+            .map_err(|error| format!("current selected actor executable open: {error}"))?;
+        let named = current
+            .metadata()
+            .map_err(|error| format!("current selected actor executable metadata: {error}"))?;
+        let stamp = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec());
+        if stamp(&held) != stamp(original) || stamp(&named) != stamp(original) {
+            return Err(format!(
+                "selected actor executable changed after original measurement; original={:?} held={:?} current={:?}",
+                stamp(original),
+                stamp(&held),
+                stamp(&named)
+            ));
+        }
+        if self.exited()?
+            || process_birth(self.process_id)? != self.birth
+            || std::time::Instant::now() >= cutoff
+        {
+            return Err(
+                "original selected actor/cutoff changed through current executable readback".into(),
+            );
+        }
+        Ok(
+            serde_json::json!({"current_image_verified":true,"pid":self.process_id,"birth":self.birth,
+            "device":held.dev(),"inode":held.ino(),"length":held.len(),"original_held_metadata_unchanged":true,
+            "rehash":"not repeated; unchanged original measured executable remains held"}),
+        )
     }
 
     pub fn live_snapshot(&self) -> Result<LinuxHeldSnapshot, String> {

@@ -7,6 +7,35 @@ use memcordon_ci::windows_consumer_readiness::{
 };
 
 #[test]
+fn completed_released_native_failure_cannot_wait_for_a_positive_fixture() {
+    let bytes = include_bytes!("fixtures/windows_restricted_completed_failure.json");
+    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
+    let provider = result
+        .provider_association
+        .as_ref()
+        .unwrap()
+        .provider
+        .clone();
+    assert!(result.attempts.last().unwrap().error.is_none());
+    let failure = check_positive_barrier_result(bytes, &provider)
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("wrapper-status=125"));
+    assert!(failure.contains("outcome=Completed"));
+    assert!(failure.contains("windows-status=3221225794 (0xC0000142)"));
+    assert!(failure.contains("launch=ReleaseIssued"));
+    assert!(failure.contains("no original attempt error"));
+    let mut foreign = provider;
+    foreign.generation = memcordon_core::BoundedText::new("foreign-generation").unwrap();
+    assert!(
+        check_positive_barrier_result(bytes, &foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("provider binding")
+    );
+}
+
+#[test]
 fn completed_restricted_launch_failure_cannot_wait_for_a_positive_fixture() {
     let bytes = include_bytes!("fixtures/windows_restricted_launch_failure.json");
     let result = memcordon_core::ResultV1::parse(bytes).unwrap();
@@ -29,6 +58,40 @@ fn completed_restricted_launch_failure_cannot_wait_for_a_positive_fixture() {
     assert!(check_positive_barrier_result(&bytes[..bytes.len() / 2], provider).is_err());
     let unbound = include_bytes!("fixtures/private_worker_loss_result.json");
     assert!(check_positive_barrier_result(unbound, provider).is_err());
+}
+
+#[test]
+fn released_loader_event_context_requires_exact_failure_and_retirement() {
+    use memcordon_ci::windows_consumer_readiness::released_target_loader_event_candidate;
+    let bytes = include_bytes!("fixtures/windows_restricted_completed_failure.json");
+    let result = memcordon_core::ResultV1::parse(bytes).unwrap();
+    assert!(released_target_loader_event_candidate(&result));
+    let refusal = memcordon_core::ResultV1::parse(include_bytes!(
+        "fixtures/windows_restricted_launch_failure.json"
+    ))
+    .unwrap();
+    assert!(!released_target_loader_event_candidate(&refusal));
+    let mut missing_retirement = result.clone();
+    missing_retirement
+        .attempts
+        .last_mut()
+        .unwrap()
+        .restart_safety
+        .helpers_reaped = false;
+    assert!(!released_target_loader_event_candidate(&missing_retirement));
+    let mut cleanup_error = result.clone();
+    cleanup_error
+        .cleanup
+        .failed_operations
+        .push("fixture retirement uncertain".into());
+    assert!(!released_target_loader_event_candidate(&cleanup_error));
+    let mut different_status = result;
+    different_status.outcome.wrapper_status = 0;
+    assert!(!released_target_loader_event_candidate(&different_status));
+    different_status.outcome.wrapper_status = 125;
+    different_status.outcome.native_termination =
+        Some(memcordon_core::ChildTermination::WindowsStatus { status: 1 });
+    assert!(!released_target_loader_event_candidate(&different_status));
 }
 
 fn descriptor() -> Descriptor {

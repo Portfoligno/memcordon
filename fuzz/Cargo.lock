@@ -797,6 +797,8 @@ dependencies = [
  "memcordon-readiness-verifier",
  "memcordon-testkit",
  "memcordon-windows-launch-core",
+ "memcordon-windows-loader-lab",
+ "nix",
  "rustix",
  "semver",
  "serde",
@@ -894,6 +896,20 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "memcordon-windows-loader-lab"
+version = "0.5.8-dev"
+dependencies = [
+ "clap",
+ "hex",
+ "memcordon-core",
+ "memcordon-windows-launch-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "windows-sys 0.61.2",
 ]
 

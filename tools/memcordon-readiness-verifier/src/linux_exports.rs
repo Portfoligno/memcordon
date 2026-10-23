@@ -1709,11 +1709,11 @@ pub(crate) fn validate_export_held_family(
     let bytes: Vec<u8> = serde_json::from_value(worker["journal_bytes"].clone())
         .map_err(|error| error.to_string())?;
     let journal = crate::linux_recovery_route::decode_journal(&bytes, attempt)?;
-    if journal["phase"] != "checkpoint-committed"
-        || journal["release_knowledge"] != "not-released"
+    if journal["phase"] != "release-intent"
+        || journal["release_knowledge"] != "possibly-released"
         || !journal["mixed_export_intent"].is_null()
     {
-        return Err("export pre-ACK journal carries later release/export authority".into());
+        return Err("export pre-ACK journal does not match conservative prepared intent or carries export authority".into());
     }
     if worker["format"] != "memcordon.linux-prepared-worker-observation"
         || worker["revision"] != 1

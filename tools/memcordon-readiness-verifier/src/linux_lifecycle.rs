@@ -91,12 +91,12 @@ pub fn validate_linux_lifecycle_intervention(
     let expected_phase = if phase == "drain" {
         "retiring"
     } else {
-        "checkpoint-committed"
+        "release-intent"
     };
     let knowledge = if phase == "drain" {
         "exec-observed"
     } else {
-        "not-released"
+        "possibly-released"
     };
     let journal_actor = match actor {
         "frontend" => "frontend",
@@ -873,8 +873,8 @@ fn validate_worker(raw: &Value, prepared: &Value, agent_bytes: &[u8]) -> Verific
     {
         return Err("lifecycle original worker protected journal/native image differs".into());
     }
-    if journal["phase"] != "checkpoint-committed"
-        || journal["release_knowledge"] != "not-released"
+    if journal["phase"] != "release-intent"
+        || journal["release_knowledge"] != "possibly-released"
         || !journal["mixed_export_intent"].is_null()
     {
         return Err(
@@ -991,7 +991,6 @@ fn validate_frontend(
         (3, "65534"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
-        (7, "+512M"),
         (8, "+300s"),
         (9, "--sealed"),
         (10, "--workload-contract"),
@@ -1081,7 +1080,17 @@ fn validate_frontend(
     for argument in target {
         public_arguments.push(serde_json::json!({"display":std::str::from_utf8(argument).map_err(|error|error.to_string())?,"raw":null}));
     }
-    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":"+512M"},{"kind":"time","token":"+300s"}],"memory_token":"+512M","deadline_token":"+300s","argv":public_arguments});
+    let memory = format!(
+        "+{}B",
+        context
+            .input
+            .memory_bytes
+            .ok_or("lifecycle frozen memory limit absent")?
+    );
+    if arguments.get(7).map(Vec::as_slice) != Some(memory.as_bytes()) {
+        return Err("lifecycle native frontend memory differs from frozen image budget".into());
+    }
+    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":memory},{"kind":"time","token":"+300s"}],"memory_token":memory,"deadline_token":"+300s","argv":public_arguments});
     Ok((public, status))
 }
 
@@ -1133,7 +1142,7 @@ fn validate_provider_request(
         )?,
         arguments,
         &[],
-        Some(512 * 1024 * 1024),
+        context.input.memory_bytes,
         None,
     )?;
     Ok(public)
@@ -1196,8 +1205,8 @@ fn validate_boundary(
         || allocation["worker_index"]
             .as_u64()
             .is_none_or(|index| index >= 128)
-        || allocation["phase"] != "checkpoint-committed"
-        || allocation["release_knowledge"] != "not-released"
+        || allocation["phase"] != "release-intent"
+        || allocation["release_knowledge"] != "possibly-released"
         || journal["phase"] != allocation["phase"]
         || journal["release_knowledge"] != allocation["release_knowledge"]
         || allocation["journal_sha256"] != sha256(journal_bytes)
@@ -2290,6 +2299,8 @@ fn original_context(
         .ok_or("lifecycle original owner path differs")?;
     let mut peers = BTreeMap::new();
     let allowed = [
+        "fixture-memory-budget.json",
+        "fixture-memory-max.json",
         "challenge.bin",
         "frontend-invocation.json",
         "frontend-preinput.json",
@@ -2417,7 +2428,7 @@ fn original_context(
         || !input.binary.is_empty()
         || !matches!(&input.target_argv,NativeArguments::UnixBytes(actual) if *actual==arguments)
         || input.deadline_millis != Some(300000)
-        || input.memory_bytes != Some(512 * 1024 * 1024)
+        || input.memory_bytes.is_none()
         || input.toolchain_identity.is_some()
     {
         return Err("lifecycle original fixture recipe/input budgets differ".into());
@@ -2598,6 +2609,37 @@ fn original_context(
         &e.run_id,
         attempt,
     )?;
+    validate_fixture_memory_budget(
+        &decode("fixture-memory-budget.json")?,
+        &owner,
+        &acquisition,
+        &request,
+        &e.key,
+        input.memory_bytes.ok_or("lifecycle memory limit absent")?,
+    )?;
+    let maximum = decode("fixture-memory-max.json")?;
+    closed(
+        &maximum,
+        &[
+            "format",
+            "revision",
+            "key",
+            "attempt_id",
+            "cgroup_inode",
+            "memory_max",
+            "budget_sha256",
+        ],
+    )?;
+    if maximum["format"] != "memcordon.linux-lifecycle-memory-max"
+        || maximum["revision"] != 1
+        || maximum["key"] != serde_json::to_value(&e.key).map_err(|error| error.to_string())?
+        || maximum["attempt_id"] != attempt
+        || maximum["cgroup_inode"] != prepared["mixed_cgroup_identity"]["inode"]
+        || maximum["memory_max"].as_u64() != input.memory_bytes
+        || maximum["budget_sha256"] != custody.hash(path("fixture-memory-budget.json")?)?
+    {
+        return Err("lifecycle native memory.max differs from original frozen attempt".into());
+    }
     let raw: Value = crate::wire::json(custody.bytes(&e.raw)?)?;
     closed(
         &raw,
@@ -2638,4 +2680,90 @@ fn original_context(
         case_directory,
         frontend_directory,
     })
+}
+
+// Independent reconstruction from the source-bound acquisition inventory. The
+// receipt is evidence, never permission to choose different fixture headroom.
+fn validate_fixture_memory_budget(
+    receipt: &Value,
+    owner: &Value,
+    acquisition: &Value,
+    request: &Value,
+    key: &CaseKey,
+    memory: u64,
+) -> VerificationResult<()> {
+    closed(
+        receipt,
+        &[
+            "format", "revision", "source", "cell", "lease_id", "key", "budget",
+        ],
+    )?;
+    let budget = &receipt["budget"];
+    closed(
+        budget,
+        &[
+            "runtime_image",
+            "input_image",
+            "page_bytes",
+            "image_bytes",
+            "rounded_image_bytes",
+            "headroom_bytes",
+            "limit_bytes",
+        ],
+    )?;
+    let page = budget["page_bytes"]
+        .as_u64()
+        .filter(|v| v.is_power_of_two() && *v >= 4096 && *v <= 65536)
+        .ok_or("lifecycle fixture page size invalid")?;
+    let mut image_bytes = 0_u64;
+    let mut rounded = 0_u64;
+    for kind in ["runtime", "input"] {
+        let image = &acquisition["images"][kind];
+        let reference = crate::linux_image_reference(image, &key.target)?;
+        let field = format!("{kind}_image");
+        if budget[&field] != reference || request[&field] != reference {
+            return Err("lifecycle fixture budget crosses admitted image references".into());
+        }
+        for entry in image["entries"]
+            .as_array()
+            .ok_or("lifecycle image inventory absent")?
+        {
+            if entry["kind"] == "regular" {
+                let size = entry["size"]
+                    .as_u64()
+                    .ok_or("lifecycle image size absent")?;
+                image_bytes = image_bytes
+                    .checked_add(size)
+                    .ok_or("lifecycle image size overflow")?;
+                let charge = size
+                    .div_ceil(page)
+                    .checked_mul(page)
+                    .ok_or("lifecycle image page overflow")?;
+                rounded = rounded
+                    .checked_add(charge)
+                    .ok_or("lifecycle image charge overflow")?;
+            }
+        }
+    }
+    let headroom = 512 * 1024 * 1024_u64;
+    let limit = rounded
+        .checked_add(headroom)
+        .ok_or("lifecycle fixture budget overflow")?;
+    if receipt["format"] != "memcordon.linux-fixture-memory-budget"
+        || receipt["revision"] != 1
+        || receipt["source"] != owner["identity"]
+        || receipt["cell"] != owner["cell"]
+        || receipt["lease_id"] != owner["lease_id"]
+        || receipt["key"] != serde_json::to_value(key).map_err(|error| error.to_string())?
+        || budget["image_bytes"] != image_bytes
+        || budget["rounded_image_bytes"] != rounded
+        || budget["headroom_bytes"] != headroom
+        || budget["limit_bytes"] != limit
+        || memory != limit
+    {
+        return Err(
+            "lifecycle fixture memory receipt differs from original images/headroom/owner".into(),
+        );
+    }
+    Ok(())
 }

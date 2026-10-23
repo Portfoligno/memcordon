@@ -602,6 +602,62 @@ fn run_spawner(
     }
 }
 
+pub fn run_workload(request: &Path, result: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(request).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+        return Err("workload diagnostic request is not a bounded regular file".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err("workload diagnostic request is a reparse point".into());
+        }
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("workload diagnostic request exceeds bound".into());
+    }
+    let input: memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    input.validate()?;
+    #[cfg(windows)]
+    {
+        windows_service::run_workload(
+            &std::env::current_exe().map_err(|error| error.to_string())?,
+            request,
+            result,
+            &input,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = result;
+        Err("actual-workload diagnostic requires native Windows".into())
+    }
+}
+
 #[cfg(windows)]
 mod windows_service {
     use std::{
@@ -636,13 +692,51 @@ mod windows_service {
         run_id: &str,
         scenario_id: &str,
     ) -> Result<(), String> {
+        run_inner(executable, scenario, result, run_id, scenario_id, None)
+    }
+
+    pub fn run_workload(
+        executable: &Path,
+        request: &Path,
+        result: &Path,
+        input: &memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1,
+    ) -> Result<(), String> {
+        let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        if input.work_deadline_tick_ms <= now || input.cleanup_deadline_tick_ms <= now {
+            return Err("workload diagnostic cutoff expired before service creation".into());
+        }
+        let base = Instant::now();
+        let work = base
+            .checked_add(Duration::from_millis(input.work_deadline_tick_ms - now))
+            .ok_or("workload service work cutoff overflow")?;
+        let cleanup = base
+            .checked_add(Duration::from_millis(input.cleanup_deadline_tick_ms - now))
+            .ok_or("workload service cleanup cutoff overflow")?;
+        run_inner(
+            executable,
+            request,
+            result,
+            &input.diagnostic_id,
+            "actual-workload",
+            Some((work, cleanup)),
+        )
+    }
+
+    fn run_inner(
+        executable: &Path,
+        scenario: &Path,
+        result: &Path,
+        run_id: &str,
+        scenario_id: &str,
+        cutoffs: Option<(Instant, Instant)>,
+    ) -> Result<(), String> {
         let source = SourceToken::current()?;
         let source_process_id = unsafe { GetCurrentProcessId() };
         let source_creation_time = current_process_creation_time()?;
         let service_name = crate::spawner::lab_service_name(run_id, scenario_id);
         let mut service_name_wide = service_name.encode_utf16().collect::<Vec<_>>();
         service_name_wide.push(0);
-        let arguments = [
+        let mut arguments = vec![
             executable.as_os_str().encode_wide().collect::<Vec<_>>(),
             OsStr::new("service-spawner").encode_wide().collect(),
             OsStr::new("--service-run-id").encode_wide().collect(),
@@ -660,6 +754,18 @@ mod windows_service {
             OsStr::new("--source-token").encode_wide().collect(),
             (source.0 as usize).to_string().encode_utf16().collect(),
         ];
+        if cutoffs.is_some() {
+            arguments[1] = OsStr::new("service-workload").encode_wide().collect();
+            // Replace the two legacy run/scenario identity options with one exact service name.
+            arguments.splice(
+                2..6,
+                [
+                    OsStr::new("--service-name").encode_wide().collect(),
+                    service_name.encode_utf16().collect(),
+                ],
+            );
+            arguments[4] = OsStr::new("--request").encode_wide().collect();
+        }
         let mut command_line = memcordon_core::encode_windows_command_line(&arguments);
         command_line.push(0);
         let manager =
@@ -700,12 +806,19 @@ mod windows_service {
                 "start isolated lab service: {}",
                 std::io::Error::last_os_error()
             );
-            return match delete_and_verify(service, &manager, &service_name_wide, false) {
+            return match delete_and_verify_until(
+                service,
+                &manager,
+                &service_name_wide,
+                false,
+                cutoffs.map(|value| value.1),
+            ) {
                 Ok(()) => Err(primary),
                 Err(cleanup) => Err(format!("{primary}; cleanup: {cleanup}")),
             };
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline =
+            cutoffs.map_or_else(|| Instant::now() + Duration::from_secs(60), |value| value.0);
         loop {
             let mut status = SERVICE_STATUS_PROCESS::default();
             let mut required = 0_u32;
@@ -724,13 +837,25 @@ mod windows_service {
                     "query isolated lab service: {}",
                     std::io::Error::last_os_error()
                 );
-                return match delete_and_verify(service, &manager, &service_name_wide, true) {
+                return match delete_and_verify_until(
+                    service,
+                    &manager,
+                    &service_name_wide,
+                    true,
+                    cutoffs.map(|value| value.1),
+                ) {
                     Ok(()) => Err(primary),
                     Err(cleanup) => Err(format!("{primary}; cleanup: {cleanup}")),
                 };
             }
             if status.dwCurrentState == SERVICE_STOPPED {
-                delete_and_verify(service, &manager, &service_name_wide, false)?;
+                delete_and_verify_until(
+                    service,
+                    &manager,
+                    &service_name_wide,
+                    false,
+                    cutoffs.map(|value| value.1),
+                )?;
                 return (status.dwWin32ExitCode == 0).then_some(()).ok_or_else(|| {
                     format!(
                         "isolated lab service failed scenario {scenario_id}: {}",
@@ -739,7 +864,13 @@ mod windows_service {
                 });
             }
             if Instant::now() >= deadline {
-                delete_and_verify(service, &manager, &service_name_wide, true)?;
+                delete_and_verify_until(
+                    service,
+                    &manager,
+                    &service_name_wide,
+                    true,
+                    cutoffs.map(|value| value.1),
+                )?;
                 return Err(format!(
                     "isolated lab service timed out for scenario {scenario_id}"
                 ));
@@ -748,19 +879,20 @@ mod windows_service {
         }
     }
 
-    fn delete_and_verify(
+    fn delete_and_verify_until(
         mut service: OwnedService,
         manager: &ServiceHandle,
         service_name: &[u16],
         stop: bool,
+        cutoff: Option<Instant>,
     ) -> Result<(), String> {
         if stop {
-            service.stop_and_delete()?;
+            service.stop_and_delete_until(cutoff)?;
         } else {
             service.delete()?;
         }
         drop(service);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = cutoff.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
         loop {
             let reopened =
                 unsafe { OpenServiceW(manager.0, service_name.as_ptr(), SERVICE_QUERY_STATUS) };
@@ -866,7 +998,7 @@ mod windows_service {
             Ok(())
         }
 
-        fn stop_and_delete(&mut self) -> Result<(), String> {
+        fn stop_and_delete_until(&mut self, cutoff: Option<Instant>) -> Result<(), String> {
             let mut status = SERVICE_STATUS::default();
             if unsafe { ControlService(self.handle.0, SERVICE_CONTROL_STOP, &raw mut status) } == 0
                 && status.dwCurrentState != SERVICE_STOPPED
@@ -876,7 +1008,7 @@ mod windows_service {
                     std::io::Error::last_os_error()
                 ));
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = cutoff.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
             loop {
                 let mut observed = SERVICE_STATUS_PROCESS::default();
                 let mut required = 0_u32;

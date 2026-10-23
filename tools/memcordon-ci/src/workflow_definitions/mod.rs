@@ -14,6 +14,7 @@ mod formatting;
 mod host_preparation;
 mod invocations;
 mod literal;
+mod native_coverage;
 mod native_invocations;
 mod release;
 mod release_fuzz;
@@ -65,6 +66,7 @@ pub fn definition(name: &str) -> Result<Value> {
     let mut value =
         original(name).ok_or_else(|| CiError::Message("unknown workflow definition".into()))?;
     adapters::apply(&mut value, name)?;
+    native_coverage::apply(&mut value, name)?;
     validate_references(&value)?;
     validate_semantics(&value)?;
     Ok(value)
@@ -166,6 +168,7 @@ pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Map
         .ok_or_else(|| CiError::Message("workflow mapping absent".into()))?
         .clone();
     if name == "release.yml" {
+        concurrency::project_native_coverage(&mut projected, &expected)?;
         release_fuzz::project(&mut projected, &expected, &original)?;
         host_preparation::project(&mut projected, &expected, &original)?;
     }

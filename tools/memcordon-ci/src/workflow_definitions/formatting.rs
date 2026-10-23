@@ -2,6 +2,55 @@
 use crate::{CiError, Result};
 use serde_yaml::Value;
 
+/// Identical native-owner steps share YAML nodes, never execution owners.
+/// Parsing the final document below must still reproduce every original step.
+fn mark_native_steps(document: &mut Value, replacements: &mut Vec<(String, String)>) -> Result<()> {
+    let jobs = document["jobs"].as_mapping_mut().expect("source jobs");
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for (name, job) in jobs.iter() {
+        if name
+            .as_str()
+            .is_some_and(|name| name.starts_with("native-macos-x64"))
+        {
+            for step in job["steps"].as_sequence().expect("source steps") {
+                *counts.entry(serde_json::to_string(step)?).or_default() += 1;
+            }
+        }
+    }
+    let mut anchors = std::collections::BTreeMap::<String, String>::new();
+    for (name, job) in jobs.iter_mut() {
+        if !name
+            .as_str()
+            .is_some_and(|name| name.starts_with("native-macos-x64"))
+        {
+            continue;
+        }
+        for step in job["steps"].as_sequence_mut().expect("source steps") {
+            let identity = serde_json::to_string(step)?;
+            if counts.get(&identity).copied().unwrap_or_default() < 2 {
+                continue;
+            }
+            let replacement = if let Some(anchor) = anchors.get(&identity) {
+                format!("*{anchor}")
+            } else {
+                let anchor = format!("native_owner_step_{}", anchors.len());
+                let fields = serde_yaml::to_string(step)?;
+                let mut replacement = format!("&{anchor}");
+                for line in fields.lines() {
+                    replacement.push_str("\n  ");
+                    replacement.push_str(line);
+                }
+                anchors.insert(identity, anchor);
+                replacement
+            };
+            let marker = format!("MEMCORDON_NATIVE_STEP_{}_END", replacements.len());
+            replacements.push((marker.clone(), replacement));
+            *step = Value::String(marker);
+        }
+    }
+    Ok(())
+}
+
 /// Reuse pinned action scalars with native YAML anchors. Aliases change only
 /// presentation; the parsed document is checked against the authored data.
 fn mark_actions(document: &mut Value, replacements: &mut Vec<(String, String)>) {
@@ -179,10 +228,24 @@ fn indent_sequences(yaml: &str) -> String {
 pub(super) fn serialize(name: &str, document: &Value) -> Result<String> {
     let mut styled = document.clone();
     let mut replacements = mark_inline(name, &mut styled)?;
+    if name == "release.yml" {
+        mark_native_steps(&mut styled, &mut replacements)?;
+    }
     mark_actions(&mut styled, &mut replacements);
     let mut yaml = serde_yaml::to_string(&styled)?;
     for (marker, collection) in replacements {
-        yaml = yaml.replace(&marker, &collection);
+        let offset = yaml
+            .find(&marker)
+            .ok_or_else(|| CiError::Message("workflow presentation marker absent".into()))?;
+        let line_start = yaml[..offset]
+            .rfind('\n')
+            .map_or(0, |position| position + '\n'.len_utf8());
+        let indentation = yaml[line_start..offset]
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        let collection = collection.replace('\n', &format!("\n{}", " ".repeat(indentation)));
+        yaml.replace_range(offset..offset + marker.len(), &collection);
     }
     let yaml = indent_sequences(&yaml);
     if serde_yaml::from_str::<Value>(&yaml)? != *document {

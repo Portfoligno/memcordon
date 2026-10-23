@@ -68,6 +68,16 @@ fn scope(
     }
 }
 
+fn coverage_cache_owner() -> Option<(usize, &'static str)> {
+    match std::env::var("GITHUB_JOB").ok().as_deref() {
+        Some("native-macos-x64-shard-0") => Some((0, "coverage-v1-four-0")),
+        Some("native-macos-x64-shard-1") => Some((1, "coverage-v1-four-1")),
+        Some("native-macos-x64-shard-2") => Some((2, "coverage-v1-four-2")),
+        Some("native-macos-x64-shard-3") => Some((3, "coverage-v1-four-3")),
+        _ => None,
+    }
+}
+
 pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
     let ordinary = |purpose, shard| {
         vec![scope(
@@ -117,7 +127,11 @@ pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
                 scope(
                     "native-tests",
                     purpose,
-                    "complete",
+                    if matches!(suite, Suite::ReleaseReadiness) {
+                        coverage_cache_owner().map_or("complete", |(_, shard)| shard)
+                    } else {
+                        "complete"
+                    },
                     Some(P::NativeTests),
                     "compiled-native-complete",
                 ),

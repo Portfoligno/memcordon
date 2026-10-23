@@ -962,7 +962,81 @@ pub fn host_network_configuration_unchanged(
     before: &serde_json::Value,
     after: &serde_json::Value,
 ) -> Result<bool> {
-    Ok(network_configuration(before)? == network_configuration(after)?)
+    Ok(host_network_comparison(before, after)?["unchanged"] == true)
+}
+
+/// Preserve the raw captures while explaining the exact semantic comparison.
+pub fn host_network_comparison(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut before = network_configuration(before)?;
+    let mut after = network_configuration(after)?;
+    let acceleration_churn =
+        super::linux_network_topology::project_acceleration_churn(&mut before, &mut after);
+    let mut changes = Vec::new();
+    let mut omitted = 0_usize;
+    let summarize = |value: Option<&serde_json::Value>| -> Result<serde_json::Value> {
+        let Some(value) = value else {
+            return Ok(serde_json::json!({"present":false}));
+        };
+        let bytes = serde_json::to_vec(value)?;
+        if bytes.len() <= 4096 {
+            return Ok(serde_json::json!({"present":true,"value":value}));
+        }
+        Ok(
+            serde_json::json!({"present":true,"bytes":bytes.len(),"sha256":DiagnosticSha256::from_bytes(sha2::Sha256::digest(&bytes).into()),"value_omitted":true}),
+        )
+    };
+    let keys = before
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .chain(after.as_object().into_iter().flat_map(|map| map.keys()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in keys {
+        if before.get(key) == after.get(key) {
+            continue;
+        }
+        if matches!(key.as_str(), "facts" | "links")
+            && before.get(key).is_some_and(serde_json::Value::is_object)
+            && after.get(key).is_some_and(serde_json::Value::is_object)
+        {
+            let members = before
+                .get(key)
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flat_map(|map| map.keys())
+                .chain(
+                    after
+                        .get(key)
+                        .and_then(serde_json::Value::as_object)
+                        .into_iter()
+                        .flat_map(|map| map.keys()),
+                )
+                .collect::<std::collections::BTreeSet<_>>();
+            for member in members {
+                let left = before.get(key).and_then(|map| map.get(member));
+                let right = after.get(key).and_then(|map| map.get(member));
+                if left == right {
+                    continue;
+                }
+                if changes.len() < 128 {
+                    changes.push(serde_json::json!({"path":[key,member],"before":summarize(left)?,"after":summarize(right)?}));
+                } else {
+                    omitted += 1;
+                }
+            }
+        } else if changes.len() < 128 {
+            changes.push(serde_json::json!({"path":[key],"before":summarize(before.get(key))?,"after":summarize(after.get(key))?}));
+        } else {
+            omitted += 1;
+        }
+    }
+    Ok(
+        serde_json::json!({"format":"memcordon.host-network-comparison","revision":1,
+        "unchanged":before==after,"acceleration_churn":acceleration_churn,"changes":changes,"omitted_changes":omitted}),
+    )
 }
 
 /// Publish this fixture's contract for its unprivileged selected caller.
@@ -1025,11 +1099,10 @@ fn host_network_snapshot() -> Result<serde_json::Value> {
             .file_name()
             .into_string()
             .map_err(|_| CiError::Message("host link name is not UTF-8".into()))?;
-        let mut values = std::collections::BTreeMap::new();
-        for leaf in ["ifindex", "address", "flags", "operstate"] {
-            values.insert(leaf, fs::read(entry.path().join(leaf))?);
-        }
-        links.insert(name, values);
+        links.insert(
+            name.clone(),
+            super::linux_network_observation::observe_link(Path::new("/sys/class/net"), &name)?,
+        );
     }
     Ok(
         serde_json::json!({"namespace_device":namespace.dev(), "namespace_inode":namespace.ino(), "facts":facts, "links":links}),
@@ -3174,7 +3247,10 @@ fn run_owned(
         .collect::<Vec<_>>();
     let host_after = host_network_snapshot().and_then(|after| {
         source::write_json(&output.join("host-network-after.json"), &after)?;
-        if !host_network_configuration_unchanged(&host_before, &after)? { return Err(CiError::Message("private installed execution changed host network namespace, links, routes or sysctls".into())); }
+        let comparison = host_network_comparison(&host_before, &after)?;
+        let comparison_path = output.join("host-network-comparison.json");
+        source::write_json(&comparison_path, &comparison)?;
+        if comparison["unchanged"] != true { return Err(CiError::Message(format!("host network configuration differs across private installed execution; structural comparison={}", comparison_path.display()))); }
         Ok(())
     });
     let mut failures = [

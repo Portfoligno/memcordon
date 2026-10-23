@@ -1,6 +1,44 @@
 use memcordon_ci::release::linux_installed_consumer::host_network_configuration_unchanged;
 use serde_json::{Value, json};
 
+#[test]
+fn captured_same_mac_slave_addition_stays_strict_without_native_provenance() {
+    let before: Value =
+        serde_json::from_slice(include_bytes!("fixtures/linux_host_network_before.json")).unwrap();
+    let after: Value =
+        serde_json::from_slice(include_bytes!("fixtures/linux_host_network_after.json")).unwrap();
+    let original_before = before.clone();
+    let original_after = after.clone();
+    let comparison =
+        memcordon_ci::release::linux_installed_consumer::host_network_comparison(&before, &after)
+            .unwrap();
+    assert_eq!(comparison["unchanged"], false);
+    assert!(
+        comparison["acceleration_churn"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let changes = comparison["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["path"], json!(["links", "enP29613s1"]));
+    assert_eq!(changes[0]["before"]["present"], false);
+    assert_eq!(before, original_before);
+    assert_eq!(after, original_after);
+}
+
+#[test]
+fn malformed_link_population_has_an_explicit_structural_delta() {
+    let before = snapshot(LOOPBACK_ROUTE);
+    let mut after = before.clone();
+    after["links"] = json!("not a native link map");
+    let comparison =
+        memcordon_ci::release::linux_installed_consumer::host_network_comparison(&before, &after)
+            .unwrap();
+    assert_eq!(comparison["unchanged"], false);
+    assert_eq!(comparison["changes"][0]["path"], json!(["links"]));
+}
+
 const LOOPBACK_ROUTE: &str = "00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000005 00000000 80200001 lo\n";
 
 fn snapshot(route: &str) -> Value {

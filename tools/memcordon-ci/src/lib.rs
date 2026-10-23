@@ -13,6 +13,9 @@ pub mod capability;
 pub mod cargo_progress;
 pub mod ci_operation_time;
 pub mod command;
+pub mod command_progress_line;
+#[cfg(unix)]
+pub mod compiler_pool;
 pub mod config;
 pub mod consumer_readiness_ledger;
 pub mod download_cache;
@@ -25,6 +28,7 @@ pub mod linux_consumer_readiness;
 pub mod miri_cache;
 pub mod miri_targets;
 pub mod native_channel;
+pub mod native_coverage;
 pub mod native_results;
 pub mod native_test_plan;
 pub mod policy;

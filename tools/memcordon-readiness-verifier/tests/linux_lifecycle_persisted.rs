@@ -11,6 +11,61 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn lifecycle_derived_image_budget_preserves_headroom_and_rejects_rehashed_changes() {
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    let receipt = format!("{prefix}/fixture-memory-budget.json");
+    for field in [
+        "headroom_bytes",
+        "image_bytes",
+        "rounded_image_bytes",
+        "limit_bytes",
+        "page_bytes",
+    ] {
+        let mut case = linux_lifecycle_case::allocation_case("frontend");
+        case.validate().unwrap();
+        case.mutate(&receipt, |value| value["budget"][field] = json!(1));
+        assert!(case.validate().is_err(), "accepted altered {field}");
+    }
+    for field in ["source", "cell", "lease_id", "key"] {
+        let mut case = linux_lifecycle_case::allocation_case("frontend");
+        case.mutate(&receipt, |value| value[field] = json!("unrelated"));
+        assert!(case.validate().is_err(), "accepted altered {field}");
+    }
+}
+
+#[test]
+fn lifecycle_native_memory_limit_and_budget_peer_are_required() {
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    for field in ["memory_max", "cgroup_inode", "attempt_id", "budget_sha256"] {
+        let mut case = linux_lifecycle_case::allocation_case("guardian");
+        case.mutate(&format!("{prefix}/fixture-memory-max.json"), |value| {
+            value[field] = json!(0)
+        });
+        assert!(case.validate().is_err(), "accepted altered native {field}");
+    }
+    let mut case = linux_lifecycle_case::allocation_case("control");
+    case.mutate("case-evidence.json", |value| {
+        value["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|peer| peer["role"] != "fixture-memory-budget.json");
+    });
+    assert!(case.validate().is_err());
+}
+
+#[test]
+fn lifecycle_descriptor_cannot_reuse_headroom_as_the_total_limit() {
+    let mut case = linux_lifecycle_case::allocation_case("worker");
+    case.mutate(
+        "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0/fixture-input.json",
+        |value| {
+            value["memory_bytes"] = json!(512 * 1024 * 1024_u64);
+        },
+    );
+    assert!(case.validate().is_err());
+}
+
+#[test]
 fn measured_recovery_joins_the_complete_original_lifecycle_graph() {
     use memcordon_readiness_verifier::original_fixture_recovery_contract as contract;
     use sha2::{Digest, Sha256};
@@ -165,6 +220,23 @@ fn persisted_report_delivery_keeps_completed_provider_terminal_separate_from_nat
         case.validate().is_err(),
         "accepted rewriting original completed provider status to local frontend failure"
     );
+}
+
+#[test]
+fn prepared_lifecycle_rejects_obsolete_checkpoint_claims() {
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    for phase in ["allocation", "release"] {
+        let mut case = linux_lifecycle_case::loss_case("frontend", phase);
+        case.validate().unwrap();
+        case.mutate(&format!("{prefix}/lifecycle-loss-raw.json"), |raw| {
+            raw["observations"][0]["phase"] = json!("checkpoint-committed");
+            raw["observations"][0]["release_knowledge"] = json!("not-released");
+        });
+        assert!(
+            case.validate().is_err(),
+            "accepted obsolete {phase} checkpoint tuple"
+        );
+    }
 }
 
 #[test]

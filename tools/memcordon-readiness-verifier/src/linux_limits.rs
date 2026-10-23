@@ -138,10 +138,10 @@ fn validate_memory_source(
         || journal["mixed_worker"]["start_time"] != birth
         || journal["target"]["pid"].as_u64() != native.root_pid.map(u64::from)
         || journal["target"]["start_time"].as_u64() != native.root_birth
-        || journal["phase"] != "target-gated"
-        || journal["release_knowledge"] != "not-released"
+        || journal["phase"] != "execution-observed"
+        || journal["release_knowledge"] != "exec-observed"
     {
-        return Err("memory worker journal is not selected pre-release family".into());
+        return Err("memory worker journal is not selected executing memory family".into());
     }
     closed(
         stopped,

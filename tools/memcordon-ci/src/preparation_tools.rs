@@ -160,15 +160,38 @@ fn read(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
+    let file = options.open(&path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > limit {
         return Err(invalid("preparation file kind or size is invalid"));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
+    (&file).take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > limit {
         return Err(invalid("preparation file changed or exceeds its bound"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let key = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.nlink(),
+                m.uid(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if key(&metadata) != key(&file.metadata()?)
+            || key(&metadata) != key(&fs::symlink_metadata(&path)?)
+        {
+            return Err(invalid("preparation held/named file changed while reading"));
+        }
     }
     Ok(bytes)
 }
@@ -284,6 +307,121 @@ fn validate(root: &Path, record: &Record, expected: &Inputs) -> Result<()> {
         if cold != legacy {
             return Err(invalid("preparation helper roles have different bytes"));
         }
+    }
+    Ok(())
+}
+
+/// Resolved in the original runner, never reconstructed from sudo's environment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessHelperContext {
+    pub repository: String,
+    pub workflow: String,
+    pub run: String,
+    pub attempt: u64,
+    pub source_commit: String,
+    pub version: String,
+}
+
+pub fn running_readiness_helper_digest(root: &Path) -> Result<String> {
+    let executable = std::env::current_exe()?;
+    let relative = executable
+        .strip_prefix(root)
+        .map_err(|_| invalid("running helper escapes workspace"))?;
+    if ![
+        Path::new("target/ci-driver-cold/release").join(helper()),
+        Path::new("target/ci/release").join(helper()),
+    ]
+    .contains(&relative.to_path_buf())
+    {
+        return Err(invalid("running helper is not a selected preparation role"));
+    }
+    Ok(artifacts::checksum(&read(root, relative, FILE_LIMIT)?))
+}
+
+/// Admit only the transported consumer helper. This does not certify results or
+/// replace the complete driver preparation check. The CI runner remains trusted.
+fn validate_helper_record(
+    root: &Path,
+    context: &ReadinessHelperContext,
+    expected_digest: &str,
+) -> Result<u64> {
+    let record: Record = serde_json::from_slice(&read(
+        root,
+        Path::new(manifest(Kind::Readiness)),
+        RECORD_LIMIT,
+    )?)?;
+    record.inputs.source.validate()?;
+    for value in [&context.repository, &context.workflow, &context.run] {
+        if value.is_empty() || value.len() > 1024 || value.contains(['\0', '\r', '\n']) {
+            return Err(invalid("resolved helper invocation invalid"));
+        }
+    }
+    let host = distribution::native_target()?;
+    if record.format != FORMAT
+        || record.inputs.kind != Kind::Readiness
+        || record.inputs.host != host
+        || record.inputs.producer != producer(Kind::Readiness, host)?
+        || record.inputs.source.commit() != context.source_commit
+        || record.inputs.source.version().to_string() != context.version
+        || record.inputs.invocation
+            != (Invocation {
+                repository: context.repository.clone(),
+                workflow: context.workflow.clone(),
+                run: context.run.clone(),
+                attempt: context.attempt.to_string(),
+            })
+        || context.attempt == 0
+        || record.inputs.toolchains
+            != artifacts::checksum(&read(root, Path::new("ci/toolchains.toml"), RECORD_LIMIT)?)
+    {
+        return Err(invalid("transported helper source/host/invocation differs"));
+    }
+    let paths = [
+        Path::new("target/ci-driver-cold/release").join(helper()),
+        Path::new("target/ci/release").join(helper()),
+    ];
+    let actual = records(root, &paths)?;
+    for member in &actual {
+        if !member.executable
+            || member.sha256 != expected_digest
+            || record
+                .files
+                .iter()
+                .filter(|value| value.path == member.path)
+                .count()
+                != 1
+            || !record.files.iter().any(|value| value == member)
+        {
+            return Err(invalid("transported helper role/bytes differ"));
+        }
+    }
+    if actual[0].size != actual[1].size {
+        return Err(invalid("transported helper sizes differ"));
+    }
+    Ok(actual[0].size)
+}
+
+pub fn validate_readiness_helper(
+    root: &Path,
+    context: &ReadinessHelperContext,
+    expected_digest: &str,
+) -> Result<()> {
+    let size = validate_helper_record(root, context, expected_digest)?;
+    let paths = [
+        Path::new("target/ci-driver-cold/release").join(helper()),
+        Path::new("target/ci/release").join(helper()),
+    ];
+    let executable = std::env::current_exe()?;
+    if !paths.iter().any(|path| root.join(path) == executable) {
+        return Err(invalid("running helper is not an exact selected role"));
+    }
+    let relative = executable
+        .strip_prefix(root)
+        .map_err(|_| invalid("running helper escapes workspace"))?;
+    let bytes = read(root, relative, FILE_LIMIT)?;
+    if bytes.len() as u64 != size || artifacts::checksum(&bytes) != expected_digest {
+        return Err(invalid("running helper digest differs"));
     }
     Ok(())
 }

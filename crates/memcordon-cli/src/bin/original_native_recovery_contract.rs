@@ -7,6 +7,28 @@ mod canonical_json;
 pub const INPUT_BOUND: usize = 65_536;
 pub const RECORD_BOUND: u64 = 16 * 1024 * 1024;
 pub const RESULT_LEAF: &str = "original-native-recovery-result.json";
+pub const FAILURE_LEAF: &str = "original-native-recovery-failure.json";
+pub const FAILURE_BOUND: usize = 65_536;
+
+/// Anchor the remaining wall-clock allowance to a monotonic sample taken
+/// BEFORE the wall sample. Reusing the result never renews the original budget.
+pub fn monotonic_cleanup_cutoff(
+    original_wall_ms: u64,
+    sampled_monotonic_ns: u64,
+    sampled_wall_ms: u64,
+) -> Result<u64, String> {
+    // The wall sample is floor-rounded to milliseconds. Discard its uncertain
+    // final millisecond; this is a conservative reduction, never added grace.
+    let remaining = original_wall_ms
+        .checked_sub(sampled_wall_ms)
+        .and_then(|remaining| remaining.checked_sub(1))
+        .filter(|remaining| *remaining != 0)
+        .ok_or_else(|| "original recovery cleanup cutoff exhausted".to_owned())?;
+    remaining
+        .checked_mul(1_000_000)
+        .and_then(|remaining| sampled_monotonic_ns.checked_add(remaining))
+        .ok_or_else(|| "original recovery cleanup cutoff conversion overflow".to_owned())
+}
 pub const TEST_NAME: &str =
     "native_original_recovery::native_original_recovery_emit_actual_receipt";
 
@@ -327,4 +349,40 @@ pub struct RecoveryResult {
     pub completed_unix_millis: u64,
     pub within_original_cleanup: bool,
     pub outstanding: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseObservation {
+    pub started_monotonic_nanos: Option<u64>,
+    pub finished_monotonic_nanos: Option<u64>,
+    pub contention_count: u64,
+    pub lock_acquired: bool,
+    pub validated_acquisition: bool,
+    pub held_device: Option<u64>,
+    pub held_inode: Option<u64>,
+    pub native_error: Option<i32>,
+    pub operation: String,
+}
+
+/// Failed-operation evidence only; this is deliberately not a RecoveryResult.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryFailure {
+    pub format: String,
+    pub revision: u32,
+    pub input_sha256: String,
+    pub context: String,
+    pub identity: Identity,
+    pub native_target: String,
+    pub scope_id: String,
+    pub recovery_harness_owner_sha256: String,
+    pub original_records: Vec<(String, String)>,
+    pub original_cleanup_deadline_unix_millis: u64,
+    pub monotonic_cutoff_nanos: Option<u64>,
+    pub observed_unix_millis: u64,
+    pub stage: String,
+    pub recovery_entered: bool,
+    pub error: String,
+    pub lease: LeaseObservation,
 }

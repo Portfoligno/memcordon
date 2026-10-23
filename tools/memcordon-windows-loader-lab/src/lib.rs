@@ -1,3 +1,14 @@
 pub mod artifact;
+#[cfg(windows)]
+pub mod holder_creation;
+pub mod holder_filtering_history;
+pub mod holder_protocol;
+pub mod holder_sid_attributes;
+pub mod module_observation;
+pub mod resume_thread;
 pub mod scenario;
+pub mod selected_policy;
+#[cfg(windows)]
+pub mod selected_policy_native;
 pub mod target;
+pub mod workload;

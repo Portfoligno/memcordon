@@ -180,13 +180,19 @@ pub(super) fn settle_native(
     let boot =
         fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| error.to_string())?;
     let same_boot = record.boot_identity.as_str() == boot.trim();
-    for owner in [Some(&record.frontend), record.mixed_worker.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter(|_| same_boot)
+    for (role, owner) in [
+        ("frontend", Some(&record.frontend)),
+        ("mixed-worker", record.mixed_worker.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(role, owner)| owner.map(|owner| (role, owner)))
+    .filter(|_| same_boot)
     {
         if HeldProcess::acquire(owner)?.is_some() {
-            return Err("mixed recovery refuses a live native owner".into());
+            return Err(format!(
+                "mixed recovery refuses a live native owner: role={role} pid={} birth={} held_identity_matched=true retirement_observed=false",
+                owner.pid, owner.start_time
+            ));
         }
     }
     let target = record

@@ -56,6 +56,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }
 [workspace.lints.clippy]
 all = "warn"
 
+# Reduce cold controller optimization work without changing product builds.
+[profile.release.package.memcordon-ci]
+opt-level = 1
+
 # Native inventory hashes complete toolchains and SDKs before cache restoration.
 # Optimize the controller and its runtime dependencies without removing checks.
 [profile.ci-bootstrap]

@@ -14,6 +14,82 @@ use std::os::unix::fs::MetadataExt;
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+fn publish_failure(directory: &File, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > contract::FAILURE_BOUND {
+        return Err("original recovery failure exceeds bound".into());
+    }
+    let mut file = File::from(
+        rustix::fs::openat(
+            directory,
+            contract::FAILURE_LEAF,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    if !before.is_file()
+        || before.uid() != 0
+        || before.nlink() != 1
+        || before.mode() & 0o7777 != 0o600
+    {
+        return Err("original recovery failure file custody differs".into());
+    }
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    directory.sync_all().map_err(|error| error.to_string())?;
+    let mut named = File::from(
+        rustix::fs::openat(
+            directory,
+            contract::FAILURE_LEAF,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let after = named.metadata().map_err(|error| error.to_string())?;
+    let mut readback = Vec::new();
+    std::io::Read::by_ref(&mut named)
+        .take(contract::FAILURE_BOUND as u64 + 1)
+        .read_to_end(&mut readback)
+        .map_err(|error| error.to_string())?;
+    let final_held = named.metadata().map_err(|error| error.to_string())?;
+    let final_named = rustix::fs::statat(
+        directory,
+        contract::FAILURE_LEAF,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    if final_held.dev() != after.dev()
+        || final_held.ino() != after.ino()
+        || final_held.len() != after.len()
+        || final_held.ctime() != after.ctime()
+        || final_held.ctime_nsec() != after.ctime_nsec()
+        || final_named.st_dev != final_held.dev()
+        || final_named.st_ino != final_held.ino()
+        || final_named.st_uid != 0
+        || final_named.st_nlink != 1
+        || final_named.st_mode & 0o177777 != 0o100600
+        || final_named.st_size != bytes.len() as i64
+        || final_named.st_ctime != final_held.ctime()
+        || final_named.st_ctime_nsec != final_held.ctime_nsec() as u64
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.uid() != 0
+        || after.nlink() != 1
+        || after.mode() & 0o7777 != 0o600
+        || after.len() != bytes.len() as u64
+        || readback != bytes
+    {
+        return Err("original recovery failure publication readback differs".into());
+    }
+    Ok(())
+}
+
 fn now() -> Result<u64, String> {
     u64::try_from(
         std::time::SystemTime::now()
@@ -316,10 +392,82 @@ fn run() -> Result<(), String> {
         return Err("original recovery measured owner/input association differs".into());
     }
     validate_records(&input, &records, &harness_owner)?;
-    if now()? >= input.cleanup_deadline_unix_millis {
-        return Err("original recovery cleanup cutoff exhausted before recovery".into());
-    }
-    let outstanding = crate::linux::recovery::recover_authenticated_administration()?;
+    let sampled_monotonic = crate::linux::clock::monotonic_nanos()?;
+    let before_recovery = now()?;
+    let mut observation = crate::linux::recovery::AdministrationObservation {
+        stage: "cleanup-cutoff-conversion",
+        ..Default::default()
+    };
+    let cutoff = contract::monotonic_cleanup_cutoff(
+        input.cleanup_deadline_unix_millis,
+        sampled_monotonic,
+        before_recovery,
+    );
+    let recovery = match cutoff.as_ref() {
+        Ok(cutoff) => crate::linux::recovery::recover_authenticated_administration_until(
+            *cutoff,
+            &mut observation,
+        ),
+        Err(error) => Err(error.clone()),
+    };
+    let lease = contract::LeaseObservation {
+        started_monotonic_nanos: observation.lease.started_monotonic_nanos,
+        finished_monotonic_nanos: observation.lease.finished_monotonic_nanos,
+        contention_count: observation.lease.contention_count,
+        lock_acquired: observation.lease.lock_acquired,
+        validated_acquisition: observation.lease.validated_acquisition,
+        held_device: observation.lease.held_device,
+        held_inode: observation.lease.held_inode,
+        native_error: observation.lease.native_error,
+        operation: observation.lease.operation.clone(),
+    };
+    eprintln!("original recovery lease observation: {lease:?}");
+    let outstanding = match recovery {
+        Ok(outstanding) => outstanding,
+        Err(primary) => {
+            let mut detail = primary.clone();
+            if detail.len() > 4096 {
+                let mut end = 4096 - "[truncated]".len();
+                while !detail.is_char_boundary(end) {
+                    end -= 1;
+                }
+                detail.truncate(end);
+                detail.push_str("[truncated]");
+            }
+            let publication = (|| {
+                let failure = contract::RecoveryFailure {
+                    format: "memcordon.original-native-recovery-failure".into(),
+                    revision: 1,
+                    input_sha256: hash(&bytes),
+                    context: input.context.kind().into(),
+                    identity: input.identity.clone(),
+                    native_target: input.native_target.clone(),
+                    scope_id: input.scope_id.clone(),
+                    recovery_harness_owner_sha256: input.recovery_harness_owner_sha256.clone(),
+                    original_records: input
+                        .context
+                        .records()
+                        .iter()
+                        .map(|(role, record)| ((*role).into(), record.sha256.clone()))
+                        .collect(),
+                    original_cleanup_deadline_unix_millis: input.cleanup_deadline_unix_millis,
+                    monotonic_cutoff_nanos: cutoff.ok(),
+                    observed_unix_millis: now()?,
+                    stage: observation.stage.into(),
+                    recovery_entered: observation.recovery_entered,
+                    error: detail,
+                    lease,
+                };
+                serde_json::to_vec(&failure)
+                    .map_err(|error| error.to_string())
+                    .and_then(|output| publish_failure(&directory, &output))
+            })();
+            return Err(match publication {
+                Ok(()) => primary,
+                Err(secondary) => format!("{primary}; failure diagnostic publication: {secondary}"),
+            });
+        }
+    };
     let completed = now()?;
     let result = RecoveryResult {
         format: "memcordon.original-native-recovery-result".into(),
@@ -361,13 +509,18 @@ fn run() -> Result<(), String> {
     file.sync_all().map_err(|error| error.to_string())?;
     directory.sync_all().map_err(|error| error.to_string())?;
     drop(held);
+    let after_persistence = now()?;
     if !result.within_original_cleanup
         || !result.outstanding.is_empty()
-        || now()? >= input.cleanup_deadline_unix_millis
+        || after_persistence >= input.cleanup_deadline_unix_millis
     {
-        return Err(
-            "original native recovery retains obligations or exceeded cleanup cutoff".into(),
-        );
+        return Err(format!(
+            "original native recovery failed: outstanding_count={} completion_expired={} post_persistence_expired={} before_recovery_unix_millis={before_recovery} completed_unix_millis={completed} after_persistence_unix_millis={after_persistence} original_cleanup_deadline_unix_millis={}",
+            result.outstanding.len(),
+            !result.within_original_cleanup,
+            after_persistence >= input.cleanup_deadline_unix_millis,
+            input.cleanup_deadline_unix_millis
+        ));
     }
     Ok(())
 }

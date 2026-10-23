@@ -20,6 +20,7 @@ fn observation_precedes_callback_settlement_and_preserves_original_status() {
             Some(peer_cancelled),
             Some(ProgressOutput {
                 sender: progress_sender,
+                admitted: None,
                 omitted: Arc::new(AtomicU64::new(0)),
             }),
         )

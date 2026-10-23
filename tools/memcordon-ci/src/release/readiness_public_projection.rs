@@ -4,7 +4,6 @@ use crate::{CiError, Result};
 use memcordon_readiness_verifier::Artifact;
 use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, renameat, unlinkat};
 use std::{
-    collections::BTreeSet,
     fs::File,
     io::{Read, Write},
     os::unix::fs::MetadataExt,
@@ -12,9 +11,7 @@ use std::{
     time::Instant,
 };
 
-use memcordon_readiness_verifier::{
-    MAX_ARTIFACT_BYTES as MAX_FILE, MAX_INDEX_BYTES, MAX_PRODUCER_ARTIFACTS, MAX_PRODUCER_BYTES,
-};
+use memcordon_readiness_verifier::{MAX_ARTIFACT_BYTES as MAX_FILE, MAX_INDEX_BYTES};
 
 fn error(message: &str) -> CiError {
     CiError::Message(message.into())
@@ -202,6 +199,34 @@ pub(super) fn publish(source: &Path, cell: &CellEvidence, deadline: Instant) -> 
     write_cell(&bundle, cell)
 }
 
+/// Canonicalize the actual final cell union after authenticating every reference.
+pub(super) fn canonicalize(
+    source: &Path,
+    cell: &mut CellEvidence,
+    deadline: Instant,
+) -> Result<()> {
+    check_deadline(deadline)?;
+    let source = root(source)?;
+    let overhead = (serde_json::to_vec_pretty(cell)?.len() as u64)
+        .checked_add(MAX_INDEX_BYTES as u64)
+        .ok_or_else(|| error("public projection overhead overflow"))?;
+    let catalog = super::super::readiness_artifact_catalog::CanonicalCatalog::build(
+        &cell.artifacts,
+        overhead,
+        deadline,
+        |record| {
+            let relative = crate::release::artifacts::safe_relative(Path::new(&record.path))?;
+            let name = relative
+                .file_name()
+                .ok_or_else(|| error("public artifact basename absent"))?;
+            let held_parent = parent(&source, &relative, false)?;
+            read_selected(&held_parent, name, record).map(|_| ())
+        },
+    )?;
+    cell.artifacts = catalog.into_records();
+    Ok(())
+}
+
 fn copy_selected(
     source: &File,
     bundle: &File,
@@ -209,49 +234,10 @@ fn copy_selected(
     overhead: u64,
     deadline: Instant,
 ) -> Result<()> {
-    if records.len() > MAX_PRODUCER_ARTIFACTS {
-        return Err(error("public artifact catalog exceeds bound"));
-    }
-    let total = records
-        .iter()
-        .try_fold(overhead, |total, record| total.checked_add(record.length))
-        .ok_or_else(|| error("public artifact total overflow"))?;
-    if total > MAX_PRODUCER_BYTES || records.iter().any(|record| record.length > MAX_FILE) {
-        return Err(error("public artifact byte plan exceeds producer bound"));
-    }
-    let mut directories = BTreeSet::new();
+    super::super::readiness_artifact_catalog::preflight_unique(records, overhead, deadline)?;
     for record in records {
         check_deadline(deadline)?;
         let relative = crate::release::artifacts::safe_relative(Path::new(&record.path))?;
-        for ancestor in relative
-            .ancestors()
-            .skip(1)
-            .filter(|path| !path.as_os_str().is_empty())
-        {
-            directories.insert(ancestor.to_path_buf());
-        }
-    }
-    if records
-        .len()
-        .checked_add(directories.len())
-        .and_then(|count| count.checked_add(2))
-        .is_none_or(|count| count > MAX_PRODUCER_ARTIFACTS)
-    {
-        return Err(error("public producer member plan exceeds bound"));
-    }
-    let mut paths = BTreeSet::new();
-    for record in records {
-        check_deadline(deadline)?;
-        let relative = crate::release::artifacts::safe_relative(Path::new(&record.path))?;
-        if relative.starts_with("producer")
-            || relative == Path::new("cell.json")
-            || relative == Path::new("producer-manifest.json")
-            || !paths.insert(relative.clone())
-        {
-            return Err(error(
-                "public artifact catalog repeats or substitutes a reserved path",
-            ));
-        }
         let name = relative
             .file_name()
             .ok_or_else(|| error("public artifact basename absent"))?;

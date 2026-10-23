@@ -480,7 +480,8 @@ fn memory_actions(
     resume["format"] = json!("memcordon.linux-memory-worker-resume");
     resume["signal"] = json!(18);
     let mut journal = graph.journal.clone();
-    journal["phase"] = json!("target-gated");
+    journal["phase"] = json!("execution-observed");
+    journal["release_knowledge"] = json!("exec-observed");
     journal["mixed_admission_metadata"] = graph.prepared["admission"].clone();
     let journal_bytes = prepared::durable_journal(&journal);
     let mut source = graph.worker.clone();

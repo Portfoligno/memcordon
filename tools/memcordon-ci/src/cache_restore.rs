@@ -24,11 +24,28 @@ pub enum CompiledPartition {
     MiriTargets,
 }
 
+pub(crate) fn native_coverage_shard(shard: &str) -> Option<u8> {
+    match shard {
+        "coverage-v1-four-0" => Some(0),
+        "coverage-v1-four-1" => Some(1),
+        "coverage-v1-four-2" => Some(2),
+        "coverage-v1-four-3" => Some(3),
+        _ => None,
+    }
+}
+
 pub fn partition_layout(
     purpose: &str,
     shard: &str,
     partition: Option<CompiledPartition>,
 ) -> Result<CacheLayout> {
+    if native_coverage_shard(shard).is_some()
+        && (purpose != "native-readiness" || partition != Some(CompiledPartition::NativeTests))
+    {
+        return Err(CiError::Message(
+            "coverage cache selection requires its native test partition".into(),
+        ));
+    }
     let mut selected = layout(purpose, shard)?;
     let Some(partition) = partition else {
         return Ok(selected);
@@ -208,6 +225,9 @@ pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
         ],
         ("native-release" | "native-readiness" | "windows-working", "complete") => {
             &["target/ci/native", "target/ci-build/product"]
+        }
+        ("native-readiness", selected) if native_coverage_shard(selected).is_some() => {
+            &["target/ci/native"]
         }
         ("miri", "first") => &["target/ci/miri-first"],
         ("miri", "second") => &["target/ci/miri-second"],

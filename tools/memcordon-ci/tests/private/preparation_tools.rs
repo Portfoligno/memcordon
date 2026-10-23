@@ -1,5 +1,99 @@
 use super::*;
 
+#[test]
+fn transported_helper_record_binds_both_roles_source_and_resolved_invocation() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("ci")).unwrap();
+    fs::write(
+        temp.path().join("ci/toolchains.toml"),
+        b"selected toolchain inputs",
+    )
+    .unwrap();
+    let paths = [
+        Path::new("target/ci-driver-cold/release").join(helper()),
+        Path::new("target/ci/release").join(helper()),
+    ];
+    for path in &paths {
+        fs::create_dir_all(temp.path().join(path).parent().unwrap()).unwrap();
+        fs::write(temp.path().join(path), b"retained helper decoder fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path().join(path), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let context = ReadinessHelperContext {
+        repository: "owner/repo".into(),
+        workflow: "Release".into(),
+        run: "12".into(),
+        attempt: 3,
+        source_commit: "a".repeat(40),
+        version: "1.2.3".into(),
+    };
+    let host = distribution::native_target().unwrap();
+    let record = Record {
+        format: FORMAT,
+        inputs: Inputs {
+            kind: Kind::Readiness,
+            source: BuildSourceIdentity::Working {
+                version: semver::Version::new(1, 2, 3),
+                commit: context.source_commit.clone(),
+            },
+            host: host.into(),
+            toolchains: artifacts::checksum(b"selected toolchain inputs"),
+            invocation: Invocation {
+                repository: context.repository.clone(),
+                workflow: context.workflow.clone(),
+                run: context.run.clone(),
+                attempt: context.attempt.to_string(),
+            },
+            producer: producer(Kind::Readiness, host).unwrap(),
+        },
+        files: records(temp.path(), &paths).unwrap(),
+    };
+    let manifest = temp.path().join(manifest(Kind::Readiness));
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, serde_json::to_vec(&record).unwrap()).unwrap();
+    let digest = artifacts::checksum(b"retained helper decoder fixture");
+    assert_eq!(
+        validate_helper_record(temp.path(), &context, &digest).unwrap(),
+        b"retained helper decoder fixture".len() as u64
+    );
+    // This decoder fixture never claims to be the running transported helper.
+    assert!(
+        validate_readiness_helper(temp.path(), &context, &digest)
+            .unwrap_err()
+            .to_string()
+            .contains("exact selected role")
+    );
+    for field in [
+        "repository",
+        "workflow",
+        "run",
+        "attempt",
+        "source",
+        "version",
+    ] {
+        let mut changed = context.clone();
+        match field {
+            "repository" => changed.repository = "other/repo".into(),
+            "workflow" => changed.workflow = "Other".into(),
+            "run" => changed.run = "13".into(),
+            "attempt" => changed.attempt = 4,
+            "source" => changed.source_commit = "c".repeat(40),
+            "version" => changed.version = "1.2.4".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_helper_record(temp.path(), &changed, &digest).is_err(),
+            "{field}"
+        );
+    }
+    assert!(validate_helper_record(temp.path(), &context, &"0".repeat(64)).is_err());
+    fs::write(temp.path().join(&paths[1]), b"different helper bytes").unwrap();
+    assert!(validate_helper_record(temp.path(), &context, &digest).is_err());
+}
+
 fn selected() -> Inputs {
     Inputs {
         kind: Kind::Private,

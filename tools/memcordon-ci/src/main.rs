@@ -405,6 +405,7 @@ fn run() -> Result<()> {
                 &command,
                 memcordon_ci::release::ReleaseCommand::CompileTarget { .. }
                     | memcordon_ci::release::ReleaseCommand::ValidatePackage { .. }
+                    | memcordon_ci::release::ReleaseCommand::NativeCoverageShard { .. }
             ) {
                 ci_segments::native::run(&root, command)
             } else if let memcordon_ci::release::ReleaseCommand::BuildTarget {

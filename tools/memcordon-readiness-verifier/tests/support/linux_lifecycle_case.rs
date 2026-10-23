@@ -55,6 +55,11 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
     };
     let runtime = image("original-runtime", "bin/owned-readiness");
     let input = image("original-input", "inputs/owned-readiness");
+    let page_bytes = 4096_u64;
+    let image_bytes = 2 * fixture.len() as u64;
+    let rounded_image_bytes = 2 * (fixture.len() as u64).div_ceil(page_bytes) * page_bytes;
+    let memory_bytes = rounded_image_bytes + 512 * 1024 * 1024;
+    let memory_token = format!("+{memory_bytes}B");
     let outputs = if phase == "drain" {
         vec![
             "work/orphan-descendant.bin".into(),
@@ -96,7 +101,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         &original["provider"],
         &case.record.run_id,
         &argv,
-        512 * 1024 * 1024,
+        memory_bytes,
         300000,
         agent,
     );
@@ -114,6 +119,23 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         });
     };
     persist(&mut case, "challenge.bin", &challenge);
+    let budget = json!({"format":"memcordon.linux-fixture-memory-budget","revision":1,
+        "source":identity,"cell":cell,"lease_id":"original-lease","key":key,
+        "budget":{"runtime_image":contract["runtime_image"],"input_image":contract["input_image"],
+        "page_bytes":page_bytes,"image_bytes":image_bytes,"rounded_image_bytes":rounded_image_bytes,
+        "headroom_bytes":512*1024*1024_u64,"limit_bytes":memory_bytes}});
+    let budget_bytes = serde_json::to_vec(&budget).unwrap();
+    persist(&mut case, "fixture-memory-budget.json", &budget_bytes);
+    persist(
+        &mut case,
+        "fixture-memory-max.json",
+        &serde_json::to_vec(&json!({
+            "format":"memcordon.linux-lifecycle-memory-max","revision":1,"key":key,
+            "attempt_id":attempt,"cgroup_inode":graph.prepared["mixed_cgroup_identity"]["inode"],
+            "memory_max":memory_bytes,"budget_sha256":sha256(&budget_bytes),
+        }))
+        .unwrap(),
+    );
     for (name, bytes) in [
         ("selected-cli-image.bin", cli.as_slice()),
         ("selected-agent-image.bin", agent.as_slice()),
@@ -161,7 +183,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         "--clear-groups",
         "--",
         "/usr/libexec/memcordon",
-        "+512M",
+        &memory_token,
         "+300s",
         "--sealed",
         "--workload-contract",
@@ -312,7 +334,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         let export = json!({"format":"memcordon.private-export","revision":1,"attempt_id":attempt,"root_layout":contract["root_layout"],"identity":contract["execution_identity"]["identity"],"files":[]});
         let export_bytes = serde_json::to_vec(&export).unwrap();
         persist(&mut case, "export-receipt.json", &export_bytes);
-        let result = executed_result(
+        let mut result = executed_result(
             &case,
             &graph,
             &original,
@@ -320,6 +342,8 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
             &argv,
             sha256(&export_bytes),
         );
+        result["invocation"]["budget_tokens"][0]["token"] = json!(memory_token);
+        result["invocation"]["memory_token"] = json!(memory_token);
         let result_bytes = serde_json::to_vec(&result).unwrap();
         persist(
             &mut case,
@@ -343,7 +367,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         );
     }
     let allocation = json!({"format":"memcordon.linux-lifecycle-allocation","revision":1,"identity":identity,"cell":cell,"lease_id":"original-lease","key":key,"attempt_id":attempt,"worker_index":0,
-        "worker_source":graph.worker,"phase":"checkpoint-committed","release_knowledge":"not-released","journal_sha256":sha256(&graph.journal_bytes),"prepared":graph.prepared,"frontend_invocation":command});
+        "worker_source":graph.worker,"phase":"release-intent","release_knowledge":"possibly-released","journal_sha256":sha256(&graph.journal_bytes),"prepared":graph.prepared,"frontend_invocation":command});
     let observations = if delivery {
         vec![allocation]
     } else {
@@ -372,7 +396,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         binary: vec![],
         target_argv: NativeArguments::UnixBytes(argv),
         deadline_millis: Some(300000),
-        memory_bytes: Some(512 * 1024 * 1024),
+        memory_bytes: Some(memory_bytes),
         toolchain_identity: None,
     };
     case.json(

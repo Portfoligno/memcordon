@@ -301,6 +301,8 @@ struct OwnedResourceCheckpoint {
 
 #[derive(Default)]
 pub struct InstalledMixedDriver {
+    pub(super) publication:
+        Option<std::sync::Arc<super::linux_lifecycle_diagnostics::HeldCellPublication>>,
     isolation_account_contexts: Vec<AccountRefusalContext>,
     isolation_import_contexts: Vec<AccountRefusalContext>,
     cross_attempt_reports: Vec<super::linux_cross_attempt_cases::CrossAttemptReport>,
@@ -337,6 +339,14 @@ struct AccountRefusalContext {
 }
 
 impl InstalledMixedDriver {
+    pub(super) fn with_publication(
+        publication: std::sync::Arc<super::linux_lifecycle_diagnostics::HeldCellPublication>,
+    ) -> Self {
+        Self {
+            publication: Some(publication),
+            ..Self::default()
+        }
+    }
     /// Reconstruct only the finite image import intents from this installation.
     /// Called after native attempt recovery and before policy/image retirement.
     #[expect(
@@ -1487,6 +1497,86 @@ impl InstalledMixedDriver {
     /// Transfers only persisted rows belonging to this controller's actual
     /// completed collections. Missing normalized evidence stays non-passed;
     /// the outer ledger retains every untouched required row.
+    pub fn collect_diagnostic_artifacts(
+        &self,
+        artifact_root: &Path,
+        artifacts: &mut Vec<memcordon_readiness_verifier::Artifact>,
+    ) -> Result<()> {
+        use memcordon_readiness_verifier::Artifact;
+        for report in &self.lifecycle_reports {
+            for artifact in &report.artifacts {
+                if artifact.length > 512 * 1024 * 1024 {
+                    return Err(CiError::Message(
+                        "lifecycle diagnostic artifact exceeds bound".into(),
+                    ));
+                }
+                let path = Path::new(&artifact.path);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err(CiError::Message(
+                        "lifecycle diagnostic artifact escapes selected root".into(),
+                    ));
+                }
+                let bytes = read_owned_resource(&artifact_root.join(path), artifact.length)?;
+                if bytes.len() as u64 != artifact.length
+                    || super::artifacts::checksum(&bytes) != artifact.sha256
+                {
+                    return Err(CiError::Message(
+                        "lifecycle diagnostic registered bytes changed".into(),
+                    ));
+                }
+                artifacts.push(artifact.clone());
+            }
+        }
+        let (recovery_files, recovery_issues) =
+            crate::linux_consumer_readiness::recovery_artifact_tree::collect_diagnostic_attempts(
+                artifact_root,
+                |path, bound| read_owned_resource(path, bound).map_err(|error| error.to_string()),
+            )
+            .map_err(CiError::Message)?;
+        if !recovery_files.is_empty() {
+            for (path, bytes) in recovery_files {
+                artifacts.push(Artifact {
+                    path,
+                    length: bytes.len() as u64,
+                    sha256: super::artifacts::checksum(&bytes),
+                });
+            }
+            let summary = serde_json::to_vec(
+                &serde_json::json!({"format":"memcordon.original-recovery-diagnostic-inventory","revision":1,"diagnostic_only":true,"issues":recovery_issues}),
+            )?;
+            let publication = self.publication.as_deref().ok_or_else(|| {
+                CiError::Message("original cell publication capability absent".into())
+            })?;
+            let path = publication
+                .prefix()
+                .join("recovery-diagnostic-inventory.json");
+            if path.exists() {
+                if read_owned_resource(&path, 16 * 1024 * 1024)? != summary {
+                    return Err(CiError::Message(
+                        "original recovery diagnostic inventory changed".into(),
+                    ));
+                }
+                let _held = super::linux_lifecycle_diagnostics::register_existing(
+                    publication,
+                    &path,
+                    artifacts,
+                )?;
+            } else {
+                let _held = super::linux_lifecycle_diagnostics::publish(
+                    publication,
+                    &path,
+                    &summary,
+                    artifacts,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn collect_case_records(
         &self,
         identity: &SourceIdentity,
@@ -2328,6 +2418,11 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained original lifecycle report");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        publication: self.publication.as_deref().ok_or_else(|| {
+                            CiError::Message(
+                                "original selected cell publication capability absent".into(),
+                            )
+                        })?,
                         lease_owner_path: &input
                             .output
                             .parent()
@@ -2398,6 +2493,11 @@ impl InstalledMixedDriver {
                         .last_mut()
                         .expect("retained limits report owner");
                     let context = super::linux_readiness_limits_cases::LimitsContext {
+                        publication: self.publication.as_deref().ok_or_else(|| {
+                            CiError::Message(
+                                "original selected cell publication capability absent".into(),
+                            )
+                        })?,
                         lease_owner_path: &input
                             .output
                             .parent()

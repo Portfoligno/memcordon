@@ -459,6 +459,18 @@ pub struct ProcessIdentity {
     pub birth: u128,
 }
 
+/// Capture identity only while the caller still owns this unreaped child.
+#[cfg(target_os = "macos")]
+pub fn macos_owned_child_identity(child: &Child) -> io::Result<ProcessIdentity> {
+    process_identity(child.id())
+}
+
+/// Read-only, finite diagnostic census of the original admitted process group.
+#[cfg(target_os = "macos")]
+pub fn macos_owned_compile_sample(root: ProcessIdentity) -> Result<serde_json::Value, String> {
+    crate::macos_watchdog::owned_compile_sample(root.pid, root.birth)
+}
+
 #[cfg(target_os = "linux")]
 pub fn linux_limit_delta_is_authoritative() -> bool {
     crate::linux_cgroup::test_limit_delta()

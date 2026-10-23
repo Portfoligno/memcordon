@@ -735,6 +735,49 @@ fn sealed_package_stable_lease_survives_legacy_inode_replacement() {
 
 #[test]
 #[ignore = "requires privileged Linux sealed certification"]
+fn sealed_package_deadline_lease_waits_for_actual_shared_owner() {
+    let mut expired = crate::linux::service::PackageLeaseObservation::default();
+    assert!(crate::linux::service::acquire_package_lease_until_observed(0, &mut expired).is_err());
+    assert!(!expired.lock_acquired && !expired.validated_acquisition);
+    let initial = crate::linux::service::acquire_package_lease().unwrap();
+    drop(initial);
+    let shared = crate::linux::service::acquire_shared_package_lease().unwrap();
+    assert!(crate::linux::service::acquire_package_lease().is_err());
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(shared);
+    });
+    let cutoff = crate::linux::clock::monotonic_nanos()
+        .unwrap()
+        .checked_add(2_000_000_000)
+        .unwrap();
+    let mut observed = crate::linux::service::PackageLeaseObservation::default();
+    let result = crate::linux::service::acquire_package_lease_until_observed(cutoff, &mut observed);
+    release.join().unwrap();
+    let exclusive = result.unwrap();
+    assert!(observed.validated_acquisition && observed.lock_acquired);
+    assert!(observed.contention_count > 0);
+    assert!(observed.finished_monotonic_nanos.unwrap() < cutoff);
+    assert!(observed.held_device.is_some() && observed.held_inode.is_some());
+    drop(exclusive);
+
+    let shared = crate::linux::service::acquire_shared_package_lease().unwrap();
+    let cutoff = crate::linux::clock::monotonic_nanos()
+        .unwrap()
+        .checked_add(30_000_000)
+        .unwrap();
+    let mut observed = crate::linux::service::PackageLeaseObservation::default();
+    let error = crate::linux::service::acquire_package_lease_until_observed(cutoff, &mut observed)
+        .unwrap_err();
+    assert!(error.contains("original cleanup cutoff expired"));
+    assert!(!observed.lock_acquired && !observed.validated_acquisition);
+    assert!(observed.contention_count > 0);
+    drop(shared);
+    assert!(crate::linux::service::acquire_package_lease().is_ok());
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed certification"]
 fn sealed_package_upgrade_recovers_before_advertising() {
     load_legacy_runtime_directory_units();
     let identity = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2".to_owned();

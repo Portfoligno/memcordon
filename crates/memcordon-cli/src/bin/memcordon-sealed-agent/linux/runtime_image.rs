@@ -52,16 +52,29 @@ pub fn retire(definition_path: &Path) -> Result<(), String> {
     if matches!(
         lease.read_any()?,
         Some(crate::policy_registry::VersionedActivation::V3(_))
-    ) || lease.versioned_live_bindings()?.iter().any(|(_, binding)| {
-        matches!(
-            binding,
-            crate::policy_registry::VersionedLiveBinding::Mixed(_)
-        )
-    }) {
+    ) {
         return Err(
-            "restore nonmixed policy and settle all mixed admissions before image retirement"
+            "restore nonmixed policy and settle all mixed admissions before image retirement; active_version=3; mixed_bindings=not-queried"
                 .into(),
         );
+    }
+    let bindings = lease.versioned_live_bindings()?;
+    let mixed: Vec<_> = bindings
+        .iter()
+        .filter_map(|(identity, binding)| {
+            matches!(
+                binding,
+                crate::policy_registry::VersionedLiveBinding::Mixed(_)
+            )
+            .then_some(identity)
+        })
+        .collect();
+    if !mixed.is_empty() {
+        return Err(format!(
+            "restore nonmixed policy and settle all mixed admissions before image retirement; active_version_is_3=false; mixed_binding_count={}; first_identities={:?}",
+            mixed.len(),
+            mixed.iter().take(8).collect::<Vec<_>>()
+        ));
     }
     let reference = definition.reference()?;
     let store = store(false)?;

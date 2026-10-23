@@ -9,6 +9,23 @@ use std::path::PathBuf;
 #[path = "windows_component_worker_wait.rs"]
 mod worker_wait;
 
+/// These losses leave the launcher service alive to finish the original
+/// attempt's closure publication. Their terminal recovery must follow that
+/// exact worker thread, not just the lost peer or frontend's exit.
+pub fn launcher_settlement_before_recovery(
+    fault: Option<memcordon_core::WindowsSealedFault>,
+) -> bool {
+    matches!(
+        fault,
+        Some(
+            memcordon_core::WindowsSealedFault::FrontendDisconnectedAfterAuthorization
+                | memcordon_core::WindowsSealedFault::FrontendKilledAfterAuthorization
+                | memcordon_core::WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                | memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
+        )
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentInput {
@@ -249,6 +266,160 @@ pub fn frontend_guardian_injection_authority(
     ) || observed.selected != selected
         || !rejection.is_consistent()
     {
+        return false;
+    }
+    guardian_frontend_chain_authority(
+        rejection, selected, provider, attempt, request, live, observed,
+    )
+}
+
+/// Values queried from the original retained native process/thread owners.
+pub struct ControlServiceRetirement {
+    pub process: memcordon_core::WindowsProcessIdentityV1,
+    pub thread: memcordon_core::WindowsWorkerThreadIdentityV1,
+    pub process_status: Option<u32>,
+    pub thread_status: u32,
+    pub frontend: memcordon_core::WindowsProcessIdentityV1,
+    pub frontend_status: u32,
+}
+
+pub struct ObservedControlServiceLoss {
+    site: memcordon_core::WindowsControlWorkerSiteV1,
+    frontend: ObservedFrontendLoss,
+}
+
+/// Shared by pre-authority observation and the mandatory later retirement check.
+pub fn control_retirement_matches(
+    selected: memcordon_core::WindowsSealedFault,
+    thread_status: u32,
+    process_retired: bool,
+    process_status: Option<u32>,
+) -> bool {
+    use memcordon_core::WindowsSealedFault::*;
+    match selected {
+        ControlServiceKilledAfterAuthorization => {
+            process_retired && thread_status == 0xC000_013A && process_status == Some(0xC000_013A)
+        }
+        ControlWorkerKilledAfterAuthorization => !process_retired && thread_status == 0,
+        _ => false,
+    }
+}
+
+pub fn control_service_loss_observation(
+    site: &memcordon_core::WindowsControlWorkerSiteV1,
+    held: &ControlServiceRetirement,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+) -> Option<ObservedControlServiceLoss> {
+    use memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization as Selected;
+    let nonce = live.live_nonce.as_deref()?;
+    let target = live.live_target_identity.as_ref()?;
+    (live.is_consistent()
+        && site.binds(
+            &String::from(live.association.attempt_id.clone()),
+            nonce,
+            &String::from(live.association.request_sha256.clone()),
+            Selected,
+            target.process_id,
+        )
+        && site.process == held.process
+        && site.thread == held.thread
+        && control_retirement_matches(
+            Selected,
+            held.thread_status,
+            held.process_status.is_some(),
+            held.process_status,
+        )
+        && held.frontend.process_id != 0
+        && held.frontend.creation_time_100ns != 0
+        && held.frontend_status == 125)
+        .then(|| ObservedControlServiceLoss {
+            site: site.clone(),
+            frontend: ObservedFrontendLoss {
+                selected: Selected,
+                identity: held.frontend.clone(),
+                native_status: held.frontend_status,
+            },
+        })
+}
+
+pub fn control_service_guardian_injection_authority(
+    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observed: &ObservedControlServiceLoss,
+) -> bool {
+    selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
+        && live.live_nonce.as_deref().is_some_and(|nonce| {
+            live.live_target_identity.as_ref().is_some_and(|target| {
+                observed
+                    .site
+                    .binds(attempt, nonce, request, selected, target.process_id)
+            })
+        })
+        && guardian_frontend_chain_authority(
+            rejection,
+            selected,
+            provider,
+            attempt,
+            request,
+            live,
+            &observed.frontend,
+        )
+}
+
+pub fn control_service_recovery_authority(
+    response: &memcordon_core::WindowsProviderResponseV3,
+    delivery: &memcordon_core::WindowsTerminalDeliveryEvidenceV1,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observed: &ObservedControlServiceLoss,
+) -> bool {
+    use memcordon_core::*;
+    let WindowsProviderResponseV3::Reject {
+        schema_version,
+        attempt_id,
+        nonce,
+        request_sha256,
+        rejection,
+    } = response
+    else {
+        return false;
+    };
+    let Ok(authority) = response.terminal_authority_json() else {
+        return false;
+    };
+    *schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+        && delivery.is_consistent()
+        && delivery.attempt_id == *attempt_id
+        && delivery.nonce == *nonce
+        && delivery.request_sha256 == *request_sha256
+        && delivery.authority_sha256
+            == crate::windows_causal_acceptance::sha256(authority.as_bytes())
+        && live.live_nonce.as_ref() == Some(nonce)
+        && control_service_guardian_injection_authority(
+            rejection,
+            WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+            &live.association.provider,
+            attempt_id,
+            request_sha256,
+            live,
+            observed,
+        )
+}
+
+fn guardian_frontend_chain_authority(
+    rejection: &memcordon_core::WindowsProviderRejectionV2,
+    selected: memcordon_core::WindowsSealedFault,
+    provider: &memcordon_core::PublicProviderBindingV1,
+    attempt: &str,
+    request: &str,
+    live: &memcordon_core::WindowsGuardianAttemptObservation,
+    observed: &ObservedFrontendLoss,
+) -> bool {
+    use memcordon_core::*;
+    if observed.selected != selected || !rejection.is_consistent() {
         return false;
     }
     let (Some(failure), Some(guardian), Some(terminal)) = (
@@ -1364,6 +1535,8 @@ mod native {
         let held_worker = Arc::clone(&worker);
         let control_worker = Arc::new(Mutex::new(None));
         let held_control_worker = Arc::clone(&control_worker);
+        let control_site = Arc::new(Mutex::new(None));
+        let held_control_site = Arc::clone(&control_site);
         let frontend = Arc::new(Mutex::new(None));
         let held_frontend = Arc::clone(&frontend);
         let wrapper = Arc::new(Mutex::new(None));
@@ -1404,8 +1577,6 @@ mod native {
                     | memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
             )
         );
-        let control_process_loss = fault
-            == Some(memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization);
         let progression_config = config.clone();
         let progression_input = input.clone();
         let mut progression_record = record.clone();
@@ -1587,7 +1758,7 @@ mod native {
                     .lock()
                     .map_err(|_| io::Error::other("component association poisoned"))? =
                     Some(observation);
-                if worker_loss || frontend_loss {
+                if worker_loss || super::launcher_settlement_before_recovery(fault) {
                     let observed = held_live
                         .lock()
                         .map_err(|_| io::Error::other("component association poisoned"))?;
@@ -1646,7 +1817,7 @@ mod native {
                         ));
                     }
                     drop(live);
-                    let process = observed.process;
+                    let process = observed.process.clone();
                     let thread = observed.thread;
                     let scm = crate::windows_readiness_faults::observe_running_control_service()?;
                     if scm["process_id"] != process.process_id {
@@ -1672,6 +1843,10 @@ mod native {
                         .lock()
                         .map_err(|_| io::Error::other("control worker ownership poisoned"))? =
                         Some(held);
+                    *held_control_site
+                        .lock()
+                        .map_err(|_| io::Error::other("control site ownership poisoned"))? =
+                        Some(observed);
                 }
                 crate::windows_consumer_readiness::native::signal(&gate)?;
                 if fault
@@ -1936,6 +2111,7 @@ mod native {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| CiError::Message("component launch nonce absent".into()))?;
             let mut observed_frontend_loss = None;
+            let mut observed_control_service_loss = None;
             if fault.is_some_and(|fault| {
                 matches!(
                     fault,
@@ -2220,13 +2396,13 @@ mod native {
                     .checked_add(recovery_budget)
                     .ok_or_else(|| CiError::Message("terminal recovery cutoff overflow".into()))?;
                 let recovery_cutoff = recovery_cutoff.min(deadlines.cleanup);
-                if frontend_loss {
+                if super::launcher_settlement_before_recovery(fault) {
                     let worker = worker.lock().map_err(|_| {
                         CiError::Message("component worker ownership poisoned".into())
                     })?;
                     let worker = worker.as_ref().ok_or_else(|| {
                         CiError::Message(
-                            "frontend loss lacks its original held launcher worker".into(),
+                            "selected peer loss lacks its original held launcher worker".into(),
                         )
                     })?;
                     let wait_started = Instant::now();
@@ -2240,6 +2416,7 @@ mod native {
                             "attempt_id":attempt,"request_sha256":request,
                             "process_id":worker.process.identity.pid,"process_creation_time_100ns":worker.process.identity.birth,
                             "thread":worker.identity,"held_before_fault":true,"thread_exit_observed":true,
+                            "selected_fault":fault,
                             "native_exit_status":native_status,"process_retirement_observed":process_retired,
                             "phase_budget_ms":recovery_budget.as_millis(),"wait_elapsed_ms":wait_started.elapsed().as_millis(),
                             "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis,
@@ -2249,7 +2426,7 @@ mod native {
                     )?;
                     if process_retired {
                         return Err(CiError::Message(
-                            "frontend loss unexpectedly retired its launcher service process"
+                            "selected peer loss unexpectedly retired its launcher service process"
                                 .into(),
                         ));
                     }
@@ -2278,6 +2455,60 @@ mod native {
                     } else {
                         None
                     };
+                if fault
+                    == Some(
+                        memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization,
+                    )
+                {
+                    let control = control_worker.lock().map_err(|_| {
+                        CiError::Message("control worker ownership poisoned".into())
+                    })?;
+                    let control = control.as_ref().ok_or_else(|| {
+                        CiError::Message("original held control owner absent".into())
+                    })?;
+                    let frontend = frontend
+                        .lock()
+                        .map_err(|_| CiError::Message("frontend ownership poisoned".into()))?;
+                    let frontend = frontend
+                        .as_ref()
+                        .ok_or_else(|| CiError::Message("original held frontend absent".into()))?;
+                    let identity = |process: &memcordon_testkit::WindowsImageProcess| -> Result<memcordon_core::WindowsProcessIdentityV1> {
+                        Ok(memcordon_core::WindowsProcessIdentityV1 { process_id: process.identity.pid,
+                            creation_time_100ns: u64::try_from(process.identity.birth).map_err(|_| CiError::Message("native process birth exceeds u64".into()))? })
+                    };
+                    let site = control_site
+                        .lock()
+                        .map_err(|_| CiError::Message("control site ownership poisoned".into()))?;
+                    let site = site.as_ref().ok_or_else(|| {
+                        CiError::Message("original verified control site absent".into())
+                    })?;
+                    let association = live
+                        .lock()
+                        .map_err(|_| CiError::Message("component association poisoned".into()))?;
+                    let association = association.as_ref().ok_or_else(|| {
+                        CiError::Message("original held association absent".into())
+                    })?;
+                    if control.process.has_exited()? && frontend.has_exited()? {
+                        observed_control_service_loss = control_service_loss_observation(
+                            site,
+                            &ControlServiceRetirement {
+                                process: identity(&control.process)?,
+                                thread: control.identity,
+                                process_status: control.process.native_exit_status()?,
+                                thread_status: worker_exit(control)?,
+                                frontend: identity(frontend)?,
+                                frontend_status: frontend.native_exit_status()?.ok_or_else(
+                                    || {
+                                        CiError::Message(
+                                            "original frontend native exit absent".into(),
+                                        )
+                                    },
+                                )?,
+                            },
+                            association,
+                        );
+                    }
+                }
                 let recovery_budget = recovery_cutoff
                     .checked_duration_since(Instant::now())
                     .filter(|budget| !budget.is_zero())
@@ -2378,6 +2609,14 @@ mod native {
                             matches!(&response,memcordon_core::WindowsProviderResponseV3::Reject {rejection,..}
                                 if frontend_guardian_injection_authority(rejection,selected,&config.provider,attempt,request,association,observed)))
                     } else { false };
+                    let selected_control_guardian_original = if let (Some(selected), Some(observed)) = (fault, observed_control_service_loss.as_ref()) {
+                        let association = live.lock().map_err(|_| CiError::Message("component association poisoned".into()))?;
+                        let delivery = recovered.get("frontend_delivery").cloned().and_then(|value|
+                            serde_json::from_value::<memcordon_core::WindowsTerminalDeliveryEvidenceV1>(value).ok());
+                        selected == memcordon_core::WindowsSealedFault::ControlServiceKilledAfterAuthorization
+                            && association.as_ref().zip(delivery.as_ref()).is_some_and(|(association, delivery)|
+                                control_service_recovery_authority(&response, delivery, association, observed))
+                    } else { false };
                     if let Some(receipt) = receipt {
                         receipt.validate_for_attempt().map_err(|error| CiError::Message(error.into()))?;
                         if receipt.attempt_id == attempt && receipt.nonce == nonce && receipt.request_sha256 == request
@@ -2389,7 +2628,7 @@ mod native {
                                     && event.code == memcordon_core::FailureCodeV1::GuardianLoss
                                     && event.observed_phase == memcordon_core::AttemptObservationPhaseV1::Monitoring
                                     && event.native_code.is_none()))
-                                || ((selected_transport_original || selected_frontend_guardian_original) && receipt.execution().is_some_and(|(_, outcome, _)|
+                                || ((selected_transport_original || selected_frontend_guardian_original || selected_control_guardian_original) && receipt.execution().is_some_and(|(_, outcome, _)|
                                     matches!(outcome, memcordon_core::RunOutcome::MonitorFailed { .. })))
                                 || (worker_loss && fault!=Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
                                     && if fault == Some(memcordon_core::WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) {
@@ -2417,7 +2656,8 @@ mod native {
             }
             if !rejected {
                 return Err(CiError::Message(format!(
-                    "native injected fault lacks bound failure authority; natural/policy completion cannot substitute; recovery-context={}",
+                    "native injected fault lacks bound failure authority; natural/policy completion cannot substitute; selected-fault={fault:?}; attempt={attempt}; request={request}; retained-directory={}; recovery-context={}",
+                    directory.display(),
                     recovery_failure
                         .as_deref()
                         .unwrap_or("no nonzero recovery command observed")
@@ -2783,13 +3023,15 @@ mod native {
                     })?;
                     let status = worker_exit(worker)?;
                     let process_retired = worker.process.has_exited()?;
-                    if process_retired != control_process_loss
-                        || status != if control_process_loss { 0xC000_013A } else { 0 }
-                    {
-                        return Err(CiError::Message("actual control worker thread/process exit differs from selected action".into()));
-                    }
-                    if process_retired && worker.process.native_exit_status()? != Some(0xC000_013A)
-                    {
+                    let process_status = worker.process.native_exit_status()?;
+                    if !fault.is_some_and(|selected| {
+                        control_retirement_matches(
+                            selected,
+                            status,
+                            process_retired,
+                            process_status,
+                        )
+                    }) {
                         return Err(CiError::Message(
                             "actual held control service status differs".into(),
                         ));

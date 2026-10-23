@@ -71,6 +71,10 @@ pub struct ProgressChunk {
 pub struct ProgressOutput {
     pub sender: mpsc::SyncSender<ProgressChunk>,
     pub omitted: Arc<AtomicU64>,
+    /// Optional nonblocking, observational publication while the original child
+    /// is still owned and unreaped. It never participates in settlement.
+    pub admitted:
+        Option<mpsc::SyncSender<Result<memcordon_platform::test_support::ProcessIdentity, String>>>,
 }
 
 #[derive(Default)]
@@ -530,6 +534,16 @@ fn observe_deadline_child(
         }
     };
     let boundary_admitted = started.elapsed();
+    #[cfg(target_os = "macos")]
+    if let Some(sender) = progress
+        .as_ref()
+        .and_then(|progress| progress.admitted.as_ref())
+    {
+        let _ = sender.try_send(
+            memcordon_platform::test_support::macos_owned_child_identity(&child)
+                .map_err(|error| error.to_string()),
+        );
+    }
     let stdout_reader = reader(
         child.stdout.take().expect("stdout was configured as piped"),
         output_limit,

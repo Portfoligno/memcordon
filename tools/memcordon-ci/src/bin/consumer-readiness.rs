@@ -85,6 +85,9 @@ enum Operation {
         output: PathBuf,
         #[arg(long)]
         acquisition_root: Option<PathBuf>,
+        #[cfg(target_os = "linux")]
+        #[arg(long, hide = true)]
+        privileged_seal_context: Option<String>,
     },
     Identity {
         #[arg(long)]
@@ -307,7 +310,28 @@ fn run(operation: Operation) -> Result<(), String> {
             cell,
             output,
             acquisition_root,
+            #[cfg(target_os = "linux")]
+            privileged_seal_context,
         } => {
+            // Always-run publication gets one separate finite cutoff. It does
+            // not renew acquisition/cleanup, including already expired work.
+            #[cfg(target_os = "linux")]
+            let parent_publication_deadline =
+                if acquisition_root.is_some() && rustix::process::geteuid().as_raw() != 0 {
+                    Some(
+                        u64::try_from(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_err(|e| e.to_string())?
+                                .as_millis(),
+                        )
+                        .map_err(|e| e.to_string())?
+                        .checked_add(60_000)
+                        .ok_or("publication cutoff overflow")?,
+                    )
+                } else {
+                    None
+                };
             join_github_identity(&identity, github_context)?;
             let (job, run_attempt) = if github_context {
                 let context = github_producer_context()?;
@@ -324,9 +348,179 @@ fn run(operation: Operation) -> Result<(), String> {
             if run_attempt == 0 {
                 return Err("producer attempt must be positive".into());
             }
+            #[cfg(target_os = "linux")]
+            let scoped = if let Some(acquisition) = &acquisition_root {
+                use memcordon_ci::{
+                    preparation_tools as preparation, release::readiness_producer_seal as seal,
+                };
+                let workspace = std::env::current_dir().map_err(|e| e.to_string())?;
+                let acquisition = std::path::absolute(acquisition).map_err(|e| e.to_string())?;
+                let cell_path = std::path::absolute(&cell).map_err(|e| e.to_string())?;
+                let output_path = std::path::absolute(&output).map_err(|e| e.to_string())?;
+                seal::selected_paths(&workspace, &acquisition, &cell_path, &output_path)?;
+                if std::path::absolute(&identity).map_err(|e| e.to_string())?
+                    != workspace.join(".release/readiness-identity.json")
+                    || std::path::absolute(&manifest).map_err(|e| e.to_string())?
+                        != workspace.join("ci/consumer-readiness-v1.toml")
+                {
+                    return Err(
+                        "privileged seal inputs differ from fixed selected workspace roles".into(),
+                    );
+                }
+                let identity_bytes = seal::read_input(
+                    &workspace,
+                    std::path::Path::new(".release/readiness-identity.json"),
+                )?;
+                memcordon_core::canonical_json::reject_duplicate_json_keys(&identity_bytes)?;
+                let selected_identity: SourceIdentity =
+                    serde_json::from_slice(&identity_bytes).map_err(|e| e.to_string())?;
+                let manifest_bytes = seal::read_input(
+                    &workspace,
+                    std::path::Path::new("ci/consumer-readiness-v1.toml"),
+                )?;
+                let context = if rustix::process::geteuid().as_raw() == 0 {
+                    let bytes = privileged_seal_context.as_deref().ok_or(
+                        "root projection sealing requires resolved original runner context",
+                    )?;
+                    if bytes.len() > 16 * 1024 {
+                        return Err("privileged seal context exceeds bound".into());
+                    }
+                    memcordon_core::canonical_json::reject_duplicate_json_keys(bytes.as_bytes())?;
+                    serde_json::from_str::<seal::Context>(bytes).map_err(|e| e.to_string())?
+                } else {
+                    if privileged_seal_context.is_some() || !github_context {
+                        return Err(
+                            "privileged sealing requires original native GitHub context".into()
+                        );
+                    }
+                    let publication_deadline_unix_millis = parent_publication_deadline
+                        .ok_or("original runner publication cutoff absent")?;
+                    let invocation = preparation::ReadinessHelperContext {
+                        repository: std::env::var("GITHUB_REPOSITORY")
+                            .map_err(|e| e.to_string())?,
+                        workflow: std::env::var("GITHUB_WORKFLOW").map_err(|e| e.to_string())?,
+                        run: selected_identity.run_id.clone(),
+                        attempt: run_attempt,
+                        source_commit: selected_identity.source_commit.clone(),
+                        version: selected_identity.version.clone(),
+                    };
+                    let scope = seal::Scope::open(
+                        &workspace,
+                        &acquisition,
+                        &cell_path,
+                        &output_path,
+                        rustix::process::geteuid().as_raw(),
+                        seal::publication_cutoff(publication_deadline_unix_millis)?,
+                    )?;
+                    seal::Context {
+                        invocation,
+                        identity: selected_identity.clone(),
+                        job: job.clone(),
+                        runner_uid: rustix::process::geteuid().as_raw(),
+                        helper_sha256: preparation::running_readiness_helper_digest(&workspace)
+                            .map_err(|e| e.to_string())?,
+                        cell_sha256: hex::encode(Sha256::digest(scope.cell_bytes())),
+                        manifest_sha256: hex::encode(Sha256::digest(&manifest_bytes)),
+                        publication_deadline_unix_millis,
+                    }
+                };
+                let deadline = seal::publication_cutoff(context.publication_deadline_unix_millis)?;
+                if context.job != job
+                    || context.invocation.attempt != run_attempt
+                    || context.invocation.run != selected_identity.run_id
+                    || context.invocation.source_commit != selected_identity.source_commit
+                    || context.invocation.version != selected_identity.version
+                    || serde_json::to_value(&context.identity).map_err(|e| e.to_string())?
+                        != serde_json::to_value(&selected_identity).map_err(|e| e.to_string())?
+                    || context.manifest_sha256 != hex::encode(Sha256::digest(&manifest_bytes))
+                {
+                    return Err("resolved publication identity/job/manifest differs".into());
+                }
+                preparation::validate_readiness_helper(
+                    &workspace,
+                    &context.invocation,
+                    &context.helper_sha256,
+                )
+                .map_err(|e| e.to_string())?;
+                let scope = seal::Scope::open(
+                    &workspace,
+                    &acquisition,
+                    &cell_path,
+                    &output_path,
+                    context.runner_uid,
+                    deadline,
+                )?;
+                if context.cell_sha256 != hex::encode(Sha256::digest(scope.cell_bytes())) {
+                    return Err("projected cell changed across privilege boundary".into());
+                }
+                if rustix::process::geteuid().as_raw() != 0 {
+                    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let status =
+                        CommandSpec::new("sudo", &workspace, std::time::Duration::from_secs(60))
+                            .bounded_until(deadline)
+                            .args(["-n", "--"])
+                            .arg(executable)
+                            .arg("seal-producer")
+                            .arg("--job")
+                            .arg(&job)
+                            .arg("--run-attempt")
+                            .arg(run_attempt.to_string())
+                            .arg("--identity")
+                            .arg(&identity)
+                            .arg("--manifest")
+                            .arg(&manifest)
+                            .arg("--cell")
+                            .arg(&cell_path)
+                            .arg("--output")
+                            .arg(&output_path)
+                            .arg("--acquisition-root")
+                            .arg(&acquisition)
+                            .arg("--privileged-seal-context")
+                            .arg(serde_json::to_string(&context).map_err(|e| e.to_string())?)
+                            .output();
+                    return match status {
+                        Ok(output) if output.status.success() => Ok(()),
+                        other => Err(format!(
+                            "scoped publication failed: {}",
+                            command_failure(&other)
+                        )),
+                    };
+                }
+                Some((scope, selected_identity, manifest_bytes))
+            } else {
+                if privileged_seal_context.is_some() {
+                    return Err(
+                        "privileged publication context lacks acquisition projection".into(),
+                    );
+                }
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let identity = if let Some((_, identity, _)) = &scoped {
+                identity.clone()
+            } else {
+                read::<SourceIdentity>(&identity)?
+            };
+            #[cfg(not(target_os = "linux"))]
             let identity = read::<SourceIdentity>(&identity)?;
+            #[cfg(target_os = "linux")]
+            let mut cell = if let Some((scope, _, _)) = &scoped {
+                serde_json::from_slice::<CellEvidence>(scope.cell_bytes())
+                    .map_err(|e| e.to_string())?
+            } else {
+                read::<CellEvidence>(&cell)?
+            };
+            #[cfg(not(target_os = "linux"))]
             let mut cell = read::<CellEvidence>(&cell)?;
-            if acquisition_failed(acquisition_root.as_deref())? {
+            #[cfg(target_os = "linux")]
+            let failed = if let Some((scope, _, _)) = &scoped {
+                scope.acquisition_failed()?
+            } else {
+                acquisition_failed(acquisition_root.as_deref())?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let failed = acquisition_failed(acquisition_root.as_deref())?;
+            if failed {
                 cell.cache_quiescent = false;
                 cell.cleanup_failures
                     .push("acquisition wrapper recorded native runner/cleanup failure".into());
@@ -379,7 +573,14 @@ fn run(operation: Operation) -> Result<(), String> {
                     ));
                 }
             }
-            let manifest_bytes = fs::read(manifest).map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            let manifest_bytes = if let Some((_, _, bytes)) = &scoped {
+                bytes.clone()
+            } else {
+                fs::read(&manifest).map_err(|e| e.to_string())?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let manifest_bytes = fs::read(&manifest).map_err(|e| e.to_string())?;
             let sealed = memcordon_readiness_verifier::ProducerManifest {
                 format: "memcordon.consumer-readiness.producer".into(),
                 revision: 1,
@@ -396,6 +597,10 @@ fn run(operation: Operation) -> Result<(), String> {
                 records: cell.records,
             };
             let bytes = serde_json::to_vec_pretty(&sealed).map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            if let Some((scope, _, _)) = &scoped {
+                return scope.publish(&bytes);
+            }
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

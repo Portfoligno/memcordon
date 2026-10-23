@@ -2,6 +2,173 @@ use std::path::Path;
 
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
+const OWNED_COMPILER_PROTOCOL: &str = r#"
+impl CommandSpec {
+    fn materialize(&self) {
+        self.apply_environment(&mut command);
+        #[cfg(unix)]
+        if let Some(owner) = &self.compiler_owner {
+            let protocol = owner.admit()?;
+            command.env_remove("MAKEFLAGS").env_remove("MFLAGS")
+                .env_remove("CARGO_BUILD_JOBS")
+                .env("CARGO_MAKEFLAGS", protocol.makeflags());
+        }
+    }
+}
+"#;
+
+#[test]
+fn owned_compiler_protocol_requires_the_complete_materialization_boundary() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    validate_rust_policy_bytes(boundary, OWNED_COMPILER_PROTOCOL.as_bytes()).unwrap();
+    for path in [
+        "tools/memcordon-ci/src/compiler_pool.rs",
+        "tools/memcordon-ci/src/command_other.rs",
+        "tools/memcordon-ci/tests/compiler_pool.rs",
+        "crates/example/src/lib.rs",
+    ] {
+        assert!(
+            validate_rust_policy_bytes(Path::new(path), OWNED_COMPILER_PROTOCOL.as_bytes())
+                .is_err()
+        );
+    }
+    for (before, after) in [
+        ("CommandSpec", "OtherCommand"),
+        ("impl CommandSpec", "#[cfg(any())] impl CommandSpec"),
+        ("fn materialize", "#[cfg(any())] fn materialize"),
+        ("fn materialize", "fn another_function"),
+        ("#[cfg(unix)]", ""),
+        ("#[cfg(unix)]", "#[cfg(any())]"),
+        ("#[cfg(unix)]", "#[cfg(windows)]"),
+        ("#[cfg(unix)]", "#[cfg_attr(unix, cfg(any()))]"),
+        ("#[cfg(unix)]", "#[cfg(unix)] #[cfg(any())]"),
+        ("self.apply_environment(&mut command);", ""),
+        ("&self.compiler_owner", "&self.other_owner"),
+        ("owner.admit()?", "arbitrary_protocol()"),
+        ("owner.admit()?", "other.admit()?"),
+        ("protocol.makeflags()", "\"arbitrary flags\""),
+        ("protocol.makeflags()", "unvalidated"),
+        ("protocol.makeflags()", "other.makeflags()"),
+        ("protocol.makeflags()", "protocol.makeflags(extra)"),
+        ("protocol.makeflags()", "protocol.makeflags::<Other>()"),
+        ("\"CARGO_MAKEFLAGS\"", "\"MAKEFLAGS\""),
+        ("\"CARGO_MAKEFLAGS\"", "dynamic_key"),
+        ("\"MFLAGS\"", "\"GH_TOKEN\""),
+        (".env_remove(\"MFLAGS\")", ""),
+        ("command.env_remove", "other.env_remove"),
+        (
+            "let protocol = owner.admit()?;",
+            "let protocol = owner.admit()?; let protocol = arbitrary;",
+        ),
+    ] {
+        let changed = OWNED_COMPILER_PROTOCOL.replace(before, after);
+        assert_ne!(changed, OWNED_COMPILER_PROTOCOL);
+        assert!(
+            validate_rust_policy_bytes(boundary, changed.as_bytes()).is_err(),
+            "accepted {before} -> {after}"
+        );
+    }
+}
+
+#[test]
+fn owned_compiler_protocol_accounts_for_all_mutations_and_keeps_credentials_restricted() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    for changed in [
+        OWNED_COMPILER_PROTOCOL.replace(
+            "self.apply_environment(&mut command);",
+            "self.apply_environment(&mut command); self.apply_environment(&mut command);",
+        ),
+        OWNED_COMPILER_PROTOCOL.replace(
+            "        }\n    }\n}",
+            "        }\n        self.apply_environment(&mut command);\n    }\n}",
+        ),
+        OWNED_COMPILER_PROTOCOL.replace(
+            "        }\n    }\n}",
+            "        }\n        self.apply_environment(&mut other);\n    }\n}",
+        ),
+        OWNED_COMPILER_PROTOCOL.replace(
+            "        }\n    }\n}",
+            "        }\n        command.env_remove(\"CARGO_MAKEFLAGS\");\n    }\n}",
+        ),
+        OWNED_COMPILER_PROTOCOL.replace(
+            "        }\n    }\n}",
+            "        }\n        command.env_remove(dynamic_key);\n    }\n}",
+        ),
+    ] {
+        assert_ne!(changed, OWNED_COMPILER_PROTOCOL);
+        assert!(
+            validate_rust_policy_bytes(boundary, changed.as_bytes()).is_err(),
+            "accepted repeated sanitation after protocol admission"
+        );
+    }
+    for extra in [
+        "command.env(\"CARGO_MAKEFLAGS\", protocol.makeflags());",
+        "command.env(\"CUSTOM_CI_VALUE\", \"value\");",
+        "command.envs([(\"CARGO_MAKEFLAGS\", \"value\")]);",
+        "command.env_clear();",
+        "command.env_remove(\"MAKEFLAGS\");",
+        "std::env::set_var(\"CARGO_MAKEFLAGS\", \"value\");",
+    ] {
+        let changed = [OWNED_COMPILER_PROTOCOL, "fn extra() {", extra, "}"].join("\n");
+        assert!(
+            validate_rust_policy_bytes(boundary, changed.as_bytes()).is_err(),
+            "accepted extra mutation: {extra}"
+        );
+    }
+    let duplicate = [OWNED_COMPILER_PROTOCOL, OWNED_COMPILER_PROTOCOL].join("\n");
+    assert!(validate_rust_policy_bytes(boundary, duplicate.as_bytes()).is_err());
+    for path in [
+        "tools/memcordon-ci/src/compiler_pool.rs",
+        "crates/example/src/lib.rs",
+    ] {
+        assert!(
+            validate_rust_policy_bytes(
+                Path::new(path),
+                b"fn extra() { command.env_remove(\"GH_TOKEN\"); }"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn actual_compiler_protocol_sources_satisfy_policy() {
+    validate_rust_policy_bytes(
+        Path::new("tools/memcordon-ci/src/command.rs"),
+        include_bytes!("../src/command.rs"),
+    )
+    .unwrap();
+    validate_rust_policy_bytes(
+        Path::new("tools/memcordon-ci/src/compiler_pool.rs"),
+        include_bytes!("../src/compiler_pool.rs"),
+    )
+    .unwrap();
+    // repository_policy_checks_all_lightweight_phases below exercises the
+    // complete gate used by preparation, including these same source files.
+}
+
+#[test]
+fn owned_protocol_cannot_be_overwritten_through_direct_command_calls() {
+    let boundary = Path::new("tools/memcordon-ci/src/command.rs");
+    for call in [
+        "Self::apply_environment(self, &mut command);",
+        "CommandSpec::apply_environment(self, &mut command);",
+        "Command::env_remove(&mut command, dynamic_key);",
+        "std::process::Command::env_remove(&mut command, \"CARGO_MAKEFLAGS\");",
+        "Command::env(&mut command, \"CARGO_MAKEFLAGS\", \"arbitrary\");",
+        "Command::envs(&mut command, [(\"CARGO_MAKEFLAGS\", \"arbitrary\")]);",
+        "Command::env_clear(&mut command);",
+    ] {
+        let replacement = ["        }", call, "    }", "}"].join("\n");
+        let changed = OWNED_COMPILER_PROTOCOL.replace("        }\n    }\n}", &replacement);
+        assert_ne!(changed, OWNED_COMPILER_PROTOCOL);
+        assert!(
+            validate_rust_policy_bytes(boundary, changed.as_bytes()).is_err(),
+            "accepted direct overwrite: {call}"
+        );
+    }
+}
+
 #[test]
 fn repository_policy_checks_all_lightweight_phases() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))

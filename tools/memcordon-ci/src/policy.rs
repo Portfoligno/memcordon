@@ -5679,6 +5679,7 @@ struct RustPolicy {
     calls_current_exe: bool,
     names_proc_self_exe: bool,
     calls_env_remove: bool,
+    env_removal_calls: usize,
     subprocess_env_mutations: usize,
     standard_path_mutations: usize,
     standard_proxy_mutations: usize,
@@ -5688,6 +5689,11 @@ struct RustPolicy {
     offline_download_fixture_mutations: usize,
     cargo_job_budget_mutations: usize,
     managed_miri_sysroot_mutations: usize,
+    owned_compiler_protocols: usize,
+    compiler_protocol_removals: usize,
+    compiler_protocol_setters: usize,
+    command_sanitation_clears: usize,
+    environment_sanitizations: usize,
     standard_output_mutations: usize,
     driver_fixture_mutations: [usize; 4],
     pre_exec_calls: usize,
@@ -5695,6 +5701,36 @@ struct RustPolicy {
 }
 
 impl<'ast> Visit<'ast> for RustPolicy {
+    fn visit_item_impl(&mut self, implementation: &'ast syn::ItemImpl) {
+        if matches!(implementation.self_ty.as_ref(), syn::Type::Path(path) if path.path.is_ident("CommandSpec"))
+            && implementation.trait_.is_none()
+            && implementation.attrs.is_empty()
+        {
+            for item in &implementation.items {
+                let syn::ImplItem::Fn(function) = item else {
+                    continue;
+                };
+                if function.sig.ident == "materialize" && function.attrs.is_empty() {
+                    let mut context = RustPolicy::default();
+                    context.visit_block(&function.block);
+                    if context.environment_sanitizations == 1 && context.env_removal_calls == 3 {
+                        for statements in function.block.stmts.windows(2) {
+                            if owned_compiler_protocol_branch(&statements[0], &statements[1]) {
+                                self.owned_compiler_protocols += 1;
+                            }
+                        }
+                    }
+                }
+                if function.sig.ident == "apply_environment" {
+                    let mut sanitation = RustPolicy::default();
+                    sanitation.visit_block(&function.block);
+                    self.command_sanitation_clears += sanitation.cleared_environments;
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, implementation);
+    }
+
     fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = expression.func.as_ref() {
             let segments: Vec<String> = path
@@ -5703,6 +5739,28 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect();
+            if segments.len() >= 2
+                && matches!(
+                    segments[segments.len() - 2].as_str(),
+                    "Self" | "CommandSpec"
+                )
+                && segments
+                    .last()
+                    .is_some_and(|name| name == "apply_environment")
+            {
+                self.environment_sanitizations += 1;
+            }
+            if segments.len() >= 2
+                && segments[segments.len() - 2] == "Command"
+                && segments.last().is_some_and(|name| {
+                    matches!(name.as_str(), "env" | "envs" | "env_remove" | "env_clear")
+                })
+            {
+                self.violations.push(
+                    "direct Command environment mutation bypasses reviewed method boundary"
+                        .to_owned(),
+                );
+            }
             if segments.len() >= 2
                 && segments[segments.len() - 2] == "env"
                 && segments
@@ -5752,17 +5810,30 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+        if expression.method == "apply_environment" {
+            self.environment_sanitizations += 1;
+        }
         if expression.method == "env_clear" {
             self.cleared_environments += 1;
         }
         if expression.method == "env_remove" {
             self.calls_env_remove = true;
+            self.env_removal_calls += 1;
+            if matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "MAKEFLAGS" | "MFLAGS" | "CARGO_BUILD_JOBS" | "CARGO_MAKEFLAGS"))
+            {
+                self.compiler_protocol_removals += 1;
+            }
         }
         if expression.method == "pre_exec" {
             self.pre_exec_calls += 1;
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.subprocess_env_mutations += 1;
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "CARGO_MAKEFLAGS")
+            {
+                self.compiler_protocol_setters += 1;
+            }
             if expression.method == "env"
                 && expression.args.len() == 2
                 && let syn::Expr::Lit(syn::ExprLit {
@@ -5881,10 +5952,113 @@ fn reviewed_isolated_cargo_environment(relative: &Path, visitor: &RustPolicy) ->
     relative == Path::new("tools/memcordon-ci/src/command.rs")
         && visitor.cargo_job_budget_mutations <= 1
         && visitor.managed_miri_sysroot_mutations <= 1
+        && reviewed_owned_compiler_protocol(relative, visitor)
         && visitor.subprocess_env_mutations
             == visitor.cargo_home_mutations
                 + visitor.cargo_job_budget_mutations
                 + visitor.managed_miri_sysroot_mutations
+                + visitor.owned_compiler_protocols
+}
+
+/// Match the complete capability-consuming branch, not a variable-name allowlist.
+fn owned_compiler_protocol_branch(previous: &syn::Stmt, statement: &syn::Stmt) -> bool {
+    fn path(expression: &syn::Expr, name: &str) -> bool {
+        matches!(expression, syn::Expr::Path(value) if value.path.is_ident(name))
+    }
+    fn field(expression: &syn::Expr, name: &str) -> bool {
+        matches!(expression, syn::Expr::Field(value) if path(&value.base, "self") && matches!(&value.member, syn::Member::Named(member) if member == name))
+    }
+    fn literal(expression: &syn::Expr, expected: &str) -> bool {
+        matches!(expression, syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. }) if value.value() == expected)
+    }
+    let syn::Stmt::Expr(syn::Expr::MethodCall(sanitize), Some(_)) = previous else {
+        return false;
+    };
+    if sanitize.method != "apply_environment"
+        || sanitize.turbofish.is_some()
+        || !path(&sanitize.receiver, "self")
+        || sanitize.args.len() != 1
+        || !matches!(sanitize.args.first(), Some(syn::Expr::Reference(reference)) if reference.mutability.is_some() && path(&reference.expr, "command"))
+    {
+        return false;
+    }
+    let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
+        return false;
+    };
+    if branch.else_branch.is_some()
+        || branch.attrs.len() != 1
+        || !branch.attrs[0].path().is_ident("cfg")
+        || !branch.attrs[0]
+            .parse_args::<syn::Path>()
+            .is_ok_and(|condition| condition.is_ident("unix"))
+    {
+        return false;
+    }
+    let syn::Expr::Let(binding) = branch.cond.as_ref() else {
+        return false;
+    };
+    if !matches!(binding.pat.as_ref(), syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Some") && pattern.elems.len() == 1 && matches!(pattern.elems.first(), Some(syn::Pat::Ident(owner)) if owner.ident == "owner" && owner.by_ref.is_none() && owner.mutability.is_none()))
+        || !matches!(binding.expr.as_ref(), syn::Expr::Reference(reference) if reference.mutability.is_none() && field(&reference.expr, "compiler_owner"))
+    {
+        return false;
+    }
+    let [
+        syn::Stmt::Local(protocol),
+        syn::Stmt::Expr(syn::Expr::MethodCall(setter), Some(_)),
+    ] = branch.then_branch.stmts.as_slice()
+    else {
+        return false;
+    };
+    if !matches!(&protocol.pat, syn::Pat::Ident(name) if name.ident == "protocol" && name.by_ref.is_none() && name.mutability.is_none())
+    {
+        return false;
+    }
+    let Some(initializer) = &protocol.init else {
+        return false;
+    };
+    if initializer.diverge.is_some()
+        || !matches!(initializer.expr.as_ref(), syn::Expr::Try(value) if matches!(value.expr.as_ref(), syn::Expr::MethodCall(admit) if admit.method == "admit" && admit.turbofish.is_none() && admit.args.is_empty() && path(&admit.receiver, "owner")))
+    {
+        return false;
+    }
+    if setter.method != "env"
+        || setter.turbofish.is_some()
+        || setter.args.len() != 2
+        || !literal(&setter.args[0], "CARGO_MAKEFLAGS")
+        || !matches!(&setter.args[1], syn::Expr::MethodCall(value) if value.method == "makeflags" && value.turbofish.is_none() && value.args.is_empty() && path(&value.receiver, "protocol"))
+    {
+        return false;
+    }
+    let mut receiver = setter.receiver.as_ref();
+    for key in ["CARGO_BUILD_JOBS", "MFLAGS", "MAKEFLAGS"] {
+        let syn::Expr::MethodCall(removal) = receiver else {
+            return false;
+        };
+        if removal.method != "env_remove"
+            || removal.turbofish.is_some()
+            || removal.args.len() != 1
+            || !literal(&removal.args[0], key)
+        {
+            return false;
+        }
+        receiver = removal.receiver.as_ref();
+    }
+    path(receiver, "command")
+}
+
+fn reviewed_owned_compiler_protocol(relative: &Path, visitor: &RustPolicy) -> bool {
+    if visitor.owned_compiler_protocols == 0
+        && visitor.compiler_protocol_removals == 0
+        && visitor.compiler_protocol_setters == 0
+    {
+        return true;
+    }
+    relative == Path::new("tools/memcordon-ci/src/command.rs")
+        && visitor.owned_compiler_protocols == 1
+        && visitor.compiler_protocol_setters == 1
+        && visitor.compiler_protocol_removals == 3
+        && visitor.cleared_environments <= 1
+        && visitor.cleared_environments == visitor.command_sanitation_clears
 }
 
 fn reviewed_download_fixture_environment(relative: &Path, visitor: &RustPolicy) -> bool {
@@ -5935,6 +6109,11 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     let mut visitor = RustPolicy::default();
     visitor.visit_file(&syntax);
+    if !reviewed_owned_compiler_protocol(relative, &visitor) {
+        visitor
+            .violations
+            .push("owned compiler protocol capability boundary differs".to_owned());
+    }
     let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
     let sealed_launch =
         Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
@@ -6032,6 +6211,11 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         })?;
         let mut visitor = RustPolicy::default();
         visitor.visit_file(&syntax);
+        if !reviewed_owned_compiler_protocol(relative, &visitor) {
+            visitor
+                .violations
+                .push("owned compiler protocol capability boundary differs".to_owned());
+        }
         let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
         let sealed_launch =
             Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");

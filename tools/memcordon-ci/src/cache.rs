@@ -169,6 +169,14 @@ pub fn partition_compatibility(
     use crate::cache_restore::CompiledPartition;
     inputs.insert("partition".into(), serde_json::to_string(&partition)?);
     if partition == CompiledPartition::NativeTests {
+        let coverage = inputs
+            .get("shard")
+            .and_then(|shard| crate::cache_restore::native_coverage_shard(shard));
+        if coverage.is_some() && purpose != "native-readiness" {
+            return Err(CiError::Message(
+                "coverage cache selection has a foreign purpose".into(),
+            ));
+        }
         let recipe = native_recipe(purpose)
             .ok_or_else(|| CiError::Message("purpose has no native-test recipe".into()))?;
         inputs.remove("purpose");
@@ -183,10 +191,21 @@ pub fn partition_compatibility(
             }
             .into(),
         );
-        inputs.insert(
-            "compilation-arguments".into(),
-            serde_json::to_string(recipe.first().expect("native compile recipe"))?,
-        );
+        let compilation = if let Some(selected) = coverage {
+            inputs.insert(
+                "native-coverage-selection".into(),
+                format!("coverage-v1-four-{selected}"),
+            );
+            serde_json::to_string(&(
+                "native-coverage-v1",
+                4,
+                selected,
+                "workspace-all-features-release;source-bound-named-selectors;paired-compile-execute",
+            ))?
+        } else {
+            serde_json::to_string(recipe.first().expect("native compile recipe"))?
+        };
+        inputs.insert("compilation-arguments".into(), compilation);
     }
     if partition == CompiledPartition::FuzzTargets {
         inputs.remove("shard");
@@ -467,7 +486,15 @@ fn collect_context(
             crate::preparation::compiler_budget().to_string(),
         );
     }
-    if matches!(
+    if purpose == "native-readiness"
+        && crate::cache_restore::native_coverage_shard(shard).is_some()
+        && partition == Some(crate::cache_restore::CompiledPartition::NativeTests)
+    {
+        inputs.insert(
+            "native-compiler-jobs".into(),
+            crate::preparation::compiler_budget().to_string(),
+        );
+    } else if matches!(
         purpose,
         "native-release" | "native-readiness" | "windows-working" | "private"
     ) && partition != Some(crate::cache_restore::CompiledPartition::PrivateNativeTests)
@@ -483,7 +510,16 @@ fn collect_context(
         if partition != Some(crate::cache_restore::CompiledPartition::NativeTests) {
             inputs.insert(
                 "product-compiler-jobs".into(),
-                allocation.first.get().to_string(),
+                if purpose == "native-readiness"
+                    && partition == Some(crate::cache_restore::CompiledPartition::Product)
+                    && std::env::var("GITHUB_JOB").ok().as_deref()
+                        == Some("native-macos-x64-product")
+                {
+                    crate::preparation::compiler_budget()
+                } else {
+                    allocation.first.get()
+                }
+                .to_string(),
             );
         }
         if partition != Some(crate::cache_restore::CompiledPartition::Product) {
@@ -1008,7 +1044,9 @@ fn collect_context(
             "current-nested-workspace-cargo-build-recipes".into(),
         );
     }
-    if let Some(recipe) = native_recipe(purpose) {
+    if let Some(recipe) = native_recipe(purpose)
+        && !compatibility.contains_key("native-coverage-selection")
+    {
         let compilation = recipe.into_iter().next().unwrap_or_default();
         compatibility.insert(
             "compilation-arguments".into(),

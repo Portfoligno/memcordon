@@ -2,6 +2,11 @@ use sha2::Digest;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{collections::BTreeMap, fs, path::Path};
 
+pub const LIFECYCLE_RECOVERY_OWNER_PRECONDITION: &str =
+    "lifecycle-recovery-owner-precondition.json";
+pub const LIFECYCLE_RECOVERY_DIAGNOSTIC_INVENTORY: &str =
+    "lifecycle-recovery-diagnostic-inventory.json";
+
 const RETAINED: [&str; 10] = [
     "stage.json",
     "original-native-recovery-origin.json",
@@ -14,6 +19,166 @@ const RETAINED: [&str; 10] = [
     "original-native-recovery-stderr.bin",
     "original-native-recovery-result.json",
 ];
+const FAILURE_DIAGNOSTIC: &str = "original-native-recovery-failure.json";
+
+/// Failure inventory is deliberately separate from `collect`'s single complete
+/// attempt acceptance. Partial or nonzero attempts remain diagnostics only.
+pub type DiagnosticInventory = (BTreeMap<String, Vec<u8>>, Vec<String>);
+
+pub fn collect_diagnostic_attempts(
+    output: &Path,
+    mut read: impl FnMut(&Path, u64) -> Result<Vec<u8>, String>,
+) -> Result<DiagnosticInventory, String> {
+    let mut files = BTreeMap::new();
+    let mut issues = Vec::new();
+    let mut attempts = Vec::new();
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+        .open(output)
+        .map_err(|error| error.to_string())?;
+    for (index, entry) in fs::read_dir(output)
+        .map_err(|error| error.to_string())?
+        .enumerate()
+    {
+        if index >= 4096 {
+            return Err("recovery diagnostic root inventory exceeds bound".into());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name
+            .to_str()
+            .filter(|name| name.starts_with("original-recovery-"))
+        else {
+            continue;
+        };
+        let suffix = name
+            .strip_prefix("original-recovery-")
+            .expect("selected prefix");
+        if suffix.is_empty()
+            || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || attempts.len() >= 16
+        {
+            return Err("recovery diagnostic attempt name/count differs".into());
+        }
+        attempts.push(name.to_owned());
+    }
+    attempts.sort();
+    let mut total = 0usize;
+    for attempt in attempts {
+        let directory = output.join(&attempt);
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open(&directory)
+            .map_err(|error| format!("recovery diagnostic directory {directory:?}: {error}"))?;
+        let before = held.metadata().map_err(|error| error.to_string())?;
+        if before.uid() != root.metadata().map_err(|error| error.to_string())?.uid()
+            || before.mode() & 0o022 != 0
+        {
+            return Err("recovery diagnostic attempt custody differs".into());
+        }
+        for leaf in RETAINED.into_iter().chain([FAILURE_DIAGNOSTIC]) {
+            let path = directory.join(leaf);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if leaf != FAILURE_DIAGNOSTIC {
+                        issues.push(format!("{attempt}/{leaf}: absent"));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("recovery diagnostic metadata {path:?}: {error}"));
+                }
+                Ok(metadata)
+                    if !metadata.is_file()
+                        || metadata.nlink() != 1
+                        || metadata.uid() != before.uid()
+                        || metadata.mode() & 0o022 != 0 =>
+                {
+                    return Err(format!(
+                        "recovery diagnostic file custody differs: {path:?}"
+                    ));
+                }
+                Ok(_) => {}
+            }
+            let remaining = (128 * 1024 * 1024usize)
+                .checked_sub(total)
+                .ok_or("recovery diagnostic total exceeds bound")?
+                .min(16 * 1024 * 1024);
+            let bytes = read(&path, remaining as u64)?;
+            if bytes.len() > remaining {
+                return Err("recovery diagnostic read exceeds bound".into());
+            }
+            total += bytes.len();
+            files.insert(format!("{attempt}/{leaf}"), bytes);
+        }
+        let association = (|| -> Result<(), String> {
+            let get = |leaf| {
+                files
+                    .get(&format!("{attempt}/{leaf}"))
+                    .ok_or_else(|| format!("{attempt}/{leaf}: unavailable for binding"))
+            };
+            let parse = |bytes: &[u8]| -> Result<serde_json::Value, String> {
+                memcordon_core::canonical_json::reject_duplicate_json_keys(bytes)?;
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())
+            };
+            let stage = parse(get("stage.json")?)?;
+            let invocation = parse(get("original-native-recovery-invocation.json")?)?;
+            let stage_path = stage["stage"]
+                .as_str()
+                .ok_or("recovery diagnostic stage absent")?;
+            if !Path::new(stage_path).is_absolute()
+                || Path::new(stage_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(attempt.as_str())
+                || invocation["working_directory"] != stage_path
+                || invocation["input_sha256"] != stage["input_sha256"]
+                || stage["input_sha256"]
+                    != hex::encode(sha2::Sha256::digest(get(
+                        "original-native-recovery-input.json",
+                    )?))
+                || stage["origin_sha256"]
+                    != hex::encode(sha2::Sha256::digest(get(
+                        "original-native-recovery-origin.json",
+                    )?))
+            {
+                return Err(
+                    "recovery diagnostic original stage/input/origin/invocation binding differs"
+                        .into(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = association {
+            issues.push(format!("{attempt}: unbound diagnostic: {error}"));
+        }
+        let after = held.metadata().map_err(|error| error.to_string())?;
+        let named = fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
+        let stamp = |value: &fs::Metadata| {
+            (
+                value.dev(),
+                value.ino(),
+                value.uid(),
+                value.mode(),
+                value.mtime(),
+                value.mtime_nsec(),
+                value.ctime(),
+                value.ctime_nsec(),
+            )
+        };
+        if !named.is_dir() || stamp(&before) != stamp(&after) || stamp(&before) != stamp(&named) {
+            return Err("recovery diagnostic attempt replaced during capture".into());
+        }
+    }
+    let named = fs::symlink_metadata(output).map_err(|error| error.to_string())?;
+    let held = root.metadata().map_err(|error| error.to_string())?;
+    if !named.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
+        return Err("recovery diagnostic root replaced".into());
+    }
+    Ok((files, issues))
+}
 
 pub fn projected_parent<'a>(path: &'a Path, case: &Path) -> Result<&'a Path, String> {
     let suffix = path
@@ -33,7 +198,7 @@ pub fn projected_parent<'a>(path: &'a Path, case: &Path) -> Result<&'a Path, Str
                 .is_some_and(|suffix| {
                     !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
                 })
-                && RETAINED.contains(leaf)
+                && (RETAINED.contains(leaf) || *leaf == FAILURE_DIAGNOSTIC)
         }
         _ => false,
     };

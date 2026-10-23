@@ -6,6 +6,7 @@ use std::path::Path;
 pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
     match &mut command {
         ReleaseCommand::CompileTarget {
+            product_only,
             source,
             build_source,
             consumer_readiness,
@@ -34,6 +35,7 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
             };
             let native = distribution.native()?;
             let mode = *failure_mode;
+            let product_only = *product_only;
             let recipe = if *consumer_readiness {
                 Suite::ReleaseReadiness
             } else {
@@ -45,6 +47,9 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
                 super::family(recipe),
                 false,
             )?;
+            if product_only {
+                return session.execute(root, || release::run(root, command));
+            }
             session.execute_pair(root, &["product"], || {
                 let outer = std::time::Instant::now() + std::time::Duration::from_secs(140 * 60);
                 memcordon_ci::preparation::with_operation(mode, outer, || {
@@ -74,6 +79,30 @@ pub fn run(root: &Path, mut command: ReleaseCommand) -> Result<()> {
                 )?;
             }
             release::run(root, command)
+        }
+        ReleaseCommand::NativeCoverageShard {
+            failure_mode,
+            shard,
+            ..
+        } => {
+            if super::coverage_cache_owner().map(|(owner, _)| owner) != Some(*shard) {
+                return Err(CiError::Message(
+                    "native coverage selector differs from its fixed workflow owner".into(),
+                ));
+            }
+            if std::env::var_os("GITHUB_EVENT_PATH").is_some() {
+                *failure_mode = Suite::ReleaseReadiness.resolve_failure_mode(
+                    memcordon_ci::suite::ModeRequest::Workflow(super::event_mode()?),
+                )?;
+            }
+            let recipe = Suite::ReleaseReadiness;
+            let session = memcordon_ci::segment_cache::Session::begin_selected(
+                root,
+                super::scopes(recipe),
+                super::family(recipe),
+                false,
+            )?;
+            session.execute(root, || release::run(root, command))
         }
         _ => Err(CiError::Message(
             "native split adapter requires a fixed native phase".into(),

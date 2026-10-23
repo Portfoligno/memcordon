@@ -486,12 +486,18 @@ impl PrivateNamespaceStartupProvider {
                         message.msg_flags, message.msg_controllen
                     )
                 })?;
-            if count == 0
-                || count as usize > packet.len()
+            if count as usize > packet.len()
                 || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
             {
                 return Err("MCSEALED-PRIVATE-INIT: empty or truncated record".into());
             }
+            // Ancillary descriptors have acquired RAII owners before any
+            // early return, including a peer close without credentials.
+            if count == 0 {
+                return Err("MCSEALED-PRIVATE-INIT: startup channel EOF before record".into());
+            }
+            let credentials =
+                credentials.ok_or("MCSEALED-PRIVATE-INIT: sender credentials absent")?;
             if expected_init_pid <= 0 || credentials.pid != expected_init_pid {
                 return Err("MCSEALED-PRIVATE-INIT: sender is not cloned namespace init".into());
             }
@@ -513,7 +519,7 @@ impl PrivateNamespaceStartupProvider {
 
 fn receive_startup_ancillary(
     message: &libc::msghdr,
-) -> Result<(libc::ucred, Option<OwnedFd>), String> {
+) -> Result<(Option<libc::ucred>, Option<OwnedFd>), String> {
     let mut credentials = None;
     let mut descriptors = Vec::new();
     let mut invalid = false;
@@ -561,7 +567,6 @@ fn receive_startup_ancillary(
     if invalid || descriptors.len() > 1 {
         return Err("MCSEALED-PRIVATE-INIT: invalid ancillary descriptor set".into());
     }
-    let credentials = credentials.ok_or("MCSEALED-PRIVATE-INIT: sender credentials absent")?;
     Ok((credentials, descriptors.pop()))
 }
 

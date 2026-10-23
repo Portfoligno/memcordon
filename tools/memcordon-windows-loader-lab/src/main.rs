@@ -2,6 +2,8 @@ mod controller;
 #[cfg(windows)]
 mod observer;
 mod spawner;
+#[cfg(windows)]
+mod workload_native;
 use memcordon_windows_loader_lab::{artifact, scenario, target};
 
 use clap::{Parser, Subcommand};
@@ -17,6 +19,36 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Role {
+    WorkloadDesktopHolder {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        ready: u64,
+        #[arg(long)]
+        stop: u64,
+        #[arg(long)]
+        target_token: u64,
+    },
+    RunWorkload {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+    },
+    ServiceWorkload {
+        #[arg(long)]
+        service_name: String,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+        #[arg(long)]
+        source_process_id: u32,
+        #[arg(long)]
+        source_creation_time: u64,
+        #[arg(long)]
+        source_token: u64,
+    },
     Run {
         #[arg(long)]
         output: PathBuf,
@@ -67,6 +99,28 @@ enum Role {
 
 fn main() {
     let result = match Cli::parse().role {
+        Role::WorkloadDesktopHolder {
+            request,
+            ready,
+            stop,
+            target_token,
+        } => run_workload_holder(&request, ready, stop, target_token),
+        Role::RunWorkload { request, result } => controller::run_workload(&request, &result),
+        Role::ServiceWorkload {
+            service_name,
+            request,
+            result,
+            source_process_id,
+            source_creation_time,
+            source_token,
+        } => run_workload_service(
+            &service_name,
+            &request,
+            &result,
+            source_process_id,
+            source_creation_time,
+            source_token,
+        ),
         Role::Run {
             output,
             production_plan,
@@ -104,4 +158,50 @@ fn main() {
         eprintln!("memcordon-windows-loader-lab: {error}");
         std::process::exit(2);
     }
+}
+
+#[cfg(windows)]
+fn run_workload_holder(
+    request: &std::path::Path,
+    ready: u64,
+    stop: u64,
+    target_token: u64,
+) -> Result<(), String> {
+    workload_native::run_desktop_holder(request, ready, stop, target_token)
+}
+
+#[cfg(not(windows))]
+fn run_workload_holder(_: &std::path::Path, _: u64, _: u64, _: u64) -> Result<(), String> {
+    Err("actual-workload desktop holder requires native Windows".into())
+}
+
+#[cfg(windows)]
+fn run_workload_service(
+    name: &str,
+    request: &std::path::Path,
+    result: &std::path::Path,
+    source_pid: u32,
+    source_birth: u64,
+    source_token: u64,
+) -> Result<(), String> {
+    workload_native::run_as_service(
+        name,
+        request,
+        result,
+        source_pid,
+        source_birth,
+        source_token,
+    )
+}
+
+#[cfg(not(windows))]
+fn run_workload_service(
+    _: &str,
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: u32,
+    _: u64,
+    _: u64,
+) -> Result<(), String> {
+    Err("actual-workload diagnostic service requires native Windows".into())
 }

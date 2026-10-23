@@ -1906,6 +1906,103 @@ fn process_snapshot(pid: i32) -> Result<ProcessSnapshot, io::Error> {
     })
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn owned_compile_sample(
+    root_pid: u32,
+    root_birth: u128,
+) -> Result<serde_json::Value, String> {
+    let pid = i32::try_from(root_pid).map_err(|error| error.to_string())?;
+    let matches_root = |snapshot: &ProcessSnapshot| {
+        snapshot.identity.pid == pid
+            && snapshot.process_group == pid
+            && u128::from(snapshot.identity.start_seconds) * 1_000_000
+                + u128::from(snapshot.identity.start_microseconds)
+                == root_birth
+    };
+    if !matches_root(&process_snapshot(pid).map_err(|error| error.to_string())?) {
+        return Err("original compiler process identity/group differs".into());
+    }
+    let mut pids = [0_i32; 64];
+    let capacity =
+        i32::try_from(std::mem::size_of_val(&pids)).map_err(|error| error.to_string())?;
+    // SAFETY: fixed writable PID storage; PROC_PGRP_ONLY selects only the admitted group.
+    let count = unsafe { proc_listpids(2, root_pid, pids.as_mut_ptr().cast(), capacity) };
+    if count <= 0
+        || count >= capacity
+        || count % i32::try_from(size_of::<i32>()).expect("small native size") != 0
+    {
+        return Err("owned compiler group census failed or saturated".into());
+    }
+    let mut processes = Vec::new();
+    for member in pids
+        .into_iter()
+        .take(usize::try_from(count).map_err(|error| error.to_string())? / size_of::<i32>())
+        .filter(|pid| *pid > 0)
+    {
+        let observation = (|| -> Result<serde_json::Value, String> {
+            let before = process_snapshot(member).map_err(|error| error.to_string())?;
+            let birth = u128::from(before.identity.start_seconds) * 1_000_000
+                + u128::from(before.identity.start_microseconds);
+            if before.process_group != pid || birth < root_birth {
+                return Err("member is outside the original compiler lifetime/group".into());
+            }
+            let mut usage = MaybeUninit::<RusageInfoV2>::zeroed();
+            // SAFETY: exact writable native rusage output, query only.
+            if unsafe { proc_pid_rusage(member, RUSAGE_INFO_V2, usage.as_mut_ptr().cast()) } != 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            let mut info = MaybeUninit::<ProcBsdInfo>::zeroed();
+            let length =
+                i32::try_from(size_of::<ProcBsdInfo>()).map_err(|error| error.to_string())?;
+            // SAFETY: exact writable BSD metadata output, query only.
+            if unsafe {
+                proc_pidinfo(
+                    member,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    length,
+                )
+            } != length
+            {
+                return Err("member BSD metadata unavailable".into());
+            }
+            // SAFETY: successful native calls initialized the exact output structures.
+            let usage = unsafe { usage.assume_init() };
+            let info = unsafe { info.assume_init() };
+            let after = process_snapshot(member).map_err(|error| error.to_string())?;
+            if before.identity != after.identity
+                || after.process_group != pid
+                || info.pid != member as u32
+                || info.pgid != root_pid
+                || u128::from(info.start_tvsec) * 1_000_000 + u128::from(info.start_tvusec) != birth
+            {
+                return Err("member identity changed during resource observation".into());
+            }
+            let name: Vec<u8> = info
+                .name
+                .into_iter()
+                .take_while(|byte| *byte != 0)
+                .map(|byte| byte as u8)
+                .collect();
+            Ok(
+                serde_json::json!({"pid":member,"birth_microseconds":birth,"parent_pid":info.ppid,
+                "process_group":root_pid,"native_state":info.status,"name":String::from_utf8_lossy(&name),
+                "user_cpu_nanoseconds":usage.user_time,"system_cpu_nanoseconds":usage.system_time,
+                "resident_bytes":usage.resident_size}),
+            )
+        })();
+        processes.push(serde_json::json!({"pid":member,"observation":observation}));
+    }
+    if !matches_root(&process_snapshot(pid).map_err(|error| error.to_string())?) {
+        return Err("original compiler identity changed during group observation".into());
+    }
+    Ok(
+        serde_json::json!({"scope":"original-admitted-process-group-not-escaped-descendants",
+        "root_pid":root_pid,"root_birth_microseconds":root_birth,"capacity":64,"processes":processes}),
+    )
+}
+
 pub(crate) fn sample_native(snapshots: &[ProcessSnapshot], metric: Metric) -> Result<u64, String> {
     let mut total = 0_u64;
     for snapshot in snapshots {

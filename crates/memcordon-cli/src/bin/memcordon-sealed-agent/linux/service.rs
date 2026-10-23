@@ -595,6 +595,50 @@ pub fn acquire_package_lease_until(deadline: u64) -> Result<std::fs::File, Strin
     acquire_lease_inner(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate, Some(deadline))
 }
 
+#[derive(Debug)]
+pub(crate) struct PackageLeaseObservation {
+    pub started_monotonic_nanos: Option<u64>,
+    pub finished_monotonic_nanos: Option<u64>,
+    pub contention_count: u64,
+    pub lock_acquired: bool,
+    pub validated_acquisition: bool,
+    pub held_device: Option<u64>,
+    pub held_inode: Option<u64>,
+    pub native_error: Option<i32>,
+    pub operation: String,
+}
+
+impl Default for PackageLeaseObservation {
+    fn default() -> Self {
+        Self {
+            started_monotonic_nanos: None,
+            finished_monotonic_nanos: None,
+            contention_count: 0,
+            lock_acquired: false,
+            validated_acquisition: false,
+            held_device: None,
+            held_inode: None,
+            native_error: None,
+            operation: "not-started".into(),
+        }
+    }
+}
+
+pub(crate) fn acquire_package_lease_until_observed(
+    deadline: u64,
+    observation: &mut PackageLeaseObservation,
+) -> Result<std::fs::File, String> {
+    observation.started_monotonic_nanos = Some(super::clock::monotonic_nanos()?);
+    let result = acquire_lease_observed(
+        PACKAGE_LEASE,
+        LeaseAccess::ExclusiveCreate,
+        Some(deadline),
+        Some(observation),
+    );
+    observation.finished_monotonic_nanos = super::clock::monotonic_nanos().ok();
+    result
+}
+
 pub fn acquire_legacy_package_lease_until(deadline: u64) -> Result<std::fs::File, String> {
     acquire_lease_inner(
         LEGACY_PACKAGE_LEASE,
@@ -616,6 +660,18 @@ fn acquire_lease_inner(
     access: LeaseAccess,
     deadline: Option<u64>,
 ) -> Result<std::fs::File, String> {
+    acquire_lease_observed(path, access, deadline, None)
+}
+
+fn acquire_lease_observed(
+    path: &str,
+    access: LeaseAccess,
+    deadline: Option<u64>,
+    mut observation: Option<&mut PackageLeaseObservation>,
+) -> Result<std::fs::File, String> {
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.operation = "initial-cutoff".into();
+    }
     match deadline {
         Some(cutoff) if super::clock::monotonic_nanos()? >= cutoff => {
             return Err("MCSEALED-PACKAGE-LEASE: original cleanup cutoff expired".into());
@@ -633,16 +689,31 @@ fn acquire_lease_inner(
             libc::LOCK_EX | libc::LOCK_NB
         }
     };
-    let file = options
-        .open(path)
-        .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.operation = "open-lock".into();
+    }
+    let file = options.open(path).map_err(|error| {
+        if let Some(observation) = observation.as_deref_mut() {
+            observation.native_error = error.raw_os_error();
+        }
+        format!("MCSEALED-PACKAGE-LEASE: {error}")
+    })?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.operation = "validate-lock".into();
+        observation.held_device = Some(metadata.dev());
+        observation.held_inode = Some(metadata.ino());
+    }
     if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o600 {
         return Err("MCSEALED-PACKAGE-LEASE: unsafe lock-file identity or mode".to_owned());
     }
     loop {
+        if let Some(observation) = observation.as_deref_mut() {
+            observation.operation = "pre-lock-cutoff-and-identity".into();
+            observation.native_error = None;
+        }
         if let Some(cutoff) = deadline {
             if super::clock::monotonic_nanos()? >= cutoff {
                 return Err("MCSEALED-PACKAGE-LEASE: original cleanup cutoff expired".into());
@@ -660,6 +731,11 @@ fn acquire_lease_inner(
         }
         // SAFETY: file owns the unchanged live descriptor throughout acquisition and mutation.
         if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            if let Some(observation) = observation.as_deref_mut() {
+                observation.operation = "post-lock-cutoff-and-identity".into();
+                observation.lock_acquired = true;
+                observation.native_error = None;
+            }
             match deadline {
                 Some(cutoff) if super::clock::monotonic_nanos()? >= cutoff => {
                     return Err(
@@ -684,9 +760,20 @@ fn acquire_lease_inner(
                     );
                 }
             }
+            if let Some(observation) = observation.as_deref_mut() {
+                observation.operation = "validated-exclusive-acquisition".into();
+                observation.validated_acquisition = true;
+            }
             break;
         }
         let error = std::io::Error::last_os_error();
+        if let Some(observation) = observation.as_deref_mut() {
+            observation.operation = "flock".into();
+            observation.native_error = error.raw_os_error();
+            if error.raw_os_error() == Some(libc::EAGAIN) {
+                observation.contention_count = observation.contention_count.saturating_add(1);
+            }
+        }
         let Some(cutoff) = deadline else {
             return Err(format!("MCSEALED-PACKAGE-LEASE: {error}"));
         };

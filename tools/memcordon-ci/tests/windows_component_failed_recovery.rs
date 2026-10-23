@@ -11,6 +11,29 @@ mod support;
 mod publication_wait;
 
 #[test]
+fn surviving_launcher_settles_before_control_or_frontend_loss_recovery() {
+    use WindowsSealedFault::*;
+    let required = memcordon_ci::windows_readiness_components::launcher_settlement_before_recovery;
+    for fault in [
+        ControlWorkerKilledAfterAuthorization,
+        ControlServiceKilledAfterAuthorization,
+        FrontendDisconnectedAfterAuthorization,
+        FrontendKilledAfterAuthorization,
+    ] {
+        assert!(required(Some(fault)), "{fault:?}");
+    }
+    for fault in [
+        LauncherWorkerKilledAfterAuthorization,
+        LauncherServiceKilledAfterAuthorization,
+        AllJobOwnersClosedAfterAuthorization,
+        GuardianKilledAfterAuthorization,
+    ] {
+        assert!(!required(Some(fault)), "{fault:?}");
+    }
+    assert!(!required(None));
+}
+
+#[test]
 fn publication_wait_classifies_only_actual_timeout_as_busy() {
     assert_eq!(publication_wait::failure_detail(0, None), None);
     assert_eq!(publication_wait::failure_detail(128, None), None);

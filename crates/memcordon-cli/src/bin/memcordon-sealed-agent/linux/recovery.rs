@@ -39,11 +39,46 @@ pub fn recover_administrative() -> Result<(), String> {
 /// The original measured fixture shares the real root/package-lease operation.
 /// Its provenance input does not replace authenticated persisted native owners.
 pub(crate) fn recover_authenticated_administration() -> Result<Vec<String>, String> {
+    recover_authenticated_inner(None, None)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AdministrationObservation {
+    pub stage: &'static str,
+    pub recovery_entered: bool,
+    pub lease: super::service::PackageLeaseObservation,
+}
+
+pub(crate) fn recover_authenticated_administration_until(
+    deadline: u64,
+    observation: &mut AdministrationObservation,
+) -> Result<Vec<String>, String> {
+    observation.stage = "root-authentication";
+    recover_authenticated_inner(Some(deadline), Some(observation))
+}
+
+fn recover_authenticated_inner(
+    deadline: Option<u64>,
+    mut observation: Option<&mut AdministrationObservation>,
+) -> Result<Vec<String>, String> {
     // SAFETY: geteuid has no pointer preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err("native recovery requires authenticated root administration".into());
     }
-    let _package_owner = super::service::acquire_package_lease()?;
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.stage = "package-lease-acquisition";
+    }
+    let _package_owner = match (deadline, observation.as_deref_mut()) {
+        (Some(deadline), Some(observation)) => {
+            super::service::acquire_package_lease_until_observed(deadline, &mut observation.lease)?
+        }
+        (Some(deadline), None) => super::service::acquire_package_lease_until(deadline)?,
+        (None, _) => super::service::acquire_package_lease()?,
+    };
+    if let Some(observation) = observation {
+        observation.recovery_entered = true;
+        observation.stage = "persisted-recovery";
+    }
     recover()
 }
 

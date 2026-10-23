@@ -30,6 +30,11 @@ pub struct CargoProgress {
     pub omitted_lines: u64,
     pub omitted_chunks: u64,
     pub counter_saturated: bool,
+    pub native_process_samples: VecDeque<serde_json::Value>,
+    pub unit_completions: Vec<serde_json::Value>,
+    pub omitted_unit_completions: u64,
+    #[serde(skip)]
+    unit_completion_bytes: usize,
 }
 
 impl CargoProgress {
@@ -47,6 +52,10 @@ impl CargoProgress {
             omitted_lines: 0,
             omitted_chunks: 0,
             counter_saturated: false,
+            native_process_samples: VecDeque::new(),
+            unit_completions: Vec::new(),
+            omitted_unit_completions: 0,
+            unit_completion_bytes: 0,
         }
     }
 
@@ -62,6 +71,10 @@ impl CargoProgress {
             "lock-wait"
         } else if line.starts_with("Compiling ") || line.starts_with("Checking ") {
             "compile"
+        } else if line.starts_with("Running ") {
+            "invocation"
+        } else if line.starts_with("Fresh ") {
+            "fresh-unit"
         } else if line.starts_with("Finished ") {
             "finished"
         } else {
@@ -104,6 +117,57 @@ impl CargoProgress {
         self.omitted_lines = omitted_lines;
         self.omitted_chunks = omitted_chunks;
         self.counter_saturated |= omitted_lines == u64::MAX || omitted_chunks == u64::MAX;
+    }
+
+    pub fn observe_native_resources(
+        &mut self,
+        elapsed: Duration,
+        sample: Result<serde_json::Value, String>,
+    ) {
+        if self.native_process_samples.len() == 4 {
+            self.native_process_samples.pop_front();
+        }
+        self.native_process_samples.push_back(serde_json::json!({
+            "elapsed_us":u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            "meaning":"read-only sample requested during work; may overlap cancellation; not completion authority",
+            "observation":sample
+        }));
+    }
+
+    /// Inspect already-redacted JSON before log escaping. Retain only finite
+    /// Cargo artifact identity fields, never messages, environment or argv.
+    pub fn observe_artifact(&mut self, elapsed: Duration, line: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
+            return;
+        }
+        let identity = serde_json::json!({"package":value.get("package_id"),
+            "target":value.pointer("/target/name"),"kind":value.pointer("/target/kind"),
+            "profile":value.get("profile"),"features":value.get("features"),"fresh":value.get("fresh")});
+        let completion = serde_json::json!({"observed_elapsed_us":u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            "artifact":identity,"authority":"unit-message-only; owning-command-success-and-writer-settlement-required"});
+        if let Ok(bytes) = serde_json::to_vec(&completion)
+            && self.unit_completions.len() < 4096
+            && self
+                .unit_completion_bytes
+                .checked_add(bytes.len())
+                .is_some_and(|total| total <= 4 * 1024 * 1024)
+        {
+            self.unit_completion_bytes += bytes.len();
+            self.unit_completions.push(completion);
+        } else {
+            increment(
+                &mut self.omitted_unit_completions,
+                &mut self.counter_saturated,
+            );
+        }
+        self.observe_line(
+            elapsed,
+            memcordon_testkit::OutputStream::Stdout,
+            &format!("Finished unit {identity}"),
+        );
     }
 }
 

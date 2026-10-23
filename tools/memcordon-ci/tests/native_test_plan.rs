@@ -56,7 +56,14 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
         .arguments
         .iter()
         .copied()
-        .filter(|arg| *arg != "--no-run")
+        .filter(|arg| {
+            ![
+                "--no-run",
+                "--verbose",
+                "--message-format=json-render-diagnostics",
+            ]
+            .contains(arg)
+        })
         .collect();
     let execution_inputs: Vec<_> = release[1]
         .arguments
@@ -86,7 +93,14 @@ fn native_build_and_execution_have_independent_deadlines_and_matching_targets() 
         .arguments
         .iter()
         .copied()
-        .filter(|arg| *arg != "--no-run")
+        .filter(|arg| {
+            ![
+                "--no-run",
+                "--verbose",
+                "--message-format=json-render-diagnostics",
+            ]
+            .contains(arg)
+        })
         .collect();
     let ordinary_execution_inputs: Vec<_> = ordinary[1]
         .arguments
@@ -149,7 +163,14 @@ fn cold_platform_build_allowances_preserve_the_complete_execution_graph() {
                     .arguments
                     .iter()
                     .copied()
-                    .filter(|arg| *arg != "--no-run")
+                    .filter(|arg| {
+                        ![
+                            "--no-run",
+                            "--verbose",
+                            "--message-format=json-render-diagnostics",
+                        ]
+                        .contains(arg)
+                    })
                     .collect();
                 let execution_inputs: Vec<_> = plan[1]
                     .arguments
@@ -176,7 +197,31 @@ fn platform_execution_headroom_is_finite_and_preserves_every_phase_input() {
             for platform in [NativePlatform::MacOs, NativePlatform::Other] {
                 let other = commands_for_platform(release, mode, platform);
                 assert_eq!(windows.len(), 2);
-                assert_eq!(windows[0].arguments, other[0].arguments);
+                let observed_graph: Vec<_> = other[0]
+                    .arguments
+                    .iter()
+                    .copied()
+                    .filter(|arg| {
+                        !["--verbose", "--message-format=json-render-diagnostics"].contains(arg)
+                    })
+                    .collect();
+                assert_eq!(windows[0].arguments, observed_graph);
+                assert_eq!(
+                    other[0].arguments.contains(&"--verbose"),
+                    platform == NativePlatform::MacOs
+                );
+                assert_eq!(
+                    other[0]
+                        .arguments
+                        .contains(&"--message-format=json-render-diagnostics"),
+                    platform == NativePlatform::MacOs
+                );
+                assert!(!other[1].arguments.contains(&"--verbose"));
+                assert!(
+                    !other[1]
+                        .arguments
+                        .contains(&"--message-format=json-render-diagnostics")
+                );
                 assert_eq!(windows[1].arguments, other[1].arguments);
                 // Explicit headroom above progressing 900s Windows and Mac
                 // runs, not a claim of measured complete-suite runtime.

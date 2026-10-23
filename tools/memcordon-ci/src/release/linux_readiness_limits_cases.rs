@@ -18,13 +18,14 @@ mod memory_event_counters;
 mod owner_cutoffs;
 
 #[allow(unsafe_code)] // Query only the native page-size scalar used to size the admitted fixture images.
-fn native_fixture_page_bytes() -> Result<u64> {
+pub(super) fn native_fixture_page_bytes() -> Result<u64> {
     // SAFETY: sysconf has no pointer arguments and returns the page size or a negative failure.
     u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .map_err(|_| CiError::Message("native fixture page size unavailable".into()))
 }
 
 pub struct LimitsContext<'a> {
+    pub publication: &'a super::linux_lifecycle_diagnostics::HeldCellPublication,
     pub lease_owner_path: &'a Path,
     pub recovery_harness: &'a super::linux_recovery_harness::HeldRecoveryHarness,
     pub identity: &'a SourceIdentity,
@@ -674,7 +675,7 @@ pub fn pause_memory_worker(
         ));
     }
     let original_workers = report.memory_workers.len();
-    let source = super::linux_readiness_image_cases::retain_prepared_worker(
+    let mut source = super::linux_readiness_image_cases::retain_prepared_worker(
         observer,
         context.selected_agent_sha256,
         context.work_deadline,
@@ -691,6 +692,64 @@ pub fn pause_memory_worker(
     let identity = report.memory_workers[worker_index]
         .retirement_identity()
         .map_err(CiError::Message)?;
+    // The fixture's memory barrier can arrive before the supervisor finishes
+    // its durable exec observation. Never stop it in that preceding state.
+    while super::linux_memory_worker_checkpoint::checkpoint(&source).map_err(CiError::Message)?
+        == super::linux_memory_worker_checkpoint::Checkpoint::PendingExecution
+    {
+        let remaining = remaining(context.work_deadline)?;
+        if report.memory_workers[worker_index]
+            .exited()
+            .map_err(CiError::Message)?
+        {
+            return Err(CiError::Message(
+                "memory worker exited before execution checkpoint".into(),
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        let mut directories = Vec::new();
+        let mut files = Vec::new();
+        let mut workers = Vec::new();
+        let refreshed = super::linux_readiness_image_cases::retain_prepared_worker(
+            observer,
+            context.selected_agent_sha256,
+            context.work_deadline,
+            &mut directories,
+            &mut files,
+            &mut workers,
+        )?;
+        if workers.len() != 1 {
+            return Err(CiError::Message(
+                "memory checkpoint refresh worker acquisition count differs".into(),
+            ));
+        }
+        let refreshed_identity = workers[0].retirement_identity().map_err(CiError::Message)?;
+        if (
+            refreshed_identity.pid,
+            refreshed_identity.birth,
+            refreshed_identity.parent_pid,
+            refreshed_identity.parent_birth,
+            refreshed_identity.retirement_observed,
+        ) != (
+            identity.pid,
+            identity.birth,
+            identity.parent_pid,
+            identity.parent_birth,
+            identity.retirement_observed,
+        ) {
+            return Err(CiError::Message(
+                "memory checkpoint refresh replaces original held worker".into(),
+            ));
+        }
+        let checkpoint = super::linux_memory_worker_checkpoint::checkpoint(&refreshed)
+            .map_err(CiError::Message)?;
+        source = refreshed;
+        if checkpoint == super::linux_memory_worker_checkpoint::Checkpoint::Executing {
+            report.memory_directories.extend(directories);
+            report.memory_files.extend(files);
+        }
+    }
+    remaining(context.work_deadline)?;
     let intent = serde_json::json!({"format":"memcordon.linux-memory-worker-stop-intent","revision":1,"source":context.identity,"cell":context.cell,
         "lease_id":context.lease_id,"key":key,"challenge":challenge,"worker":identity,"selected_worker_source":source,"signal":19});
     let file = std::fs::OpenOptions::new()

@@ -422,26 +422,13 @@ pub fn run(
             if observed.phase == WindowsLeasePhase::AfterCurrentUpgrade
                 && observed.result.is_some_and(|result| result.is_ok())
             {
-                let mut binaries = Vec::new();
-                for binary in &payload.distribution.binaries {
-                    let path = plan
-                        .binary_root
-                        .join(super::target::binary_name(binary, &key.target));
-                    let hash = super::artifacts::checksum(&super::artifacts::read_file(&path)?);
-                    let selected = super::installed_consumer::binary_path(
-                        &retained_current,
-                        binary,
-                        &key.target,
-                    );
-                    if hash != super::artifacts::checksum(&super::artifacts::read_file(&selected)?)
-                    {
-                        return Err(CiError::Message(
-                            "actual installed Windows upgrade bytes differ from selected component"
-                                .into(),
-                        ));
-                    }
-                    binaries.push(serde_json::json!({"binary":binary,"path":path,"sha256":hash}));
-                }
+                let binaries = super::windows_component_readback::observe(
+                    &current,
+                    &plan.binary_root,
+                    &retained_current,
+                    &payload.distribution.binaries,
+                    &key.target,
+                )?;
                 event(
                     output,
                     artifact_root,

@@ -6,6 +6,34 @@ use memcordon_testkit::OutputStream::{Stderr, Stdout};
 use std::time::Duration;
 
 #[test]
+fn bounds_native_samples_and_retains_observed_invocations_and_completions() {
+    let mut progress = CargoProgress::new(Duration::from_secs(10));
+    progress.observe_line(
+        Duration::ZERO,
+        Stderr,
+        "Running `rustc --crate-name example`",
+    );
+    progress.observe_artifact(Duration::from_secs(1),
+        r#"{"reason":"compiler-artifact","package_id":"example 1.0.0","target":{"name":"example","kind":["test"]},"profile":{"opt_level":"3"},"features":[],"fresh":false}"#);
+    assert_eq!(progress.records[0].kind, "invocation");
+    assert_eq!(progress.records[1].kind, "finished");
+    for index in 0..9 {
+        progress.observe_native_resources(
+            Duration::from_secs(index),
+            Err(format!("original owned process sample unavailable {index}")),
+        );
+    }
+    assert_eq!(progress.native_process_samples.len(), 4);
+    assert!(
+        progress.native_process_samples.back().unwrap()["observation"]["Err"]
+            .as_str()
+            .unwrap()
+            .contains('8')
+    );
+    progress.finish(0, 0);
+}
+
+#[test]
 fn records_first_lock_first_compile_and_last_consumed_progress_without_liveness_claims() {
     let mut progress = CargoProgress::new(Duration::from_secs(10));
     progress.observe_line(

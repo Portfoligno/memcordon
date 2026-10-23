@@ -74,6 +74,7 @@ impl<'a> ReadinessLinuxLease<'a> {
         deadline: Instant,
         cleanup_deadline: Instant,
         cleanup_deadline_unix_millis: u64,
+        publication: std::sync::Arc<super::linux_lifecycle_diagnostics::HeldCellPublication>,
     ) -> Result<Self> {
         if deadline > cleanup_deadline
             || cleanup_deadline.saturating_duration_since(deadline) != Duration::from_secs(15 * 60)
@@ -97,6 +98,7 @@ impl<'a> ReadinessLinuxLease<'a> {
         }
         fs::create_dir(&output)?;
         let lease_id = format!("{}-{}-{}", identity.run_id, cell.target, cell.channel);
+        publication.verify_selection(&identity, &cell, &lease_id)?;
         let journal = InstalledLifecycleJournal {
             format: "memcordon.consumer-readiness.installed-journal".into(),
             revision: 1,
@@ -125,7 +127,7 @@ impl<'a> ReadinessLinuxLease<'a> {
             predecessor,
             deadline,
             cleanup_deadline,
-            driver: InstalledMixedDriver::default(),
+            driver: InstalledMixedDriver::with_publication(publication),
             journal,
             output,
             finalization_started: false,

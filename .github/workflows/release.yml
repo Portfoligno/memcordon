@@ -2633,7 +2633,7 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-  native-macos-x64:
+  native-macos-x64-plan:
     needs: ["select", "readiness-tools-macos-x64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'
     strategy:
@@ -2645,132 +2645,183 @@ jobs:
     outputs:
       artifact-id: ${{ steps.payload.outputs.artifact-id }}
     steps:
-      - name: Configure checkout line endings
+      - &native_owner_step_0
+        name: Configure checkout line endings
         run: git config --global core.autocrlf false
         timeout-minutes: 1
-      - uses: *action_0
+      - &native_owner_step_1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.select.outputs.selected-commit }}
           fetch-depth: 0
           persist-credentials: false
         timeout-minutes: 6
-      - uses: *action_4
+      - &native_owner_step_2
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.select.outputs.selection-artifact-id }}
           path: .release
           merge-multiple: true
           digest-mismatch: error
         timeout-minutes: 6
-      - run: rustup toolchain install 1.97.1 --profile minimal
+      - &native_owner_step_3
+        run: rustup toolchain install 1.97.1 --profile minimal
         timeout-minutes: 15
-      - id: readiness-tools-download
-        uses: *action_4
+      - &native_owner_step_4
+        id: readiness-tools-download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         timeout-minutes: 6
         with:
           artifact-ids: ${{ needs.readiness-tools-macos-x64.outputs.artifact-id }}
           path: .release/readiness-tools
           merge-multiple: false
           digest-mismatch: error
-      - id: readiness-tools-extract
+      - &native_owner_step_5
+        id: readiness-tools-extract
         timeout-minutes: 15
         run: tar -xzf .release/readiness-tools/readiness-tools.tar.gz
-      - id: readiness-tools-check
+      - &native_owner_step_6
+        id: readiness-tools-check
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind readiness
-      - id: workspace-fetch-request
+      - &native_owner_step_7
+        id: workspace-fetch-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci cache-requests workspace-fetch
         if: runner.os != 'Windows'
-      - id: workspace-fetch-request-source-restore
+      - &native_owner_step_8
+        id: workspace-fetch-request-source-restore
         if: steps.workspace-fetch-request.outputs.source-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch-request.outputs.source-key }}
           path: ${{ steps.workspace-fetch-request.outputs.source-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.source-prefix }}
-      - id: workspace-fetch-request-archives-partial-restore
+      - &native_owner_step_9
+        id: workspace-fetch-request-archives-partial-restore
         if: steps.workspace-fetch-request.outputs.archives-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
-      - id: workspace-fetch-request-index-partial-restore
+      - &native_owner_step_10
+        id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
-      - id: workspace-fetch
+      - &native_owner_step_11
+        id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
-      - id: workspace-fetch-source-complete-probe
+      - &native_owner_step_12
+        id: workspace-fetch-source-complete-probe
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
         continue-on-error: true
         timeout-minutes: 1
-        uses: *action_1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
           lookup-only: true
-      - id: workspace-fetch-source-complete-save
+      - &native_owner_step_13
+        id: workspace-fetch-source-complete-save
         if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true' && steps.workspace-fetch-source-complete-probe.outputs.cache-hit != 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch.outputs.source-complete-key }}
           path: ${{ steps.workspace-fetch.outputs.source-complete-path }}
-      - id: workspace-fetch-archives-partial-save
+      - &native_owner_step_14
+        id: workspace-fetch-archives-partial-save
         if: always() && steps.workspace-fetch.outputs.archives-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch.outputs.archives-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.archives-partial-path }}
-      - id: workspace-fetch-index-partial-save
+      - &native_owner_step_15
+        id: workspace-fetch-index-partial-save
         if: always() && steps.workspace-fetch.outputs.index-partial-save == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: *action_2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           key: ${{ steps.workspace-fetch.outputs.index-partial-key }}
           path: ${{ steps.workspace-fetch.outputs.index-partial-path }}
-      - id: workspace-fetch-cleanup
+      - &native_owner_step_16
+        id: workspace-fetch-cleanup
         if: always() && (steps.workspace-fetch.outcome == 'success' || steps.workspace-fetch.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers workspace-fetch
-      - id: build-request
+      - name: Certify complete native coverage selection
+        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-plan --build-source .release/build-source.json
+        timeout-minutes: 10
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-coverage-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .release/native-coverage-plan.json
+            .release/native-coverage-deadline.json
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+  native-macos-x64-product:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - &native_owner_step_17
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.native-macos-x64-plan.outputs.artifact-id }}
+          path: .release
+          merge-multiple: true
+          digest-mismatch: error
+        timeout-minutes: 6
+      - &native_owner_step_18
+        id: build-request
         timeout-minutes: 5
         run: ./target/ci-runtime/current/memcordon-ci ci cache-requests release-readiness
         if: runner.os != 'Windows'
-      - id: build-request-native-tests-complete-restore
-        if: steps.build-request.outputs.native-tests-complete-restore == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: *action_1
-        with:
-          key: ${{ steps.build-request.outputs.native-tests-complete-key }}
-          path: ${{ steps.build-request.outputs.native-tests-complete-inbox }}
-          restore-keys: ${{ steps.build-request.outputs.native-tests-complete-prefix }}
-      - id: build-request-native-tests-partial-restore
-        if: steps.build-request.outputs.native-tests-partial-restore == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: *action_1
-        with:
-          key: ${{ steps.build-request.outputs.native-tests-partial-key }}
-          path: ${{ steps.build-request.outputs.native-tests-partial-inbox }}
-          restore-keys: ${{ steps.build-request.outputs.native-tests-partial-prefix }}
       - id: build-request-product-complete-restore
         if: steps.build-request.outputs.product-complete-restore == 'true'
         continue-on-error: true
@@ -2791,33 +2842,8 @@ jobs:
           restore-keys: ${{ steps.build-request.outputs.product-partial-prefix }}
       - id: build
         timeout-minutes: 115
-        run: ./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness --product-only --destination .release/native-product
         if: runner.os != 'Windows'
-      - id: build-native-tests-complete-probe
-        if: always() && steps.build.outputs.native-tests-complete-save == 'true'
-        continue-on-error: true
-        timeout-minutes: 1
-        uses: *action_1
-        with:
-          key: ${{ steps.build.outputs.native-tests-complete-key }}
-          path: ${{ steps.build.outputs.native-tests-complete-path }}
-          lookup-only: true
-      - id: build-native-tests-complete-save
-        if: always() && steps.build.outputs.native-tests-complete-save == 'true' && steps.build-native-tests-complete-probe.outputs.cache-hit != 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: *action_2
-        with:
-          key: ${{ steps.build.outputs.native-tests-complete-key }}
-          path: ${{ steps.build.outputs.native-tests-complete-path }}
-      - id: build-native-tests-partial-save
-        if: always() && steps.build.outputs.native-tests-partial-save == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: *action_2
-        with:
-          key: ${{ steps.build.outputs.native-tests-partial-key }}
-          path: ${{ steps.build.outputs.native-tests-partial-path }}
       - id: build-product-complete-probe
         if: always() && steps.build.outputs.product-complete-save == 'true'
         continue-on-error: true
@@ -2843,13 +2869,342 @@ jobs:
         with:
           key: ${{ steps.build.outputs.product-partial-key }}
           path: ${{ steps.build.outputs.product-partial-path }}
-      - id: build-cleanup
+      - &native_owner_step_19
+        id: build-cleanup
         if: always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers release-readiness
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-product-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-product
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+      - &native_owner_step_20
+        name: Retain bounded preparation diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/execution
+            target/ci/deadline-evidence
+            target/ci/reports/release-macos-native.json
+            target/ci/reports/release-macos-acceptance.json
+            target/ci/reports/backend-macos-watchdog.json
+            target/ci/reports/memcordon-macos-acceptance-*
+            .release/installed-results
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+  native-macos-x64-shard-0:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - *native_owner_step_17
+      - *native_owner_step_18
+      - &native_owner_step_21
+        id: build-request-native-tests-complete-restore
+        if: steps.build-request.outputs.native-tests-complete-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.build-request.outputs.native-tests-complete-key }}
+          path: ${{ steps.build-request.outputs.native-tests-complete-inbox }}
+          restore-keys: ${{ steps.build-request.outputs.native-tests-complete-prefix }}
+      - &native_owner_step_22
+        id: build-request-native-tests-partial-restore
+        if: steps.build-request.outputs.native-tests-partial-restore == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.build-request.outputs.native-tests-partial-key }}
+          path: ${{ steps.build-request.outputs.native-tests-partial-inbox }}
+          restore-keys: ${{ steps.build-request.outputs.native-tests-partial-prefix }}
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 0 --destination .release/native-coverage/0
+        if: runner.os != 'Windows'
+      - &native_owner_step_23
+        id: build-native-tests-complete-probe
+        if: always() && steps.build.outputs.native-tests-complete-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.build.outputs.native-tests-complete-key }}
+          path: ${{ steps.build.outputs.native-tests-complete-path }}
+          lookup-only: true
+      - &native_owner_step_24
+        id: build-native-tests-complete-save
+        if: always() && steps.build.outputs.native-tests-complete-save == 'true' && steps.build-native-tests-complete-probe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.build.outputs.native-tests-complete-key }}
+          path: ${{ steps.build.outputs.native-tests-complete-path }}
+      - &native_owner_step_25
+        id: build-native-tests-partial-save
+        if: always() && steps.build.outputs.native-tests-partial-save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          key: ${{ steps.build.outputs.native-tests-partial-key }}
+          path: ${{ steps.build.outputs.native-tests-partial-path }}
+      - *native_owner_step_19
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-coverage-${{ matrix.target }}-0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/0
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+      - *native_owner_step_20
+  native-macos-x64-shard-1:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - *native_owner_step_17
+      - *native_owner_step_18
+      - *native_owner_step_21
+      - *native_owner_step_22
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 1 --destination .release/native-coverage/1
+        if: runner.os != 'Windows'
+      - *native_owner_step_23
+      - *native_owner_step_24
+      - *native_owner_step_25
+      - *native_owner_step_19
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-coverage-${{ matrix.target }}-1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/1
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+      - *native_owner_step_20
+  native-macos-x64-shard-2:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - *native_owner_step_17
+      - *native_owner_step_18
+      - *native_owner_step_21
+      - *native_owner_step_22
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 2 --destination .release/native-coverage/2
+        if: runner.os != 'Windows'
+      - *native_owner_step_23
+      - *native_owner_step_24
+      - *native_owner_step_25
+      - *native_owner_step_19
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-coverage-${{ matrix.target }}-2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/2
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+      - *native_owner_step_20
+  native-macos-x64-shard-3:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - *native_owner_step_17
+      - *native_owner_step_18
+      - *native_owner_step_21
+      - *native_owner_step_22
+      - id: build
+        timeout-minutes: 115
+        run: ./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 3 --destination .release/native-coverage/3
+        if: runner.os != 'Windows'
+      - *native_owner_step_23
+      - *native_owner_step_24
+      - *native_owner_step_25
+      - *native_owner_step_19
+      - id: payload
+        uses: *action_3
+        with:
+          name: native-coverage-${{ matrix.target }}-3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/3
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+        timeout-minutes: 6
+      - *native_owner_step_20
+  native-macos-x64:
+    needs: ["select", "readiness-tools-macos-x64", "native-macos-x64-plan", "native-macos-x64-product", "native-macos-x64-shard-0", "native-macos-x64-shard-1", "native-macos-x64-shard-2", "native-macos-x64-shard-3"]
+    if: needs.select.outputs.recovery-mode == 'reprepare'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"target": "x86_64-apple-darwin", "runner": "macos-15-intel"}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    outputs:
+      artifact-id: ${{ steps.payload.outputs.artifact-id }}
+    steps:
+      - *native_owner_step_0
+      - *native_owner_step_1
+      - *native_owner_step_2
+      - *native_owner_step_3
+      - *native_owner_step_4
+      - *native_owner_step_5
+      - *native_owner_step_6
+      - *native_owner_step_7
+      - *native_owner_step_8
+      - *native_owner_step_9
+      - *native_owner_step_10
+      - *native_owner_step_11
+      - *native_owner_step_12
+      - *native_owner_step_13
+      - *native_owner_step_14
+      - *native_owner_step_15
+      - *native_owner_step_16
+      - *native_owner_step_17
+      - uses: *action_4
+        with:
+          artifact-ids: ${{ needs.native-macos-x64-product.outputs.artifact-id }}
+          path: .release/native-product
+          merge-multiple: true
+          digest-mismatch: error
+        timeout-minutes: 6
+      - uses: *action_4
+        with:
+          name: native-coverage-${{ matrix.target }}-0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/0
+          digest-mismatch: error
+        timeout-minutes: 6
+      - uses: *action_4
+        with:
+          name: native-coverage-${{ matrix.target }}-1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/1
+          digest-mismatch: error
+        timeout-minutes: 6
+      - uses: *action_4
+        with:
+          name: native-coverage-${{ matrix.target }}-2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/2
+          digest-mismatch: error
+        timeout-minutes: 6
+      - uses: *action_4
+        with:
+          name: native-coverage-${{ matrix.target }}-3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release/native-coverage/3
+          digest-mismatch: error
+        timeout-minutes: 6
       - id: build-validation
         timeout-minutes: 100
-        run: ./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness
+        run: ./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness --native-coverage .release/native-coverage --product-inputs .release/native-product
         if: runner.os != 'Windows'
       - name: Bind original native readiness source
         if: (runner.os == 'Linux' || runner.os == 'Windows') && runner.os != 'Windows'
@@ -2907,24 +3262,7 @@ jobs:
           include-hidden-files: true
           overwrite: false
         timeout-minutes: 6
-      - name: Retain bounded preparation diagnostics
-        if: always()
-        continue-on-error: true
-        uses: *action_3
-        with:
-          name: diagnostics-${{ github.job }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            target/ci/reports/execution
-            target/ci/deadline-evidence
-            target/ci/reports/release-macos-native.json
-            target/ci/reports/release-macos-acceptance.json
-            target/ci/reports/backend-macos-watchdog.json
-            target/ci/reports/memcordon-macos-acceptance-*
-            .release/installed-results
-          if-no-files-found: warn
-          include-hidden-files: true
-          overwrite: false
-        timeout-minutes: 6
+      - *native_owner_step_20
   native-macos-arm64:
     needs: ["select", "readiness-tools-macos-arm64"]
     if: needs.select.outputs.recovery-mode == 'reprepare'

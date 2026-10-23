@@ -29,6 +29,7 @@ fn progress_precedes_exit_and_peer_cancellation_settles_owned_readers() {
     let (sender, receiver) = mpsc::sync_channel(8);
     let progress = ProgressOutput {
         sender,
+        admitted: None,
         omitted: Arc::new(AtomicU64::new(0)),
     };
     let worker = std::thread::spawn(move || {
@@ -95,6 +96,7 @@ fn slow_logger_does_not_block_output_capture_or_retirement() {
         None,
         Some(ProgressOutput {
             sender,
+            admitted: None,
             omitted: omitted.clone(),
         }),
     )
@@ -116,6 +118,7 @@ fn actual_failure_notifies_even_with_a_full_progress_queue() {
         None,
         Some(ProgressOutput {
             sender,
+            admitted: None,
             omitted: Arc::new(AtomicU64::new(0)),
         }),
         Some(Arc::new(move || {

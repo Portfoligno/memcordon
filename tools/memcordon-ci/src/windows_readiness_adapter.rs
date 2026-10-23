@@ -272,6 +272,45 @@ pub fn copy_compiler_artifact(
     destination: &Path,
     expected: &str,
 ) -> crate::Result<HeldWindowsArtifact> {
+    copy_compiler_artifact_bounded(source, build_root, destination, expected, 512 * 1024 * 1024)
+}
+
+/// Select an independently published diagnostic executable, never a Cargo alias.
+#[cfg(windows)]
+pub fn prepare_workload_executable(
+    build_root: &Path,
+    report: &Path,
+) -> crate::Result<(PathBuf, HeldWindowsArtifact)> {
+    const BOUND: usize = 128 * 1024 * 1024;
+    let source = build_root.join("release/memcordon-windows-loader-lab.exe");
+    let destination = report.with_extension("workload-lab.exe");
+    if !build_root.is_absolute() || !report.is_absolute() || destination.starts_with(build_root) {
+        return Err(crate::CiError::Message(
+            "diagnostic executable destination crosses protected report boundary".into(),
+        ));
+    }
+    // This preliminary measurement grants no custody. The copier independently
+    // pins native source/ancestors and must reproduce this exact bounded digest.
+    let bytes = crate::windows_consumer_readiness::native::read(&source, BOUND)?;
+    if bytes.is_empty() {
+        return Err(crate::CiError::Message(
+            "diagnostic compiler source is empty".into(),
+        ));
+    }
+    let expected = crate::windows_causal_acceptance::sha256(&bytes);
+    let held =
+        copy_compiler_artifact_bounded(&source, build_root, &destination, &expected, BOUND as u64)?;
+    Ok((destination, held))
+}
+
+#[cfg(windows)]
+fn copy_compiler_artifact_bounded(
+    source: &Path,
+    build_root: &Path,
+    destination: &Path,
+    expected: &str,
+    bound: u64,
+) -> crate::Result<HeldWindowsArtifact> {
     use std::{fs::OpenOptions, io::Read, os::windows::fs::OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
     if !source.is_absolute()
@@ -306,20 +345,16 @@ pub fn copy_compiler_artifact(
     let identity = |file: &std::fs::File| native_compiler_source_identity(file, source);
     let file = open()?;
     let before = identity(&file)?;
-    if before.4 == 0 || before.4 > 512 * 1024 * 1024 {
+    if before.4 == 0 || before.4 > bound {
         return Err(crate::CiError::Message(
             "compiler source exceeds executable byte bound".into(),
         ));
     }
     let mut bytes = Vec::new();
-    (&file)
-        .take(512 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
+    (&file).take(bound + 1).read_to_end(&mut bytes)?;
     let named = open()?;
     let mut named_bytes = Vec::new();
-    (&named)
-        .take(512 * 1024 * 1024 + 1)
-        .read_to_end(&mut named_bytes)?;
+    (&named).take(bound + 1).read_to_end(&mut named_bytes)?;
     if before.4 != bytes.len() as u64
         || identity(&file)? != before
         || identity(&named)? != before
@@ -335,7 +370,7 @@ pub fn copy_compiler_artifact(
             crate::CiError::Message("compiler destination parent absent".into())
         })?)?;
     let _published = publish_receipt(destination, &bytes)?;
-    let copied = hold_artifact(destination, Some(expected), 512 * 1024 * 1024)?;
+    let copied = hold_artifact(destination, Some(expected), bound)?;
     if identity(&file)? != before || identity(&named)? != before {
         return Err(crate::CiError::Message(
             "compiler source changed during independent publication".into(),

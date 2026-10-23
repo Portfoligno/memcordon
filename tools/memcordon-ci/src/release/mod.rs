@@ -31,16 +31,23 @@ pub mod linux_installed_consumer;
 pub mod linux_isolation_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_isolation_recovery;
+#[cfg(unix)]
+pub mod linux_lifecycle_diagnostics;
 #[cfg(target_os = "linux")]
 pub mod linux_malformed_ingress;
+pub mod linux_memory_worker_checkpoint;
 #[cfg(target_os = "linux")]
 pub mod linux_mixed_installed;
 #[cfg(target_os = "linux")]
 pub mod linux_native_component;
 #[cfg(target_os = "linux")]
 pub mod linux_native_package;
+pub mod linux_network_observation;
+pub mod linux_network_topology;
 #[cfg(target_os = "linux")]
 pub(super) mod linux_original_recovery;
+#[cfg(unix)]
+pub mod linux_phase_journal;
 #[cfg(target_os = "linux")]
 pub mod linux_readiness_image_cases;
 #[cfg(target_os = "linux")]
@@ -53,11 +60,14 @@ pub mod linux_readiness_lifecycle_cases;
 pub mod linux_readiness_limits_cases;
 #[cfg(target_os = "linux")]
 pub mod linux_readiness_policy_cases;
+pub mod linux_recovery_diagnostic;
 #[cfg(unix)]
 pub mod linux_recovery_harness;
+pub mod linux_recovery_owners;
 #[cfg(target_os = "linux")]
 mod native_cargo_aliases;
 pub mod native_component_harness;
+pub mod native_coverage_owner;
 #[cfg(target_os = "linux")]
 mod native_executable;
 #[cfg(target_os = "linux")]
@@ -77,6 +87,9 @@ pub mod packages;
 pub mod preparation;
 pub mod public_consumer;
 pub mod publish;
+pub mod readiness_artifact_catalog;
+#[cfg(unix)]
+pub mod readiness_producer_seal;
 #[cfg(any(target_os = "linux", windows))]
 pub mod readiness_product;
 pub mod readiness_report;
@@ -89,6 +102,7 @@ pub mod rehearsal_tool;
 pub mod source;
 pub mod tag;
 pub mod target;
+pub mod windows_component_readback;
 pub mod windows_installed_consumer;
 #[cfg(any(windows, test))]
 mod windows_launcher_diagnostic;
@@ -217,6 +231,8 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     CompileTarget {
+        #[arg(long)]
+        product_only: bool,
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
@@ -229,6 +245,10 @@ pub enum ReleaseCommand {
         destination: PathBuf,
     },
     ValidatePackage {
+        #[arg(long, requires = "product_inputs")]
+        native_coverage: Option<PathBuf>,
+        #[arg(long, requires = "native_coverage")]
+        product_inputs: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "stop-after-failure")]
         failure_mode: crate::failure_mode::FailureMode,
         #[arg(long)]
@@ -239,6 +259,20 @@ pub enum ReleaseCommand {
         build_source: Option<PathBuf>,
         #[arg(long, default_value = ".release/target")]
         destination: PathBuf,
+    },
+    NativeCoverageShard {
+        #[arg(long)]
+        build_source: PathBuf,
+        #[arg(long)]
+        shard: usize,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long, value_enum, default_value = "stop-after-failure")]
+        failure_mode: crate::failure_mode::FailureMode,
+    },
+    NativeCoveragePlan {
+        #[arg(long)]
+        build_source: PathBuf,
     },
     Assemble {
         #[arg(long)]
@@ -540,41 +574,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             )
         }
         ReleaseCommand::CompileTarget {
-            failure_mode,
-            consumer_readiness,
-            source,
-            build_source,
-            destination: _,
-        } => {
-            let selected =
-                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
-            let distribution = distribution::Distribution::read(root)?;
-            let distribution = if consumer_readiness {
-                distribution.consumer_readiness()?
-            } else {
-                distribution
-            };
-            let distribution = distribution.native()?;
-            let outer = std::time::Instant::now() + std::time::Duration::from_secs(140 * 60);
-            crate::preparation::with_operation(failure_mode, outer, || {
-                let prepared = target::prepare_native_compile(
-                    root,
-                    &selected,
-                    distribution,
-                    failure_mode,
-                    target::NativeCompileMode::Split,
-                )?;
-                crate::preparation::with_operation(
-                    failure_mode,
-                    prepared.operation_deadline,
-                    || {
-                        target::compile_native_pair(root, &selected, distribution, prepared)
-                            .into_result()
-                    },
-                )
-            })
-        }
-        ReleaseCommand::ValidatePackage {
+            product_only,
             failure_mode,
             consumer_readiness,
             source,
@@ -589,13 +589,107 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             } else {
                 distribution
             };
-            target::validate_selected(
+            let distribution = distribution.native()?;
+            let outer = if product_only {
+                native_coverage_owner::original_cutoff(root, &selected, &distribution.target)?
+            } else {
+                std::time::Instant::now() + std::time::Duration::from_secs(140 * 60)
+            };
+            crate::preparation::with_operation(failure_mode, outer, || {
+                let prepared = target::prepare_native_compile(
+                    root,
+                    &selected,
+                    distribution,
+                    failure_mode,
+                    target::NativeCompileMode::Split,
+                )?;
+                crate::preparation::with_operation(
+                    failure_mode,
+                    prepared.operation_deadline,
+                    || {
+                        if product_only {
+                            target::compile_product_only(
+                                root,
+                                &selected,
+                                distribution,
+                                prepared,
+                                &destination,
+                            )
+                        } else {
+                            target::compile_native_pair(root, &selected, distribution, prepared)
+                                .into_result()
+                        }
+                    },
+                )
+            })
+        }
+        ReleaseCommand::ValidatePackage {
+            native_coverage,
+            product_inputs,
+            failure_mode,
+            consumer_readiness,
+            source,
+            build_source,
+            destination,
+        } => {
+            let selected =
+                preparation::read_build_source(source.as_deref(), build_source.as_deref())?;
+            let distribution = distribution::Distribution::read(root)?;
+            let distribution = if consumer_readiness {
+                distribution.consumer_readiness()?
+            } else {
+                distribution
+            };
+            if let (Some(receipts), Some(inputs)) = (native_coverage, product_inputs) {
+                target::validate_covered_selected(
+                    root,
+                    &selected,
+                    distribution.native()?,
+                    &destination,
+                    consumer_readiness,
+                    failure_mode,
+                    (&inputs, &receipts),
+                )
+            } else {
+                target::validate_selected(
+                    root,
+                    &selected,
+                    distribution.native()?,
+                    &destination,
+                    consumer_readiness,
+                    failure_mode,
+                )
+            }
+        }
+        ReleaseCommand::NativeCoverageShard {
+            build_source,
+            shard,
+            destination,
+            failure_mode,
+        } => {
+            let selected = preparation::read_build_source(None, Some(&build_source))?;
+            let distribution = distribution::Distribution::read(root)?;
+            let native = distribution.native()?;
+            if native.target != "x86_64-apple-darwin" {
+                return Err(CiError::Message(
+                    "distributed coverage requires macOS x64".into(),
+                ));
+            }
+            native_coverage_owner::run_shard(
                 root,
                 &selected,
-                distribution.native()?,
+                &native.target,
+                shard,
                 &destination,
-                consumer_readiness,
                 failure_mode,
+            )
+        }
+        ReleaseCommand::NativeCoveragePlan { build_source } => {
+            let selected = preparation::read_build_source(None, Some(&build_source))?;
+            native_coverage_owner::publish_plan(
+                root,
+                &selected,
+                &distribution::Distribution::read(root)?.native()?.target,
             )
         }
         ReleaseCommand::Assemble {

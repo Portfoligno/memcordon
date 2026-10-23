@@ -69,6 +69,8 @@ pub struct CommandSpec {
     output_limit: usize,
     defer_group_failure: bool,
     peer_stop_policy: Option<PeerStopPolicy>,
+    #[cfg(unix)]
+    compiler_owner: Option<crate::compiler_pool::CompilerOwner>,
 }
 
 /// Reviewed native ownership behavior when an independent peer fails.
@@ -145,6 +147,8 @@ impl CommandSpec {
             output_limit: 16 * 1024 * 1024,
             defer_group_failure: false,
             peer_stop_policy: None,
+            #[cfg(unix)]
+            compiler_owner: None,
         }
     }
 
@@ -180,6 +184,12 @@ impl CommandSpec {
 
     pub fn arg(mut self, argument: impl Into<OsString>) -> Self {
         self.arguments.push(argument.into());
+        self
+    }
+
+    #[cfg(unix)]
+    pub fn compiler_owner(mut self, owner: crate::compiler_pool::CompilerOwner) -> Self {
+        self.compiler_owner = Some(owner);
         self
     }
 
@@ -379,7 +389,24 @@ impl CommandSpec {
             None => {}
         }
         let mut arguments = self.arguments.clone();
-        if matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+        #[cfg(unix)]
+        let shared_compiler = self.compiler_owner.is_some();
+        #[cfg(not(unix))]
+        let shared_compiler = false;
+        if shared_compiler
+            && (!matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+                || arguments.iter().take_while(|arg| *arg != "--").any(|arg| {
+                    arg.to_str().is_some_and(|arg| {
+                        arg == "--jobs" || arg.starts_with("--jobs=") || arg.starts_with("-j")
+                    })
+                }))
+        {
+            return Err(CiError::Message(
+                "shared Cargo compiler pool refuses independent jobs or non-Cargo command".into(),
+            ));
+        }
+        if !shared_compiler
+            && matches!(&self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
             && arguments.first().is_some_and(|argument| {
                 matches!(
                     argument.to_str(),
@@ -452,6 +479,15 @@ impl CommandSpec {
         }
         command.args(&arguments).current_dir(&self.current_dir);
         self.apply_environment(&mut command);
+        #[cfg(unix)]
+        if let Some(owner) = &self.compiler_owner {
+            let protocol = owner.admit()?;
+            command
+                .env_remove("MAKEFLAGS")
+                .env_remove("MFLAGS")
+                .env_remove("CARGO_BUILD_JOBS")
+                .env("CARGO_MAKEFLAGS", protocol.makeflags());
+        }
         if matches!(&self.toolchain,
             Some(ToolchainInvocation::Program { executable, .. })
                 if executable.file_name().is_some_and(|name| matches!(name.to_str(), Some("cargo-fuzz" | "cargo-fuzz.exe"))))
@@ -491,7 +527,8 @@ impl CommandSpec {
     }
 
     pub fn run_owned(&self) -> crate::work_outcome::WorkOutcome<Vec<u8>> {
-        self.output_owned()
+        let outcome = self
+            .output_owned()
             .validate_after(|output| {
                 if output.status.success() {
                     Ok(())
@@ -504,7 +541,15 @@ impl CommandSpec {
                     )))
                 }
             })
-            .map(|output| output.stdout)
+            .map(|output| output.stdout);
+        #[cfg(unix)]
+        let outcome = if let Some(owner) = &self.compiler_owner {
+            let settled = owner.settle(outcome.writers());
+            outcome.postcondition(settled)
+        } else {
+            outcome
+        };
+        outcome
     }
 
     /// Bound both capture workers before they allocate subprocess output.
@@ -699,6 +744,10 @@ impl CommandSpec {
             };
             let mut value = serde_json::json!({"phase": phase.name(), "state": state, "program": self.program.to_string_lossy(), "arguments": self.arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>(), "toolchain": format!("{:?}", self.toolchain), "original-budget-ms": self.deadline.as_millis(), "available-budget-ms": observed_budget.as_millis(), "elapsed-ms": started.elapsed().as_millis()});
             value["selection"] = self.selection.clone().unwrap_or(serde_json::Value::Null);
+            #[cfg(unix)]
+            if let Some(owner) = &self.compiler_owner {
+                value["compiler-pool"] = owner.diagnostic();
+            }
             if let Some(cargo_progress) = cargo_progress {
                 value["cargo-progress"] = serde_json::to_value(cargo_progress)?;
             }
@@ -839,30 +888,34 @@ impl CommandSpec {
         let observe_cargo_progress = cfg!(target_os = "macos")
             && matches!(self.phase, Some(CiPhase::NativeCompile))
             && matches!(self.toolchain, Some(ToolchainInvocation::Cargo { .. }));
-        let (result, logger_settled, cargo_progress) = std::thread::scope(|scope| {
-            let lane = match std::thread::current().name() {
-                Some("ci-source-lane") => "first",
-                Some("ci-auxiliary-lane") => "second",
-                _ => "owner",
-            };
-            let phase = self.phase.map_or("command", CiPhase::name);
-            let (sender, receiver) =
-                std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
-            let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let logger_done = done.clone();
-            let secrets: Vec<String> = [
-                "GH_TOKEN",
-                "GITHUB_TOKEN",
-                "CARGO_REGISTRY_TOKEN",
-                "CARGO_REGISTRIES_CRATES_IO_TOKEN",
-                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-            ]
-            .into_iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .filter(|value| !value.is_empty())
-            .collect();
-            let logger = scope.spawn(move || {
+        let (result, logger_settled, cargo_progress) =
+            std::thread::scope(|scope| {
+                let lane = match std::thread::current().name() {
+                    Some("ci-source-lane") => "first",
+                    Some("ci-auxiliary-lane") => "second",
+                    _ => "owner",
+                };
+                let phase = self.phase.map_or("command", CiPhase::name);
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<memcordon_testkit::ProgressChunk>(32);
+                let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel::<
+                    std::result::Result<memcordon_platform::test_support::ProcessIdentity, String>,
+                >(1);
+                let omitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let logger_done = done.clone();
+                let secrets: Vec<String> = [
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "CARGO_REGISTRY_TOKEN",
+                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok())
+                .filter(|value| !value.is_empty())
+                .collect();
+                let logger = scope.spawn(move || {
                 let mut cargo_progress = observe_cargo_progress
                     .then(|| crate::cargo_progress::CargoProgress::new(budget));
                 let mut pending = [Vec::new(), Vec::new()];
@@ -870,7 +923,33 @@ impl CommandSpec {
                 let mut remaining: usize = 1024 * 1024;
                 let mut omitted_lines = 0_u64;
                 let mut final_chunks = 0;
+                #[cfg(target_os = "macos")]
+                let mut admitted = None;
+                #[cfg(target_os = "macos")]
+                let mut next_native_sample = Duration::ZERO;
                 loop {
+                    #[cfg(target_os = "macos")]
+                    if observe_cargo_progress
+                        && !logger_done.load(std::sync::atomic::Ordering::Acquire)
+                        && started.elapsed() < budget
+                    {
+                        if admitted.is_none() {
+                            admitted = admitted_receiver.try_recv().ok();
+                        }
+                        if started.elapsed() >= next_native_sample
+                            && let Some(root) = &admitted
+                        {
+                            let observed = root.clone().and_then(
+                                memcordon_platform::test_support::macos_owned_compile_sample,
+                            );
+                            if let Some(progress) = &mut cargo_progress {
+                                progress.observe_native_resources(started.elapsed(), observed);
+                            }
+                            next_native_sample = started.elapsed() + Duration::from_secs(5);
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = &admitted_receiver;
                     let next = if logger_done.load(std::sync::atomic::Ordering::Acquire) {
                         if final_chunks == 32 {
                             break;
@@ -893,31 +972,11 @@ impl CommandSpec {
                     };
                     for byte in chunk.bytes {
                         if byte == b'\n' {
-                            if !discarding[stream] && remaining > 0 {
-                                let mut text =
-                                    String::from_utf8_lossy(&pending[stream]).into_owned();
-                                for secret in &secrets {
-                                    text = text.replace(secret, "[redacted]");
-                                }
-                                let lower = text.to_ascii_lowercase();
-                                if [
-                                    "authorization:",
-                                    "access_token",
-                                    "refresh_token",
-                                    "password=",
-                                    "token=",
-                                ]
-                                .iter()
-                                .any(|field| lower.contains(field))
-                                {
-                                    text = "[sensitive HTTP material redacted]".into();
-                                }
-                                let safe: String =
-                                    text.chars().flat_map(char::escape_default).collect();
-                                if let Some(observed) = &mut cargo_progress {
-                                    observed.observe_line(started.elapsed(), chunk.stream, &safe);
-                                }
-                                remaining = remaining.saturating_sub(safe.len());
+                            if !discarding[stream] && let Some(safe) =
+                                crate::command_progress_line::observe_complete_line(
+                                    &pending[stream], &secrets, &mut remaining,
+                                    cargo_progress.as_mut(), started.elapsed(), chunk.stream,
+                                ) {
                                 eprintln!("[ci {lane} {phase} {:?}] {safe}", chunk.stream);
                             } else if !discarding[stream] {
                                 omitted_lines = omitted_lines.saturating_add(1);
@@ -946,54 +1005,57 @@ impl CommandSpec {
                 }
                 (cargo_progress, omitted_lines)
             });
-            let progress =
-                (progress || observe_cargo_progress).then(|| memcordon_testkit::ProgressOutput {
-                    sender,
-                    omitted: omitted.clone(),
+                let progress = (progress || observe_cargo_progress).then(|| {
+                    memcordon_testkit::ProgressOutput {
+                        sender,
+                        omitted: omitted.clone(),
+                        admitted: observe_cargo_progress.then_some(admitted_sender),
+                    }
                 });
-            let failure = if self.defer_group_failure {
-                None
-            } else {
-                group.clone().map(|group| {
-                    let operation = self.phase.map_or("command", CiPhase::name);
-                    std::sync::Arc::new(move |notice| {
-                        group.request_command_failure_notice(operation, notice)
+                let failure = if self.defer_group_failure {
+                    None
+                } else {
+                    group.clone().map(|group| {
+                        let operation = self.phase.map_or("command", CiPhase::name);
+                        std::sync::Arc::new(move |notice| {
+                            group.request_command_failure_notice(operation, notice)
+                        })
+                            as std::sync::Arc<
+                                dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
+                            >
                     })
-                        as std::sync::Arc<
-                            dyn Fn(memcordon_testkit::NativeFailureNotice) + Send + Sync,
-                        >
-                })
-            };
-            let external_stop =
-                (cancel_safe && crate::cancellation::retirement_deadline().is_none()).then(|| {
+                };
+                let external_stop = (cancel_safe
+                    && crate::cancellation::retirement_deadline().is_none())
+                .then(|| {
                     std::sync::Arc::new(|| crate::cancellation::observed().is_some())
                         as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
                 });
-            let result = memcordon_testkit::run_with_deadline_external_stop_output_limit(
-                command,
-                budget,
-                self.output_limit,
-                cancellation,
-                progress,
-                failure,
-                external_stop,
-            );
-            done.store(true, std::sync::atomic::Ordering::Release);
-            // Incomplete reader settlement cannot keep the logger waiting for
-            // a sender forever. The native result remains authoritative.
-            let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
-                Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
-                Err(_) => (false, None, 0),
-            };
-            let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
-            if let Some(observed) = &mut cargo_progress {
-                observed.finish(omitted_lines, omitted);
-            }
-            if omitted != 0 {
-                eprintln!("[ci child] omitted {omitted} progress chunks");
-            }
-            (result, logger_settled, cargo_progress)
-        });
+                let result = memcordon_testkit::run_with_deadline_external_stop_output_limit(
+                    command,
+                    budget,
+                    self.output_limit,
+                    cancellation,
+                    progress,
+                    failure,
+                    external_stop,
+                );
+                done.store(true, std::sync::atomic::Ordering::Release);
+                // Incomplete reader settlement cannot keep the logger waiting for
+                // a sender forever. The native result remains authoritative.
+                let (logger_settled, mut cargo_progress, omitted_lines) = match logger.join() {
+                    Ok((observed, omitted_lines)) => (true, observed, omitted_lines),
+                    Err(_) => (false, None, 0),
+                };
+                let omitted = omitted.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(observed) = &mut cargo_progress {
+                    observed.finish(omitted_lines, omitted);
+                }
+                if omitted != 0 {
+                    eprintln!("[ci child] omitted {omitted} progress chunks");
+                }
+                (result, logger_settled, cargo_progress)
+            });
         if !self.defer_group_failure
             && (result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|output| !output.status.success()))

@@ -392,7 +392,7 @@ pub fn build_selected_with_failure(
                 destination,
                 consumer_readiness,
                 failure_mode,
-                deadline,
+                NativeTestEvidence::Local(deadline),
             )
         })
     })
@@ -624,6 +624,15 @@ pub fn compile_native_pair(
     } else {
         crate::performance_plan::Layout::Serial
     };
+    #[cfg(unix)]
+    let compiler_pool = crate::compiler_pool::pair(
+        if allocation.parallel {
+            allocation.first.get() + allocation.second.get()
+        } else {
+            allocation.first.get()
+        },
+        allocation.parallel,
+    );
     let PreparedNativeCompile {
         command,
         toolchain,
@@ -640,9 +649,21 @@ pub fn compile_native_pair(
                     "compiled-product-complete",
                 ))
                 .then_owned(|_| {
-                    command
+                    #[cfg(unix)]
+                    let command = match &compiler_pool {
+                        Ok(owners) => command.compiler_owner(owners[0].clone()),
+                        Err(error) => {
+                            return crate::work_outcome::WorkOutcome::observed(
+                                Err(CiError::Message(format!("compiler pool creation: {error}"))),
+                                crate::work_outcome::WriterSettlement::NotStarted,
+                            );
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let command = command
                         .arg("--jobs")
-                        .arg(allocation.first.get().to_string())
+                        .arg(allocation.first.get().to_string());
+                    command
                         .run_owned()
                         .map(|_| ())
                         .validate_after(|_| {
@@ -665,10 +686,23 @@ pub fn compile_native_pair(
                     "compiled-native-complete",
                 ))
                 .then_owned(|_| {
-                    rustup_cargo(root, &toolchain, ["test"], compile.deadline)
-                        .args(compile.arguments)
+                    let command = rustup_cargo(root, &toolchain, ["test"], compile.deadline)
+                        .args(compile.arguments);
+                    #[cfg(unix)]
+                    let command = match &compiler_pool {
+                        Ok(owners) => command.compiler_owner(owners[1].clone()),
+                        Err(error) => {
+                            return crate::work_outcome::WorkOutcome::observed(
+                                Err(CiError::Message(format!("compiler pool creation: {error}"))),
+                                crate::work_outcome::WriterSettlement::NotStarted,
+                            );
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let command = command
                         .arg("--jobs")
-                        .arg(allocation.second.get().to_string())
+                        .arg(allocation.second.get().to_string());
+                    command
                         .bounded_until(operation_deadline)
                         .phase(crate::command::CiPhase::NativeCompile)
                         .selection(selected, Some(&distribution.target))
@@ -680,6 +714,148 @@ pub fn compile_native_pair(
                 })
         },
     )
+}
+
+/// One independently settled product owner exports bytes, not a writable target tree.
+pub fn compile_product_only(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    prepared: PreparedNativeCompile,
+    destination: &Path,
+) -> Result<()> {
+    if distribution.target != "x86_64-apple-darwin" || destination.try_exists()? {
+        return Err(CiError::Message(
+            "partitioned product requires fresh macOS x64 ownership".into(),
+        ));
+    }
+    let cutoff = prepared.operation_deadline.min(
+        crate::preparation::active_group()
+            .map_or(prepared.operation_deadline, |group| group.deadline()),
+    );
+    super::native_coverage_owner::validate_product_plan(
+        root,
+        selected,
+        &distribution.target,
+        cutoff,
+    )?;
+    crate::workflow_output::revoke_compilation("compiled-product-complete")?;
+    let result = prepared.command.run_owned();
+    if !result.writers().permits_reading() {
+        return Err(CiError::Message("product writers have not settled".into()));
+    }
+    result.into_result()?;
+    if std::time::Instant::now() >= cutoff {
+        return Err(CiError::Message(
+            "original product operation cutoff exhausted".into(),
+        ));
+    }
+    selected.recheck(root)?;
+    let inputs = product_inputs(root, selected, distribution)?;
+    fs::create_dir_all(destination)?;
+    for binary in &distribution.binaries {
+        let filename = binary_name(binary, &distribution.target);
+        let bytes = artifacts::read_file(
+            &root
+                .join("target/ci-build/product")
+                .join(&distribution.target)
+                .join("release")
+                .join(&filename),
+        )?;
+        fs::write(destination.join(filename), bytes)?;
+    }
+    source::write_json(&destination.join("product.json"), &inputs)?;
+    fs::write(
+        destination.join("original-deadline.json"),
+        artifacts::read_file(&root.join(".release/native-coverage-deadline.json"))?,
+    )?;
+    if std::time::Instant::now() >= cutoff {
+        return Err(CiError::Message(
+            "original product cutoff exhausted during export".into(),
+        ));
+    }
+    crate::workflow_output::compilation_complete("compiled-product-complete")?;
+    Ok(())
+}
+
+pub fn validate_covered_selected(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    distribution: &TargetDistribution,
+    destination: &Path,
+    consumer_readiness: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+    coverage: (&Path, &Path),
+) -> Result<()> {
+    let (inputs, receipts) = coverage;
+    if distribution.target != "x86_64-apple-darwin" {
+        return Err(CiError::Message(
+            "distributed native coverage is only admitted for macOS x64".into(),
+        ));
+    }
+    selected.recheck(root)?;
+    distribution.validate()?;
+    let retained: NativeProductInputs =
+        serde_json::from_slice(&artifacts::read_file(&inputs.join("product.json"))?)?;
+    if retained.source != *selected || retained.distribution != *distribution {
+        return Err(CiError::Message(
+            "independent product source or distribution differs".into(),
+        ));
+    }
+    let deadline_path = root.join(".release/native-coverage-deadline.json");
+    let deadline_bytes = artifacts::read_file(&inputs.join("original-deadline.json"))?;
+    if artifacts::read_file(&deadline_path)? != deadline_bytes {
+        return Err(CiError::Message(
+            "product original distributed deadline differs".into(),
+        ));
+    }
+    let deadline =
+        super::native_coverage_owner::original_cutoff(root, selected, &distribution.target)?;
+    crate::preparation::with_operation(failure_mode, deadline, || {
+        let product = root
+            .join("target/ci-build/product")
+            .join(&distribution.target)
+            .join("release");
+        fs::create_dir_all(&product)?;
+        for binary in &distribution.binaries {
+            let filename = binary_name(binary, &distribution.target);
+            let bytes = artifacts::read_file(&inputs.join(&filename))?;
+            validate_executable(&bytes, &distribution.target)?;
+            if retained.products.get(&filename) != Some(&artifacts::checksum(&bytes)) {
+                return Err(CiError::Message(
+                    "independent product bytes differ from settled owner receipt".into(),
+                ));
+            }
+            let path = product.join(filename);
+            fs::write(&path, bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        if product_inputs(root, selected, distribution)?.products != retained.products {
+            return Err(CiError::Message(
+                "independent product inventory differs".into(),
+            ));
+        }
+        super::native_coverage_owner::validate_all(
+            root,
+            selected,
+            distribution,
+            receipts,
+            deadline,
+        )?;
+        validate_and_package_native(
+            root,
+            selected,
+            distribution,
+            destination,
+            consumer_readiness,
+            failure_mode,
+            NativeTestEvidence::Distributed(deadline),
+        )
+    })
 }
 
 pub fn validate_selected(
@@ -709,9 +885,14 @@ pub fn validate_selected(
             destination,
             consumer_readiness,
             failure_mode,
-            deadline,
+            NativeTestEvidence::Local(deadline),
         )
     })
+}
+
+enum NativeTestEvidence {
+    Local(std::time::Instant),
+    Distributed(std::time::Instant),
 }
 
 fn validate_and_package_native(
@@ -721,13 +902,18 @@ fn validate_and_package_native(
     destination: &Path,
     consumer_readiness: bool,
     failure_mode: crate::failure_mode::FailureMode,
-    operation_deadline: std::time::Instant,
+    evidence: NativeTestEvidence,
 ) -> Result<()> {
+    let (operation_deadline, coverage_verified) = match evidence {
+        NativeTestEvidence::Local(deadline) => (deadline, false),
+        NativeTestEvidence::Distributed(deadline) => (deadline, true),
+    };
     let product = root.join("target/ci-build/product");
     let toolchain = crate::config::toolchains(root)?.stable;
     for phase in crate::native_test_plan::commands_with_failure(true, failure_mode)
         .into_iter()
         .skip(1)
+        .filter(|_| !coverage_verified)
     {
         crate::workflow_output::revoke_compilation("compiled-native-complete")?;
         let diagnostic_phase = if phase.arguments.contains(&"--no-run") {

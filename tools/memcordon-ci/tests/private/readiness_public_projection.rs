@@ -1,4 +1,5 @@
 use super::*;
+use memcordon_readiness_verifier::MAX_PRODUCER_BYTES;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 fn cell(records: Vec<Artifact>) -> CellEvidence {
@@ -32,6 +33,56 @@ fn record(path: &str, bytes: &[u8]) -> Artifact {
 }
 fn cutoff() -> Instant {
     Instant::now() + std::time::Duration::from_secs(5)
+}
+
+#[test]
+fn canonical_final_union_exports_later_case_and_revalidates_during_copy() {
+    let owned = tempfile::tempdir().unwrap();
+    let path = owned.path().canonicalize().unwrap();
+    std::fs::create_dir(path.join("private")).unwrap();
+    std::fs::write(path.join("private/shared.bin"), b"shared").unwrap();
+    std::fs::write(path.join("private/recipe59.bin"), b"later").unwrap();
+    let shared = record("private/shared.bin", b"shared");
+    let mut selected = cell(vec![
+        shared.clone(),
+        shared,
+        record("private/recipe59.bin", b"later"),
+    ]);
+    canonicalize(&path, &mut selected, cutoff()).unwrap();
+    assert_eq!(selected.artifacts.len(), 2);
+    publish(&path, &selected, cutoff()).unwrap();
+    assert_eq!(
+        std::fs::read(path.join("producer/private/recipe59.bin")).unwrap(),
+        b"later"
+    );
+    let published: CellEvidence =
+        serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
+    assert_eq!(published.artifacts.len(), 2);
+    std::fs::write(path.join("private/recipe59.bin"), b"drift").unwrap();
+    assert!(publish(&path, &selected, cutoff()).is_err());
+    let incomplete: CellEvidence =
+        serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
+    assert!(!incomplete.cache_quiescent);
+    assert!(
+        incomplete
+            .cleanup_failures
+            .iter()
+            .any(|error| error == "public evidence projection incomplete")
+    );
+}
+
+#[test]
+fn late_structural_conflict_copies_no_earlier_member() {
+    let owned = tempfile::tempdir().unwrap();
+    let path = owned.path().canonicalize().unwrap();
+    std::fs::write(path.join("first.bin"), b"first").unwrap();
+    let selected = cell(vec![
+        record("first.bin", b"first"),
+        record("producer/forged.bin", b"forged"),
+    ]);
+    assert!(publish(&path, &selected, cutoff()).is_err());
+    assert!(!path.join("producer/first.bin").exists());
+    assert!(path.join("producer/cell.json").exists());
 }
 
 #[test]

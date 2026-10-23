@@ -1,6 +1,285 @@
 //! Finite topology changes; ordinary and Release leaves retain their event scope.
 use super::{Result, text};
 use serde_yaml::Value;
+use std::collections::BTreeSet;
+
+fn no_soft_failure(value: &Value) -> bool {
+    value.get("continue-on-error").is_none() || value["continue-on-error"].as_bool() == Some(false)
+}
+
+fn distributed_native(workflow: &Value, name: &str, driver: &str, args: &str) -> Result<bool> {
+    if !args
+        .split_whitespace()
+        .any(|word| word == "--native-coverage")
+    {
+        return Ok(false);
+    }
+    let fail = || crate::CiError::Message("distributed native producer contract differs".into());
+    if workflow["name"].as_str() != Some("Release")
+        || name != "native-macos-x64"
+        || driver != "./target/ci-runtime/current/memcordon-ci"
+        || args
+            != "--build-source .release/build-source.json --consumer-readiness --native-coverage .release/native-coverage --product-inputs .release/native-product"
+    {
+        return Err(fail());
+    }
+    let jobs = &workflow["jobs"];
+    let definitions = [
+        (
+            "native-macos-x64-plan",
+            vec!["select", "readiness-tools-macos-x64"],
+            "./target/ci-runtime/current/memcordon-ci release native-coverage-plan --build-source .release/build-source.json",
+        ),
+        (
+            "native-macos-x64-product",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness --product-only --destination .release/native-product",
+        ),
+        (
+            "native-macos-x64-shard-0",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 0 --destination .release/native-coverage/0",
+        ),
+        (
+            "native-macos-x64-shard-1",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 1 --destination .release/native-coverage/1",
+        ),
+        (
+            "native-macos-x64-shard-2",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 2 --destination .release/native-coverage/2",
+        ),
+        (
+            "native-macos-x64-shard-3",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 3 --destination .release/native-coverage/3",
+        ),
+        (
+            "native-macos-x64",
+            vec![
+                "select",
+                "readiness-tools-macos-x64",
+                "native-macos-x64-plan",
+                "native-macos-x64-product",
+                "native-macos-x64-shard-0",
+                "native-macos-x64-shard-1",
+                "native-macos-x64-shard-2",
+                "native-macos-x64-shard-3",
+            ],
+            "./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness --native-coverage .release/native-coverage --product-inputs .release/native-product",
+        ),
+    ];
+    for (id, expected_needs, command) in definitions {
+        let shard = match id {
+            "native-macos-x64-shard-0" => Some(0),
+            "native-macos-x64-shard-1" => Some(1),
+            "native-macos-x64-shard-2" => Some(2),
+            "native-macos-x64-shard-3" => Some(3),
+            _ => None,
+        };
+        let job = &jobs[id];
+        let needs = job["needs"].as_sequence().ok_or_else(fail)?;
+        let selected: BTreeSet<_> = needs.iter().filter_map(Value::as_str).collect();
+        if selected != expected_needs.into_iter().collect()
+            || selected.len() != needs.len()
+            || job["if"].as_str() != Some("needs.select.outputs.recovery-mode == 'reprepare'")
+            || !no_soft_failure(job)
+            || job["runs-on"].as_str() != Some("${{ matrix.runner }}")
+            || (shard.is_some() && job.get("outputs").is_some())
+            || (shard.is_none()
+                && job["outputs"]["artifact-id"].as_str()
+                    != Some("${{ steps.payload.outputs.artifact-id }}"))
+        {
+            return Err(fail());
+        }
+        let matrix = job["strategy"]["matrix"].as_mapping().ok_or_else(fail)?;
+        if matrix.len() != 1 {
+            return Err(fail());
+        }
+        let entries = job["strategy"]["matrix"]["include"]
+            .as_sequence()
+            .ok_or_else(fail)?;
+        for entry in entries {
+            if entry["target"].as_str() != Some("x86_64-apple-darwin")
+                || entry["runner"].as_str() != Some("macos-15-intel")
+                || entry.as_mapping().is_none_or(|map| map.len() != 2)
+            {
+                return Err(fail());
+            }
+        }
+        if entries.len() != 1 {
+            return Err(fail());
+        }
+        let steps = job["steps"].as_sequence().ok_or_else(fail)?;
+        let matches: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step["run"].as_str() == Some(command))
+            .collect();
+        if matches.len() != 1 {
+            return Err(fail());
+        }
+        let (index, work) = matches[0];
+        let expected_guard = (id != "native-macos-x64-plan").then_some("runner.os != 'Windows'");
+        if !no_soft_failure(work) || work["if"].as_str() != expected_guard || work["if"].is_bool() {
+            return Err(fail());
+        }
+        let previous = &steps[..index];
+        if !previous.iter().any(|step| step["uses"].as_str().is_some_and(|action| action.starts_with("actions/checkout@"))
+            && step["with"]["ref"].as_str()==Some("${{ needs.select.outputs.selected-commit }}")
+            && step["with"]["persist-credentials"].as_bool()==Some(false)
+            && no_soft_failure(step) && step.get("if").is_none())
+            || !download(previous,"artifact-ids","${{ needs.select.outputs.selection-artifact-id }}",".release")
+            || !previous.iter().any(|step| step["run"].as_str()==Some("./target/ci-runtime/current/memcordon-ci ci preparation-tools check --kind readiness")
+                && no_soft_failure(step) && step.get("if").is_none())
+        { return Err(fail()); }
+        if id != "native-macos-x64-plan"
+            && !download(
+                previous,
+                "artifact-ids",
+                "${{ needs.native-macos-x64-plan.outputs.artifact-id }}",
+                ".release",
+            )
+        {
+            return Err(fail());
+        }
+        if (id == "native-macos-x64-product" || shard.is_some())
+            && !steps[index + 1..].iter().any(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("actions/cache/save@"))
+                    && step["if"]
+                        .as_str()
+                        .is_some_and(|guard| guard.contains("always()"))
+            })
+        {
+            return Err(fail());
+        }
+        match id {
+            "native-macos-x64-plan" => {
+                if !upload(
+                    &steps[index + 1..],
+                    "native-coverage-plan-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ".release/native-coverage-plan.json\n.release/native-coverage-deadline.json\n",
+                ) {
+                    return Err(fail());
+                }
+            }
+            "native-macos-x64-product" => {
+                if !upload(
+                    &steps[index + 1..],
+                    "native-product-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ".release/native-product",
+                ) {
+                    return Err(fail());
+                }
+            }
+            "native-macos-x64" => {
+                if !upload(
+                    &steps[index + 1..],
+                    "native-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ".release/target",
+                ) {
+                    return Err(fail());
+                }
+                if !download(
+                    previous,
+                    "artifact-ids",
+                    "${{ needs.native-macos-x64-product.outputs.artifact-id }}",
+                    ".release/native-product",
+                ) {
+                    return Err(fail());
+                }
+                for (artifact, path) in [
+                    (
+                        "native-coverage-${{ matrix.target }}-0-${{ github.run_id }}-${{ github.run_attempt }}",
+                        ".release/native-coverage/0",
+                    ),
+                    (
+                        "native-coverage-${{ matrix.target }}-1-${{ github.run_id }}-${{ github.run_attempt }}",
+                        ".release/native-coverage/1",
+                    ),
+                    (
+                        "native-coverage-${{ matrix.target }}-2-${{ github.run_id }}-${{ github.run_attempt }}",
+                        ".release/native-coverage/2",
+                    ),
+                    (
+                        "native-coverage-${{ matrix.target }}-3-${{ github.run_id }}-${{ github.run_attempt }}",
+                        ".release/native-coverage/3",
+                    ),
+                ] {
+                    if !download(previous, "name", artifact, path) {
+                        return Err(fail());
+                    }
+                }
+            }
+            _ => {
+                let shard = shard.expect("fixed distributed shard job");
+                let artifact = format!(
+                    "native-coverage-${{{{ matrix.target }}}}-{shard}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}"
+                );
+                let path = format!(".release/native-coverage/{shard}");
+                if !upload(&steps[index + 1..], &artifact, &path) {
+                    return Err(fail());
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn download(steps: &[Value], key: &str, selected: &str, destination: &str) -> bool {
+    steps.iter().any(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|action| action.starts_with("actions/download-artifact@"))
+            && step["with"][key].as_str() == Some(selected)
+            && step["with"]["path"].as_str() == Some(destination)
+            && step["with"]["digest-mismatch"].as_str() == Some("error")
+            && (key != "artifact-ids"
+                || (step["with"]["merge-multiple"].as_bool() == Some(true)
+                    && step["with"]["name"].is_null()))
+            && (key != "name" || step["with"]["artifact-ids"].is_null())
+            && no_soft_failure(step)
+            && step.get("if").is_none()
+    })
+}
+fn upload(steps: &[Value], name: &str, path: &str) -> bool {
+    steps.iter().any(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|action| action.starts_with("actions/upload-artifact@"))
+            && step["with"]["name"].as_str() == Some(name)
+            && step["with"]["path"].as_str() == Some(path)
+            && step["id"].as_str() == Some("payload")
+            && step["with"]["if-no-files-found"].as_str() == Some("error")
+            && step["with"]["overwrite"].as_bool() == Some(false)
+            && step["with"]["include-hidden-files"].as_bool() == Some(true)
+            && no_soft_failure(step)
+            && step.get("if").is_none()
+    })
+}
 
 pub(super) fn apply(workflow: &mut Value, file: &str) -> Result<()> {
     let jobs = workflow["jobs"].as_mapping_mut().expect("source jobs");
@@ -158,7 +437,7 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
             }
         }
     }
-    for (_, job) in jobs {
+    for (name, job) in jobs {
         if job["strategy"]["matrix"].is_mapping()
             && job["strategy"]["fail-fast"].as_bool() != Some(false)
         {
@@ -191,6 +470,9 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
                 {
                     return Err(fail("native validation must require compiler success"));
                 }
+                if distributed_native(workflow, name.as_str().unwrap_or(""), driver, args)? {
+                    continue;
+                }
                 let compile = steps[..index]
                     .iter()
                     .position(|candidate| {
@@ -216,6 +498,37 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
 /// Legacy validators still inspect the pre-adapter command/cache vocabulary.
 /// Only exact reviewed topology edits are projected; changed real dependencies,
 /// guards, permissions, runner layouts or leaf steps fail before that projection.
+pub(super) fn project_native_coverage(
+    actual: &mut serde_yaml::Mapping,
+    expected: &Value,
+) -> Result<()> {
+    let jobs = actual
+        .get_mut(text("jobs"))
+        .and_then(Value::as_mapping_mut)
+        .expect("jobs");
+    let owners = [
+        "native-macos-x64-plan",
+        "native-macos-x64-product",
+        "native-macos-x64-shard-0",
+        "native-macos-x64-shard-1",
+        "native-macos-x64-shard-2",
+        "native-macos-x64-shard-3",
+        "native-macos-x64",
+    ];
+    for name in owners {
+        if jobs.get(text(name)) != expected["jobs"].get(name) {
+            return Err(crate::CiError::Message(format!(
+                "distributed native owner differs from reviewed source: {name}"
+            )));
+        }
+    }
+    for name in &owners[..6] {
+        jobs.remove(text(name));
+    }
+    // The aggregate remains exact for the existing preparation projection.
+    Ok(())
+}
+
 pub(super) fn project(
     actual: &mut serde_yaml::Mapping,
     expected: &Value,

@@ -1153,6 +1153,17 @@ fn split_fuzz(workflow: &mut Value) -> Result<()> {
 }
 
 pub(super) fn operation_recipe(command: &str) -> Option<&str> {
+    if [
+        LiteralRun::NativeCoverageShard0,
+        LiteralRun::NativeCoverageShard1,
+        LiteralRun::NativeCoverageShard2,
+        LiteralRun::NativeCoverageShard3,
+    ]
+    .into_iter()
+    .any(|run| run.command() == command)
+    {
+        return Some("release-readiness");
+    }
     if let Some((_, recipe)) = command.split_once(" ci segment ") {
         return Some(recipe);
     }

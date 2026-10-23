@@ -1,6 +1,13 @@
 //! Reviewed native command inventory. Runtime values never become shell source.
 #[derive(Clone, Copy)]
 pub(super) enum LiteralRun {
+    NativeCoveragePlan,
+    NativeCoverageProduct,
+    NativeCoverageShard0,
+    NativeCoverageShard1,
+    NativeCoverageShard2,
+    NativeCoverageShard3,
+    NativeCoverageAggregate,
     InstalledLoaderCleanupNative,
     InstalledLoaderCleanupCargo,
     LinuxProjectedProducerSeal,
@@ -1734,6 +1741,27 @@ pub(super) enum LiteralRun {
 impl LiteralRun {
     pub(super) fn command(self) -> &'static str {
         match self {
+            Self::NativeCoveragePlan => {
+                "./target/ci-runtime/current/memcordon-ci release native-coverage-plan --build-source .release/build-source.json"
+            }
+            Self::NativeCoverageProduct => {
+                "./target/ci-runtime/current/memcordon-ci release compile-target --build-source .release/build-source.json --consumer-readiness --product-only --destination .release/native-product"
+            }
+            Self::NativeCoverageShard0 => {
+                "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 0 --destination .release/native-coverage/0"
+            }
+            Self::NativeCoverageShard1 => {
+                "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 1 --destination .release/native-coverage/1"
+            }
+            Self::NativeCoverageShard2 => {
+                "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 2 --destination .release/native-coverage/2"
+            }
+            Self::NativeCoverageShard3 => {
+                "./target/ci-runtime/current/memcordon-ci release native-coverage-shard --build-source .release/build-source.json --shard 3 --destination .release/native-coverage/3"
+            }
+            Self::NativeCoverageAggregate => {
+                "./target/ci-runtime/current/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness --native-coverage .release/native-coverage --product-inputs .release/native-product"
+            }
             Self::InstalledLoaderCleanupNative => {
                 "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/native"
             }

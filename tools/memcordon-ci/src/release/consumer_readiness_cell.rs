@@ -209,6 +209,22 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
     fs::create_dir_all(&arguments.destination)?;
     let artifact_root = std::path::absolute(&arguments.destination)?;
     let prefix = artifact_root.join(&key.target).join(&key.channel);
+    #[cfg(target_os = "linux")]
+    let publication = {
+        if !rustix::process::geteuid().is_root() {
+            return Err(CiError::Message(
+                "cell publication requires the original privileged controller".into(),
+            ));
+        }
+        std::sync::Arc::new(
+            super::linux_lifecycle_diagnostics::HeldCellPublication::create(
+                &artifact_root,
+                &identity,
+                &key,
+            )?,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
     fs::create_dir_all(&prefix)?;
     let owner_path = prefix.join("cell-owner.json");
     if owner_path.exists() {
@@ -321,6 +337,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                 deadline,
                 cleanup_deadline,
                 arguments.operation_deadline_unix_millis,
+                publication.clone(),
             )?;
             let observed = super::linux_installed_consumer::run_with_extension(
                 root,
@@ -328,24 +345,61 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                 &prefix.join("installed"),
                 &mut lease,
             );
-            let (records, artifacts) = lease.driver.collect_case_records(
-                &identity,
-                &key,
-                &artifact_root,
-                &prefix.join("installed"),
-            )?;
-            for record in records {
-                let selected = cell
-                    .records
-                    .iter_mut()
-                    .find(|selected| selected.key == record.key)
-                    .ok_or_else(|| {
-                        CiError::Message("installed driver emitted an unknown finite row".into())
-                    })?;
-                *selected = record;
+            let (diagnostics, normalized) =
+                super::linux_lifecycle_diagnostics::capture_before_normalize(
+                    &mut cell.artifacts,
+                    |retained| {
+                        lease
+                            .driver
+                            .collect_diagnostic_artifacts(&artifact_root, retained)
+                    },
+                    || {
+                        lease.driver.collect_case_records(
+                            &identity,
+                            &key,
+                            &artifact_root,
+                            &prefix.join("installed"),
+                        )
+                    },
+                );
+            let normalized = normalized.and_then(|(records, artifacts)| -> Result<()> {
+                for record in records {
+                    let selected = cell
+                        .records
+                        .iter_mut()
+                        .find(|selected| selected.key == record.key)
+                        .ok_or_else(|| {
+                            CiError::Message(
+                                "installed driver emitted an unknown finite row".into(),
+                            )
+                        })?;
+                    *selected = record;
+                }
+                for artifact in artifacts {
+                    if let Some(existing) = cell
+                        .artifacts
+                        .iter()
+                        .find(|existing| existing.path == artifact.path)
+                    {
+                        if existing.length != artifact.length || existing.sha256 != artifact.sha256
+                        {
+                            return Err(CiError::Message(
+                                "diagnostic and normalized artifact bytes conflict".into(),
+                            ));
+                        }
+                    } else {
+                        cell.artifacts.push(artifact);
+                    }
+                }
+                Ok(())
+            });
+            if let Err(primary) = observed {
+                return Err(CiError::Message(format!(
+                    "{primary}; diagnostic-retention={diagnostics:?}; case-normalization={normalized:?}"
+                )));
             }
-            cell.artifacts.extend(artifacts);
-            observed?;
+            diagnostics?;
+            normalized?;
             let (product, artifacts) = super::readiness_product::collect(
                 &identity,
                 &key,
@@ -584,6 +638,16 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
         }
         Ok(())
     })();
+    #[cfg(target_os = "linux")]
+    let result = crate::work_outcome::join_completed(
+        crate::work_outcome::WorkOutcome::from_result(result),
+        crate::work_outcome::WorkOutcome::from_result(public_projection::canonicalize(
+            &arguments.destination,
+            &mut cell,
+            cleanup_deadline,
+        )),
+    )
+    .into_result();
     if let Err(error) = &result {
         owner.cleanup_failures.push(error.to_string());
         cell.cleanup_failures.push(error.to_string());
@@ -699,6 +763,7 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
                 }
                 cell.cache_quiescent = false;
                 cell.cleanup_failures.push(cause.to_string());
+                public_projection::canonicalize(&arguments.destination, &mut cell, deadline)?;
                 super::source::write_json(&cell_path, &cell)?;
                 public_projection::publish(&arguments.destination, &cell, deadline)
             })();
@@ -720,6 +785,7 @@ pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
             ));
         }
         cell.cache_quiescent = true;
+        public_projection::canonicalize(&arguments.destination, &mut cell, deadline)?;
         super::source::write_json(&cell_path, &cell)?;
         public_projection::publish(&arguments.destination, &cell, deadline)
     }

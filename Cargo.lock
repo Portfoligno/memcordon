@@ -725,6 +725,8 @@ dependencies = [
  "memcordon-readiness-verifier",
  "memcordon-testkit",
  "memcordon-windows-launch-core",
+ "memcordon-windows-loader-lab",
+ "nix",
  "rustix",
  "semver",
  "serde",

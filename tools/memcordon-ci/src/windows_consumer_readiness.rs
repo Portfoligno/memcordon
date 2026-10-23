@@ -16,6 +16,10 @@ pub mod descriptor;
 #[path = "windows_loader_event_diagnostics.rs"]
 pub mod loader_event_diagnostics;
 
+#[cfg(windows)]
+#[path = "windows_workload_diagnostic.rs"]
+mod workload_diagnostic;
+
 #[cfg(any(windows, test))]
 #[path = "windows_installed_loader_diagnostic.rs"]
 pub(crate) mod installed_loader_diagnostic;
@@ -763,7 +767,7 @@ fn decode_events(bytes: &[u8], live: bool) -> Result<Vec<Event>> {
     Ok(result)
 }
 
-/// A completed launch refusal cannot satisfy the live positive-fixture barrier.
+/// A launch refusal or abnormal completion cannot satisfy the live positive-fixture barrier.
 /// This observation only rejects; it never supplies accepted workload authority.
 pub fn check_positive_barrier_result(
     bytes: &[u8],
@@ -780,10 +784,20 @@ pub fn check_positive_barrier_result(
             "positive barrier result has no matching selected provider binding".into(),
         ));
     }
-    if matches!(
-        result.outcome.kind,
-        OutcomeKindV1::LaunchFailure | OutcomeKindV1::ProviderFailure
-    ) || result.authorization == AuthorizationV1::RejectedBeforeRelease
+    let native_failure = match result.outcome.native_termination.as_ref() {
+        Some(ChildTermination::ExitCode { code }) => *code != 0,
+        Some(ChildTermination::WindowsStatus { status }) => *status != 0,
+        Some(ChildTermination::UnixSignal { .. }) => true,
+        Some(ChildTermination::Unavailable) | None => false,
+    };
+    let completed_failure = result.outcome.kind == OutcomeKindV1::Completed
+        && (result.outcome.wrapper_status != 0 || native_failure);
+    if completed_failure
+        || matches!(
+            result.outcome.kind,
+            OutcomeKindV1::LaunchFailure | OutcomeKindV1::ProviderFailure
+        )
+        || result.authorization == AuthorizationV1::RejectedBeforeRelease
         || matches!(
             result.launch.state,
             LaunchStateV1::NotCreated | LaunchStateV1::ExecFailed
@@ -793,9 +807,17 @@ pub fn check_positive_barrier_result(
             .attempts
             .last()
             .and_then(|attempt| attempt.error.as_ref());
+        let native_termination = match result.outcome.native_termination.as_ref() {
+            Some(ChildTermination::WindowsStatus { status }) => {
+                format!("windows-status={status} (0x{status:08X})")
+            }
+            other => format!("{other:?}"),
+        };
         return Err(CiError::Message(format!(
-            "positive fixture launch already failed; wrapper-status={}; authorization={:?}; launch={:?}; original={}",
+            "positive fixture launch already failed; wrapper-status={}; outcome={:?}; native-termination={}; authorization={:?}; launch={:?}; original={}",
             result.outcome.wrapper_status,
+            result.outcome.kind,
+            native_termination,
             result.authorization,
             result.launch.state,
             original.map_or_else(
@@ -809,6 +831,33 @@ pub fn check_positive_barrier_result(
         )));
     }
     Ok(())
+}
+
+/// Select read-only OS-event context; this never establishes execution or retirement.
+pub fn released_target_loader_event_candidate(result: &ResultV1) -> bool {
+    result.outcome.kind == OutcomeKindV1::Completed
+        && result.outcome.wrapper_status == 125
+        && result.authorization == AuthorizationV1::Granted
+        && result.launch.state == LaunchStateV1::ReleaseIssued
+        && matches!(
+            result.outcome.native_termination,
+            Some(ChildTermination::WindowsStatus { status: 0xC0000142 })
+        )
+        && result.cleanup.state == CleanupStateV1::Complete
+        && result.cleanup.direct_child_reaped
+        && result.cleanup.workload_empty == Some(true)
+        && result.cleanup.outstanding.is_empty()
+        && result.cleanup.failed_operations.is_empty()
+        && result.attempts.last().is_some_and(|attempt| {
+            let proof = &attempt.restart_safety;
+            proof.direct_child_reaped
+                && proof.workload_empty == Some(true)
+                && proof.helpers_reaped
+                && proof.containment_removed
+                && proof.containment_incapable_of_live_members
+                && proof.sealed_boundary_retired
+                && proof.errors.is_empty()
+        })
 }
 
 pub fn assess(
@@ -2381,6 +2430,82 @@ pub(crate) mod native {
         Ok(bytes)
     }
 
+    fn retain_callback_product_context(
+        public_report: &Path,
+        report: &Path,
+        provider: &memcordon_core::PublicProviderBindingV1,
+    ) -> Result<serde_json::Value> {
+        if !public_report.try_exists()? {
+            return Ok(serde_json::json!({"authority":"diagnostic-only", "result":"absent"}));
+        }
+        let bytes = read(
+            public_report,
+            crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+        )?;
+        let result = ResultV1::parse(&bytes).map_err(CiError::Message)?;
+        let association = result.provider_association.as_ref().ok_or_else(|| {
+            CiError::Message("callback product context lacks provider association".into())
+        })?;
+        if &association.provider != provider {
+            return Err(CiError::Message(
+                "callback product context provider differs".into(),
+            ));
+        }
+        let retain = |extension: &str, bytes: &[u8]| -> Result<serde_json::Value> {
+            let path = report.with_extension(extension);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            if read(&path, bytes.len())? != bytes {
+                return Err(CiError::Message(
+                    "callback product context copy differs".into(),
+                ));
+            }
+            Ok(
+                serde_json::json!({"path":path,"sha256":crate::windows_causal_acceptance::sha256(bytes)}),
+            )
+        };
+        // Preserve the original independently of any sidecar read or validation error.
+        let original = retain("failed-frontend.json", &bytes)?;
+        let terminal_context = (|| -> Result<serde_json::Value> {
+            let path = public_report.with_extension("terminal-observation.json");
+            if !path.try_exists()? {
+                return Ok(serde_json::json!({"state":"absent"}));
+            }
+            let bytes = read(&path, memcordon_platform::MAX_TERMINAL_OBSERVATION_BYTES)?;
+            let terminal: memcordon_platform::AuthenticatedWindowsTerminalObservation =
+                serde_json::from_slice(&bytes)?;
+            if terminal.format != "memcordon.windows-terminal-observation"
+                || terminal.revision != 1
+                || terminal.provider != association.provider
+                || terminal.terminal.attempt_id != String::from(association.attempt_id.clone())
+                || terminal.terminal.request_sha256
+                    != String::from(association.request_sha256.clone())
+                || terminal.terminal.validate_for_attempt().is_err()
+                || !terminal.frontend_delivery.is_consistent()
+                || terminal.frontend_delivery.attempt_id != terminal.terminal.attempt_id
+                || terminal.frontend_delivery.nonce != terminal.terminal.nonce
+                || terminal.frontend_delivery.request_sha256 != terminal.terminal.request_sha256
+                || crate::windows_causal_acceptance::sha256(&terminal.provider_request)
+                    != terminal.terminal.request_sha256
+            {
+                return Err(CiError::Message(
+                    "callback terminal context association differs".into(),
+                ));
+            }
+            retain("failed-terminal-observation.json", &bytes)
+        })()
+        .map_err(|error| error.to_string());
+        Ok(
+            serde_json::json!({"authority":"diagnostic-only", "original":original,
+            "terminal":terminal_context, "terminal_use":"associated context, never outcome acceptance"}),
+        )
+    }
+
     #[allow(unsafe_code)] // Fixed-size native cryptographic challenge generation.
     pub(crate) fn random_challenge() -> Result<[u8; 32]> {
         let mut random = [0u8; 32];
@@ -3006,7 +3131,8 @@ pub(crate) mod native {
         let gate_name = input.descriptor.start_gate.as_ref().ok_or_else(|| {
             CiError::Message("positive input omitted held-root native barrier".into())
         })?;
-        let gate = event_create(gate_name)?;
+        let gate = Arc::new(event_create(gate_name)?);
+        let callback_gate = Arc::clone(&gate);
         let endpoint_event = (input.descriptor.case == descriptor::Case::EndpointMismatch)
             .then(|| event_create(&format!("{gate_name}-endpoint-observed")))
             .transpose()?;
@@ -3296,7 +3422,7 @@ pub(crate) mod native {
                 *observed_guardian_owner
                     .lock()
                     .map_err(|_| io::Error::other("guardian ownership poisoned"))? = Some(guardian);
-                signal(&gate)?;
+                signal(callback_gate.as_ref())?;
                 if owns_tcp {
                     let deadline = work_deadline.min(Instant::now() + Duration::from_secs(60));
                     let port = loop {
@@ -4025,11 +4151,18 @@ pub(crate) mod native {
             }) = &output
             {
                 let retention = (|| -> Result<()> {
+                    let product_context = if *capture_complete && cleanup.is_ok() {
+                        retain_callback_product_context(&public_report, &report, &config.provider)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Err("callback capture or cleanup is unsettled".to_owned())
+                    };
                     let diagnostic = serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-positive-callback-failure", "revision":1,
                         "error":error.to_string(), "capture_complete":capture_complete,
                         "observed_status":observed_status.map(|status| status.code()),
                         "termination":termination.map(|status| status.code()), "cleanup":cleanup,
+                        "product_context":product_context,
                     }))?;
                     for (extension, bytes) in [
                         ("stdout.bin", stdout.as_slice()),
@@ -4078,18 +4211,28 @@ pub(crate) mod native {
                                 "OS diagnostic original result provider differs".into(),
                             ));
                         }
-                        if original.authorization != AuthorizationV1::RejectedBeforeRelease
-                            || original.launch.state != LaunchStateV1::NotCreated
-                            || !original
+                        let bootstrap_refusal = original.authorization
+                            == AuthorizationV1::RejectedBeforeRelease
+                            && original.launch.state == LaunchStateV1::NotCreated
+                            && original
                                 .attempts
                                 .last()
                                 .and_then(|attempt| attempt.error.as_ref())
                                 .is_some_and(|error| {
                                     error.code == "MCSPAWN-FAILED"
                                         && error.message.contains("bootstrap_role=loader-control")
-                                })
-                        {
+                                });
+                        let released_target =
+                            super::released_target_loader_event_candidate(&original);
+                        if !bootstrap_refusal && !released_target {
                             return Ok(());
+                        }
+                        if released_target {
+                            let descriptor = super::workload_diagnostic::gate_sddl(gate.as_ref())?;
+                            drop(crate::windows_readiness_adapter::publish_receipt(
+                                &report.with_extension("original-gate.sddl"),
+                                descriptor.as_bytes(),
+                            )?);
                         }
                         let capture = super::loader_event_diagnostics::observe(work_deadline);
                         let observed_utc = std::time::SystemTime::now();
@@ -4114,6 +4257,10 @@ pub(crate) mod native {
                             "installed_images":config.installed_components,"original_result":public_report,
                             "original_result_sha256":crate::windows_causal_acceptance::sha256(&bytes),
                             "original_failure":failure,
+                            "trigger":if released_target { "released-target-initialization-failure" } else { "bootstrap-launch-refusal" },
+                            "original_outcome":original.outcome,
+                            "observed_target_pid":original.launch.target_pid,
+                            "observed_target_pid_is_not_faulting_identity":true,
                             "controller_started_unix_millis":unix_millis(native_started_utc)?,
                             "controller_observed_unix_millis":unix_millis(observed_utc)?,
                             "bootstrap_birth_identity":null,"event_correlation":"unverified-candidates",
@@ -4510,6 +4657,41 @@ pub(crate) mod native {
             &config.installed_agent.sha256,
             &config.installed_manifest.sha256,
         )?;
+        let report = config
+            .output_directory
+            .join(&input.key.family)
+            .join(&input.key.scenario)
+            .join("result.json");
+        let original_path = report.with_extension("failed-frontend.json");
+        if original_path.try_exists()? {
+            let original = ResultV1::parse(&read(
+                &original_path,
+                crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+            )?)
+            .map_err(CiError::Message)?;
+            if super::released_target_loader_event_candidate(&original) {
+                let gate = read(&report.with_extension("original-gate.sddl"), 16 * 1024)?;
+                let gate =
+                    String::from_utf8(gate).map_err(|error| CiError::Message(error.to_string()))?;
+                let observed = super::workload_diagnostic::observe(
+                    config,
+                    input,
+                    &report,
+                    &input.descriptor.output_root.join("frontend-result.json"),
+                    &gate,
+                    deadlines.work,
+                    deadlines.cleanup,
+                )
+                .map_err(|error| error.to_string());
+                drop(crate::windows_readiness_adapter::publish_receipt(
+                    &report.with_extension("workload-diagnostic.json"),
+                    &serde_json::to_vec(
+                        &serde_json::json!({"authority":"diagnostic-only", "original_failure_unchanged":true,"observation":observed}),
+                    )?,
+                )?);
+                return Ok(());
+            }
+        }
         super::installed_loader_diagnostic::retain(config, input, deadlines)
     }
 

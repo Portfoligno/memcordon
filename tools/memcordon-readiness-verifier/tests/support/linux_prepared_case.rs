@@ -114,7 +114,7 @@ pub fn prepared_graph(
     let journal_process = |pid, birth| json!({"pid":pid,"start_time":birth});
     let journal = json!({"attempt_id":attempt,"boot_identity":"12345678-1234-1234-1234-123456789abc",
         "frontend":journal_process(102,301),"caller_envelope_digest":sha256(b"original caller envelope"),
-        "admission_metadata":null,"phase":"checkpoint-committed","release_knowledge":"not-released","binding":null,
+        "admission_metadata":null,"phase":"release-intent","release_knowledge":"possibly-released","binding":null,
         "guardian":journal_process(105,304),"namespace_init":journal_process(104,303),"target":journal_process(103,302),
         "network_namespace_inode":103,"checkpoint":null,"checkpoint_digest":null,"gated_facts":null,"cleanup_error":null,
         "mixed_admission_metadata":admission,"mixed_worker":journal_process(101,300),

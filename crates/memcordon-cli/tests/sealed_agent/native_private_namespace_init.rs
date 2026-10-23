@@ -58,6 +58,70 @@ fn ready() -> PrivateNamespaceStartupObservation {
 }
 
 #[test]
+fn closed_startup_channel_reports_eof_without_inventing_missing_credentials() {
+    let (provider, init) = private_namespace_startup_channel().unwrap();
+    drop(init);
+    let error = provider
+        .receive(
+            std::process::id() as libc::pid_t,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.contains("startup channel EOF"), "{error}");
+    assert!(!error.contains("sender credentials absent"), "{error}");
+}
+
+#[test]
+fn zero_byte_startup_record_closes_received_rights_before_refusal() {
+    let (provider, init) = private_namespace_startup_channel().unwrap();
+    let mut pipe = [-1; 2];
+    // SAFETY: pipe2 initializes two fresh descriptors owned immediately below.
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut control = [0usize; 8];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<i32>() as u32) } as usize;
+    // SAFETY: the aligned initialized control buffer contains one SCM_RIGHTS
+    // header; sendmsg borrows the live read end and has no data payload.
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        assert!(!header.is_null());
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(size_of::<i32>() as u32) as usize;
+        libc::CMSG_DATA(header)
+            .cast::<i32>()
+            .write_unaligned(reader.as_raw_fd());
+        assert_eq!(
+            libc::sendmsg(init.as_fd().as_raw_fd(), &message, libc::MSG_NOSIGNAL),
+            0
+        );
+    }
+    drop(reader);
+    let error = provider
+        .receive(
+            std::process::id() as libc::pid_t,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.contains("startup channel EOF"), "{error}");
+    let mut poll = libc::pollfd {
+        fd: writer.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // With the sent and received read ends both closed, the real pipe exposes
+    // POLLERR. A leaked received SCM_RIGHTS descriptor would keep it readable.
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
+    assert_ne!(poll.revents & libc::POLLERR, 0);
+}
+
+#[test]
 fn v4_startup_codec_requires_exact_native_readback_and_namespace_owner() {
     let observation = ready();
     let packet = encode_private_namespace_startup(&observation).unwrap();

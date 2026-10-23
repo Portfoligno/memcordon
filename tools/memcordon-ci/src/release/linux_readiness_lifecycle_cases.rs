@@ -231,12 +231,13 @@ fn require_live(
 
 #[derive(Default)]
 pub struct LifecycleReport {
+    fixture_budget: Option<LifecycleFixtureBudget>,
     fixture_exports: Vec<super::fixture_export_retirement::Owner>,
     original_work_deadline: Option<Instant>,
     original_cleanup_deadline: Option<Instant>,
     pub native: super::linux_readiness_limits_cases::LimitsReport,
     workers: Vec<HeldLinuxProcess>,
-    actor_owners: Vec<HeldLinuxProcess>,
+    actor_owners: Vec<InterventionOwner>,
     controls: Vec<HeldControlConnection>,
     files: Vec<File>,
     directories: Vec<File>,
@@ -244,6 +245,20 @@ pub struct LifecycleReport {
     pub completed: Vec<(memcordon_readiness_verifier::CaseKey, std::path::PathBuf)>,
     pub records: Vec<memcordon_readiness_verifier::CaseRecord>,
     pub artifacts: Vec<memcordon_readiness_verifier::Artifact>,
+}
+
+struct InterventionOwner {
+    key: memcordon_readiness_verifier::CaseKey,
+    attempt: String,
+    role: String,
+    owner: HeldLinuxProcess,
+    image: Option<serde_json::Value>,
+}
+
+struct LifecycleFixtureBudget {
+    budget: super::linux_fixture_memory_budget::FrozenImageMemoryBudget,
+    receipt: Vec<u8>,
+    file: File,
 }
 
 impl LifecycleReport {
@@ -255,6 +270,7 @@ impl LifecycleReport {
             && self.controls.is_empty()
             && self.files.is_empty()
             && self.directories.is_empty()
+            && self.fixture_budget.is_none()
     }
 }
 
@@ -271,7 +287,11 @@ pub fn finalize_report(report: &mut LifecycleReport, deadline: Instant) -> Resul
     for owner in &mut report.fixture_exports {
         owner.retire()?;
     }
-    for worker in report.workers.iter().chain(&report.actor_owners) {
+    for worker in report
+        .workers
+        .iter()
+        .chain(report.actor_owners.iter().map(|actor| &actor.owner))
+    {
         while !worker.exited().map_err(CiError::Message)? {
             if Instant::now() >= deadline {
                 return Err(CiError::Message(
@@ -286,6 +306,7 @@ pub fn finalize_report(report: &mut LifecycleReport, deadline: Instant) -> Resul
     report.actor_owners.clear();
     report.files.clear();
     report.directories.clear();
+    report.fixture_budget = None;
     Ok(())
 }
 
@@ -299,6 +320,9 @@ pub fn begin_case(
     prefix: &str,
     challenge: &str,
 ) -> Result<usize> {
+    context
+        .publication
+        .verify_selection(context.identity, context.cell, context.lease_id)?;
     use super::linux_mixed_installed::{
         InstalledMixedLaunch, InstalledMixedLaunchInput, OwnedMixedRecipe,
     };
@@ -314,7 +338,10 @@ pub fn begin_case(
             "lifecycle original installed owner/cutoff differs".into(),
         ));
     }
-    if !report.native.owners.is_empty() || !report.completed.is_empty() {
+    if !report.native.owners.is_empty()
+        || !report.completed.is_empty()
+        || report.fixture_budget.is_some()
+    {
         return Err(CiError::Message(
             "one lifecycle report cannot replace its original native attempt".into(),
         ));
@@ -395,6 +422,45 @@ pub fn begin_case(
     if delivery {
         args.push("0".into());
     }
+    // The unchanged workload headroom excludes the already admitted image
+    // inventory, whose tmpfs copy is charged to this same attempt.
+    let budget = super::linux_fixture_memory_budget::FrozenImageMemoryBudget::for_images(
+        &context.images.runtime,
+        &context.images.input,
+        &context.contract.runtime_image,
+        &context.contract.input_image,
+        super::linux_readiness_limits_cases::native_fixture_page_bytes()?,
+        512 * 1024 * 1024,
+    )
+    .map_err(CiError::Message)?;
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "format":"memcordon.linux-fixture-memory-budget", "revision":1,
+        "source":context.identity, "cell":context.cell, "lease_id":context.lease_id,
+        "key":key, "budget":budget,
+    }))?;
+    let receipt_path = context
+        .artifact_root
+        .join(prefix)
+        .join("fixture-memory-budget.json");
+    retain_bytes(&receipt_path, &receipt, &mut report.files)?;
+    let file = report
+        .files
+        .last()
+        .ok_or_else(|| CiError::Message("held fixture budget absent".into()))?
+        .try_clone()?;
+    let memory = budget.token();
+    report
+        .artifacts
+        .push(memcordon_readiness_verifier::Artifact {
+            path: format!("{prefix}/fixture-memory-budget.json"),
+            length: receipt.len() as u64,
+            sha256: super::artifacts::checksum(&receipt),
+        });
+    report.fixture_budget = Some(LifecycleFixtureBudget {
+        budget,
+        receipt,
+        file,
+    });
     let launch = InstalledMixedLaunch::start_with_delivery_controls(
         InstalledMixedLaunchInput {
             directory,
@@ -403,7 +469,7 @@ pub fn begin_case(
             caller_gid: 65534,
             target_arguments: &args,
             deadline: std::ffi::OsStr::new("+300s"),
-            memory: std::ffi::OsStr::new("+512MiB"),
+            memory: std::ffi::OsStr::new(&memory),
         },
         delivery,
         None,
@@ -435,6 +501,54 @@ pub fn begin_case(
         .observer
         .as_ref()
         .expect("retained original native prepared observer");
+    {
+        use std::io::Read;
+        let group = observer
+            .retain_cgroup_descriptor()
+            .map_err(CiError::Message)?;
+        let maximum = File::from(
+            rustix::fs::openat(
+                &group,
+                "memory.max",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| CiError::Message(error.to_string()))?,
+        );
+        let mut bytes = Vec::new();
+        (&maximum).take(65).read_to_end(&mut bytes)?;
+        let observed = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|_| bytes.len() <= 64)
+            .and_then(|text| text.trim_end_matches('\n').parse::<u64>().ok())
+            .ok_or_else(|| CiError::Message("lifecycle native memory.max invalid".into()))?;
+        let frozen = report
+            .fixture_budget
+            .as_ref()
+            .expect("original fixture budget retained");
+        frozen
+            .budget
+            .require_maximum(observed)
+            .map_err(CiError::Message)?;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.linux-lifecycle-memory-max", "revision":1,
+            "key":key, "attempt_id":observer.observation.admission.attempt_id.as_str(),
+            "cgroup_inode":group.metadata()?.ino(), "memory_max":observed,
+            "budget_sha256":super::artifacts::checksum(&frozen.receipt),
+        }))?;
+        retain_bytes(
+            &context
+                .artifact_root
+                .join(prefix)
+                .join("fixture-memory-max.json"),
+            &receipt,
+            &mut report.files,
+        )?;
+        report.files.push(maximum);
+        report.directories.push(group);
+    }
     owner.prepared_native_receipt = Some(
         observer
             .persist_native_receipt(
@@ -484,6 +598,98 @@ pub fn begin_case(
             context.work_deadline,
         )?);
     }
+    if !delivery {
+        let selected = match actor {
+            "frontend" => &observer.caller,
+            "worker" | "control" => &report.workers[worker_index],
+            "guardian" => &observer.guardian,
+            _ => {
+                return Err(CiError::Message(
+                    "unknown original lifecycle intervention actor".into(),
+                ));
+            }
+        };
+        let attempt = observer.observation.admission.attempt_id.as_str();
+        let duplicated = selected.duplicate_for_intervention(context.work_deadline);
+        let acquisition = match duplicated.as_ref() {
+            Ok(owner) => {
+                serde_json::json!({"acquired":true,"pid":owner.process_id,"birth":owner.birth,"original_pidfd_duplicated":true})
+            }
+            Err(error) => serde_json::json!({"acquired":false,"failure":error}),
+        };
+        let early = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.lifecycle-intervention-early-ownership","revision":1,"diagnostic_only":true,
+            "key":key,"attempt_id":attempt,"role":actor,"stage":"prepared-before-release",
+            "expected_pid":selected.process_id,"expected_birth":selected.birth,
+            "acquisition":acquisition
+        }))?;
+        let early_retained = super::linux_lifecycle_diagnostics::publish(
+            context.publication,
+            &context
+                .artifact_root
+                .join(prefix)
+                .join("intervention-early-ownership.json"),
+            &early,
+            &mut report.artifacts,
+        );
+        let duplicate = match duplicated {
+            Ok(owner) => owner,
+            Err(primary) => {
+                return Err(CiError::Message(format!(
+                    "original {actor} intervention capability at prepared barrier failed: {primary:?}; evidence={:?}",
+                    early_retained.as_ref().map(|_| ())
+                )));
+            }
+        };
+        // Store cleanup custody before any further fallible image measurement.
+        report.actor_owners.push(InterventionOwner {
+            key: key.clone(),
+            attempt: attempt.to_owned(),
+            role: actor.to_owned(),
+            owner: duplicate,
+            image: None,
+        });
+        report.files.push(early_retained?);
+        let selected = report
+            .actor_owners
+            .last_mut()
+            .expect("original selected actor retained");
+        let image = selected
+            .owner
+            .hold_executable_image(context.work_deadline)
+            .map_err(|error| {
+                CiError::Message(format!(
+                    "original {actor} pid={} birth={} early executable measurement: {error}",
+                    selected.owner.process_id, selected.owner.birth
+                ))
+            })?;
+        let expected_image = if actor == "frontend" {
+            context.selected_cli_sha256
+        } else {
+            context.selected_agent_sha256
+        };
+        if image["sha256"] != expected_image {
+            return Err(CiError::Message(format!(
+                "original {actor} prepared executable differs from selected installed image"
+            )));
+        }
+        selected.image = Some(image.clone());
+        let measured = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.lifecycle-intervention-early-image","revision":1,
+            "diagnostic_only":true,"key":key,"attempt_id":attempt,"role":actor,"native_image":image,"selected_image_sha256":expected_image}),
+        )?;
+        report
+            .files
+            .push(super::linux_lifecycle_diagnostics::publish(
+                context.publication,
+                &context
+                    .artifact_root
+                    .join(prefix)
+                    .join("intervention-early-image.json"),
+                &measured,
+                &mut report.artifacts,
+            )?);
+    }
     let (journal, record) = retain_phase_journal(
         observer.observation.admission.attempt_id.as_str(),
         context.work_deadline,
@@ -503,7 +709,54 @@ pub fn begin_case(
         "phase":record["phase"],"release_knowledge":record["release_knowledge"],
         "journal_sha256":super::artifacts::checksum(&journal),"prepared":observer.observation,
         "frontend_invocation":serde_json::from_slice::<serde_json::Value>(&owner.launch.retained_frontend_invocation()?)?}));
+    let errors = retain_existing_context(context, &context.artifact_root.join(prefix), report);
+    if !errors.is_empty() {
+        return Err(CiError::Message(format!(
+            "original lifecycle allocation context retention failed: {errors:?}"
+        )));
+    }
     Ok(index)
+}
+
+fn retain_existing_context(
+    context: &super::linux_readiness_limits_cases::LimitsContext<'_>,
+    directory: &std::path::Path,
+    report: &mut LifecycleReport,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for name in [
+        "allocation-phase-journal.bin",
+        "frontend-preinput.json",
+        "frontend-invocation.json",
+        "prepared-native-before-ack.json",
+    ] {
+        let mut captured = Vec::new();
+        match super::linux_lifecycle_diagnostics::register_existing(
+            context.publication,
+            &directory.join(name),
+            &mut captured,
+        ) {
+            Ok(file) => {
+                for artifact in captured {
+                    match report
+                        .artifacts
+                        .iter()
+                        .find(|old| old.path == artifact.path)
+                    {
+                        Some(old)
+                            if old.length == artifact.length && old.sha256 == artifact.sha256 => {}
+                        Some(_) => errors.push(format!(
+                            "existing context {name} changed from original registered bytes"
+                        )),
+                        None => report.artifacts.push(artifact),
+                    }
+                }
+                report.files.push(file);
+            }
+            Err(error) => errors.push(format!("existing context {name}: {error}")),
+        }
+    }
+    errors
 }
 
 fn retain_bytes(path: &std::path::Path, bytes: &[u8], owners: &mut Vec<File>) -> Result<()> {
@@ -532,6 +785,9 @@ pub fn intervene(
     index: usize,
     directory: &std::path::Path,
 ) -> Result<()> {
+    // This runs before any new phase probe, so failed capture cannot erase
+    // independently retained original input/owner evidence.
+    let mut diagnostic_errors = retain_existing_context(context, directory, report);
     let owner = report
         .native
         .owners
@@ -560,19 +816,53 @@ pub fn intervene(
         .workers
         .get(worker_index)
         .ok_or_else(|| CiError::Message("original lifecycle native worker owner absent".into()))?;
+    // Register independent existing context even if a new publication fails.
     let (journal, record) = retain_phase_journal(
-        observer.observation.admission.attempt_id.as_str(),
-        context.work_deadline,
-        &mut report.files,
-    )?;
+        observer.observation.admission.attempt_id.as_str(), context.work_deadline, &mut report.files,
+    ).map_err(|primary| CiError::Message(format!("selected lifecycle phase={phase}; {primary}; existing context retention={diagnostic_errors:?}")))?;
+    // Preserve the authenticated observation even if the selected barrier fails.
+    let journal_capture = super::linux_lifecycle_diagnostics::publish(
+        context.publication,
+        &directory.join("phase-journal.bin"),
+        &journal,
+        &mut report.artifacts,
+    );
+    match journal_capture {
+        Ok(file) => report.files.push(file),
+        Err(error) => diagnostic_errors.push(format!("phase journal publication: {error}")),
+    }
+    let secondary = (|| -> Result<()> {
+        let witness = serde_json::to_vec(&serde_json::json!({
+            "format":"memcordon.linux-lifecycle-barrier-observation","revision":1,
+            "diagnostic_only":true,"key":owner.key,"admission":observer.observation.admission,
+            "selected_phase":phase,"phase":record["phase"],
+            "release_knowledge":record["release_knowledge"],
+            "journal_sha256":super::artifacts::checksum(&journal),
+            "frontend":observer.caller.retirement_identity().map_err(CiError::Message)?,
+            "worker":worker.retirement_identity().map_err(CiError::Message)?,
+            "guardian":observer.guardian.retirement_identity().map_err(CiError::Message)?
+        }))?;
+        report
+            .files
+            .push(super::linux_lifecycle_diagnostics::publish(
+                context.publication,
+                &directory.join("barrier-observation.json"),
+                &witness,
+                &mut report.artifacts,
+            )?);
+        Ok(())
+    })();
+    if let Err(error) = secondary {
+        diagnostic_errors.push(error.to_string());
+    }
     let mut barrier = None;
     match phase {
         "allocation"
-            if record["phase"] == "checkpoint-committed"
-                && record["release_knowledge"] == "not-released" => {}
+            if record["phase"] == "release-intent"
+                && record["release_knowledge"] == "possibly-released" => {}
         "release"
-            if record["phase"] == "checkpoint-committed"
-                && record["release_knowledge"] == "not-released" =>
+            if record["phase"] == "release-intent"
+                && record["release_knowledge"] == "possibly-released" =>
         {
             let path = owner
                 .launch
@@ -602,11 +892,16 @@ pub fn intervene(
                 && record["release_knowledge"] == "exec-observed"
                 && observer.target.exited().map_err(CiError::Message)? => {}
         _ => {
-            return Err(CiError::Message(
-                "actual native lifecycle phase has not reached selected intervention barrier"
-                    .into(),
-            ));
+            return Err(CiError::Message(format!(
+                "actual native lifecycle phase has not reached selected {phase} intervention barrier: phase={} release_knowledge={}; diagnostic capture errors={diagnostic_errors:?}",
+                record["phase"], record["release_knowledge"]
+            )));
         }
+    }
+    if !diagnostic_errors.is_empty() {
+        return Err(CiError::Message(format!(
+            "lifecycle barrier diagnostic capture incomplete: {diagnostic_errors:?}"
+        )));
     }
     if record["frontend"]["pid"] != observer.caller.process_id
         || record["frontend"]["start_time"] != observer.caller.birth
@@ -619,33 +914,41 @@ pub fn intervene(
             "current lifecycle journal replaces original held actors".into(),
         ));
     }
-    retain_bytes(
-        &directory.join("phase-journal.bin"),
-        &journal,
-        &mut report.files,
-    )?;
     let target = match actor {
         "frontend" => &observer.caller,
         "worker" | "control" => worker,
         "guardian" => &observer.guardian,
         _ => return Err(CiError::Message("unknown lifecycle native actor".into())),
     };
-    let identity = target.retirement_identity().map_err(CiError::Message)?;
-    report.actor_owners.push(
-        HeldLinuxProcess::acquire(target.process_id, target.birth).map_err(CiError::Message)?,
-    );
-    let image = report
-        .actor_owners
-        .last_mut()
-        .expect("retained selected actor image owner")
-        .hold_executable_image(context.work_deadline)
+    let mut retained = report.actor_owners.iter().filter(|retained| {
+        retained.key == owner.key
+            && retained.attempt == observer.observation.admission.attempt_id.as_str()
+            && retained.role == actor
+    });
+    let selected = retained.next().ok_or_else(|| {
+        CiError::Message("original prepared intervention capability absent".into())
+    })?;
+    if retained.next().is_some()
+        || selected.owner.process_id != target.process_id
+        || selected.owner.birth != target.birth
+    {
+        return Err(CiError::Message(
+            "original prepared intervention capability association differs".into(),
+        ));
+    }
+    let identity = selected
+        .owner
+        .retirement_identity()
         .map_err(CiError::Message)?;
+    let image = selected.image.as_ref().ok_or_else(|| {
+        CiError::Message("original prepared intervention image pin absent".into())
+    })?;
     let selected_image = if actor == "frontend" {
         context.selected_cli_sha256
     } else {
         context.selected_agent_sha256
     };
-    if image["sha256"] != selected_image || target.exited().map_err(CiError::Message)? {
+    if image["sha256"] != selected_image {
         return Err(CiError::Message(
             "actual lifecycle actor image differs from selected installed owner".into(),
         ));
@@ -661,6 +964,41 @@ pub fn intervene(
         &serde_json::to_vec(&intent)?,
         &mut report.files,
     )?;
+    let current_image = match selected
+        .owner
+        .verify_intervention_image(context.work_deadline)
+    {
+        Ok(value) => value,
+        Err(primary) => {
+            let failure = serde_json::to_vec(
+                &serde_json::json!({"format":"memcordon.lifecycle-intervention-not-performed","revision":1,
+                "diagnostic_only":true,"key":owner.key,"attempt_id":selected.attempt,"role":actor,"stage":"immediate-pre-action-current-image-and-liveness",
+                "expected_identity":identity,"observed_retirement":selected.owner.retirement_identity(),"phase":record["phase"],"release_knowledge":record["release_knowledge"],
+                "original_work_deadline_unix_millis":context.work_deadline_unix_millis,"reason":primary}),
+            )?;
+            let published = super::linux_lifecycle_diagnostics::publish(
+                context.publication,
+                &directory.join("intervention-not-performed.json"),
+                &failure,
+                &mut report.artifacts,
+            );
+            let evidence = match published {
+                Ok(file) => {
+                    report.files.push(file);
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            return Err(CiError::Message(format!(
+                "selected {actor} intervention not performed: {primary}; evidence={evidence:?}"
+            )));
+        }
+    };
+    if Instant::now() >= context.work_deadline {
+        return Err(CiError::Message(
+            "original intervention cutoff expired immediately before action".into(),
+        ));
+    }
     let action = if actor == "control" {
         let connection = report
             .controls
@@ -672,11 +1010,27 @@ pub fn intervene(
             .ok_or_else(|| {
                 CiError::Message("original lifecycle control connection absent".into())
             })?;
-        connection.shutdown(worker, &observer.caller, context.work_deadline)?
+        match connection.shutdown(worker, &observer.caller, context.work_deadline) {
+            Ok(mut value) => {
+                value["current_image_check"] = current_image;
+                value
+            }
+            Err(reason) => {
+                serde_json::json!({"format":"memcordon.linux-lifecycle-control-not-performed","revision":1,
+                "native_status":-1,"not_performed_reason":reason.to_string(),"current_image_check":current_image})
+            }
+        }
     } else {
-        let native = target.signal_kill().map_err(CiError::Message)?;
-        serde_json::json!({"format":"memcordon.linux-lifecycle-pidfd-kill","revision":1,"actor":identity,
-            "signal":9,"native_status":if native.is_ok(){0}else{-1},"native_errno":native.err()})
+        match selected.owner.signal_kill() {
+            Ok(native) => {
+                serde_json::json!({"format":"memcordon.linux-lifecycle-pidfd-kill","revision":1,"actor":identity,
+                "signal":9,"native_status":if native.is_ok(){0}else{-1},"native_errno":native.err(),"current_image_check":current_image})
+            }
+            Err(reason) => {
+                serde_json::json!({"format":"memcordon.linux-lifecycle-pidfd-kill","revision":1,"actor":identity,
+                "signal":9,"native_status":-1,"native_errno":null,"not_performed_reason":reason,"current_image_check":current_image})
+            }
+        }
     };
     retain_bytes(
         &directory.join("controller-action.json"),
@@ -1118,6 +1472,64 @@ pub fn run_case(
             report.files.push(journal);
         }
     }
+    // Orphan recovery refuses live frontend/worker owners. Package-lease
+    // release is not process retirement; use the original held pidfds only.
+    let selected_worker = report
+        .observations
+        .iter()
+        .find(|observation| {
+            observation["key"] == serde_json::to_value(&key).unwrap_or(serde_json::Value::Null)
+        })
+        .and_then(|observation| observation["worker_index"].as_u64())
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| report.workers.get(index))
+        .ok_or_else(|| {
+            CiError::Message(
+                "original lifecycle selected worker source association absent before recovery"
+                    .into(),
+            )
+        })?;
+    let observer = report.native.owners[index]
+        .observer
+        .as_ref()
+        .ok_or_else(|| {
+            CiError::Message("original lifecycle frontend owner absent before recovery".into())
+        })?;
+    let sample = || -> std::result::Result<super::linux_recovery_owners::Owners, String> {
+        Ok(super::linux_recovery_owners::Owners {
+            frontend: observer.caller.retirement_identity().map_err(|error| format!("original frontend pid={} birth={} held-pidfd retirement observation: {error}", observer.caller.process_id, observer.caller.birth))?,
+            worker: selected_worker.retirement_identity().map_err(|error| format!("original selected worker pid={} birth={} held-pidfd retirement observation: {error}", selected_worker.process_id, selected_worker.birth))?,
+        })
+    };
+    let before = sample().map_err(CiError::Message)?;
+    let retirement =
+        super::linux_recovery_owners::await_retirement(before, context.cleanup_deadline, sample);
+    let retirement_bytes = serde_json::to_vec(&serde_json::json!({
+        "format":"memcordon.linux-original-recovery-owner-precondition","revision":1,
+        "diagnostic_only":true,"identity":context.identity,"cell":context.cell,
+        "lease_id":context.lease_id,"key":key,"attempt_id":observer.observation.admission.attempt_id,
+        "original_cleanup_deadline_unix_millis":context.cleanup_deadline_unix_millis,
+        "observation":retirement,
+        "frontend_still_live":!retirement.after.frontend.retirement_observed,
+        "worker_still_live":!retirement.after.worker.retirement_observed,
+        "target_init_guardian":"not a precondition; original recovery retains their cleanup responsibility"
+    }))?;
+    let retained = super::linux_lifecycle_diagnostics::publish(
+        context.publication,
+        &root.join(crate::linux_consumer_readiness::recovery_artifact_tree::LIFECYCLE_RECOVERY_OWNER_PRECONDITION),
+        &retirement_bytes,
+        &mut report.artifacts,
+    );
+    if !retirement.retired {
+        return Err(CiError::Message(format!(
+            "{}; frontend={:?}; worker={:?}; precondition publication={:?}",
+            retirement.reason,
+            retirement.after.frontend,
+            retirement.after.worker,
+            retained.as_ref().map(|_| ())
+        )));
+    }
+    report.files.push(retained?);
     use super::linux_original_recovery::{contract, record};
     let original_input = contract::Input {
         format: "memcordon.original-native-recovery-input".into(),
@@ -1155,11 +1567,66 @@ pub fn run_case(
             }
         },
     };
-    let recovery = super::linux_original_recovery::run(
+    let recovery_result = super::linux_original_recovery::run(
         context.recovery_harness,
         &original_input,
         context.cleanup_deadline,
-    )?;
+    );
+    // These attempts are nested under this selected recipe root, not the global
+    // artifact root. Register partial/failed evidence before propagating Err.
+    let recovery_retention = (|| -> Result<()> {
+        let (files, issues) =
+            crate::linux_consumer_readiness::recovery_artifact_tree::collect_diagnostic_attempts(
+                &root,
+                |path, bound| {
+                    super::linux_mixed_installed::read_owned_resource(path, bound)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(CiError::Message)?;
+        for (path, bytes) in files {
+            let path = root.join(path);
+            let held = super::linux_lifecycle_diagnostics::register_existing(
+                context.publication,
+                &path,
+                &mut report.artifacts,
+            )?;
+            if held.metadata()?.len() != bytes.len() as u64
+                || report
+                    .artifacts
+                    .last()
+                    .is_none_or(|artifact| artifact.sha256 != super::artifacts::checksum(&bytes))
+            {
+                return Err(CiError::Message(
+                    "original recovery retained diagnostic extent changed".into(),
+                ));
+            }
+            report.files.push(held);
+        }
+        let inventory = serde_json::to_vec(
+            &serde_json::json!({"format":"memcordon.original-recovery-selected-attempt-inventory","revision":1,"diagnostic_only":true,"issues":issues}),
+        )?;
+        report
+            .files
+            .push(super::linux_lifecycle_diagnostics::publish(
+                context.publication,
+                &root.join(crate::linux_consumer_readiness::recovery_artifact_tree::LIFECYCLE_RECOVERY_DIAGNOSTIC_INVENTORY),
+                &inventory,
+                &mut report.artifacts,
+            )?);
+        Ok(())
+    })();
+    let recovery = match recovery_result {
+        Ok(recovery) => {
+            recovery_retention?;
+            recovery
+        }
+        Err(primary) => {
+            return Err(CiError::Message(format!(
+                "{primary}; selected original recovery diagnostic retention={recovery_retention:?}"
+            )));
+        }
+    };
     let mut invocation = recovery.invocation.clone();
     invocation["original_fixture"] = recovery.proof().clone();
     invocation["original_fixture"]["acquisition_artifacts"] =
@@ -1232,16 +1699,21 @@ pub fn run_case(
     let actor_birth = intent["actor"]["birth"]
         .as_u64()
         .ok_or_else(|| CiError::Message("original lifecycle actor birth absent".into()))?;
-    let mut actors = report
-        .actor_owners
-        .iter()
-        .filter(|actor| u64::from(actor.process_id) == actor_pid && actor.birth == actor_birth);
+    let mut actors = report.actor_owners.iter().filter(|actor| {
+        actor.key == key
+            && actor.attempt == observer.observation.admission.attempt_id.as_str()
+            && u64::from(actor.owner.process_id) == actor_pid
+            && actor.owner.birth == actor_birth
+    });
     let selected_actor = if delivery {
         &observer.caller
     } else {
-        actors.next().ok_or_else(|| {
-            CiError::Message("original lifecycle controller actor owner absent".into())
-        })?
+        &actors
+            .next()
+            .ok_or_else(|| {
+                CiError::Message("original lifecycle controller actor owner absent".into())
+            })?
+            .owner
     };
     if actors.next().is_some() {
         return Err(CiError::Message(
@@ -1317,6 +1789,49 @@ pub fn normalize_completed(
             .map_err(|error| CiError::Message(error.to_string()))?
             .to_str()
             .ok_or_else(|| CiError::Message("lifecycle artifact namespace is not UTF8".into()))?;
+        let frozen = report
+            .fixture_budget
+            .as_ref()
+            .ok_or_else(|| CiError::Message("original lifecycle fixture budget absent".into()))?;
+        let reconstructed =
+            super::linux_fixture_memory_budget::FrozenImageMemoryBudget::for_images(
+                &images.runtime,
+                &images.input,
+                &images.runtime.reference().map_err(CiError::Message)?,
+                &images.input.reference().map_err(CiError::Message)?,
+                frozen.budget.page_bytes,
+                512 * 1024 * 1024,
+            )
+            .map_err(CiError::Message)?;
+        if serde_json::to_vec(&reconstructed)? != serde_json::to_vec(&frozen.budget)? {
+            return Err(CiError::Message(
+                "lifecycle fixture budget differs from original images".into(),
+            ));
+        }
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut held = frozen.file.try_clone()?;
+            held.seek(SeekFrom::Start(0))?;
+            let mut receipt = Vec::new();
+            held.take(frozen.receipt.len() as u64 + 1)
+                .read_to_end(&mut receipt)?;
+            let named = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(directory.join("fixture-memory-budget.json"))?;
+            let before = frozen.file.metadata()?;
+            let after = named.metadata()?;
+            if receipt != frozen.receipt
+                || before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || before.nlink() != 1
+                || before.len() != frozen.receipt.len() as u64
+            {
+                return Err(CiError::Message(
+                    "held lifecycle fixture budget changed".into(),
+                ));
+            }
+        }
         let mut added = Vec::new();
         let mut persist = |name: &str, bytes: &[u8]| -> Result<Artifact> {
             if Instant::now() >= input.cleanup_deadline {
@@ -1416,7 +1931,7 @@ pub fn normalize_completed(
             binary: Vec::new(),
             target_argv: NativeArguments::UnixBytes(target),
             deadline_millis: Some(300_000),
-            memory_bytes: Some(512 * 1024 * 1024),
+            memory_bytes: Some(frozen.budget.limit_bytes),
             toolchain_identity: None,
         };
         let descriptor = persist("fixture-input.json", &serde_json::to_vec(&descriptor)?)?;
@@ -1518,6 +2033,8 @@ pub fn normalize_completed(
         }
         let mut peers = Vec::new();
         for name in [
+            "fixture-memory-budget.json",
+            "fixture-memory-max.json",
             "challenge.bin",
             "frontend-invocation.json",
             "frontend-preinput.json",
@@ -1655,7 +2172,21 @@ pub fn normalize_completed(
             length: bytes.len() as u64,
             sha256: super::artifacts::checksum(&bytes),
         });
-        report.artifacts.extend(added);
+        for artifact in added {
+            if let Some(original) = report
+                .artifacts
+                .iter()
+                .find(|value| value.path == artifact.path)
+            {
+                if original.length != artifact.length || original.sha256 != artifact.sha256 {
+                    return Err(CiError::Message(
+                        "lifecycle frozen artifact changed before normalization".into(),
+                    ));
+                }
+            } else {
+                report.artifacts.push(artifact);
+            }
+        }
         report.records.push(CaseRecord {
             key: key.clone(),
             run_id: input.identity.run_id.clone(),
@@ -1684,17 +2215,35 @@ pub fn retain_phase_journal(
             "lifecycle phase attempt/cutoff differs".into(),
         ));
     }
-    let path = std::path::PathBuf::from("/var/lib/memcordon/sealed").join(attempt);
-    let ancestry_start = owners.len();
+    // Probes own their descriptors transactionally. Only a selected stable
+    // snapshot may extend the caller's retained custody.
+    let mut ancestry = Vec::new();
+    let mut original_ancestry = Vec::new();
     let root = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
-    owners.push(root);
+    let metadata = root.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() == 0
+    {
+        return Err(CiError::Message(
+            "actual lifecycle journal root custody differs".into(),
+        ));
+    }
+    ancestry.push(root);
+    original_ancestry.push((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+    ));
     for component in ["var", "lib", "memcordon", "sealed"] {
         let next = File::from(
             rustix::fs::openat(
-                owners.last().expect("held native journal parent"),
+                ancestry.last().expect("held native journal parent"),
                 component,
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
@@ -1714,120 +2263,88 @@ pub fn retain_phase_journal(
                 "actual lifecycle journal ancestry is not protected held root custody".into(),
             ));
         }
-        owners.push(next);
-    }
-    let file = File::from(
-        rustix::fs::openat(
-            owners.last().expect("held sealed journal directory"),
-            attempt,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|error| CiError::Message(error.to_string()))?,
-    );
-    let before = file.metadata()?;
-    owners.push(file.try_clone()?);
-    if !before.is_file()
-        || before.uid() != 0
-        || before.nlink() != 1
-        || before.mode() & 0o7777 != 0o600
-        || before.len() > 1024 * 1024
-    {
-        return Err(CiError::Message(
-            "actual lifecycle phase journal custody differs".into(),
-        ));
-    }
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| CiError::Message(error.to_string()))?;
-    let (body, digest) = text
-        .rsplit_once("digest=")
-        .ok_or_else(|| CiError::Message("phase journal checksum absent".into()))?;
-    if digest != format!("{}\n", super::artifacts::checksum(body.as_bytes())) {
-        return Err(CiError::Message(
-            "actual phase journal checksum differs".into(),
-        ));
-    }
-    let mut lines = body.lines();
-    if lines.next() != Some("format=memcordon.private-native-journal")
-        || lines.next() != Some("revision=1")
-    {
-        return Err(CiError::Message(
-            "actual lifecycle journal envelope differs".into(),
-        ));
-    }
-    let group = lines
-        .next()
-        .and_then(|line| line.strip_prefix("cgroup="))
-        .ok_or_else(|| CiError::Message("phase journal cgroup absent".into()))?;
-    let payload = lines
-        .next()
-        .and_then(|line| line.strip_prefix("payload="))
-        .ok_or_else(|| CiError::Message("phase journal payload absent".into()))?;
-    if lines.next().is_some() || group != attempt {
-        return Err(CiError::Message(
-            "phase journal original cgroup/envelope differs".into(),
-        ));
-    }
-    memcordon_core::workload_contract::reject_duplicate_json_keys(payload.as_bytes())
-        .map_err(CiError::Message)?;
-    let record: serde_json::Value = serde_json::from_slice(payload.as_bytes())?;
-    if record["attempt_id"] != attempt {
-        return Err(CiError::Message(
-            "actual phase journal attempt differs".into(),
-        ));
-    }
-    let held = owners
-        .last()
-        .expect("retained lifecycle journal descriptor")
-        .metadata()?;
-    let named = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)?
-        .metadata()?;
-    let stamp = |metadata: &std::fs::Metadata| {
-        (
+        original_ancestry.push((
             metadata.dev(),
             metadata.ino(),
-            metadata.len(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-            metadata.nlink(),
             metadata.uid(),
             metadata.mode(),
-        )
-    };
-    if stamp(&before) != stamp(&held) || stamp(&held) != stamp(&named) || Instant::now() >= deadline
-    {
-        return Err(CiError::Message(
-            "actual lifecycle journal changed during phase capture".into(),
         ));
+        ancestry.push(next);
     }
-    for (index, name) in [
+    let names = [
         "/",
         "/var",
         "/var/lib",
         "/var/lib/memcordon",
         "/var/lib/memcordon/sealed",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let named = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(name)?;
-        let held = owners[ancestry_start + index].metadata()?;
-        let current = named.metadata()?;
-        if (held.dev(), held.ino(), held.uid(), held.mode())
-            != (current.dev(), current.ino(), current.uid(), current.mode())
-        {
-            return Err(CiError::Message(
-                "actual lifecycle journal ancestor replaced during phase capture".into(),
-            ));
+    ];
+    let verify_ancestry = || -> Result<()> {
+        for (index, name) in names.iter().enumerate() {
+            let named = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(name)?;
+            let held = ancestry[index].metadata()?;
+            let current = named.metadata()?;
+            if (held.dev(), held.ino(), held.uid(), held.mode()) != original_ancestry[index]
+                || (current.dev(), current.ino(), current.uid(), current.mode())
+                    != original_ancestry[index]
+                || held.nlink() == 0
+                || current.nlink() == 0
+                || held.uid() != 0
+                || held.mode() & 0o022 != 0
+                || current.uid() != 0
+                || current.mode() & 0o022 != 0
+            {
+                return Err(CiError::Message(
+                    "actual lifecycle journal ancestor replaced during phase capture".into(),
+                ));
+            }
+        }
+        Ok(())
+    };
+    let mut expected = None;
+    let mut advances = 0_u64;
+    let mut history = std::collections::VecDeque::new();
+    loop {
+        verify_ancestry()?;
+        let capture = super::linux_phase_journal::capture(
+            ancestry.last().expect("held sealed journal directory"),
+            attempt,
+            0,
+            expected.as_ref(),
+            deadline,
+        );
+        let diagnostic = capture.diagnostic();
+        verify_ancestry()?;
+        match capture {
+            super::linux_phase_journal::Capture::Stable(snapshot) => {
+                if Instant::now() >= deadline {
+                    return Err(CiError::Message(format!(
+                        "actual lifecycle journal original cutoff expired before custody commit; advances={advances}; history={history:?}"
+                    )));
+                }
+                let (bytes, record, held) = (snapshot.bytes, snapshot.record, snapshot.held);
+                owners.append(&mut ancestry);
+                owners.push(held);
+                return Ok((bytes, record));
+            }
+            super::linux_phase_journal::Capture::GenerationAdvanced { association, .. } => {
+                advances = advances.saturating_add(1);
+                if history.len() == 8 {
+                    history.pop_front();
+                }
+                history.push_back(diagnostic);
+                if expected.is_none() {
+                    expected = Some(association);
+                }
+                std::thread::yield_now();
+            }
+            _ => {
+                return Err(CiError::Message(format!(
+                    "actual lifecycle journal capture failed; attempt={attempt}; advances={advances}; diagnostic={diagnostic}; history={history:?}"
+                )));
+            }
         }
     }
-    Ok((bytes, record))
 }

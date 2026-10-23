@@ -1,6 +1,5 @@
 //! Genuine private measured-fixture recovery and retained native process evidence.
-#[path = "../../../../crates/memcordon-cli/src/bin/original_native_recovery_contract.rs"]
-pub mod contract;
+pub use super::linux_recovery_diagnostic::contract;
 use super::{artifacts, linux_recovery_harness::HeldRecoveryHarness};
 use crate::{CiError, Result, command::CommandSpec, linux_consumer_readiness::HeldLinuxProcess};
 use std::{
@@ -92,7 +91,12 @@ pub fn run(
         let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&original_path)?;
+            .open(&original_path)
+            .map_err(|error| {
+                CiError::Message(format!(
+                    "original recovery open source role={role} path={original_path:?}: {error}"
+                ))
+            })?;
         let before = source.metadata()?;
         if !before.is_file()
             || before.uid() != 0
@@ -219,7 +223,7 @@ pub fn run(
             creation = Some(serde_json::json!({"identity":process.retirement_identity().map_err(CiError::Message)?,"image":image}));
             held = Some(process);
             Ok(())
-        })?;
+        }).map_err(|error| CiError::Message(format!("original recovery invoke measured harness executable={:?} cwd={root:?} input={input_path:?}: {error}", harness.harness().executable)))?;
     create(
         &root.join("original-native-recovery-stdout.bin"),
         &observed.stdout,
@@ -279,15 +283,40 @@ pub fn run(
             Err(error) => return Err(error.into()),
         }
     }
+    // A failed operation has a separate diagnostic record, never a success
+    // receipt. Retention errors remain secondary to the child's native status.
+    let failure_diagnostic = (|| -> std::result::Result<Option<serde_json::Value>, String> {
+        let path = root.join(contract::FAILURE_LEAF);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failure diagnostic metadata: {error}")),
+            Ok(_) => {}
+        }
+        let bytes = super::linux_mixed_installed::read_owned_resource(
+            &path,
+            contract::FAILURE_BOUND as u64,
+        )
+        .map_err(|error| format!("failure diagnostic read: {error}"))?;
+        create(&retained_attempt.join(contract::FAILURE_LEAF), &bytes)
+            .map_err(|error| format!("failure diagnostic retention: {error}"))?;
+        super::linux_recovery_diagnostic::failure(&bytes, &input_bytes).map(Some)
+    })();
     harness.verify()?;
     let named = std::fs::symlink_metadata(root)?;
     if (named.dev(), named.ino()) != (directory_identity.dev(), directory_identity.ino())
         || !named.is_dir()
         || !retired
         || !observed.status.success()
+        || !matches!(&failure_diagnostic, Ok(None))
     {
+        let receipt_diagnostic = super::linux_mixed_installed::read_owned_resource(
+            &retained_attempt.join(contract::RESULT_LEAF),
+            4 * 1024 * 1024,
+        )
+        .map_err(|error| format!("retained receipt read: {error}"))
+        .and_then(|bytes| super::linux_recovery_diagnostic::receipt(&bytes, &input_bytes));
         return Err(CiError::Message(format!(
-            "original measured recovery failed or original scope/process changed; expected-root-device={}; expected-root-inode={}; actual-root-device={}; actual-root-inode={}; actual-root-is-directory={}; pidfd-retirement-observed={retired}; native-status={:?}; native-wait-status={}; stdout-bytes={}; stdout={:?}; stderr-bytes={}; stderr={:?}",
+            "original measured recovery failed or original scope/process changed; retained-attempt={retained_attempt:?}; diagnostic-receipt={receipt_diagnostic:?}; diagnostic-failure={failure_diagnostic:?}; expected-root-device={}; expected-root-inode={}; actual-root-device={}; actual-root-inode={}; actual-root-is-directory={}; pidfd-retirement-observed={retired}; native-status={:?}; native-wait-status={}; stdout-bytes={}; stdout={:?}; stderr-bytes={}; stderr={:?}",
             directory_identity.dev(),
             directory_identity.ino(),
             named.dev(),
