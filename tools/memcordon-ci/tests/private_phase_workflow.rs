@@ -27,16 +27,10 @@ fn private_payloads_and_runtime_are_required_exact_host_artifact_phases() {
             == Some(
                 "./target/ci-runtime/current/memcordon-ci ci segment backend-linux-private-prepare"
             )));
-        assert!(!steps.iter().any(|step| {
+        assert!(steps.iter().any(|step| {
             step["run"]
                 .as_str()
                 .is_some_and(|run| run.contains(" ci segment workspace-fetch"))
-        }));
-        assert!(!steps.iter().any(|step| {
-            step["id"].as_str().is_some_and(|id| {
-                id.starts_with("private-run-private-native-tests-")
-                    || id.starts_with("private-run-request-private-native-tests-")
-            })
         }));
         let upload = steps
             .iter()
@@ -64,14 +58,6 @@ fn private_payloads_and_runtime_are_required_exact_host_artifact_phases() {
             step["run"].as_str().is_some_and(|run| {
                 run.contains(" ci driver-build")
                     || run.contains("--target-dir target/ci-driver-cold")
-            })
-        }));
-        assert!(!steps.iter().any(|step| {
-            step["id"].as_str().is_some_and(|id| {
-                id.starts_with("private-run-product-")
-                    || id.starts_with("private-run-native-tests-")
-                    || id.starts_with("private-run-request-product-")
-                    || id.starts_with("private-run-request-native-tests-")
             })
         }));
         for step in producer["steps"].as_sequence().unwrap().iter().chain(steps) {

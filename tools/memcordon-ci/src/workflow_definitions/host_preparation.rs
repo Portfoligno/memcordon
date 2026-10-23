@@ -354,10 +354,9 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
             if field(&steps[check], "run") != tools_command(host.starts_with("windows-"), false)
                 || !steps[check]["if"].is_null()
                 || steps[check]["continue-on-error"].as_bool() == Some(true)
-                || steps[..check].iter().any(|step| {
-                    field(step, "run").contains(" ci cache-requests ")
-                        || field(step, "run").contains(" release compile-target ")
-                })
+                || steps[..check]
+                    .iter()
+                    .any(|step| field(step, "run").contains(" release compile-target "))
             {
                 return Err(CiError::Message(
                     "helper source check must precede selected work".into(),

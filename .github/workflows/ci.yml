@@ -60,8 +60,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -78,12 +78,12 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
-        timeout-minutes: 4
-        run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select
+        timeout-minutes: 66
+        run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-select --feedback repository-policy
       - id: driver-context-source-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.source-restore == 'true'
         continue-on-error: true
@@ -100,7 +100,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -109,7 +109,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -118,7 +118,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -127,14 +127,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
-        timeout-minutes: 50
-        run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
+        timeout-minutes: 112
+        run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build --feedback repository-policy
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -151,7 +151,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -168,7 +168,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -193,7 +193,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -235,10 +235,10 @@ jobs:
         run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci-driver-cold -p memcordon-ci --bin memcordon-ci
       - id: driver-cold-adopt
         if: steps.driver-cold-build.outcome == 'success'
-        timeout-minutes: 15
-        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
+        timeout-minutes: 77
+        run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold --feedback repository-policy
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -255,7 +255,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -291,22 +291,13 @@ jobs:
         if: always() && steps.driver-cold-adopt.outcome == 'success'
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci driver-cleanup
-      - id: driver-workflows-check
-        if: runner.os != 'Windows'
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci workflows --check
-      - name: Run repository policy
-        id: suite-policy
-        run: ./target/ci-runtime/current/memcordon-ci ci segment policy
-        if: runner.os != 'Windows'
-        timeout-minutes: 60
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   quality:
     if: github.event_name != 'push'
     name: quality / check and Clippy
     runs-on: ubuntu-24.04
-    timeout-minutes: 294
+    timeout-minutes: 279
     steps:
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -319,10 +310,6 @@ jobs:
       - name: Install quality Rust
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
         timeout-minutes: 15
-      - name: Check Rust formatting
-        run: rustup run 1.97.1 cargo fmt --all -- --check
-        timeout-minutes: 15
-        id: early-format
       - id: public-source-seed-restore
         uses: *action_1
         continue-on-error: true
@@ -342,8 +329,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -360,7 +347,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -382,7 +369,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -391,7 +378,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -400,7 +387,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -409,14 +396,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -433,7 +420,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -450,7 +437,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -475,7 +462,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -520,7 +507,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -537,7 +524,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -597,7 +584,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -606,14 +593,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -660,7 +647,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.quality-run-request.outputs.compiled-complete-key }}
-          path: ${{ steps.quality-run-request.outputs.compiled-complete-inbox }}
+          path: ${{ steps.quality-run-request.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.quality-run-request.outputs.compiled-complete-prefix }}
       - id: quality-run-request-compiled-partial-restore
         if: steps.quality-run-request.outputs.compiled-partial-restore == 'true'
@@ -669,7 +656,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.quality-run-request.outputs.compiled-partial-key }}
-          path: ${{ steps.quality-run-request.outputs.compiled-partial-inbox }}
+          path: ${{ steps.quality-run-request.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.quality-run-request.outputs.compiled-partial-prefix }}
       - name: Run quality suite
         id: quality-run
@@ -677,7 +664,7 @@ jobs:
         if: runner.os != 'Windows'
         timeout-minutes: 100
       - id: quality-run-compiled-complete-probe
-        if: always() && steps.quality-run.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.quality-run.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -746,8 +733,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -764,7 +751,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -786,7 +773,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -795,7 +782,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -804,7 +791,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -813,14 +800,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -837,7 +824,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -854,7 +841,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -879,7 +866,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -924,7 +911,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -941,7 +928,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1001,7 +988,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -1010,14 +997,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1064,7 +1051,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.msrv-run-request.outputs.compiled-complete-key }}
-          path: ${{ steps.msrv-run-request.outputs.compiled-complete-inbox }}
+          path: ${{ steps.msrv-run-request.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.msrv-run-request.outputs.compiled-complete-prefix }}
       - id: msrv-run-request-compiled-partial-restore
         if: steps.msrv-run-request.outputs.compiled-partial-restore == 'true'
@@ -1073,7 +1060,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.msrv-run-request.outputs.compiled-partial-key }}
-          path: ${{ steps.msrv-run-request.outputs.compiled-partial-inbox }}
+          path: ${{ steps.msrv-run-request.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.msrv-run-request.outputs.compiled-partial-prefix }}
       - name: Run MSRV suite
         id: msrv-run
@@ -1081,7 +1068,7 @@ jobs:
         if: runner.os != 'Windows'
         timeout-minutes: 100
       - id: msrv-run-compiled-complete-probe
-        if: always() && steps.msrv-run.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.msrv-run.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1147,8 +1134,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -1165,7 +1152,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -1187,7 +1174,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -1196,7 +1183,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -1205,7 +1192,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -1214,14 +1201,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1238,7 +1225,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1255,7 +1242,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1280,7 +1267,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1325,7 +1312,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1342,7 +1329,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1402,7 +1389,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -1411,14 +1398,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1465,7 +1452,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.quality-run-request.outputs.compiled-complete-key }}
-          path: ${{ steps.quality-run-request.outputs.compiled-complete-inbox }}
+          path: ${{ steps.quality-run-request.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.quality-run-request.outputs.compiled-complete-prefix }}
       - id: quality-run-request-compiled-partial-restore
         if: steps.quality-run-request.outputs.compiled-partial-restore == 'true'
@@ -1474,7 +1461,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.quality-run-request.outputs.compiled-partial-key }}
-          path: ${{ steps.quality-run-request.outputs.compiled-partial-inbox }}
+          path: ${{ steps.quality-run-request.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.quality-run-request.outputs.compiled-partial-prefix }}
       - name: Run quality suite
         id: quality-run
@@ -1482,7 +1469,7 @@ jobs:
         if: runner.os != 'Windows'
         timeout-minutes: 100
       - id: quality-run-compiled-complete-probe
-        if: always() && steps.quality-run.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.quality-run.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1567,8 +1554,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -1585,7 +1572,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -1607,7 +1594,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -1616,7 +1603,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -1625,7 +1612,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -1634,14 +1621,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1658,7 +1645,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1675,7 +1662,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1700,7 +1687,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1745,7 +1732,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1762,7 +1749,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1809,8 +1796,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap-windows
         if: runner.os == 'Windows' && steps.driver-bootstrap-cache-windows.outcome == 'success' && steps.driver-bootstrap-cache-windows.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -1827,7 +1814,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.image-key }}
-          path: ${{ steps.driver-context-windows.outputs.image-inbox }}
+          path: ${{ steps.driver-context-windows.outputs.image-path }}
           restore-keys: ${{ steps.driver-context-windows.outputs.image-prefix }}
       - id: driver-selection-windows
         if: steps.driver-bootstrap-windows.outputs.bootstrap-ready == 'true'
@@ -1849,7 +1836,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context-windows.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context-windows.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context-windows.outputs.archives-partial-prefix }}
       - id: driver-context-windows-index-partial-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.index-partial-restore == 'true'
@@ -1858,7 +1845,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.index-partial-key }}
-          path: ${{ steps.driver-context-windows.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context-windows.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context-windows.outputs.index-partial-prefix }}
       - id: driver-context-windows-compiled-complete-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-complete-restore == 'true'
@@ -1867,7 +1854,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context-windows.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context-windows.outputs.compiled-complete-prefix }}
       - id: driver-context-windows-compiled-partial-restore
         if: steps.driver-selection-windows.outputs.build-required == 'true' && steps.driver-context-windows.outputs.compiled-partial-restore == 'true'
@@ -1876,14 +1863,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context-windows.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context-windows.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context-windows.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context-windows.outputs.compiled-partial-prefix }}
       - id: driver-managed-build-windows
         if: steps.driver-selection-windows.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci.exe ci driver-build
       - id: driver-managed-build-windows-bootstrap-probe
-        if: always() && steps.driver-managed-build-windows.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1900,7 +1887,7 @@ jobs:
           key: ${{ steps.driver-managed-build-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.bootstrap-path }}
       - id: driver-managed-build-windows-image-probe
-        if: always() && steps.driver-managed-build-windows.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1917,7 +1904,7 @@ jobs:
           key: ${{ steps.driver-managed-build-windows.outputs.image-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.image-path }}
       - id: driver-managed-build-windows-compiled-complete-probe
-        if: always() && steps.driver-managed-build-windows.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1942,7 +1929,7 @@ jobs:
           key: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build-windows.outputs.compiled-partial-path }}
       - id: driver-managed-build-windows-source-complete-probe
-        if: always() && steps.driver-managed-build-windows.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build-windows.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -1987,7 +1974,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci.exe ci driver-adopt-cold
       - id: driver-cold-adopt-windows-bootstrap-probe
-        if: always() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2004,7 +1991,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt-windows.outputs.bootstrap-path }}
       - id: driver-cold-adopt-windows-source-complete-probe
-        if: always() && steps.driver-cold-adopt-windows.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt-windows.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2064,7 +2051,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -2073,14 +2060,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2136,7 +2123,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-windows-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-windows-request-index-partial-restore
         if: steps.workspace-fetch-windows-request.outputs.index-partial-restore == 'true'
@@ -2145,14 +2132,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-windows-request.outputs.index-partial-prefix }}
       - id: workspace-fetch-windows
         run: ./target/ci-runtime/current/memcordon-ci.exe ci segment workspace-fetch
         if: runner.os == 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-windows-source-complete-probe
-        if: always() && steps.workspace-fetch-windows.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch-windows.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2199,7 +2186,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-compile-request.outputs.native-tests-complete-key }}
-          path: ${{ steps.native-compile-request.outputs.native-tests-complete-inbox }}
+          path: ${{ steps.native-compile-request.outputs.native-tests-complete-path }}
           restore-keys: ${{ steps.native-compile-request.outputs.native-tests-complete-prefix }}
       - id: native-compile-request-native-tests-partial-restore
         if: steps.native-compile-request.outputs.native-tests-partial-restore == 'true'
@@ -2208,14 +2195,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-compile-request.outputs.native-tests-partial-key }}
-          path: ${{ steps.native-compile-request.outputs.native-tests-partial-inbox }}
+          path: ${{ steps.native-compile-request.outputs.native-tests-partial-path }}
           restore-keys: ${{ steps.native-compile-request.outputs.native-tests-partial-prefix }}
       - id: native-compile
         run: ./target/ci-runtime/current/memcordon-ci ci segment native-compile
         if: runner.os != 'Windows'
         timeout-minutes: 35
       - id: native-compile-native-tests-complete-probe
-        if: always() && steps.native-compile.outputs.native-tests-complete-save == 'true'
+        if: '!cancelled() && steps.native-compile.outputs.native-tests-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2254,7 +2241,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-compile-windows-request.outputs.native-tests-complete-key }}
-          path: ${{ steps.native-compile-windows-request.outputs.native-tests-complete-inbox }}
+          path: ${{ steps.native-compile-windows-request.outputs.native-tests-complete-path }}
           restore-keys: ${{ steps.native-compile-windows-request.outputs.native-tests-complete-prefix }}
       - id: native-compile-windows-request-native-tests-partial-restore
         if: steps.native-compile-windows-request.outputs.native-tests-partial-restore == 'true'
@@ -2263,14 +2250,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-compile-windows-request.outputs.native-tests-partial-key }}
-          path: ${{ steps.native-compile-windows-request.outputs.native-tests-partial-inbox }}
+          path: ${{ steps.native-compile-windows-request.outputs.native-tests-partial-path }}
           restore-keys: ${{ steps.native-compile-windows-request.outputs.native-tests-partial-prefix }}
       - id: native-compile-windows
         run: ./target/ci-runtime/current/memcordon-ci.exe ci segment native-compile
         if: runner.os == 'Windows'
         timeout-minutes: 35
       - id: native-compile-windows-native-tests-complete-probe
-        if: always() && steps.native-compile-windows.outputs.native-tests-complete-save == 'true'
+        if: '!cancelled() && steps.native-compile-windows.outputs.native-tests-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2309,7 +2296,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-run-request.outputs.auxiliary-profiles-complete-key }}
-          path: ${{ steps.native-run-request.outputs.auxiliary-profiles-complete-inbox }}
+          path: ${{ steps.native-run-request.outputs.auxiliary-profiles-complete-path }}
           restore-keys: ${{ steps.native-run-request.outputs.auxiliary-profiles-complete-prefix }}
       - id: native-run-request-auxiliary-profiles-partial-restore
         if: steps.native-run-request.outputs.auxiliary-profiles-partial-restore == 'true'
@@ -2318,7 +2305,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-run-request.outputs.auxiliary-profiles-partial-key }}
-          path: ${{ steps.native-run-request.outputs.auxiliary-profiles-partial-inbox }}
+          path: ${{ steps.native-run-request.outputs.auxiliary-profiles-partial-path }}
           restore-keys: ${{ steps.native-run-request.outputs.auxiliary-profiles-partial-prefix }}
       - name: Run native suite
         id: native-run
@@ -2326,7 +2313,7 @@ jobs:
         if: runner.os != 'Windows'
         timeout-minutes: 40
       - id: native-run-auxiliary-profiles-complete-probe
-        if: always() && steps.native-run.outputs.auxiliary-profiles-complete-save == 'true'
+        if: '!cancelled() && steps.native-run.outputs.auxiliary-profiles-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2365,7 +2352,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-complete-key }}
-          path: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-complete-inbox }}
+          path: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-complete-path }}
           restore-keys: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-complete-prefix }}
       - id: native-run-windows-request-auxiliary-profiles-partial-restore
         if: steps.native-run-windows-request.outputs.auxiliary-profiles-partial-restore == 'true'
@@ -2374,7 +2361,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-partial-key }}
-          path: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-partial-inbox }}
+          path: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-partial-path }}
           restore-keys: ${{ steps.native-run-windows-request.outputs.auxiliary-profiles-partial-prefix }}
       - name: Run native suite
         id: native-run-windows
@@ -2382,7 +2369,7 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 40
       - id: native-run-windows-auxiliary-profiles-complete-probe
-        if: always() && steps.native-run-windows.outputs.auxiliary-profiles-complete-save == 'true'
+        if: '!cancelled() && steps.native-run-windows.outputs.auxiliary-profiles-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2454,8 +2441,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -2472,7 +2459,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -2494,7 +2481,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -2503,7 +2490,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -2512,7 +2499,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -2521,14 +2508,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2545,7 +2532,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2562,7 +2549,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2587,7 +2574,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2632,7 +2619,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2649,7 +2636,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2709,7 +2696,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -2718,14 +2705,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2772,7 +2759,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.deadline-run-request.outputs.compiled-complete-key }}
-          path: ${{ steps.deadline-run-request.outputs.compiled-complete-inbox }}
+          path: ${{ steps.deadline-run-request.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.deadline-run-request.outputs.compiled-complete-prefix }}
       - id: deadline-run-request-compiled-partial-restore
         if: steps.deadline-run-request.outputs.compiled-partial-restore == 'true'
@@ -2781,14 +2768,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.deadline-run-request.outputs.compiled-partial-key }}
-          path: ${{ steps.deadline-run-request.outputs.compiled-partial-inbox }}
+          path: ${{ steps.deadline-run-request.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.deadline-run-request.outputs.compiled-partial-prefix }}
       - id: deadline-run
         run: ./target/ci-runtime/current/memcordon-ci ci segment macos-deadline
         if: runner.os != 'Windows'
         timeout-minutes: 75
       - id: deadline-run-compiled-complete-probe
-        if: always() && steps.deadline-run.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.deadline-run.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2816,7 +2803,7 @@ jobs:
         if: always() && (steps.deadline-run.outcome == 'success' || steps.deadline-run.outcome == 'failure')
         timeout-minutes: 2
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers macos-deadline
-      - if: always()
+      - if: '!cancelled()'
         uses: ./.github/actions/upload-artifact
         with:
           name: macos-deadline-${{ matrix.id }}
@@ -2830,7 +2817,7 @@ jobs:
     if: github.event_name != 'push'
     name: Supply chain / audit
     runs-on: ubuntu-24.04
-    timeout-minutes: 347
+    timeout-minutes: 330
     steps:
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -2862,8 +2849,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -2880,7 +2867,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -2902,7 +2889,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -2911,7 +2898,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -2920,7 +2907,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -2929,14 +2916,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2953,7 +2940,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2970,7 +2957,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -2995,7 +2982,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3040,7 +3027,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3057,7 +3044,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3117,7 +3104,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -3126,14 +3113,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3171,7 +3158,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers workspace-fetch
       - id: supply-run-request
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-audit-prepare
+        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-audit
         if: runner.os != 'Windows'
       - id: supply-run-request-source-restore
         if: steps.supply-run-request.outputs.source-restore == 'true'
@@ -3189,7 +3176,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.archives-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.archives-partial-prefix }}
       - id: supply-run-request-index-partial-restore
         if: steps.supply-run-request.outputs.index-partial-restore == 'true'
@@ -3198,7 +3185,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.index-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.index-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.index-partial-prefix }}
       - id: supply-run-request-cargo-audit-image-restore
         if: steps.supply-run-request.outputs.cargo-audit-image-restore == 'true'
@@ -3225,7 +3212,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.cargo-audit-complete-key }}
-          path: ${{ steps.supply-run-request.outputs.cargo-audit-complete-inbox }}
+          path: ${{ steps.supply-run-request.outputs.cargo-audit-complete-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.cargo-audit-complete-prefix }}
       - id: supply-run-request-cargo-audit-partial-restore
         if: steps.supply-run-request.outputs.cargo-audit-partial-restore == 'true'
@@ -3234,15 +3221,15 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.cargo-audit-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.cargo-audit-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.cargo-audit-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.cargo-audit-partial-prefix }}
       - name: Run supply-chain suite
         id: supply-run
-        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-audit-prepare
+        timeout-minutes: 130
+        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-audit
         if: runner.os != 'Windows'
-        timeout-minutes: 70
       - id: supply-run-source-complete-probe
-        if: always() && steps.supply-run.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3275,7 +3262,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.index-partial-key }}
           path: ${{ steps.supply-run.outputs.index-partial-path }}
       - id: supply-run-cargo-audit-image-probe
-        if: always() && steps.supply-run.outputs.cargo-audit-image-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-audit-image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3292,7 +3279,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.cargo-audit-image-key }}
           path: ${{ steps.supply-run.outputs.cargo-audit-image-path }}
       - id: supply-run-cargo-audit-source-complete-probe
-        if: always() && steps.supply-run.outputs.cargo-audit-source-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-audit-source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3309,7 +3296,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.cargo-audit-source-complete-key }}
           path: ${{ steps.supply-run.outputs.cargo-audit-source-complete-path }}
       - id: supply-run-cargo-audit-complete-probe
-        if: always() && steps.supply-run.outputs.cargo-audit-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-audit-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3336,26 +3323,14 @@ jobs:
       - id: supply-run-cleanup
         if: always() && (steps.supply-run.outcome == 'success' || steps.supply-run.outcome == 'failure')
         timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-audit-prepare
-      - id: supply-run-check-request
-        timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-audit-check
-        if: runner.os != 'Windows'
-      - id: supply-run-check
-        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-audit-check
-        if: runner.os != 'Windows'
-        timeout-minutes: 70
-      - id: supply-run-check-cleanup
-        if: always() && (steps.supply-run-check.outcome == 'success' || steps.supply-run-check.outcome == 'failure')
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-audit-check
+        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-audit
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   supply-chain-deny:
     if: github.event_name != 'push'
     name: Supply chain / deny
     runs-on: ubuntu-24.04
-    timeout-minutes: 347
+    timeout-minutes: 330
     steps:
       - name: Configure checkout line endings
         run: git config --global core.autocrlf false
@@ -3387,8 +3362,8 @@ jobs:
         uses: *action_1
         with:
           path: target/ci-bootstrap-in
-          key: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
-          restore-keys: mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
+          key: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup
+          restore-keys: mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-
       - id: driver-bootstrap
         if: runner.os != 'Windows' && steps.driver-bootstrap-cache.outcome == 'success' && steps.driver-bootstrap-cache.outputs.cache-matched-key != ''
         timeout-minutes: 2
@@ -3405,7 +3380,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.image-key }}
-          path: ${{ steps.driver-context.outputs.image-inbox }}
+          path: ${{ steps.driver-context.outputs.image-path }}
           restore-keys: ${{ steps.driver-context.outputs.image-prefix }}
       - id: driver-selection
         if: steps.driver-bootstrap.outputs.bootstrap-ready == 'true'
@@ -3427,7 +3402,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.archives-partial-key }}
-          path: ${{ steps.driver-context.outputs.archives-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.archives-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.archives-partial-prefix }}
       - id: driver-context-index-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.index-partial-restore == 'true'
@@ -3436,7 +3411,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.index-partial-key }}
-          path: ${{ steps.driver-context.outputs.index-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.index-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.index-partial-prefix }}
       - id: driver-context-compiled-complete-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-complete-restore == 'true'
@@ -3445,7 +3420,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-complete-key }}
-          path: ${{ steps.driver-context.outputs.compiled-complete-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-complete-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-complete-prefix }}
       - id: driver-context-compiled-partial-restore
         if: steps.driver-selection.outputs.build-required == 'true' && steps.driver-context.outputs.compiled-partial-restore == 'true'
@@ -3454,14 +3429,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.driver-context.outputs.compiled-partial-key }}
-          path: ${{ steps.driver-context.outputs.compiled-partial-inbox }}
+          path: ${{ steps.driver-context.outputs.compiled-partial-path }}
           restore-keys: ${{ steps.driver-context.outputs.compiled-partial-prefix }}
       - id: driver-managed-build
         if: steps.driver-selection.outputs.build-required == 'true'
         timeout-minutes: 50
         run: ./target/ci-runtime/bootstrap/memcordon-ci ci driver-build
       - id: driver-managed-build-bootstrap-probe
-        if: always() && steps.driver-managed-build.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3478,7 +3453,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.bootstrap-key }}
           path: ${{ steps.driver-managed-build.outputs.bootstrap-path }}
       - id: driver-managed-build-image-probe
-        if: always() && steps.driver-managed-build.outputs.image-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3495,7 +3470,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.image-key }}
           path: ${{ steps.driver-managed-build.outputs.image-path }}
       - id: driver-managed-build-compiled-complete-probe
-        if: always() && steps.driver-managed-build.outputs.compiled-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.compiled-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3520,7 +3495,7 @@ jobs:
           key: ${{ steps.driver-managed-build.outputs.compiled-partial-key }}
           path: ${{ steps.driver-managed-build.outputs.compiled-partial-path }}
       - id: driver-managed-build-source-complete-probe
-        if: always() && steps.driver-managed-build.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-managed-build.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3565,7 +3540,7 @@ jobs:
         timeout-minutes: 15
         run: ./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold
       - id: driver-cold-adopt-bootstrap-probe
-        if: always() && steps.driver-cold-adopt.outputs.bootstrap-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.bootstrap-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3582,7 +3557,7 @@ jobs:
           key: ${{ steps.driver-cold-adopt.outputs.bootstrap-key }}
           path: ${{ steps.driver-cold-adopt.outputs.bootstrap-path }}
       - id: driver-cold-adopt-source-complete-probe
-        if: always() && steps.driver-cold-adopt.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.driver-cold-adopt.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3642,7 +3617,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.archives-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.archives-partial-prefix }}
       - id: workspace-fetch-request-index-partial-restore
         if: steps.workspace-fetch-request.outputs.index-partial-restore == 'true'
@@ -3651,14 +3626,14 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.workspace-fetch-request.outputs.index-partial-key }}
-          path: ${{ steps.workspace-fetch-request.outputs.index-partial-inbox }}
+          path: ${{ steps.workspace-fetch-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.workspace-fetch-request.outputs.index-partial-prefix }}
       - id: workspace-fetch
         run: ./target/ci-runtime/current/memcordon-ci ci segment workspace-fetch
         if: runner.os != 'Windows'
         timeout-minutes: 25
       - id: workspace-fetch-source-complete-probe
-        if: always() && steps.workspace-fetch.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.workspace-fetch.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3696,7 +3671,7 @@ jobs:
         run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers workspace-fetch
       - id: supply-run-request
         timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-deny-prepare
+        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-deny
         if: runner.os != 'Windows'
       - id: supply-run-request-source-restore
         if: steps.supply-run-request.outputs.source-restore == 'true'
@@ -3714,7 +3689,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.archives-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.archives-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.archives-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.archives-partial-prefix }}
       - id: supply-run-request-index-partial-restore
         if: steps.supply-run-request.outputs.index-partial-restore == 'true'
@@ -3723,7 +3698,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.index-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.index-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.index-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.index-partial-prefix }}
       - id: supply-run-request-cargo-deny-image-restore
         if: steps.supply-run-request.outputs.cargo-deny-image-restore == 'true'
@@ -3750,7 +3725,7 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.cargo-deny-complete-key }}
-          path: ${{ steps.supply-run-request.outputs.cargo-deny-complete-inbox }}
+          path: ${{ steps.supply-run-request.outputs.cargo-deny-complete-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.cargo-deny-complete-prefix }}
       - id: supply-run-request-cargo-deny-partial-restore
         if: steps.supply-run-request.outputs.cargo-deny-partial-restore == 'true'
@@ -3759,15 +3734,15 @@ jobs:
         uses: *action_1
         with:
           key: ${{ steps.supply-run-request.outputs.cargo-deny-partial-key }}
-          path: ${{ steps.supply-run-request.outputs.cargo-deny-partial-inbox }}
+          path: ${{ steps.supply-run-request.outputs.cargo-deny-partial-path }}
           restore-keys: ${{ steps.supply-run-request.outputs.cargo-deny-partial-prefix }}
       - name: Run supply-chain suite
         id: supply-run
-        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-deny-prepare
+        timeout-minutes: 130
+        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-deny
         if: runner.os != 'Windows'
-        timeout-minutes: 70
       - id: supply-run-source-complete-probe
-        if: always() && steps.supply-run.outputs.source-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3800,7 +3775,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.index-partial-key }}
           path: ${{ steps.supply-run.outputs.index-partial-path }}
       - id: supply-run-cargo-deny-image-probe
-        if: always() && steps.supply-run.outputs.cargo-deny-image-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-deny-image-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3817,7 +3792,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.cargo-deny-image-key }}
           path: ${{ steps.supply-run.outputs.cargo-deny-image-path }}
       - id: supply-run-cargo-deny-source-complete-probe
-        if: always() && steps.supply-run.outputs.cargo-deny-source-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-deny-source-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3834,7 +3809,7 @@ jobs:
           key: ${{ steps.supply-run.outputs.cargo-deny-source-complete-key }}
           path: ${{ steps.supply-run.outputs.cargo-deny-source-complete-path }}
       - id: supply-run-cargo-deny-complete-probe
-        if: always() && steps.supply-run.outputs.cargo-deny-complete-save == 'true'
+        if: '!cancelled() && steps.supply-run.outputs.cargo-deny-complete-save == ''true'''
         continue-on-error: true
         timeout-minutes: 1
         uses: *action_1
@@ -3861,19 +3836,7 @@ jobs:
       - id: supply-run-cleanup
         if: always() && (steps.supply-run.outcome == 'success' || steps.supply-run.outcome == 'failure')
         timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-deny-prepare
-      - id: supply-run-check-request
-        timeout-minutes: 5
-        run: ./target/ci-runtime/current/memcordon-ci ci cache-requests supply-deny-check
-        if: runner.os != 'Windows'
-      - id: supply-run-check
-        run: ./target/ci-runtime/current/memcordon-ci ci segment supply-deny-check
-        if: runner.os != 'Windows'
-        timeout-minutes: 70
-      - id: supply-run-check-cleanup
-        if: always() && (steps.supply-run-check.outcome == 'success' || steps.supply-run-check.outcome == 'failure')
-        timeout-minutes: 2
-        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-deny-check
+        run: ./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-deny
     env:
       CARGO_HOME: ${{ github.workspace }}/target/ci-cargo-home
   source-seed:
@@ -3932,3 +3895,25 @@ jobs:
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/.cache
             target/ci-cargo-home/registry/index/index.crates.io-1949cf8c6b5b557f/config.json
           key: ${{ steps.public-source-seed-restore.outputs.cache-primary-key }}
+  format:
+    name: CI source formatting
+    if: github.event_name != 'push'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 42
+    steps:
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
+        timeout-minutes: 1
+      - name: Check out repository
+        uses: *action_0
+        with:
+          persist-credentials: false
+        timeout-minutes: 6
+      - name: Install formatter
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+        timeout-minutes: 15
+      - name: Check formatting
+        run: rustup run 1.97.1 cargo fmt --all -- --check
+        timeout-minutes: 15

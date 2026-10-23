@@ -111,8 +111,8 @@ native architectures, cold Windows/macOS hosts, real full-catalogue release
 rehearsal or healthy/failing Actions timings. Those acceptance runs belong in CI;
 no elapsed-time improvement is claimed before measurement. If concurrency fails
 native acceptance, select one-worker rehearsal or serial compilation while
-retaining coverage. If cache identity fails, disable compiled restoration and run
-clean. If early routing fails, restore late assembly ordering without bypassing
+retaining coverage. Unavailable current cache compatibility takes the ordinary
+clean build path. If early routing fails, restore late assembly ordering without bypassing
 rehearsal or accepting incomplete recovery artifacts.
 
 Normal publication and publication-only recovery have separate tag-only writer
@@ -370,19 +370,18 @@ nor a transfer manifest means that the current tests, native readiness or
 rehearsal passed. Optional cache context/transfer time is bounded separately from
 the original production deadlines; unavailable cache reuse takes the source path.
 
-`ci/driver-bootstrap.toml` deliberately starts with no enabled executable-cache
-hosts. Current-source cold builds and adoption remain available. Enable a host
-only after real cold/warm native acceptance, full input/image validation and a
-review of its selected job budget. No cross-platform bootstrap support or warm
-performance improvement is claimed by portable tests. A failed first cold build
+`ci/driver-bootstrap.toml` enables executable reuse on all six supported native
+hosts, subject to current input/image compatibility and owned-byte checks.
+Current-source cold builds and adoption remain available. No historical cache
+test approval is required to use compatible outputs. A failed first cold build
 has no Rust supervisor to retain a safe partial driver target. Publication and
 rehearsal continue to use their selected immutable prepared artifacts; the
 publication-tool producer actually compiles current source.
 
 Portable ordering/allocation tests and a linked timer test establish only their
 executed scope. Native Linux/macOS/Windows cancellation, reader retirement and
-clock handoff acceptance, representative event execution, and a controlled
-cache-service save/verified later restore require their actual environments.
+clock handoff acceptance and representative event execution require their actual
+environments.
 No hosted acceptance, cache persistence or performance improvement follows from
 the generated graph or an action's successful conclusion alone.
 
@@ -395,7 +394,24 @@ jobs still require their native test producer to succeed. These artifacts
 contain only selected program bytes and their checked identity, never native
 operation clocks or prepared test results. The original native work clock
 starts on the native runner and remains there through required retirement.
-This preparation boundary does not enable executable cache reuse on any host.
+This preparation boundary does not change executable cache enablement.
+
+`CI source formatting`, `Release source formatting` and `Release source policy`
+are independent required source checks. Release final assembly depends on its
+format and policy owners. Required-status configuration that relied on CI quality
+also needs the new formatting check before relying on compiler-only quality.
+Workflow edits do not update repository rulesets.
+
+Selection uses the freshly compiled current-source driver for parity, selected
+inputs and publication-tool preparation before optional adoption/export. Policy
+and planners run before their own retention tails; source verification runs
+before full source acquisition. Separate audit and deny leaves retain one live
+session through their actual check and only then offer settled outputs.
+
+Branch supersession uses separate workflow/event/ref lanes. Cancellation stops
+new ordinary diagnostic/reporting work and lookup probes. Finite cleanup of
+already-owned resources and eligible cache saves remain best effort within the
+runner lifetime; a save never changes a failed or canceled workload result.
 
 Release fuzz now requires the actual `fuzz-setup` producer (`Release fuzz setup`)
 before each unchanged quarter compiles and executes. A setup failure makes the

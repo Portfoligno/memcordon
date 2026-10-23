@@ -142,7 +142,6 @@ fn downloaded_tools_inputs_and_credentials_cannot_be_substituted_or_bypassed() {
             "token-env",
             "checkout",
             "cargo",
-            "cache",
             "compound",
             "shell",
             "unpinned",
@@ -165,7 +164,7 @@ fn downloaded_tools_inputs_and_credentials_cannot_be_substituted_or_bypassed() {
                 "token-env" => {
                     value["steps"][count - 2]["env"]["GH_TOKEN"] = "${{ github.token }}".into()
                 }
-                "checkout" | "cargo" | "cache" => {
+                "checkout" | "cargo" => {
                     let injected = match case {
                         "checkout" => {
                             "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
@@ -173,9 +172,7 @@ fn downloaded_tools_inputs_and_credentials_cannot_be_substituted_or_bypassed() {
                         "cargo" => {
                             "run: rustup run 1.97.1 cargo build --locked --release --target-dir target/ci -p memcordon-ci --bin memcordon-ci\n"
                         }
-                        _ => {
-                            "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9\nwith:\n  path: .release/rehearsal-results\n  key: fixture\n"
-                        }
+                        _ => unreachable!(),
                     };
                     value["steps"]
                         .as_sequence_mut()
@@ -271,7 +268,7 @@ fn recovery_routes_original_pair_and_helper_packing_is_required_in_both_modes() 
 }
 
 #[test]
-fn rehearsal_helper_compiles_current_source_before_independent_retention_and_packing() {
+fn rehearsal_helper_compiles_current_source_before_packing() {
     let baseline = workflow();
     validate(&baseline).unwrap();
     let steps = baseline["jobs"]["rehearsal-tool"]["steps"]
@@ -297,45 +294,8 @@ fn rehearsal_helper_compiles_current_source_before_independent_retention_and_pac
     let pack: Vec<_> = steps.iter().enumerate().filter(|(_,step)|step["run"] == "./.release/tool/memcordon-ci release rehearsal-tool --executable target/ci/rehearsal-build/release/memcordon-release-rehearsal").map(|(index,_)|index).collect();
     assert_eq!(pack.len(), 1);
     let pack = pack[0];
-    let cleanup = find("helper-build-cleanup");
     let upload = find("helper");
-    assert!(build < cleanup && cleanup < pack && pack < upload);
-    assert_eq!(
-        steps[cleanup]["run"],
-        "./.release/tool/memcordon-ci ci cleanup-transfers rehearsal-tool-build"
-    );
-    assert_eq!(
-        steps[cleanup]["if"],
-        "always() && (steps.helper-build.outcome == 'success' || steps.helper-build.outcome == 'failure')"
-    );
-    for class in ["complete", "partial"] {
-        let save = find(&format!("helper-build-compiled-{class}-save"));
-        assert!(build < save && save < cleanup);
-        assert_eq!(
-            steps[save]["with"]["key"],
-            format!("${{{{ steps.helper-build.outputs.compiled-{class}-key }}}}")
-        );
-        assert_eq!(
-            steps[save]["with"]["path"],
-            format!("${{{{ steps.helper-build.outputs.compiled-{class}-path }}}}")
-        );
-        let guard =
-            format!("always() && steps.helper-build.outputs.compiled-{class}-save == 'true'");
-        let guard = if class == "complete" {
-            format!(
-                "{guard} && steps.helper-build-compiled-complete-probe.outputs.cache-hit != 'true'"
-            )
-        } else {
-            guard
-        };
-        assert_eq!(steps[save]["if"], guard);
-        let mut ungated = baseline.clone();
-        ungated["jobs"]["rehearsal-tool"]["steps"][save]["if"] = "always()".into();
-        assert!(
-            validate(&ungated).is_err(),
-            "{class} save lost its actual completion/partial owner"
-        );
-    }
+    assert!(build < pack && pack < upload);
     let mut missing = baseline.clone();
     missing["jobs"]["rehearsal-tool"]["steps"]
         .as_sequence_mut()
@@ -349,14 +309,7 @@ fn rehearsal_helper_compiles_current_source_before_independent_retention_and_pac
     optional["jobs"]["rehearsal-tool"]["steps"][build]["continue-on-error"] = true.into();
     assert!(
         validate(&optional).is_err(),
-        "helper compilation remains required even when cache retention is optional"
-    );
-    let mut mixed = baseline.clone();
-    mixed["jobs"]["rehearsal-tool"]["steps"][find("helper-build-compiled-partial-save")]["with"]
-        ["key"] = "${{ steps.helper-build.outputs.compiled-complete-key }}".into();
-    assert!(
-        validate(&mixed).is_err(),
-        "partial helper output cannot be saved under the complete key"
+        "helper compilation remains required"
     );
 }
 

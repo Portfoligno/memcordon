@@ -1,8 +1,14 @@
 use memcordon_ci::workflow_definitions;
 use serde_yaml::Value;
 
+#[track_caller]
 fn rejects(mut workflow: Value, mutation: impl FnOnce(&mut Value)) {
+    let original = workflow.clone();
     mutation(&mut workflow);
+    assert_ne!(
+        workflow, original,
+        "workflow mutation must change its input"
+    );
     assert!(workflow_definitions::validate_semantics(&workflow).is_err());
 }
 
@@ -66,6 +72,12 @@ fn matrices_preserve_peer_retention_and_native_validation_requires_success() {
                     rejects(workflow.clone(), |v| {
                         v["jobs"][id]["steps"][index]["continue-on-error"] = Value::Bool(true)
                     });
+                    rejects(workflow.clone(), |v| {
+                        v["jobs"][id]["steps"]
+                            .as_sequence_mut()
+                            .unwrap()
+                            .remove(index);
+                    });
                 }
                 if step["run"]
                     .as_str()
@@ -74,33 +86,10 @@ fn matrices_preserve_peer_retention_and_native_validation_requires_success() {
                     rejects(workflow.clone(), |v| {
                         v["jobs"][id]["steps"][index]["if"] = Value::String("always()".into())
                     });
-                    rejects(workflow.clone(), |v| {
-                        v["jobs"][id]["steps"]
-                            .as_sequence_mut()
-                            .unwrap()
-                            .retain(|s| {
-                                !s["run"]
-                                    .as_str()
-                                    .is_some_and(|run| run.contains(" release compile-target "))
-                            });
-                    });
                 }
             }
         }
     }
-}
-
-#[test]
-fn split_quality_cache_roots_cannot_import_mixed_archives() {
-    use memcordon_ci::cache_restore::roots;
-    assert_eq!(
-        roots("quality-compiler-v1", "complete").unwrap(),
-        [std::path::PathBuf::from("target/ci/quality")]
-    );
-    assert_eq!(
-        roots("quality-documentation-v1", "complete").unwrap(),
-        [std::path::PathBuf::from("target/ci/quality-doc")]
-    );
 }
 
 #[test]

@@ -176,12 +176,14 @@ pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
         )],
         Suite::SupplyChain
         | Suite::PrepareTools
+        | Suite::SupplyAudit
+        | Suite::SupplyDeny
         | Suite::SupplyAuditPrepare
         | Suite::SupplyDenyPrepare => ["cargo-audit", "cargo-deny"]
             .into_iter()
             .filter(|purpose| match suite {
-                Suite::SupplyAuditPrepare => *purpose == "cargo-audit",
-                Suite::SupplyDenyPrepare => *purpose == "cargo-deny",
+                Suite::SupplyAudit | Suite::SupplyAuditPrepare => *purpose == "cargo-audit",
+                Suite::SupplyDeny | Suite::SupplyDenyPrepare => *purpose == "cargo-deny",
                 _ => true,
             })
             .map(|purpose| CompiledScope {
@@ -405,6 +407,8 @@ fn run_resolved(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
             | Suite::PrepareFuzz
             | Suite::MiriSetup
             | Suite::SupplyChain
+            | Suite::SupplyAudit
+            | Suite::SupplyDeny
             | Suite::SupplyAuditPrepare
             | Suite::SupplyDenyPrepare
     );
@@ -436,6 +440,9 @@ fn run_resolved(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
         });
     }
     session.execute_with(root, |cache| {
+        if matches!(suite, Suite::SupplyAudit | Suite::SupplyDeny) {
+            return crate::suites::supply_owned_leaf(root, suite, mode, cache);
+        }
         let sysroot = matches!(suite, Suite::MiriSetup)
             .then(|| cache.optional(|| memcordon_ci::miri_cache::identity(root)));
         if sysroot.as_ref().is_some_and(|result| {

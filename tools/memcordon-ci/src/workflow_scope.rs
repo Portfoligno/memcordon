@@ -107,14 +107,21 @@ pub fn from_event_file(event_name: &str, full_ref: &str, path: &Path) -> Result<
 }
 
 pub fn emit_from_github() -> Result<()> {
+    emit(read_from_github()?)
+}
+
+pub fn read_from_github() -> Result<Scope> {
     let required = |name: &str| {
         std::env::var(name).map_err(|_| CiError::Message(format!("workflow scope requires {name}")))
     };
-    let scope = from_event_file(
+    from_event_file(
         &required("GITHUB_EVENT_NAME")?,
         &required("GITHUB_REF")?,
         Path::new(&required("GITHUB_EVENT_PATH")?),
-    )?;
+    )
+}
+
+pub fn emit(scope: Scope) -> Result<()> {
     crate::workflow_output::write(&[(
         "standalone-common",
         if scope.standalone_common() {

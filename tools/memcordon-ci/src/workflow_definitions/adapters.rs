@@ -50,7 +50,7 @@ struct CacheSlot<'a> {
     name: &'a str,
 }
 impl CacheSlot<'_> {
-    fn restore(&self, path_suffix: &str) -> Value {
+    fn restore(&self) -> Value {
         action(
             &format!("{}-{}-restore", self.owner, self.name),
             true,
@@ -60,7 +60,7 @@ impl CacheSlot<'_> {
             ),
             object(&[
                 ("key", output(self.owner, self.name, "key")),
-                ("path", output(self.owner, self.name, path_suffix)),
+                ("path", output(self.owner, self.name, "path")),
                 ("restore-keys", output(self.owner, self.name, "prefix")),
             ]),
             2,
@@ -88,7 +88,16 @@ impl CacheSlot<'_> {
         let mut lookup = inputs.clone();
         set(&mut lookup, "lookup-only", Value::Bool(true));
         vec![
-            action(&probe, true, ready.clone(), lookup, 1),
+            action(
+                &probe,
+                true,
+                format!(
+                    "!cancelled() && steps.{}.outputs.{}-save == 'true'",
+                    self.owner, self.name
+                ),
+                lookup,
+                1,
+            ),
             action(
                 &format!("{}-{}-save", self.owner, self.name),
                 false,
@@ -100,12 +109,8 @@ impl CacheSlot<'_> {
     }
 }
 
-fn source_slots() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("source", "path"),
-        ("archives-partial", "inbox"),
-        ("index-partial", "inbox"),
-    ]
+fn source_slots() -> Vec<&'static str> {
+    vec!["source", "archives-partial", "index-partial"]
 }
 fn acquires_sources(recipe: &str) -> bool {
     matches!(
@@ -118,13 +123,15 @@ fn acquires_sources(recipe: &str) -> bool {
             | "supply-chain"
             | "supply-audit-prepare"
             | "supply-deny-prepare"
+            | "supply-audit"
+            | "supply-deny"
     )
 }
 fn tools(recipe: &str) -> &'static [&'static str] {
     match recipe {
         "supply-chain" | "prepare-tools" => &["cargo-audit", "cargo-deny"],
-        "supply-audit-prepare" => &["cargo-audit"],
-        "supply-deny-prepare" => &["cargo-deny"],
+        "supply-audit-prepare" | "supply-audit" => &["cargo-audit"],
+        "supply-deny-prepare" | "supply-deny" => &["cargo-deny"],
         "prepare-fuzz" => &["cargo-fuzz"],
         _ => &[],
     }
@@ -149,6 +156,8 @@ fn compiled_slots(recipe: &str) -> Vec<&'static str> {
         | "supply-chain"
         | "supply-audit-prepare"
         | "supply-deny-prepare"
+        | "supply-audit"
+        | "supply-deny"
         | "supply-audit-check"
         | "supply-deny-check"
         | "release-validate-package" => vec![],
@@ -215,6 +224,44 @@ fn outer_condition(condition: &str) -> String {
     }
     condition.to_owned()
 }
+fn security_invocation(recipe: &str, path: u8, operation: u8) -> Option<Value> {
+    let commands = match (recipe, path) {
+        ("supply-audit", 0) => [
+            "./target/ci-runtime/current/memcordon-ci ci segment supply-audit",
+            "./target/ci-runtime/current/memcordon-ci ci cache-requests supply-audit",
+            "./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-audit",
+        ],
+        ("supply-audit", 1) => [
+            "./.release/tool/memcordon-ci ci segment supply-audit",
+            "./.release/tool/memcordon-ci ci cache-requests supply-audit",
+            "./.release/tool/memcordon-ci ci cleanup-transfers supply-audit",
+        ],
+        ("supply-audit", 2) => [
+            "./target/ci-runtime/current/memcordon-ci.exe ci segment supply-audit",
+            "./target/ci-runtime/current/memcordon-ci.exe ci cache-requests supply-audit",
+            "./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers supply-audit",
+        ],
+        ("supply-deny", 0) => [
+            "./target/ci-runtime/current/memcordon-ci ci segment supply-deny",
+            "./target/ci-runtime/current/memcordon-ci ci cache-requests supply-deny",
+            "./target/ci-runtime/current/memcordon-ci ci cleanup-transfers supply-deny",
+        ],
+        ("supply-deny", 1) => [
+            "./.release/tool/memcordon-ci ci segment supply-deny",
+            "./.release/tool/memcordon-ci ci cache-requests supply-deny",
+            "./.release/tool/memcordon-ci ci cleanup-transfers supply-deny",
+        ],
+        ("supply-deny", 2) => [
+            "./target/ci-runtime/current/memcordon-ci.exe ci segment supply-deny",
+            "./target/ci-runtime/current/memcordon-ci.exe ci cache-requests supply-deny",
+            "./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers supply-deny",
+        ],
+        _ => return None,
+    };
+    commands
+        .get(usize::from(operation))
+        .map(|command| text(command))
+}
 fn host_guard(outer: &str, windows: bool) -> String {
     let host = if windows {
         "runner.os == 'Windows'"
@@ -236,13 +283,16 @@ pub(super) fn segment_steps(
     id: &str,
 ) -> Result<Vec<Value>> {
     let outer = outer_condition(field(&old, "if"));
+    if matches!(recipe, "supply-audit" | "supply-deny") {
+        set(&mut old, "timeout-minutes", number("130"));
+    }
     let selected_path = if windows { 2 } else { path };
     let suffix = if windows && mixed { "-windows" } else { "" };
     let owner = format!("{id}{suffix}");
     let request = format!("{owner}-request");
     let run = |op| {
-        invocation(recipe, selected_path, op)
-            .map(literal)
+        security_invocation(recipe, selected_path, op)
+            .or_else(|| invocation(recipe, selected_path, op).map(literal))
             .ok_or_else(|| CiError::Message(format!("unsupported literal segment: {recipe}")))
     };
     let condition = if path == 1 {
@@ -270,13 +320,13 @@ pub(super) fn segment_steps(
     let execute_only = recipe.starts_with("fuzz-execute-");
     let mut steps = if execute_only { Vec::new() } else { vec![ask] };
     if acquires_sources(recipe) {
-        for (slot, path) in source_slots() {
+        for slot in source_slots() {
             steps.push(
                 CacheSlot {
                     owner: &request,
                     name: slot,
                 }
-                .restore(path),
+                .restore(),
             );
         }
     }
@@ -290,23 +340,18 @@ pub(super) fn segment_steps(
                     owner: &request,
                     name: &format!("{partition}-{class}"),
                 }
-                .restore("inbox"),
+                .restore(),
             );
         }
     }
     for tool in tools(recipe) {
-        for (class, path) in [
-            ("image", "path"),
-            ("source", "path"),
-            ("complete", "inbox"),
-            ("partial", "inbox"),
-        ] {
+        for class in ["image", "source", "complete", "partial"] {
             steps.push(
                 CacheSlot {
                     owner: &request,
                     name: &format!("{tool}-{class}"),
                 }
-                .restore(path),
+                .restore(),
             );
         }
     }
@@ -316,7 +361,7 @@ pub(super) fn segment_steps(
                 owner: &request,
                 name: "sysroot",
             }
-            .restore("path"),
+            .restore(),
         );
     }
     let native_build = matches!(recipe, "release-build" | "release-readiness");
@@ -585,8 +630,8 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
     if source_build.is_none() {
         let cache = id("bootstrap-cache");
         steps.push(action(&cache,true,host.clone(),object(&[("path",text("target/ci-bootstrap-in")),
-            ("key",text("mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
-            ("restore-keys",text("mc-ci-bootstrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
+            ("key",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
+            ("restore-keys",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
         steps.push(driver_step(&probe,DriverOperation::Probe,windows,format!("{host} && steps.{cache}.outcome == 'success' && steps.{cache}.outputs.cache-matched-key != ''"),2,true));
         steps.push(driver_step(
             &context,
@@ -601,7 +646,7 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
                 owner: &context,
                 name: "image",
             }
-            .restore("inbox"),
+            .restore(),
         );
         steps.push(driver_step(
             &select,
@@ -622,7 +667,7 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
                 owner: &context,
                 name,
             }
-            .restore(if name == "source" { "path" } else { "inbox" });
+            .restore();
             set(
                 &mut restore,
                 "if",
@@ -716,6 +761,225 @@ fn selected_hosts(job: &Value) -> Result<Vec<bool>> {
     Ok(hosts.into_iter().collect())
 }
 
+fn early_source_checks(workflow: &mut Value, name: &str) -> Result<()> {
+    if name != "release.yml" {
+        return Ok(());
+    }
+    for (_, job) in workflow["jobs"].as_mapping_mut().expect("release jobs") {
+        let Some(steps) = job["steps"].as_sequence_mut() else {
+            continue;
+        };
+        let verify = steps.iter().position(|step| field(step,"run") == "./.release/tool/memcordon-ci release verify-source --build-source .release/build-source.json");
+        if let Some(verify) = verify
+            && let Some(fetch) = steps.iter().position(|step| {
+                field(step, "run")
+                    == "./.release/tool/memcordon-ci ci cache-requests workspace-fetch"
+            })
+            && verify > fetch
+        {
+            let check = steps.remove(verify);
+            steps.insert(fetch, check);
+        }
+    }
+    let steps = workflow["jobs"]["select"]["steps"]
+        .as_sequence_mut()
+        .expect("selection steps");
+    let mut retention = Vec::new();
+    let mut work = Vec::new();
+    for mut step in std::mem::take(steps) {
+        let id = field(&step, "id");
+        if id == "driver-cold-adopt"
+            || id.starts_with("driver-cold-adopt-")
+            || id == "driver-cold-cleanup"
+        {
+            if id == "driver-cold-adopt" {
+                set(
+                    &mut step,
+                    "if",
+                    text(
+                        "!cancelled() && runner.os != 'Windows' && steps.driver-cold-build.outcome == 'success'",
+                    ),
+                );
+            }
+            retention.push(step);
+            continue;
+        }
+        let replacement = match field(&step, "run") {
+            "./target/ci-runtime/current/memcordon-ci ci workflows --check" => {
+                Some("./target/ci-driver-cold/release/memcordon-ci ci workflows --check")
+            }
+            "./target/ci-runtime/current/memcordon-ci release select-preparation" => {
+                Some("./target/ci-driver-cold/release/memcordon-ci release select-preparation")
+            }
+            "./target/ci-runtime/current/memcordon-ci release check-preparation --build-source .release/build-source.json --consumer-readiness" => {
+                Some(
+                    "./target/ci-driver-cold/release/memcordon-ci release check-selected-inputs --build-source .release/build-source.json --consumer-readiness",
+                )
+            }
+            "./target/ci-runtime/current/memcordon-ci release publication-tool" => {
+                Some("./target/ci-driver-cold/release/memcordon-ci release publication-tool")
+            }
+            _ => None,
+        };
+        if let Some(command) = replacement {
+            set(&mut step, "run", text(command));
+            let minutes = match command {
+                "./target/ci-driver-cold/release/memcordon-ci ci workflows --check" => "2",
+                "./target/ci-driver-cold/release/memcordon-ci release select-preparation" => "15",
+                "./target/ci-driver-cold/release/memcordon-ci release check-selected-inputs --build-source .release/build-source.json --consumer-readiness" => {
+                    "20"
+                }
+                "./target/ci-driver-cold/release/memcordon-ci release publication-tool" => "10",
+                _ => unreachable!("finite fresh-source operation"),
+            };
+            set(&mut step, "timeout-minutes", number(minutes));
+        }
+        work.push(step);
+    }
+    let after = work
+        .iter()
+        .position(|step| field(step, "id") == "tool")
+        .ok_or_else(|| CiError::Message("selection tool upload absent".into()))?;
+    work.splice(after + 1..after + 1, retention);
+    *steps = work;
+    Ok(())
+}
+
+fn apply_feedback(workflow: &mut Value, name: &str) -> Result<()> {
+    let selected = match name {
+        "ci.yml" => Some(("policy", "repository-policy", 62)),
+        "deep-ci.yml" => Some(("performance-plan", "deep-plan", 12)),
+        "backend-certification.yml" => Some(("macos-performance-plan", "backend-plan", 12)),
+        _ => None,
+    };
+    if let Some((owner, feedback, allowance)) = selected {
+        let job = &mut workflow["jobs"][owner];
+        let steps = job["steps"]
+            .as_sequence_mut()
+            .expect("feedback owner steps");
+        steps.retain(|step| {
+            let command = field(step, "run");
+            ![
+                " ci workflows --check",
+                " ci check-workflows",
+                " suite policy",
+                " ci segment policy",
+                " ci cache-requests policy",
+                " ci cleanup-transfers policy",
+                " ci workflow-scope",
+                " ci performance-plan",
+            ]
+            .iter()
+            .any(|suffix| command.ends_with(suffix))
+        });
+        for step in steps {
+            let operation = match field(step, "id") {
+                "driver-selection" => "select",
+                "driver-managed-build" => "build",
+                "driver-cold-adopt" => "adopt",
+                _ => continue,
+            };
+            let command = match (feedback, operation) {
+                ("repository-policy", "select") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-select --feedback repository-policy"
+                }
+                ("repository-policy", "build") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-build --feedback repository-policy"
+                }
+                ("repository-policy", "adopt") => {
+                    "./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold --feedback repository-policy"
+                }
+                ("deep-plan", "select") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-select --feedback deep-plan"
+                }
+                ("deep-plan", "build") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-build --feedback deep-plan"
+                }
+                ("deep-plan", "adopt") => {
+                    "./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold --feedback deep-plan"
+                }
+                ("backend-plan", "select") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-select --feedback backend-plan"
+                }
+                ("backend-plan", "build") => {
+                    "./target/ci-runtime/bootstrap/memcordon-ci ci driver-build --feedback backend-plan"
+                }
+                ("backend-plan", "adopt") => {
+                    "./target/ci-driver-cold/release/memcordon-ci ci driver-adopt-cold --feedback backend-plan"
+                }
+                _ => unreachable!("closed feedback route"),
+            };
+            let original = step["timeout-minutes"].as_u64().expect("driver ceiling");
+            set(step, "run", text(command));
+            set(
+                step,
+                "timeout-minutes",
+                Value::Number((original + allowance).into()),
+            );
+        }
+        let outputs: &[(&str, &str)] = match feedback {
+            "deep-plan" => &[
+                ("combined", "stress-combined"),
+                ("split", "stress-split"),
+                ("has-combined", "stress-has-combined"),
+                ("has-split", "stress-has-split"),
+                ("standalone-common", "standalone-common"),
+            ],
+            "backend-plan" => &[
+                ("split", "macos-split"),
+                ("standalone-common", "standalone-common"),
+            ],
+            _ => &[],
+        };
+        for (name, output) in outputs {
+            set(
+                &mut job["outputs"],
+                name,
+                text(&format!(
+                    "${{{{ steps.driver-selection.outputs.{output} || steps.driver-managed-build.outputs.{output} || steps.driver-cold-adopt.outputs.{output} }}}}"
+                )),
+            );
+        }
+    }
+    if name == "release.yml" {
+        let mut ci = super::original("ci.yml").expect("source CI definition");
+        apply(&mut ci, "ci.yml")?;
+        let mut policy = ci["jobs"]["policy"].clone();
+        policy["steps"]
+            .as_sequence_mut()
+            .expect("policy steps")
+            .retain(|step| field(step, "id") != "public-source-seed-restore");
+        set(&mut policy, "name", text("Release source policy"));
+        set(
+            &mut policy,
+            "if",
+            text(
+                "github.event.deleted != true && (github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare')",
+            ),
+        );
+        set(
+            &mut policy,
+            "permissions",
+            object(&[("contents", text("read"))]),
+        );
+        for step in policy["steps"].as_sequence_mut().expect("policy steps") {
+            if field(step, "uses").starts_with("actions/checkout@") {
+                set(&mut step["with"], "ref", text("${{ github.sha }}"));
+            }
+        }
+        set(&mut workflow["jobs"], "source-policy", policy);
+        let needs = workflow["jobs"]["assemble"]["needs"]
+            .as_sequence_mut()
+            .expect("assembly dependencies");
+        for required in ["source-policy"] {
+            if !needs.iter().any(|value| value.as_str() == Some(required)) {
+                needs.push(text(required));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     super::concurrency::apply(workflow, name)?;
     let jobs = workflow["jobs"].as_mapping_mut().expect("source jobs");
@@ -802,6 +1066,11 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
             if let Some((recipe, path)) = segment_recipe(&command) {
                 let recipe =
                     super::concurrency::recipe(job_name.as_str().expect("job name"), recipe);
+                let recipe = match recipe {
+                    "supply-audit-prepare" => "supply-audit",
+                    "supply-deny-prepare" => "supply-deny",
+                    other => other,
+                };
                 let outer = outer_condition(field(&step, "if"));
                 if !seen.insert((recipe.to_owned(), outer)) {
                     continue;
@@ -826,21 +1095,6 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
                             &id,
                         )?);
                     }
-                }
-                if let Some(check) = match recipe {
-                    "supply-audit-prepare" => Some("supply-audit-check"),
-                    "supply-deny-prepare" => Some("supply-deny-check"),
-                    _ => None,
-                } {
-                    let owner = format!("{id}-check");
-                    steps.extend(segment_steps(
-                        object(&[]),
-                        check,
-                        path,
-                        false,
-                        false,
-                        &owner,
-                    )?);
                 }
             } else {
                 if command.contains("./target/ci/release/memcordon-ci")
@@ -991,6 +1245,8 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
     if name == "backend-certification.yml" {
         super::backend_private::apply(workflow)?;
     }
+    early_source_checks(workflow, name)?;
+    apply_feedback(workflow, name)?;
     super::source_seed::apply(workflow, name)?;
     apply_budgets(workflow, name)?;
     Ok(())
@@ -1183,34 +1439,6 @@ pub(super) fn operation_recipe(command: &str) -> Option<&str> {
         return Some("working-windows-prepare");
     }
     None
-}
-pub(super) fn save_slots(recipe: &str) -> Vec<String> {
-    if invocation(recipe, 0, 0).is_none()
-        && !matches!(
-            recipe,
-            "backend-linux-private-prepare" | "backend-linux-private-runtime"
-        )
-    {
-        return vec![];
-    }
-    let mut names = Vec::new();
-    if acquires_sources(recipe) {
-        names.extend(["source-complete", "archives-partial", "index-partial"].map(str::to_owned));
-    }
-    for partition in compiled_slots(recipe) {
-        for class in ["complete", "partial"] {
-            names.push(format!("{partition}-{class}"));
-        }
-    }
-    for tool in tools(recipe) {
-        for class in ["image", "source-complete", "complete", "partial"] {
-            names.push(format!("{tool}-{class}"));
-        }
-    }
-    if recipe == "miri-setup" {
-        names.push("sysroot".into());
-    }
-    names
 }
 /// Only missing bounds with an existing reviewed native/tool counterpart are
 /// supplied here. Unknown commands fail generation instead of inheriting an
@@ -1663,7 +1891,7 @@ pub(super) fn job_budget_definition(job: &Value) -> Result<super::budget::JobDef
                     {
                         continue;
                     }
-                    let minutes = step["timeout-minutes"]
+                    let mut minutes = step["timeout-minutes"]
                         .as_u64()
                         .filter(|minutes| *minutes > 0)
                         .ok_or_else(|| {
@@ -1678,8 +1906,13 @@ pub(super) fn job_budget_definition(job: &Value) -> Result<super::budget::JobDef
                     } else {
                         field(step, "id").into()
                     };
-                    let node = N::minutes(label, minutes)?;
                     let command = field(step, "run");
+                    // A miss performs only selection. The continuation belongs
+                    // to exactly one active-image/build/adoption route.
+                    if *driver != 'r' && command.contains(" ci driver-select --feedback ") {
+                        minutes = 4;
+                    }
+                    let node = N::minutes(label, minutes)?;
                     if has_native_clock
                         && (command.contains(" release compile-target ")
                             || command.contains(" release validate-package ")

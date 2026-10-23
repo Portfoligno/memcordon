@@ -25,6 +25,8 @@ pub enum Suite {
     NativeCompile,
     NativeExecute,
     SupplyChain,
+    SupplyAudit,
+    SupplyDeny,
     SupplyAuditPrepare,
     SupplyAuditCheck,
     SupplyDenyPrepare,
@@ -122,6 +124,8 @@ impl Suite {
             | NativeCompile
             | NativeExecute
             | SupplyChain
+            | SupplyAudit
+            | SupplyDeny
             | SupplyAuditPrepare
             | SupplyAuditCheck
             | SupplyDenyPrepare

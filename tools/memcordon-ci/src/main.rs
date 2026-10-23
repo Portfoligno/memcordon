@@ -73,9 +73,22 @@ enum CiCommand {
     DriverImageProbe,
     DriverCleanup,
     DriverContext,
-    DriverSelect,
-    DriverBuild,
-    DriverAdoptCold,
+    DriverSelect {
+        #[arg(long, value_enum)]
+        feedback: Option<memcordon_ci::driver_cache::DriverFeedback>,
+    },
+    DriverBuild {
+        #[arg(long, value_enum)]
+        feedback: Option<memcordon_ci::driver_cache::DriverFeedback>,
+    },
+    DriverAdoptCold {
+        #[arg(long, value_enum)]
+        feedback: Option<memcordon_ci::driver_cache::DriverFeedback>,
+    },
+    Feedback {
+        #[arg(value_enum)]
+        operation: memcordon_ci::driver_cache::DriverFeedback,
+    },
     PreparationTools {
         #[arg(value_enum)]
         operation: memcordon_ci::preparation_tools::Operation,
@@ -312,9 +325,16 @@ fn run() -> Result<()> {
             CiCommand::DriverImageProbe => memcordon_ci::driver_cache::image_probe(&root),
             CiCommand::DriverCleanup => memcordon_ci::driver_cache::cleanup(&root),
             CiCommand::DriverContext => memcordon_ci::driver_cache::context(&root),
-            CiCommand::DriverSelect => memcordon_ci::driver_cache::select(&root),
-            CiCommand::DriverBuild => memcordon_ci::driver_cache::build(&root),
-            CiCommand::DriverAdoptCold => memcordon_ci::driver_cache::adopt_cold(&root),
+            CiCommand::DriverSelect { feedback } => {
+                memcordon_ci::driver_cache::select(&root, feedback)
+            }
+            CiCommand::DriverBuild { feedback } => {
+                memcordon_ci::driver_cache::build(&root, feedback)
+            }
+            CiCommand::DriverAdoptCold { feedback } => {
+                memcordon_ci::driver_cache::adopt_cold(&root, feedback)
+            }
+            CiCommand::Feedback { operation } => operation.run(&root),
             CiCommand::PreparationTools { operation, kind } => {
                 memcordon_ci::preparation_tools::run(&root, operation, kind)
             }

@@ -60,11 +60,9 @@ affected compiled entry. Synchronous native discovery has a finite optional
 workflow-step timeout; it never activates a shell developer environment.
 
 A service hit, a dependency seed retained by sanitation and actual Cargo reuse
-are different observations. The local auxiliary regression transports the real
-member list, preserves an external registry artifact and observes Cargo freshness
-after sanitation. Native Windows correspondence and hosted cold/save/warm results
-must be measured on their actual runners; cross-target typechecking does not
-establish them. No cache outcome replaces native tests, readiness cleanup,
+are different observations. Normal operation can report these facts separately;
+a successful service transfer does not establish Cargo reuse. No cache outcome
+replaces native tests, readiness cleanup,
 diagnostic ownership or release rehearsal.
 
 Layout 6 separates native tests, selected product compilation, private native
@@ -92,12 +90,10 @@ Unsupported source scope remains cold; unsafe paths and unresolved owners block
 mutation. No registry settings, remote caches or paid storage limits are changed.
 
 Generated Miri sysroots and stable ordinary packaged consumers have separate
-native acceptance gates. The Miri gate requires the exact pinned nightly's real
-setup/transport/interpretation regression. The consumer gate requires actual
-four-package compilation, external Cargo freshness, local rebuilding and fresh
-installation at identical canonical coordinates. Gates are source-reviewed
-target/toolchain tuples, never restored readiness files or environment switches.
-The corresponding ignored native regressions document their explicit commands.
+current compatibility inputs. Miri uses its actual setup identity; ordinary
+consumer availability follows current native compatibility while retaining
+source, target, byte, path and owner checks. No historical native test or
+target/toolchain approval is required for reuse.
 Existing readiness/public/capture workflow consumers remain ephemeral; the
 current workflow inventory contains no eligible ordinary consumer caller.
 # Rust workflow authoring and cache transport
@@ -115,6 +111,11 @@ contain cache identities and bounded paths. Settlement and compilation facts
 come from current native owners; they cannot be restored from a request or
 manifest. Save actions consume only the corresponding producer's validated
 `*-save`, `*-key` and `*-path` outputs and use explicit `always()` guards.
+Restore and save use the same workspace-relative provider path for each payload
+family and complete/partial class. Bootstrap images use `target/ci-bootstrap-in`;
+current images use `target/ci-transfer/driver-image`. Compiler, tool-build and
+registry snapshot transports share their path constructor across request,
+import, staging and cleanup. Live build and executable roots remain separate.
 Completed and partial compiler transfers stay distinct, with a new envelope
 namespace and safe inbox validation before any live-root import. Unsafe paths or
 unresolved ownership remain failures. Optional malformed cache data can be
@@ -153,8 +154,21 @@ without a host/nightly rollout whitelist; explicit setup and interpreted tests
 still execute. Backend branch supersession stops work admission and attempts
 bounded native retirement; forceful runner termination is never reported clean.
 
-Portable structural and mutation tests do not demonstrate hosted cache storage,
-Windows rename/share behavior, Linux/macOS cold/warm native operation, or measured
-transfer/build performance. Those outcomes require their actual native/service
-acceptance. Report cache eligibility, an attempted transfer and verified later
-retrieval separately.
+CI and Release formatting have independent root jobs. Release repository policy
+also has its own root job; final assembly requires both owners. Required policy
+and planner feedback runs in the actual current executable before optional
+exports, and selected-source verification precedes source acquisition. Audit
+and deny remain separate typed leaves, each checking before its retention tail.
+
+Branch pushes supersede earlier runs in their workflow/event/ref lane. Ordinary
+diagnostics and lookup probes use cancellation-sensitive conditions. Actual
+owner retirement and eligible saves retain bounded `always()` finalization;
+saving is best effort within the runner's remaining lifetime.
+
+Normal logs may report cache eligibility, an attempted transfer and observed
+retrieval separately. These observations are not a release or reuse prerequisite.
+CI dependency, tool-image, sysroot and compilation caches remain operational.
+This repository does not maintain CI-cache regression, mutation, round-trip or
+native-qualification test cases. Keep actual path, source, credential,
+compatibility and owner checks at their operational boundaries. Do not replace
+removed cases with a cache approval or test-absence gate.

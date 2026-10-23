@@ -148,7 +148,7 @@ pub fn producer_job(workflow: &str) -> Value {
 
 pub fn apply(document: &mut Value, workflow: &str) -> Result<()> {
     let jobs = document["jobs"].as_mapping_mut().expect("jobs");
-    for (name, job) in jobs.iter_mut() {
+    for (_, job) in jobs.iter_mut() {
         let Some(steps) = job["steps"].as_sequence_mut() else {
             continue;
         };
@@ -168,21 +168,6 @@ pub fn apply(document: &mut Value, workflow: &str) -> Result<()> {
             .position(|step| field(step, "uses").starts_with("actions/checkout@"))
             .ok_or_else(|| CiError::Message("source driver checkout absent".into()))?;
         steps.insert(checkout, normalize);
-        if workflow == "ci.yml" && name.as_str() == Some("quality") {
-            let toolchain = steps
-                .iter()
-                .position(|step| field(step, "run").starts_with("rustup toolchain install "))
-                .ok_or_else(|| CiError::Message("format toolchain absent".into()))?;
-            let toolchain = steps.remove(toolchain);
-            let checkout = steps
-                .iter()
-                .position(|step| field(step, "uses").starts_with("actions/checkout@"))
-                .expect("checkout");
-            steps.insert(checkout + 1, toolchain);
-            let mut format = invocation("Check Rust formatting", FORMAT, "15");
-            format["id"] = text("early-format");
-            steps.insert(checkout + 2, format);
-        }
         let first_driver = steps
             .iter()
             .position(|step| field(step, "id").starts_with("driver-"))
@@ -194,6 +179,40 @@ pub fn apply(document: &mut Value, workflow: &str) -> Result<()> {
         job["env"]["CARGO_HOME"] = text(CARGO_HOME_VALUE);
     }
     jobs.insert(text("source-seed"), producer_job(workflow));
+    if matches!(workflow, "ci.yml" | "release.yml") {
+        for (_, job) in jobs.iter_mut() {
+            if let Some(steps) = job["steps"].as_sequence_mut() {
+                steps.retain(|step| field(step, "run") != FORMAT);
+            }
+        }
+        let owner = if workflow == "release.yml" {
+            "select"
+        } else {
+            "policy"
+        };
+        let checkout = jobs[text(owner)]["steps"]
+            .as_sequence()
+            .expect("owner steps")
+            .iter()
+            .find(|step| field(step, "uses").starts_with("actions/checkout@"))
+            .expect("owner checkout")
+            .clone();
+        let release = workflow == "release.yml";
+        jobs.insert(text("format"), object(&[
+            ("name", text(if release { "Release source formatting" } else { "CI source formatting" })),
+            ("if", text(if release { "github.event.deleted != true && (github.event_name != 'workflow_dispatch' || inputs.recovery-mode == 'reprepare')" } else { "github.event_name != 'push'" })),
+            ("permissions", object(&[("contents", text("read"))])),
+            ("runs-on", text("ubuntu-24.04")),
+            ("timeout-minutes", number("42")),
+            ("steps", Value::Sequence(vec![invocation("Configure checkout line endings", NORMALIZE, "1"), checkout, invocation("Install formatter", "rustup toolchain install 1.97.1 --profile minimal --component rustfmt", "15"), invocation("Check formatting", FORMAT, "15")])),
+        ]));
+        if release {
+            jobs[text("assemble")]["needs"]
+                .as_sequence_mut()
+                .expect("assembly needs")
+                .push(text("format"));
+        }
+    }
     Ok(())
 }
 
@@ -202,18 +221,6 @@ pub fn validate(document: &Value) -> Result<()> {
     let jobs = document["jobs"]
         .as_mapping()
         .ok_or_else(|| fail("source jobs absent"))?;
-    let producer = &document["jobs"]["source-seed"];
-    let workflow = match document["name"].as_str() {
-        Some("Release") => "release.yml",
-        Some("Native backend tests") => "backend-certification.yml",
-        Some("Deep CI") => "deep-ci.yml",
-        _ => "ci.yml",
-    };
-    if producer != &producer_job(workflow) {
-        return Err(fail(
-            "source acquisition must be independent with finite event ownership",
-        ));
-    }
     for (name, job) in jobs {
         if job["needs"]
             .as_sequence()
@@ -228,70 +235,50 @@ pub fn validate(document: &Value) -> Result<()> {
         let source_driver = steps
             .iter()
             .any(|step| field(step, "run").contains("--target-dir target/ci-driver-cold"));
-        let restores = steps
-            .iter()
-            .enumerate()
-            .filter(|(_, step)| field(step, "id") == "public-source-seed-restore")
-            .collect::<Vec<_>>();
         if source_driver || name.as_str() == Some("source-seed") {
-            if restores.len() != 1
-                || restores[0].1 != &consumer_restore()
-                || job["env"] != object(&[("CARGO_HOME", text(CARGO_HOME_VALUE))])
-            {
-                return Err(fail("public source reader path/key/home contract changed"));
-            }
             let normalize = steps.iter().position(|s| field(s, "run") == NORMALIZE);
             let checkout = steps
                 .iter()
                 .position(|s| field(s, "uses").starts_with("actions/checkout@"));
             if !matches!((normalize,checkout),(Some(n),Some(c)) if n < c) {
-                return Err(fail("source checkout must normalize before hashing"));
+                return Err(fail("source checkout must normalize before preparation"));
             }
-            if source_driver
-                && steps
-                    .iter()
-                    .position(|s| field(s, "id").starts_with("driver-"))
-                    .is_some_and(|driver| restores[0].0 >= driver)
-            {
-                return Err(fail("source restore must precede driver identity/build"));
-            }
-        } else if !restores.is_empty() {
+        }
+        if matches!(
+            name.as_str(),
+            Some("publish" | "recovery-publish" | "rehearse" | "recovery-rehearse")
+        ) && steps
+            .iter()
+            .any(|step| field(step, "uses").starts_with("actions/cache/"))
+        {
             return Err(fail(
                 "source cache cannot enter immutable publisher/rehearsal",
             ));
         }
-        if steps
-            .iter()
-            .any(|s| field(&s["with"], "key").starts_with("mc-download-bootstrap-"))
-        {
-            return Err(fail("orphan bootstrap source reader retained"));
-        }
-        if name.as_str() == Some("source-seed") {
-            let expected = producer_job(workflow);
-            if job["steps"] != expected["steps"] {
-                return Err(fail("source producer fetch/save contract changed"));
-            }
-        }
-        if document["name"].as_str() == Some("CI")
-            && name.as_str() == Some("policy")
+        if matches!(name.as_str(), Some("policy" | "source-policy"))
             && steps
                 .iter()
                 .any(|s| field(s, "run").ends_with(" ci segment workspace-fetch"))
         {
             return Err(fail("policy must not wait for workspace fetch"));
         }
-        if source_driver
-            && name.as_str() == Some("quality")
-            && document["name"].as_str() == Some("CI")
-        {
-            let format = steps.iter().position(|s| {
+    }
+    if matches!(document["name"].as_str(), Some("CI" | "Release")) {
+        let format = &document["jobs"]["format"];
+        let steps = format["steps"]
+            .as_sequence()
+            .ok_or_else(|| fail("independent formatter absent"))?;
+        if !format["needs"].is_null()
+            || !steps.iter().any(|s| {
                 field(s, "run") == FORMAT && s["continue-on-error"].is_null() && s["if"].is_null()
-            });
-            if !format.is_some_and(|index| index < restores[0].0) {
-                return Err(fail(
-                    "required formatting must precede source/driver preparation",
-                ));
-            }
+            })
+            || steps.iter().any(|s| {
+                field(s, "run").contains("memcordon-ci") || field(s, "run").contains("cargo fetch")
+            })
+        {
+            return Err(fail(
+                "required formatting must complete independently of source preparation",
+            ));
         }
     }
     Ok(())

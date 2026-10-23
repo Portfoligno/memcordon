@@ -168,6 +168,23 @@ fn preparation_rejects_wrong_source_host_invocation_or_kind_before_reading_membe
 #[test]
 fn producer_hosts_are_closed_and_records_do_not_accept_test_certificates() {
     assert_eq!(
+        producer(Kind::PrivateDriver, "x86_64-unknown-linux-gnu").unwrap(),
+        "private-linux-tools-x64"
+    );
+    assert_eq!(
+        producer(Kind::PrivateDriver, "aarch64-unknown-linux-gnu").unwrap(),
+        "private-linux-tools-arm64"
+    );
+    for host in [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+        "unsupported",
+    ] {
+        assert!(producer(Kind::PrivateDriver, host).is_err());
+    }
+    assert_eq!(
         producer(Kind::Private, "aarch64-unknown-linux-gnu").unwrap(),
         "private-linux-prepare-arm64"
     );

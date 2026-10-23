@@ -1,6 +1,6 @@
 //! Independent checks over actual YAML. No renderer equality or restored fact
 //! can supply a required work operation or native checkpoint here.
-use super::{adapters, text, validate_ready_save};
+use super::{adapters, text};
 use crate::{CiError, Result};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -17,47 +17,26 @@ fn required(step: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn key_reference(value: &str) -> Option<(&str, &str)> {
-    value
-        .strip_prefix("${{ steps.")?
-        .strip_suffix("-key }}")?
-        .split_once(".outputs.")
-}
-fn owner_slots(command: &str) -> Option<Vec<String>> {
-    if command.ends_with(" ci driver-build") {
-        return Some(
-            [
-                "bootstrap",
-                "image",
-                "compiled-complete",
-                "compiled-partial",
-                "source-complete",
-                "archives-partial",
-                "index-partial",
-            ]
-            .map(str::to_owned)
-            .into(),
-        );
-    }
-    if command.ends_with(" ci driver-adopt-cold") {
-        return Some(
-            [
-                "bootstrap",
-                "source-complete",
-                "archives-partial",
-                "index-partial",
-            ]
-            .map(str::to_owned)
-            .into(),
-        );
-    }
-    adapters::operation_recipe(command).map(adapters::save_slots)
-}
 fn recipe(command: &str) -> Option<&str> {
     command.split_once(" ci segment ").map(|(_, recipe)| recipe)
 }
 
 pub fn validate(document: &Value) -> Result<()> {
+    if document["name"] == "Release" {
+        let needs = document["jobs"]["assemble"]["needs"]
+            .as_sequence()
+            .ok_or_else(|| reject("assembly dependencies absent"))?;
+        if !["format", "source-policy"]
+            .iter()
+            .all(|owner| needs.contains(&text(owner)))
+            || !document["jobs"]["source-policy"].is_mapping()
+            || !document["jobs"]["source-policy"]["needs"].is_null()
+        {
+            return Err(reject(
+                "assembly requires independent source formatting and policy",
+            ));
+        }
+    }
     super::source_seed::validate(document)?;
     super::concurrency::validate(document)?;
     if document["name"].as_str() == Some("Release") {
@@ -92,20 +71,12 @@ pub fn validate(document: &Value) -> Result<()> {
                     || command.contains(" release build-target ")
                     || command.ends_with(" release working-windows-prepare")
                     || command.ends_with(" ci driver-build")
+                    || command.contains(" ci driver-build --feedback ")
+                    || command.contains(" ci driver-select --feedback ")
+                    || command.contains(" ci driver-adopt-cold --feedback ")
                     || command.contains("--target-dir target/ci-driver-cold")
                 {
                     required(step)?;
-                }
-                if command.contains(" ci cache-requests ")
-                    || command.ends_with(" ci driver-context")
-                {
-                    required(step)
-                        .map_err(|_| reject("cache context must preserve unsafe failure"))?;
-                }
-                if command.contains(" ci cache-requests fuzz-execute-") {
-                    return Err(reject(
-                        "execution must not reimport the earlier compiler inbox",
-                    ));
                 }
                 if recipe(command) == Some("prepare-miri-components") {
                     let driver = command
@@ -148,84 +119,6 @@ pub fn validate(document: &Value) -> Result<()> {
             if !field(step, "id").is_empty() && owners.insert(field(step, "id"), index).is_some() {
                 return Err(reject("duplicate workflow step id"));
             }
-            if !field(step, "uses").starts_with("actions/cache/save@") {
-                continue;
-            }
-            if job_name.as_str() == Some("source-seed")
-                && field(step, "id") == "public-source-seed-save"
-            {
-                continue; // Complete finite source job was independently validated above.
-            }
-            let Some((owner, slot)) = key_reference(field(&step["with"], "key")) else {
-                return Err(reject(
-                    "cache save key must name its actual producer and class",
-                ));
-            };
-            let owner_index = *owners
-                .get(owner)
-                .ok_or_else(|| reject("cache save owner must precede transfer"))?;
-            if owner_index >= index {
-                return Err(reject("cache save owner must precede transfer"));
-            }
-            let allowed = owner_slots(field(&steps[owner_index], "run"))
-                .ok_or_else(|| reject("cache save has no finite work owner"))?;
-            if !allowed.iter().any(|name| name == slot) {
-                return Err(reject("cache slot does not belong to its finite recipe"));
-            }
-            required(&steps[owner_index])?;
-            if !validate_ready_save(step.as_mapping().expect("step mapping"))? {
-                return Err(reject("cache save class/key/path binding is invalid"));
-            }
-            let windows = field(&steps[owner_index], "run").contains("memcordon-ci.exe");
-            let next_work = steps
-                .iter()
-                .enumerate()
-                .skip(owner_index + 1)
-                .find(|(_, candidate)| {
-                    let guard = field(candidate, "if");
-                    if (windows && guard.contains("runner.os != 'Windows'"))
-                        || (!windows && guard.contains("runner.os == 'Windows'"))
-                    {
-                        return false;
-                    }
-                    if candidate["continue-on-error"].as_bool() == Some(true) {
-                        return false;
-                    }
-                    let run = field(candidate, "run");
-                    if run.contains(" ci cache-requests ")
-                        || run.contains(" ci cleanup-transfers ")
-                        || run.ends_with(" ci driver-cleanup")
-                    {
-                        return false;
-                    }
-                    !run.is_empty()
-                        || field(candidate, "uses").starts_with("actions/upload-artifact@")
-                })
-                .map(|(index, _)| index);
-            if next_work.is_some_and(|next| index >= next) {
-                return Err(reject(
-                    "early retention boundary must precede later required work",
-                ));
-            }
-            if !slot.ends_with("partial") {
-                let probe = format!("{owner}-{slot}-probe");
-                let probe_index = *owners
-                    .get(probe.as_str())
-                    .ok_or_else(|| reject("exact save probe must precede transfer"))?;
-                let probe = &steps[probe_index];
-                let expected = format!("always() && steps.{owner}.outputs.{slot}-save == 'true'");
-                if probe_index <= owner_index
-                    || field(probe, "if") != expected
-                    || probe["with"]["lookup-only"].as_bool() != Some(true)
-                    || probe["with"]["key"] != step["with"]["key"]
-                    || probe["with"]["path"] != step["with"]["path"]
-                    || !field(probe, "uses").starts_with("actions/cache/restore@")
-                {
-                    return Err(reject(
-                        "exact save probe must use the same ready class/key/path",
-                    ));
-                }
-            }
         }
         for (compile_index, compile) in steps.iter().enumerate() {
             let Some((driver, selected)) = field(compile, "run").split_once(" ci segment ") else {
@@ -249,24 +142,8 @@ pub fn validate(document: &Value) -> Result<()> {
                     "actual compilation lost its required execution phase",
                 ));
             };
-            let owner = field(compile, "id");
-            let slot = if selected == "native-compile" {
-                "native-tests"
-            } else {
-                "compiled"
-            };
-            for class in ["complete", "partial"] {
-                if execute_index <= compile_index
-                    || !steps[compile_index + 1..execute_index].iter().any(|step| {
-                        field(step, "uses").starts_with("actions/cache/save@")
-                            && key_reference(field(&step["with"], "key"))
-                                == Some((owner, format!("{slot}-{class}").as_str()))
-                    })
-                {
-                    return Err(reject(
-                        "early compilation checkpoint must precede actual execution",
-                    ));
-                }
+            if execute_index <= compile_index {
+                return Err(reject("actual execution must follow compilation"));
             }
         }
     }
@@ -293,7 +170,7 @@ fn validate_fuzz_split(document: &Value) -> Result<()> {
             .as_sequence()
             .is_none_or(|needs| needs != &vec![text("performance-plan"), text("fuzz-setup")])
         || field(shard, "if")
-            != "always() && needs.performance-plan.result == 'success' && (needs.performance-plan.outputs.standalone-common == 'true')"
+            != "!cancelled() && needs.performance-plan.result == 'success' && (needs.performance-plan.outputs.standalone-common == 'true')"
         || setup["runs-on"] != "ubuntu-24.04"
         || !setup["strategy"].is_null()
     {
@@ -304,7 +181,7 @@ fn validate_fuzz_split(document: &Value) -> Result<()> {
     if !shard["needs"]
         .as_sequence()
         .is_some_and(|needs| needs.iter().any(|n| n == "fuzz-setup"))
-        || !field(shard, "if").starts_with("always()")
+        || !field(shard, "if").starts_with("!cancelled()")
     {
         return Err(reject("fuzz shards require successful actual setup"));
     }

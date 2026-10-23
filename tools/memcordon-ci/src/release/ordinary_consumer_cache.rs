@@ -1,11 +1,6 @@
 //! Job-local ordinary Cargo sources. Only `build/` is ever a transport member.
 //!
-//! Rollout: on each native target run `cargo test -p memcordon-ci --test
-//! ordinary_consumer_cache actual_packaged_ordinary_consumer_round_trip_reuses_only_registry_dependencies
-//! -- --ignored --exact`. Review its real registry freshness, local rebuilding,
-//! immutable package and fresh binary-install assertions before adding that exact
-//! native target and pinned toolchain tuple to `VALIDATED_NATIVE_TARGETS`. Never activate through environment
-//! variables or persisted success files. Rerun after compiler/layout changes.
+//! Reuse follows current native compatibility, source bytes, and owned layout.
 use super::{artifacts, distribution, packages::PackageConsumer, source, target::TargetBundle};
 use crate::{CiError, Result, cache_inputs::KeyInputs, cache_restore::RestoreMode};
 use serde::{Deserialize, Serialize};
@@ -82,8 +77,8 @@ impl OrdinarySlot {
         Self::open_at(root, Path::new(&temporary), target)
     }
 
-    /// Explicit path seam for ownership tests; production always uses RUNNER_TEMP.
-    pub fn open_at(root: &Path, temporary: &Path, target: &str) -> Result<Self> {
+    /// Open the selected owned slot beneath the runner's temporary directory.
+    fn open_at(root: &Path, temporary: &Path, target: &str) -> Result<Self> {
         if target != distribution::native_target()? {
             return Err(CiError::Message(
                 "ordinary consumer requires actual native target".into(),
@@ -465,43 +460,12 @@ fn selected(
     Ok(native.distribution)
 }
 
-/// Until a target's real four-package round trip is run, it remains cold.
-// Actual four-package archive/build/install round trip: c4bda6e1, 124.47s.
-// rustc 1.97.1 (8bab26f4f), Cargo 1.97.1 (c980f4866), native Apple ARM64.
-const VALIDATED_NATIVE_TARGETS: &[(&str, &str, &str, &str)] = &[(
-    "aarch64-apple-darwin",
-    "1.97.1",
-    "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
-    "cargo 1.97.1 (c980f4866 2026-06-30)",
-)];
-
-pub fn native_reuse_validated(target: &str) -> bool {
-    VALIDATED_NATIVE_TARGETS
-        .iter()
-        .any(|(selected, _, _, _)| *selected == target)
-}
-
-fn available(state: &SlotContext, target: &str) -> bool {
-    VALIDATED_NATIVE_TARGETS
-        .iter()
-        .any(|(selected, toolchain, compiler_commit, cargo)| {
-            *selected == target
-                && state.compatibility.get("toolchain").map(String::as_str) == Some(*toolchain)
-                && state.compatibility.get("rustc").is_some_and(|identity| {
-                    identity
-                        .lines()
-                        .any(|line| line.strip_prefix("commit-hash: ") == Some(*compiler_commit))
-                })
-                && state
-                    .compatibility
-                    .get("cargo")
-                    .is_some_and(|identity| identity.trim() == *cargo)
-        })
-        && state
-            .compatibility
-            .get("native-available")
-            .map(String::as_str)
-            == Some("true")
+fn available(state: &SlotContext) -> bool {
+    state
+        .compatibility
+        .get("native-available")
+        .map(String::as_str)
+        == Some("true")
 }
 
 pub fn emit(root: &Path, target: &Path, packages: &Path, for_save: bool) -> Result<()> {
@@ -545,7 +509,7 @@ fn emit_state(
     for_save: bool,
     target: &str,
 ) -> Result<()> {
-    let usable = available(state, target);
+    let usable = available(state);
     crate::workflow_output::write(&[
         ("compiled-cache-usable", usable.to_string()),
         (
@@ -580,7 +544,7 @@ fn emit_state(
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"layout":"stable-ordinary", "compiled-cache-usable":usable, "reason":if usable { "validated ordinary consumer" } else { "native/compiler acceptance or current compatibility unavailable; cold compilation" }, "target":target})
+            &serde_json::json!({"layout":"stable-ordinary", "compiled-cache-usable":usable, "reason":if usable { "current native compatibility available" } else { "current native compatibility unavailable; cold compilation" }, "target":target})
         )?
     );
     Ok(())
@@ -639,10 +603,7 @@ fn sanitize(root: &Path, consumer: &PackageConsumer, mode: RestoreMode) -> Resul
     let valid = build_ready(&target)?;
     let state = read_state(&slot.context())?;
     drop(locks);
-    if matches!(mode, RestoreMode::Discard)
-        || !valid
-        || !available(&state, distribution::native_target()?)
-    {
+    if matches!(mode, RestoreMode::Discard) || !valid || !available(&state) {
         if target.try_exists()? {
             fs::remove_dir_all(&target)?;
         }

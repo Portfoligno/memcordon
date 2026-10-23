@@ -53,10 +53,8 @@ fn cleanup_requires_both_command_and_settled_cell_and_retains_each_failure() {
         cleanup_failures(&output(true), &Err("cell access denied".into())).join("; ");
     assert!(missing_cell.contains("cell access denied"));
     let mut cell = settled_cell();
-    cell.cache_quiescent = false;
     cell.cleanup_failures.push("native owner still held".into());
     let unsettled = cleanup_failures(&output(true), &Ok(cell)).join("; ");
-    assert!(unsettled.contains("cache-quiescent=false"));
     assert!(unsettled.contains("native owner still held"));
 
     let failed_observation = Err(memcordon_ci::CiError::Message(

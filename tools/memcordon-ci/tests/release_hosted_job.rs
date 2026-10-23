@@ -4,12 +4,7 @@ use std::process::Command;
 #[test]
 fn retired_hosted_job_commands_are_not_executable_routes() {
     let executable = env!("CARGO_BIN_EXE_memcordon-ci");
-    for command in [
-        "release-hosted-job",
-        "release-hosted-register",
-        "release-hosted-cache-register",
-        "release-hosted-cache-collect",
-    ] {
+    for command in ["release-hosted-job", "release-hosted-register"] {
         let output = Command::new(executable).arg(command).output().unwrap();
         assert!(
             !output.status.success(),

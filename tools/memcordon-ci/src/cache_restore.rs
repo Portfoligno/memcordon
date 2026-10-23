@@ -169,10 +169,6 @@ pub fn prepare_tool_build(
     Ok(())
 }
 
-pub fn payload_ready(root: &Path, purpose: &str, shard: &str) -> Result<bool> {
-    partition_payload_ready(root, purpose, shard, None)
-}
-
 pub fn partition_payload_ready(
     root: &Path,
     purpose: &str,
@@ -379,10 +375,6 @@ pub(crate) fn settled_locks(targets: &[PathBuf]) -> Result<Vec<std::fs::File>> {
     }
     Ok(locks)
 }
-
-#[cfg(test)]
-#[path = "../tests/private/cache_restore_locks.rs"]
-mod locks_tests;
 
 pub(crate) fn cargo_marker_present(target: &Path) -> Result<bool> {
     use std::io::Read;

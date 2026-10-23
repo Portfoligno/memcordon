@@ -22,6 +22,7 @@ const RECORD_LIMIT: u64 = 64 * 1024;
 pub enum Kind {
     Readiness,
     Private,
+    PrivateDriver,
     ReleaseFuzz,
 }
 
@@ -102,6 +103,15 @@ fn producer(kind: Kind, host: &str) -> Result<String> {
                 ));
             }
         },
+        Kind::PrivateDriver => match suffix {
+            "linux-x64" => "private-linux-tools-x64".into(),
+            "linux-arm64" => "private-linux-tools-arm64".into(),
+            _ => {
+                return Err(invalid(
+                    "private driver preparation requires its native Linux host",
+                ));
+            }
+        },
         Kind::ReleaseFuzz if suffix == "linux-x64" => "fuzz-setup".into(),
         Kind::ReleaseFuzz => {
             return Err(invalid(
@@ -142,6 +152,7 @@ fn manifest(kind: Kind) -> &'static str {
     match kind {
         Kind::Readiness => "target/ci-preparation/readiness.json",
         Kind::Private => "target/ci-preparation/private.json",
+        Kind::PrivateDriver => "target/ci-preparation/private-driver.json",
         Kind::ReleaseFuzz => "target/ci-preparation/release-fuzz.json",
     }
 }
@@ -212,7 +223,7 @@ fn helper() -> &'static str {
 }
 
 fn files(root: &Path, kind: Kind) -> Result<Vec<PathBuf>> {
-    let mut files = if kind == Kind::ReleaseFuzz {
+    let files = if kind == Kind::ReleaseFuzz {
         vec![
             Path::new(".release/tool").join(executable()),
             PathBuf::from("target/ci-tools/bin/cargo-fuzz"),
@@ -220,12 +231,39 @@ fn files(root: &Path, kind: Kind) -> Result<Vec<PathBuf>> {
     } else {
         crate::driver_cache::preparation_members(root)?
     };
+    Ok(complete_files(kind, files))
+}
+
+fn complete_files(kind: Kind, mut files: Vec<PathBuf>) -> Vec<PathBuf> {
     if kind == Kind::Readiness {
         files.push(Path::new("target/ci-driver-cold/release").join(helper()));
         files.push(Path::new("target/ci/release").join(helper()));
     }
     files.sort();
-    Ok(files)
+    files
+}
+
+fn transported_files(root: &Path, record: &Record) -> Result<Vec<PathBuf>> {
+    if record.inputs.kind == Kind::ReleaseFuzz {
+        return files(root, record.inputs.kind);
+    }
+    let manifest = Path::new("target/ci-runtime/current").join("image.json");
+    let mut matches = record
+        .files
+        .iter()
+        .filter(|member| Path::new(&member.path) == manifest);
+    let member = matches
+        .next()
+        .ok_or_else(|| invalid("preparation image manifest record is absent"))?;
+    if matches.next().is_some() || member.executable || member.size == 0 || member.size > FILE_LIMIT
+    {
+        return Err(invalid("preparation image manifest record is invalid"));
+    }
+    // This record belongs to the exact required same-run producer artifact.
+    // Its hash binds those transported bytes; it is not an independent signature.
+    let files =
+        crate::driver_cache::transported_preparation_members(root, member.size, &member.sha256)?;
+    Ok(complete_files(record.inputs.kind, files))
 }
 
 fn records(root: &Path, paths: &[PathBuf]) -> Result<Vec<FileRecord>> {
@@ -278,7 +316,7 @@ fn validate(root: &Path, record: &Record, expected: &Inputs) -> Result<()> {
             "preparation source, host, protocol or invocation differs",
         ));
     }
-    let paths = files(root, expected.kind)?;
+    let paths = transported_files(root, record)?;
     if records(root, &paths)? != record.files {
         return Err(invalid("preparation bytes or member inventory differs"));
     }

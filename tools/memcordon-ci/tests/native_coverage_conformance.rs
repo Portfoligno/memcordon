@@ -1,4 +1,4 @@
-use memcordon_ci::command::CommandSpec;
+use memcordon_ci::command::{CommandSpec, bounded_excerpt};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -40,8 +40,12 @@ fn units(root: &Path, directory: &str, selectors: &[&str], execute: bool) -> BTr
     let output = command.output_owned().into_result().unwrap();
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "Cargo failed: status={}; stdout ({} bytes):\n{}\nstderr ({} bytes):\n{}",
+        output.status,
+        output.stdout.len(),
+        bounded_excerpt(&output.stdout),
+        output.stderr.len(),
+        bounded_excerpt(&output.stderr)
     );
     let units: BTreeSet<_> = String::from_utf8(output.stdout)
         .unwrap()
@@ -62,7 +66,11 @@ fn units(root: &Path, directory: &str, selectors: &[&str], execute: bool) -> BTr
 
 #[test]
 fn pinned_workspace_selectors_preserve_full_units_and_execute_the_same_selection() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     write(
         root.path(),
         "Cargo.toml",
@@ -207,7 +215,11 @@ fn pinned_workspace_selectors_preserve_full_units_and_execute_the_same_selection
 
 #[test]
 fn pinned_cargo_duplicate_ordinary_outputs_cannot_prove_independent_package_images() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     write(
         root.path(),
         "Cargo.toml",
@@ -242,6 +254,8 @@ fn pinned_cargo_duplicate_ordinary_outputs_cannot_prove_independent_package_imag
         .args(["generate-lockfile", "--offline"])
         .run()
         .unwrap();
+    // Shared ordinary output paths need serial construction to inspect identity
+    // without racing concurrent linker writes to the same destination.
     let output = cargo(root.path())
         .args([
             "test",
@@ -249,6 +263,8 @@ fn pinned_cargo_duplicate_ordinary_outputs_cannot_prove_independent_package_imag
             "--all-targets",
             "--release",
             "--no-run",
+            "--jobs",
+            "1",
             "--offline",
             "--locked",
             "--message-format=json",
@@ -258,8 +274,12 @@ fn pinned_cargo_duplicate_ordinary_outputs_cannot_prove_independent_package_imag
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "Cargo failed: status={}; stdout ({} bytes):\n{}\nstderr ({} bytes):\n{}",
+        output.status,
+        output.stdout.len(),
+        bounded_excerpt(&output.stdout),
+        output.stderr.len(),
+        bounded_excerpt(&output.stderr)
     );
     let records: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()

@@ -164,18 +164,6 @@ fn distributed_native(workflow: &Value, name: &str, driver: &str, args: &str) ->
         {
             return Err(fail());
         }
-        if (id == "native-macos-x64-product" || shard.is_some())
-            && !steps[index + 1..].iter().any(|step| {
-                step["uses"]
-                    .as_str()
-                    .is_some_and(|action| action.starts_with("actions/cache/save@"))
-                    && step["if"]
-                        .as_str()
-                        .is_some_and(|guard| guard.contains("always()"))
-            })
-        {
-            return Err(fail());
-        }
         match id {
             "native-macos-x64-plan" => {
                 if !upload(
@@ -376,14 +364,8 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
                 }],
             ),
             (docs, vec!["quality-documentation"]),
-            (
-                "supply-chain-audit",
-                vec!["supply-audit-prepare", "supply-audit-check"],
-            ),
-            (
-                "supply-chain-deny",
-                vec!["supply-deny-prepare", "supply-deny-check"],
-            ),
+            ("supply-chain-audit", vec!["supply-audit"]),
+            ("supply-chain-deny", vec!["supply-deny"]),
         ] {
             let job = jobs
                 .get(text(name))
@@ -473,7 +455,7 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
                 if distributed_native(workflow, name.as_str().unwrap_or(""), driver, args)? {
                     continue;
                 }
-                let compile = steps[..index]
+                steps[..index]
                     .iter()
                     .position(|candidate| {
                         candidate["run"]
@@ -482,13 +464,6 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
                             == Some((driver, args))
                     })
                     .ok_or_else(|| fail("native validation has no matching actual compile"))?;
-                if !steps[compile + 1..index].iter().any(|s| {
-                    s["uses"]
-                        .as_str()
-                        .is_some_and(|u| u.starts_with("actions/cache/save@"))
-                }) {
-                    return Err(fail("native compiler retention boundary missing"));
-                }
             }
         }
     }

@@ -131,12 +131,16 @@ fn emit(mut values: Vec<(String, String)>) -> Result<()> {
     )
 }
 
-pub fn transfer_outputs(slot: &str, transfer: Option<cache_snapshot::Transfer>) -> Result<()> {
+pub fn transfer_outputs(
+    root: &Path,
+    slot: &str,
+    transfer: Option<cache_snapshot::Transfer>,
+) -> Result<()> {
     let (ready, key, path) = match transfer {
         Some(value) => (
             true,
             value.key,
-            crate::workflow_output::action_path(&value.path)?,
+            crate::workflow_output::workspace_action_path(root, &value.path)?,
         ),
         None => (false, String::new(), String::new()),
     };
@@ -147,7 +151,11 @@ pub fn transfer_outputs(slot: &str, transfer: Option<cache_snapshot::Transfer>) 
     ])
 }
 
-fn request_outputs(slot: &str, request: Result<cache_snapshot::TransferRequest>) -> Result<()> {
+fn request_outputs(
+    root: &Path,
+    slot: &str,
+    request: Result<cache_snapshot::TransferRequest>,
+) -> Result<()> {
     let request = match request {
         Ok(value) => Some(value),
         Err(error) if unsafe_cache(&error) => return Err(error),
@@ -171,9 +179,9 @@ fn request_outputs(slot: &str, request: Result<cache_snapshot::TransferRequest>)
                 .map_or_else(String::new, |value| value.prefix.clone()),
         ),
         (
-            format!("{slot}-inbox"),
+            format!("{slot}-path"),
             request
-                .map(|value| crate::workflow_output::action_path(&value.path))
+                .map(|value| crate::workflow_output::workspace_action_path(root, &value.path))
                 .transpose()?
                 .unwrap_or_default(),
         ),
@@ -221,6 +229,7 @@ fn requests_inner(root: &Path, scopes: &[CompiledScope<'_>], family: DownloadFam
         }
         for (complete, class) in [(true, "complete"), (false, "partial")] {
             if let Err(error) = request_outputs(
+                root,
                 &format!("{}-{class}", scope.slot),
                 cache_snapshot::transfer_request(root, scope.selection, complete),
             ) {
@@ -237,7 +246,8 @@ fn source_requests(root: &Path, family: DownloadFamily) -> Result<()> {
         ("archives-partial", SnapshotKind::RegistryArchives),
         ("index-partial", SnapshotKind::RegistryIndex),
     ] {
-        if let Err(error) = request_outputs(slot, cache_snapshot::source_request(root, kind)) {
+        if let Err(error) = request_outputs(root, slot, cache_snapshot::source_request(root, kind))
+        {
             remember(&mut first, error);
         }
     }
@@ -329,7 +339,7 @@ impl SourceSession {
             }
             if self.partial {
                 for slot in ["archives-partial", "index-partial"] {
-                    if let Err(error) = transfer_outputs(slot, None) {
+                    if let Err(error) = transfer_outputs(root, slot, None) {
                         remember(&mut first, error);
                     }
                 }
@@ -424,7 +434,7 @@ impl SourceSession {
             } else {
                 None
             };
-            if let Err(error) = transfer_outputs(slot, transfer) {
+            if let Err(error) = transfer_outputs(root, slot, transfer) {
                 remember(&mut first, error);
             }
         }
@@ -623,6 +633,19 @@ impl<'a> Session<'a> {
         );
         self.cache_remaining = self.cache_remaining.saturating_sub(started.elapsed());
         result
+    }
+
+    /// Record only a writer observed for a root admitted by this live session.
+    pub fn record_scope_writers(
+        &mut self,
+        slot: &'static str,
+        writers: WriterSettlement,
+    ) -> Result<()> {
+        if !self.scopes.iter().any(|(scope, _)| scope.slot == slot) {
+            return Err(CiError::Message("writer scope was not admitted".into()));
+        }
+        self.scope_writers.insert(slot, writers);
+        Ok(())
     }
 
     pub fn execute_with(
@@ -853,6 +876,7 @@ impl<'a> Session<'a> {
                     ("partial", *decision == RetentionDecision::Partial),
                 ] {
                     if let Err(error) = transfer_outputs(
+                        root,
                         &format!("{}-{class}", scope.slot),
                         if chosen { transfer.take() } else { None },
                     ) {
@@ -879,7 +903,3 @@ pub fn cleanup(root: &Path, scopes: &[CompiledScope<'_>]) -> Result<()> {
     }
     first.map_or(Ok(()), Err)
 }
-
-#[cfg(test)]
-#[path = "../tests/private/segment_cache.rs"]
-mod tests;

@@ -327,16 +327,6 @@ fn quality_leaf(
 ) -> Result<()> {
     memcordon_ci::workflow_output::revoke_compilation("compiled-recipe-complete")?;
     let deadline = Instant::now() + Duration::from_secs(90 * 60);
-    if matches!(suite, Suite::QualityCompiler) {
-        for args in [
-            vec!["fmt", "--all", "--", "--check"],
-            vec!["metadata", "--locked", "--format-version", "1"],
-        ] {
-            rustup_cargo(root, stable, args, CARGO_DEADLINE)
-                .bounded_until(deadline)
-                .run()?;
-        }
-    }
     quality_compile_selected(
         root,
         stable,
@@ -604,6 +594,89 @@ fn supply_input_bytes(path: &Path, bound: u64) -> Result<Vec<u8>> {
         return Err(CiError::Message("supply input grew beyond bound".into()));
     }
     Ok(bytes)
+}
+
+pub(crate) fn supply_owned_leaf(
+    root: &Path,
+    suite: Suite,
+    mode: crate::failure_mode::FailureMode,
+    session: &mut memcordon_ci::segment_cache::Session<'_>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120 * 60);
+    crate::preparation::with_operation(mode, deadline, || {
+        supply_owned_leaf_until(root, suite, mode, session, deadline)
+    })
+}
+
+fn supply_owned_leaf_until(
+    root: &Path,
+    suite: Suite,
+    mode: crate::failure_mode::FailureMode,
+    session: &mut memcordon_ci::segment_cache::Session<'_>,
+    deadline: Instant,
+) -> Result<()> {
+    use memcordon_ci::work_outcome::WorkOutcome;
+    let audit = matches!(suite, Suite::SupplyAudit);
+    let name = if audit { "cargo-audit" } else { "cargo-deny" };
+    let checkout = root.canonicalize()?;
+    let commit = git(root, ["rev-parse", "HEAD"])?;
+    let lock = memcordon_ci::ci_operation_time::record_path(root, Path::new("Cargo.lock"))?;
+    let before = supply_input_bytes(&lock, 16 * 1024 * 1024)?;
+    let stable = config::toolchains(root)?.stable;
+    let preparation_deadline = deadline.min(Instant::now() + Duration::from_secs(60 * 60));
+    let prepare = WorkOutcome::from_result(crate::preparation::with_operation(
+        mode,
+        preparation_deadline,
+        || {
+            if root.canonicalize()? != checkout
+                || git(root, ["rev-parse", "HEAD"])? != commit
+                || supply_input_bytes(&lock, 16 * 1024 * 1024)? != before
+            {
+                return Err(CiError::Message("supply lock input changed".into()));
+            }
+            CommandSpec::new("rustup", root, Duration::from_secs(900))
+                .args(["toolchain", "install", &stable, "--profile", "minimal"])
+                .bounded_until(preparation_deadline)
+                .run()?;
+            let tools = config::tools(root)?;
+            crate::preparation::ensure_one_auxiliary_until(
+                root,
+                name,
+                if audit {
+                    &tools.cargo_audit
+                } else {
+                    &tools.cargo_deny
+                },
+                &stable,
+                preparation_deadline,
+                std::num::NonZeroUsize::new(crate::preparation::compiler_budget())
+                    .expect("positive budget"),
+            )
+            .map(|_| ())
+        },
+    ));
+    session.record_scope_writers(name, prepare.writers())?;
+    let outcome = prepare.then_owned(|()| {
+        let check_deadline = deadline.min(Instant::now() + Duration::from_secs(60 * 60));
+        supply_chain_commands(root, &stable)
+            .into_iter()
+            .nth(usize::from(!audit))
+            .expect("fixed supply command")
+            .bounded_until(check_deadline)
+            .run_owned()
+            .map(|_| ())
+    });
+    let invariant = (|| {
+        if root.canonicalize()? != checkout
+            || supply_input_bytes(&lock, 16 * 1024 * 1024)? != before
+        {
+            return Err(CiError::Message(
+                "supply-chain operations changed source or Cargo.lock".into(),
+            ));
+        }
+        Ok(())
+    })();
+    outcome.postcondition(invariant).into_result()
 }
 
 fn supply_leaf(root: &Path, stable: &str, suite: Suite) -> Result<()> {
@@ -1638,6 +1711,8 @@ pub(crate) fn run_with(
             suite,
             Suite::Policy
                 | Suite::SupplyChain
+                | Suite::SupplyAudit
+                | Suite::SupplyDeny
                 | Suite::SupplyAuditPrepare
                 | Suite::SupplyAuditCheck
                 | Suite::SupplyDenyPrepare
@@ -1660,7 +1735,9 @@ pub(crate) fn run_with(
 fn run_result(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
     if matches!(
         suite,
-        Suite::Policy
+        Suite::SupplyAudit
+            | Suite::SupplyDeny
+            | Suite::Policy
             | Suite::Stress
             | Suite::StressPackages
             | Suite::StressLifecycle
@@ -1764,6 +1841,18 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         | Suite::FuzzExecuteQuarterThree
         | Suite::FuzzExecuteQuarterFour => unreachable!("phased fuzz handled above"),
         Suite::SupplyChain => supply_chain(root, &toolchains.stable, options.failure_mode),
+        Suite::SupplyAudit | Suite::SupplyDeny => {
+            memcordon_ci::segment_cache::Session::begin_selected_restoring(
+                root,
+                crate::ci_segments::scopes(suite),
+                crate::ci_segments::family(suite),
+                true,
+                true,
+            )?
+            .execute_with(root, |session| {
+                supply_owned_leaf(root, suite, options.failure_mode, session)
+            })
+        }
         Suite::SupplyAuditPrepare
         | Suite::SupplyAuditCheck
         | Suite::SupplyDenyPrepare

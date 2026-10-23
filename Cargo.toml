@@ -60,7 +60,7 @@ all = "warn"
 [profile.release.package.memcordon-ci]
 opt-level = 1
 
-# Native inventory hashes complete toolchains and SDKs before cache restoration.
+# Use an optimized driver/bootstrap profile with its runtime checks retained.
 # Optimize the controller and its runtime dependencies without removing checks.
 [profile.ci-bootstrap]
 inherits = "dev"

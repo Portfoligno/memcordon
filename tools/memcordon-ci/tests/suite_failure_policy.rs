@@ -76,29 +76,6 @@ fn workflow_collection_executes_fixed_suites_with_supported_mode() {
             }
         }
     }
-    assert_eq!((fixed, adaptive), (20, 46));
-}
-
-#[test]
-fn cache_writes_include_real_push_tags_but_not_manual_tags_or_empty_refs() {
-    for reference in ["refs/heads/main", "refs/tags/0.5.8"] {
-        assert!(memcordon_ci::segment_cache::write_event_for(
-            Some("push"),
-            Some(reference)
-        ));
-    }
-    for reference in ["refs/heads/", "refs/tags/", "refs/pull/1/merge", ""] {
-        assert!(!memcordon_ci::segment_cache::write_event_for(
-            Some("push"),
-            Some(reference)
-        ));
-    }
-    assert!(!memcordon_ci::segment_cache::write_event_for(
-        Some("workflow_dispatch"),
-        Some("refs/tags/0.5.8")
-    ));
-    assert!(!memcordon_ci::segment_cache::write_event_for(
-        Some("pull_request"),
-        Some("refs/heads/main")
-    ));
+    // SupplyAudit and SupplyDeny are adaptive; their split CLI compatibility leaves remain.
+    assert_eq!((fixed, adaptive), (20, 48));
 }

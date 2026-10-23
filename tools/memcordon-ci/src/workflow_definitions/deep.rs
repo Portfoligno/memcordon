@@ -63,7 +63,10 @@ fn node_6() -> Value {
 
 fn node_7() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("group"), text("deep-ci-${{ github.ref }}"));
+    values.insert(
+        text("group"),
+        text("deep-ci-${{ github.event_name }}-${{ github.ref }}"),
+    );
     values.insert(text("cancel-in-progress"), Value::Bool(true));
     Value::Mapping(values)
 }

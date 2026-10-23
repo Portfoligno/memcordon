@@ -86,10 +86,8 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         ("source-checks", "release-quality-compiler"),
         ("source-docs", "quality-documentation"),
         ("msrv", "msrv"),
-        ("supply-chain-audit", "supply-audit-prepare"),
-        ("supply-chain-audit", "supply-audit-check"),
-        ("supply-chain-deny", "supply-deny-prepare"),
-        ("supply-chain-deny", "supply-deny-check"),
+        ("supply-chain-audit", "supply-audit"),
+        ("supply-chain-deny", "supply-deny"),
     ] {
         let mut changed = exact.clone();
         let command = ["./.release/tool/memcordon-ci ci segment", suite].join(" ");
@@ -111,11 +109,11 @@ fn real_release_trigger_matches_scope_and_keeps_all_branch_preparation() {
         .retain(|step| {
             !step["run"]
                 .as_str()
-                .is_some_and(|run| run.contains("release check-preparation"))
+                .is_some_and(|run| run.contains("release check-selected-inputs"))
         });
     assert!(
         validate(RELEASE, &changed).is_err(),
-        "removed inexpensive policy/source/notes owner"
+        "removed selected source/notes owner"
     );
     for family in ["miri", "fuzz"] {
         let mut changed = exact.clone();
@@ -177,12 +175,7 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
         .unwrap()
         .pop();
     assert!(validate(CI, &changed).is_err());
-    for mutation in [
-        "release-suite",
-        "head-checkout",
-        "generic-cache",
-        "skip-native",
-    ] {
+    for mutation in ["release-suite", "head-checkout", "skip-native"] {
         let mut changed = exact.clone();
         let native = &mut changed["jobs"]["native"];
         if mutation == "skip-native" {
@@ -205,20 +198,18 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
                             .is_some_and(|uses| uses.starts_with("actions/checkout@"))
                     })
                     .unwrap(),
-                "generic-cache" => steps
-                    .iter_mut()
-                    .find(|step| {
-                        step["run"]
-                            .as_str()
-                            .is_some_and(|run| run.contains(" ci cache-requests native-compile"))
-                    })
-                    .unwrap(),
                 _ => unreachable!(),
             };
             match mutation {
-                "release-suite" => step["run"] = Value::String("./target/ci/release/memcordon-ci suite backend-macos-watchdog".into()),
-                "head-checkout" => step["with"]["ref"] = Value::String("${{ github.event.pull_request.head.sha }}".into()),
-                "generic-cache" => step["run"] = Value::String("./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete".into()),
+                "release-suite" => {
+                    step["run"] = Value::String(
+                        "./target/ci/release/memcordon-ci suite backend-macos-watchdog".into(),
+                    )
+                }
+                "head-checkout" => {
+                    step["with"]["ref"] =
+                        Value::String("${{ github.event.pull_request.head.sha }}".into())
+                }
                 _ => unreachable!(),
             }
         }
@@ -228,19 +219,32 @@ fn ci_keeps_debug_matrix_and_real_pr_merge_and_dispatch_work() {
 
 #[test]
 fn standalone_routing_cannot_suppress_stress_optional_work_or_failure_assessment() {
-    for (path, planner) in [
-        (DEEP, "performance-plan"),
-        (BACKEND, "macos-performance-plan"),
+    for (path, planner, feedback) in [
+        (DEEP, "performance-plan", " --feedback deep-plan"),
+        (
+            BACKEND,
+            "macos-performance-plan",
+            " --feedback backend-plan",
+        ),
     ] {
         let exact = fixture(path);
         let mut changed = exact.clone();
         changed["jobs"][planner]["outputs"]["standalone-common"] = Value::String("false".into());
         assert!(validate(path, &changed).is_err());
         let mut changed = exact.clone();
-        changed["jobs"][planner]["steps"]
-            .as_sequence_mut()
-            .unwrap()
-            .retain(|step| step["id"] != "scope");
+        for step in changed["jobs"][planner]["steps"].as_sequence_mut().unwrap() {
+            if let Some(command) = step["run"]
+                .as_str()
+                .and_then(|command| command.strip_suffix(feedback))
+                .map(str::to_owned)
+            {
+                step["run"] = Value::String(command);
+            }
+        }
+        assert_ne!(
+            changed, exact,
+            "scope feedback mutation must change {planner}"
+        );
         assert!(validate(path, &changed).is_err());
     }
     let deep = fixture(DEEP);
@@ -310,25 +314,37 @@ fn standalone_routing_cannot_suppress_stress_optional_work_or_failure_assessment
 }
 
 #[test]
-fn release_native_cache_and_phase_retention_cannot_fall_back_to_old_wrapper() {
+fn release_native_phase_and_diagnostic_retention_cannot_fall_back_to_old_wrapper() {
     let exact = fixture(RELEASE);
-    for mutation in [
-        "generic-cache",
-        "missing-phase",
-        "missing-raw",
-        "ignore-owner-failure",
-    ] {
+    for mutation in ["missing-phase", "missing-raw", "ignore-owner-failure"] {
         let mut changed = exact.clone();
         let steps = changed["jobs"]["native-macos-arm64"]["steps"]
             .as_sequence_mut()
             .unwrap();
         match mutation {
-            "generic-cache" => steps.iter_mut().find(|step| step["run"].as_str().is_some_and(|run|run.ends_with(" ci cache-requests release-readiness"))).expect("actual native readiness cache producer")["run"] = Value::String("./target/ci/release/memcordon-ci ci cache-context --purpose native --shard complete".into()),
-            "ignore-owner-failure" => steps.iter_mut().find(|step| step["id"] == "build").unwrap()["continue-on-error"] = Value::Bool(true),
+            "ignore-owner-failure" => {
+                steps.iter_mut().find(|step| step["id"] == "build").unwrap()["continue-on-error"] =
+                    Value::Bool(true)
+            }
             _ => {
-                let diagnostic = steps.iter_mut().find(|step| step["name"] == "Retain bounded preparation diagnostics").unwrap();
-                let omitted = if mutation == "missing-phase" { "target/ci/reports/release-macos-native.json" } else { "target/ci/reports/memcordon-macos-acceptance-*" };
-                diagnostic["with"]["path"] = Value::String(diagnostic["with"]["path"].as_str().unwrap().lines().filter(|path| *path != omitted).collect::<Vec<_>>().join("\n"));
+                let diagnostic = steps
+                    .iter_mut()
+                    .find(|step| step["name"] == "Retain bounded preparation diagnostics")
+                    .unwrap();
+                let omitted = if mutation == "missing-phase" {
+                    "target/ci/reports/release-macos-native.json"
+                } else {
+                    "target/ci/reports/memcordon-macos-acceptance-*"
+                };
+                diagnostic["with"]["path"] = Value::String(
+                    diagnostic["with"]["path"]
+                        .as_str()
+                        .unwrap()
+                        .lines()
+                        .filter(|path| *path != omitted)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
             }
         }
         assert!(validate(RELEASE, &changed).is_err(), "{mutation}");

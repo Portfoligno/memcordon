@@ -393,33 +393,6 @@ fn original_group_deadline_caps_each_command_without_renewal() {
 }
 
 #[test]
-fn invalid_cache_version_probe_can_rebuild_without_stopping_the_group() {
-    let root = tempfile::tempdir().unwrap();
-    let executable = std::env::current_exe().unwrap();
-    complete_lanes(
-        Layout::Serial,
-        || {
-            let output = CommandSpec::new(&executable, root.path(), Duration::from_secs(20))
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "failing_operation_child",
-                    "--nocapture",
-                ])
-                .defer_group_failure()
-                .output_quiet()?;
-            assert!(!output.status.success());
-            CommandSpec::new(&executable, root.path(), Duration::from_secs(20))
-                .arg("--list")
-                .run()
-                .map(|_| ())
-        },
-        || Ok(()),
-    )
-    .unwrap();
-}
-
-#[test]
 fn auxiliary_setup_never_renews_an_expired_supply_deadline() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("ci")).unwrap();

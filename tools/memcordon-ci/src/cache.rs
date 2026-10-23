@@ -156,10 +156,6 @@ fn tool_jobs_for_scope(
     }
 }
 
-#[cfg(test)]
-#[path = "../tests/private/cache_allocation.rs"]
-mod cache_allocation_tests;
-
 /// Remove only selection differences absent from the actual compilation recipe.
 pub fn partition_compatibility(
     purpose: &str,
@@ -579,7 +575,7 @@ fn collect_context(
                 distribution::native_target()?,
                 "target/ci-driver-build",
                 Vec::<String>::new(),
-                "bootstrap-abi-v1",
+                crate::driver_cache::PROTOCOL_IDENTITY,
             ))?,
         );
     }

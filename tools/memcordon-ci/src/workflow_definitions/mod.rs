@@ -7,6 +7,7 @@ mod backend;
 mod backend_private;
 pub mod budget;
 mod budget_legacy;
+mod cancellation;
 mod ci;
 mod concurrency;
 mod deep;
@@ -67,6 +68,7 @@ pub fn definition(name: &str) -> Result<Value> {
         original(name).ok_or_else(|| CiError::Message("unknown workflow definition".into()))?;
     adapters::apply(&mut value, name)?;
     native_coverage::apply(&mut value, name)?;
+    cancellation::apply(&mut value);
     validate_references(&value)?;
     validate_semantics(&value)?;
     Ok(value)
@@ -158,9 +160,10 @@ pub fn run(root: &Path, write: bool) -> Result<()> {
 /// Only exact generated step adapters are projected. Actual events, jobs,
 /// dependencies, permissions, matrices and outputs remain the validator input.
 pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Mapping>> {
-    let Some(original) = original(name) else {
+    let Some(mut original) = original(name) else {
         return Ok(None);
     };
+    cancellation::apply(&mut original);
     validate_semantics(actual)?;
     let expected = definition(name)?;
     let mut projected = actual
@@ -181,6 +184,15 @@ pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Map
         .and_then(Value::as_mapping_mut)
     {
         jobs.remove(text("source-seed")); // Independently validated above; no legacy equivalent.
+        for added in ["format", "source-policy"] {
+            if let Some(job) = jobs.remove(text(added))
+                && job != expected["jobs"][added]
+            {
+                return Err(CiError::Message(
+                    "independent source owner differs from authoring".into(),
+                ));
+            }
+        }
         for (job_name, job) in jobs.iter_mut() {
             if job["env"]["CARGO_HOME"].as_str() == Some(source_seed::CARGO_HOME_VALUE) {
                 job.as_mapping_mut().expect("job map").remove(text("env"));
@@ -216,6 +228,14 @@ pub(crate) fn policy_projection(name: &str, actual: &Value) -> Result<Option<Map
                 continue;
             };
             let generated = &expected["jobs"][job_name]["steps"];
+            if job["outputs"] != expected["jobs"][job_name]["outputs"] {
+                return Err(CiError::Message(
+                    "workflow output bindings differ from authoring".into(),
+                ));
+            }
+            if let Some(outputs) = baseline.get(text("outputs")) {
+                job["outputs"] = outputs.clone();
+            }
             let legacy = baseline.get(text("steps")).unwrap_or(&Value::Null);
             if generated == legacy {
                 continue;
@@ -280,49 +300,4 @@ pub(crate) fn known_run(command: &str) -> bool {
             commands
         })
         .contains(command)
-}
-
-/// Validate migrated save forms independently of renderer equality. This check
-/// intentionally has no aggregate job result, completion string, or step map.
-pub(crate) fn validate_ready_save(step: &Mapping) -> Result<bool> {
-    let Some(inputs) = step.get(text("with")).and_then(Value::as_mapping) else {
-        return Ok(false);
-    };
-    let Some(key) = inputs.get(text("key")).and_then(Value::as_str) else {
-        return Ok(false);
-    };
-    let Some(reference) = key
-        .strip_prefix("${{ steps.")
-        .and_then(|s| s.strip_suffix("-key }}"))
-    else {
-        return Ok(false);
-    };
-    let Some((owner, slot)) = reference.split_once(".outputs.") else {
-        return Ok(false);
-    };
-    if !slot.ends_with("complete")
-        && !slot.ends_with("partial")
-        && !slot.ends_with("image")
-        && !matches!(slot, "bootstrap" | "image" | "sysroot")
-    {
-        return Ok(false);
-    }
-    let ready = format!("always() && steps.{owner}.outputs.{slot}-save == 'true'");
-    let probe = format!("{owner}-{slot}-probe");
-    let expected = if slot.ends_with("partial") {
-        ready
-    } else {
-        format!("{ready} && steps.{probe}.outputs.cache-hit != 'true'")
-    };
-    let expected_path = format!("${{{{ steps.{owner}.outputs.{slot}-path }}}}");
-    if step.get(text("if")).and_then(Value::as_str) != Some(expected.as_str())
-        || inputs.get(text("path")).and_then(Value::as_str) != Some(expected_path.as_str())
-        || step.get(text("continue-on-error")).and_then(Value::as_bool) != Some(true)
-        || step.get(text("timeout-minutes")).and_then(Value::as_u64) != Some(2)
-    {
-        return Err(CiError::Message(
-            "invalid Rust-owned cache save adapter".into(),
-        ));
-    }
-    Ok(true)
 }

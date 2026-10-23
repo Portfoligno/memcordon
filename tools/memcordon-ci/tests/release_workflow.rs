@@ -440,65 +440,10 @@ fn assembly_and_targetlocal_dependencies_preserve_every_selected_leaf() {
         assert_eq!(matrix[0]["channel"], channel);
         assert_eq!(matrix[0]["native-job"], format!("native-{target}"));
         let steps = baseline["jobs"][job]["steps"].as_sequence().unwrap();
-        let saves: Vec<_> = steps
-            .iter()
-            .enumerate()
-            .filter(|(_, step)| {
-                step["uses"]
-                    .as_str()
-                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-            })
-            .map(|(index, _)| index)
-            .collect();
-        assert!(!saves.is_empty(), "{job} cache owner must be exercised");
         let selected = unique_step(steps, "selected installed channel", |step| {
             step["id"].as_str() == Some(channel)
         });
         assert!(steps[selected]["continue-on-error"].is_null());
-        for index in saves {
-            assert!(
-                index < selected,
-                "{job} must retain its independent early transfers before installed execution"
-            );
-            let reference = steps[index]["with"]["key"]
-                .as_str()
-                .unwrap()
-                .strip_prefix("${{ steps.")
-                .and_then(|value| value.strip_suffix("-key }}"))
-                .unwrap();
-            let (owner, slot) = reference.split_once(".outputs.").unwrap();
-            assert_eq!(
-                steps[index]["with"]["path"],
-                format!("${{{{ steps.{owner}.outputs.{slot}-path }}}}")
-            );
-            let producer = unique_step(steps, "actual Rust retention owner", |step| {
-                step["id"].as_str() == Some(owner)
-            });
-            assert!(producer < index);
-            let guard = format!("steps.{owner}.outputs.{slot}-save == 'true'");
-            let original = steps[index]["if"].as_str().unwrap();
-            let ready = format!("always() && {guard}");
-            let expected = if slot.ends_with("partial") {
-                ready
-            } else {
-                format!("{ready} && steps.{owner}-{slot}-probe.outputs.cache-hit != 'true'")
-            };
-            assert_eq!(
-                original, expected,
-                "{job} must use exactly its validated transfer owner/class"
-            );
-            assert!(
-                !original.contains(&format!("steps.{channel}.")),
-                "later independent installed work cannot gate the earlier transfer"
-            );
-            let mut changed = baseline.clone();
-            changed["jobs"][job]["steps"][index]["if"] = original.replace(&guard, "true").into();
-            assert_ne!(changed, baseline);
-            assert!(
-                check(&changed).is_err(),
-                "{job} accepted a transfer without its actual Rust readiness decision"
-            );
-        }
         let mut optional = baseline.clone();
         optional["jobs"][job]["steps"][selected]["continue-on-error"] = true.into();
         assert!(
@@ -526,7 +471,6 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
         "overwrite",
         "hidden",
         "diagnostic-fatal",
-        "staging-cache",
     ] {
         let mut changed = baseline.clone();
         match case {
@@ -610,18 +554,6 @@ fn preparation_event_prerequisite_and_immutable_routing_mutations_fail() {
                 });
                 assert_eq!(steps[diagnostic]["continue-on-error"], true);
                 steps[diagnostic]["continue-on-error"] = Value::Bool(false);
-            }
-            "staging-cache" => {
-                let steps = changed["jobs"]["packages"]["steps"]
-                    .as_sequence_mut()
-                    .unwrap();
-                let restore = unique_step(steps, "package download cache", |step| {
-                    step["id"] == "workspace-fetch-request-source-restore"
-                        && step["uses"]
-                            .as_str()
-                            .is_some_and(|uses| uses.starts_with("actions/cache/restore@"))
-                });
-                steps[restore]["with"]["path"] = Value::String(".release/prepared".into());
             }
             _ => unreachable!(),
         }

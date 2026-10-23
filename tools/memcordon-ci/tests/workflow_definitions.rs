@@ -36,6 +36,46 @@ fn recipes(document: &Value) -> BTreeSet<String> {
 }
 
 #[test]
+fn publication_source_producer_really_compiles_before_adoption() {
+    let document = workflow_definitions::definition("release.yml").unwrap();
+    let steps = document["jobs"]["select"]["steps"].as_sequence().unwrap();
+    let compile = steps
+        .iter()
+        .position(|s| {
+            s["run"].as_str().is_some_and(|r| {
+                r.contains("cargo build --locked --release ")
+                    && r.contains("--target-dir target/ci-driver-cold")
+                    && r.ends_with("--bin memcordon-ci")
+            })
+        })
+        .unwrap();
+    let adoption = steps
+        .iter()
+        .position(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.ends_with(" ci driver-adopt-cold"))
+        })
+        .unwrap();
+    assert!(compile < adoption);
+    let mut changed = document.clone();
+    changed["jobs"]["select"]["steps"]
+        .as_sequence_mut()
+        .unwrap()
+        .remove(compile);
+    let root = root();
+    assert!(
+        policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/release.yml"),
+            serde_yaml::to_string(&changed).unwrap().as_bytes(),
+            &config::policy(&root).unwrap()
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn generated_content_matches_all_checked_in_workflows() {
     workflow_definitions::run(&root(), false).unwrap();
     for file in workflow_definitions::FILES {
@@ -256,15 +296,20 @@ fn actual_event_unions_native_matrix_and_shard_inventory_survive_rendering() {
             "quality-compiler",
             "quality-documentation",
             "msrv",
-            "supply-audit-prepare",
-            "supply-audit-check",
-            "supply-deny-prepare",
-            "supply-deny-check",
+            "supply-audit",
+            "supply-deny",
             "native-compile",
             "native-execute",
             "macos-deadline",
         ] {
-            assert!(actual.contains(required), "missing {required}");
+            let executed = actual.contains(required)
+                || (required == "policy"
+                    && steps(&document, "policy").iter().any(|step| {
+                        step["run"]
+                            .as_str()
+                            .is_some_and(|run| run.ends_with("--feedback repository-policy"))
+                    }));
+            assert!(executed, "missing {required}");
         }
     }
     for file in ["deep-ci.yml", "release.yml"] {
@@ -376,55 +421,7 @@ fn actual_steps_have_no_dangling_references_or_command_environment_bridge() {
 }
 
 #[test]
-fn native_checkpoint_is_between_actual_compilation_and_execution() {
-    for document in sources("ci.yml") {
-        let sequence = steps(&document, "native");
-        for windows in [false, true] {
-            let marker = if windows {
-                "memcordon-ci.exe ci segment "
-            } else {
-                "memcordon-ci ci segment "
-            };
-            let compile = sequence
-                .iter()
-                .position(|s| {
-                    s["run"]
-                        .as_str()
-                        .is_some_and(|r| r.ends_with(&format!("{marker}native-compile")))
-                })
-                .unwrap();
-            let execute = sequence
-                .iter()
-                .position(|s| {
-                    s["run"]
-                        .as_str()
-                        .is_some_and(|r| r.ends_with(&format!("{marker}native-execute")))
-                })
-                .unwrap();
-            let owner = sequence[compile]["id"].as_str().unwrap();
-            assert!(sequence[compile + 1..execute].iter().any(|step| {
-                step["uses"]
-                    .as_str()
-                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
-                    && step["if"].as_str().is_some_and(|condition| {
-                        condition.contains(&format!(
-                            "steps.{owner}.outputs.native-tests-complete-save == 'true'"
-                        ))
-                    })
-            }));
-            assert!(sequence[compile + 1..execute].iter().any(|step| {
-                step["if"].as_str().is_some_and(|condition| {
-                    condition.contains(&format!(
-                        "steps.{owner}.outputs.native-tests-partial-save == 'true'"
-                    ))
-                })
-            }));
-        }
-    }
-}
-
-#[test]
-fn publishers_and_rehearsal_never_restore_cached_executables() {
+fn publishers_and_rehearsal_require_exact_tools_and_rehearsal_graph() {
     for document in sources("release.yml") {
         for name in [
             "publish",
@@ -433,11 +430,6 @@ fn publishers_and_rehearsal_never_restore_cached_executables() {
             "recovery-rehearse",
         ] {
             let sequence = steps(&document, name);
-            assert!(sequence.iter().all(|step| {
-                !step["uses"]
-                    .as_str()
-                    .is_some_and(|uses| uses.starts_with("actions/cache/"))
-            }));
             assert!(sequence.iter().all(|step| {
                 !step["run"].as_str().is_some_and(|run| {
                     run.contains("ci-runtime") || run.contains("driver-bootstrap")
@@ -473,7 +465,7 @@ fn publishers_and_rehearsal_never_restore_cached_executables() {
 }
 
 #[test]
-fn actual_cache_adapter_mutations_are_rejected() {
+fn required_work_and_environment_boundaries_are_enforced() {
     let root = root();
     let configuration = config::policy(&root).unwrap();
     for file in workflow_definitions::FILES {
@@ -491,94 +483,37 @@ fn actual_cache_adapter_mutations_are_rejected() {
             .unwrap()
             .iter()
             .find_map(|(name, job)| {
-                if !job["steps"].as_sequence()?.iter().any(|s| {
-                    s["run"]
-                        .as_str()
-                        .is_some_and(|r| r.contains(" ci segment "))
-                }) {
-                    return None;
-                }
                 job["steps"]
                     .as_sequence()?
                     .iter()
-                    .position(|s| {
-                        s["uses"]
+                    .position(|step| {
+                        step["run"]
                             .as_str()
-                            .is_some_and(|u| u.starts_with("actions/cache/save@"))
-                            && s["if"]
-                                .as_str()
-                                .is_some_and(|c| c.contains("-complete-save"))
+                            .is_some_and(|run| run.contains(" ci segment "))
                     })
                     .map(|index| (name.as_str().unwrap().to_owned(), index))
             })
             .unwrap();
-        for mutation in [
-            "success",
-            "missing-always",
-            "partial-as-complete",
-            "environment",
-            "required-optional",
-            "early-boundary",
-        ] {
+        for mutation in ["environment", "required-optional"] {
             let mut changed = document.clone();
-            let sequence = changed["jobs"][&job_name]["steps"]
-                .as_sequence_mut()
-                .unwrap();
+            let work = &mut changed["jobs"][&job_name]["steps"][index];
             match mutation {
-                "success" => {
-                    sequence[index]["if"] =
-                        format!("success() && {}", sequence[index]["if"].as_str().unwrap()).into()
-                }
-                "missing-always" => {
-                    sequence[index]["if"] = sequence[index]["if"]
-                        .as_str()
-                        .unwrap()
-                        .strip_prefix("always() && ")
-                        .unwrap()
-                        .into()
-                }
-                "partial-as-complete" => {
-                    sequence[index]["with"]["key"] = sequence[index]["with"]["key"]
-                        .as_str()
-                        .unwrap()
-                        .replace("-complete-key", "-partial-key")
-                        .into()
-                }
                 "environment" => {
-                    sequence[index]["env"] =
-                        serde_yaml::from_str("CI_STEPS: '${{ toJSON(steps) }}'").unwrap();
+                    work["env"] = serde_yaml::from_str("CI_STEPS: '${{ toJSON(steps) }}'").unwrap();
                 }
-                "required-optional" => {
-                    let work = sequence
-                        .iter_mut()
-                        .find(|s| {
-                            s["run"]
-                                .as_str()
-                                .is_some_and(|r| r.contains(" ci segment "))
-                        })
-                        .unwrap();
-                    work["continue-on-error"] = true.into();
-                }
-                "early-boundary" => {
-                    let save = sequence.remove(index);
-                    sequence.push(save);
-                }
+                "required-optional" => work["continue-on-error"] = true.into(),
                 _ => unreachable!(),
             }
             let error = workflow_definitions::validate_semantics(&changed)
                 .unwrap_err()
                 .to_string();
             let expected = match mutation {
-                "success" | "missing-always" | "partial-as-complete" => "cache save adapter",
                 "environment" => "environment bridge",
                 "required-optional" => "required work became optional",
-                "early-boundary" => "early retention boundary",
                 _ => unreachable!(),
             };
             assert!(
-                error.contains(expected)
-                    || (mutation == "partial-as-complete"
-                        && error.contains("cache slot does not belong to its finite recipe")),
+                error.contains(expected),
                 "{file}/{mutation}: wrong semantic reason: {error}"
             );
         }

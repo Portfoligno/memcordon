@@ -2,29 +2,18 @@
 use crate::{CiError, Result};
 use serde_yaml::Value;
 
-/// Identical native-owner steps share YAML nodes, never execution owners.
+/// Identical complete steps share YAML nodes, never execution owners.
 /// Parsing the final document below must still reproduce every original step.
 fn mark_native_steps(document: &mut Value, replacements: &mut Vec<(String, String)>) -> Result<()> {
     let jobs = document["jobs"].as_mapping_mut().expect("source jobs");
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for (name, job) in jobs.iter() {
-        if name
-            .as_str()
-            .is_some_and(|name| name.starts_with("native-macos-x64"))
-        {
-            for step in job["steps"].as_sequence().expect("source steps") {
-                *counts.entry(serde_json::to_string(step)?).or_default() += 1;
-            }
+    for (_, job) in jobs.iter() {
+        for step in job["steps"].as_sequence().expect("source steps") {
+            *counts.entry(serde_json::to_string(step)?).or_default() += 1;
         }
     }
     let mut anchors = std::collections::BTreeMap::<String, String>::new();
-    for (name, job) in jobs.iter_mut() {
-        if !name
-            .as_str()
-            .is_some_and(|name| name.starts_with("native-macos-x64"))
-        {
-            continue;
-        }
+    for (_, job) in jobs.iter_mut() {
         for step in job["steps"].as_sequence_mut().expect("source steps") {
             let identity = serde_json::to_string(step)?;
             if counts.get(&identity).copied().unwrap_or_default() < 2 {
@@ -33,7 +22,7 @@ fn mark_native_steps(document: &mut Value, replacements: &mut Vec<(String, Strin
             let replacement = if let Some(anchor) = anchors.get(&identity) {
                 format!("*{anchor}")
             } else {
-                let anchor = format!("native_owner_step_{}", anchors.len());
+                let anchor = format!("shared_step_{}", anchors.len());
                 let fields = serde_yaml::to_string(step)?;
                 let mut replacement = format!("&{anchor}");
                 for line in fields.lines() {

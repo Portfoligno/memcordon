@@ -96,7 +96,7 @@ pub(super) fn apply(workflow: &mut Value) -> Result<()> {
         &mut shard,
         "if",
         text(&format!(
-            "always() && needs.select.result == 'success' && ({condition})"
+            "!cancelled() && needs.select.result == 'success' && ({condition})"
         )),
     );
     let mut late = vec![run("fuzz-setup-required", "false", 1)];
@@ -179,7 +179,7 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
     }
     let shard = &jobs["fuzz"];
     if shard["needs"] != Value::Sequence(vec![text("select"), text("fuzz-setup")])
-        || !field(shard, "if").starts_with("always() && needs.select.result == 'success'")
+        || !field(shard, "if").starts_with("!cancelled() && needs.select.result == 'success'")
     {
         return Err(reject());
     }
@@ -236,7 +236,12 @@ pub(super) fn validate(workflow: &Value) -> Result<()> {
         .ok_or_else(reject)?;
     let first = steps
         .iter()
-        .position(|step| field(step, "run").contains(" ci cache-requests "))
+        .position(|step| {
+            let run = field(step, "run");
+            run.ends_with(" ci segment workspace-fetch")
+                || run.ends_with(" ci segment fuzz-fetch")
+                || run.contains(" ci segment fuzz-compile-quarter-")
+        })
         .ok_or_else(reject)?;
     if check >= first
         || !steps.iter().any(|step| {

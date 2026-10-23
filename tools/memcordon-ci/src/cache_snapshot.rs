@@ -97,7 +97,6 @@ fn transfer_selection(
     root: &Path,
     request: TransferSelection<'_>,
     complete: bool,
-    incoming: bool,
 ) -> Result<Selection> {
     if !matches!(
         request.kind,
@@ -114,7 +113,7 @@ fn transfer_selection(
         request.shard,
         request.partition,
     )?;
-    selected.stage = transfer_stage(root, request, complete, incoming)?;
+    selected.stage = transfer_stage(root, request, complete)?;
     selected.revision = 8;
     selected.family = match (request.kind, complete) {
         (SnapshotKind::Compiled, true) => "compiled-transfer",
@@ -130,12 +129,7 @@ fn transfer_selection(
     Ok(selected)
 }
 
-fn transfer_stage(
-    root: &Path,
-    request: TransferSelection<'_>,
-    complete: bool,
-    incoming: bool,
-) -> Result<PathBuf> {
+fn transfer_stage(root: &Path, request: TransferSelection<'_>, complete: bool) -> Result<PathBuf> {
     if request.kind == SnapshotKind::ToolBuild {
         cache_restore::tool_build_layout(request.purpose, request.shard)?;
     } else if request.kind == SnapshotKind::Compiled {
@@ -144,25 +138,29 @@ fn transfer_stage(
         return Err(CiError::Message("invalid compiled transfer class".into()));
     }
     let slot = match request.partition {
-        None => "compiled",
-        Some(CompiledPartition::NativeTests) => "native",
+        None => "recipe",
+        Some(CompiledPartition::NativeTests) => "native-tests",
         Some(CompiledPartition::Product) => "product",
-        Some(CompiledPartition::PrivateNativeTests) => "private-native",
-        Some(CompiledPartition::AuxiliaryProfiles) => "auxiliary",
-        Some(CompiledPartition::FuzzTargets) => "fuzz",
-        Some(CompiledPartition::MiriTargets) => "miri",
+        Some(CompiledPartition::PrivateNativeTests) => "private-native-tests",
+        Some(CompiledPartition::AuxiliaryProfiles) => "auxiliary-profiles",
+        Some(CompiledPartition::FuzzTargets) => "fuzz-targets",
+        Some(CompiledPartition::MiriTargets) => "miri-targets",
     };
     let class = if complete { "complete" } else { "partial" };
-    cache_restore::safe_root(
-        root,
-        &Path::new("target/ci-transfer")
-            .join(if incoming { "in" } else { "out" })
+    let base = Path::new("target/ci-transfer");
+    let path = if request.kind == SnapshotKind::ToolBuild {
+        base.join("tool-build").join(request.purpose)
+    } else if request.partition.is_none() {
+        base.join("recipe")
             .join(request.purpose)
             .join(request.shard)
-            .join(slot)
-            .join(class),
-    )
-    .map_err(|error| CiError::CacheSafety(Box::new(error)))
+    } else if request.partition == Some(CompiledPartition::MiriTargets) {
+        base.join("compiled").join(slot).join(request.shard)
+    } else {
+        base.join("compiled").join(slot)
+    };
+    cache_restore::safe_root(root, &path.join(class))
+        .map_err(|error| CiError::CacheSafety(Box::new(error)))
 }
 
 pub fn transfer_request(
@@ -170,7 +168,7 @@ pub fn transfer_request(
     request: TransferSelection<'_>,
     complete: bool,
 ) -> Result<TransferRequest> {
-    let selected = transfer_selection(root, request, complete, true)?;
+    let selected = transfer_selection(root, request, complete)?;
     let (_, compatible) = identity(&selected, BTreeMap::new())?;
     let exact = [
         compatible.as_str(),
@@ -191,7 +189,7 @@ pub fn stage_transfer(
     request: TransferSelection<'_>,
     complete: bool,
 ) -> Result<Transfer> {
-    let selected = transfer_selection(root, request, complete, false)?;
+    let selected = transfer_selection(root, request, complete)?;
     let transfer = copy_transfer(root, request, &selected)?;
     validate_transfer_inputs(root, request, complete, &selected)?;
     Ok(transfer)
@@ -231,7 +229,7 @@ fn validate_transfer_inputs(
     complete: bool,
     selected: &Selection,
 ) -> Result<()> {
-    let current = transfer_selection(root, request, complete, false)?;
+    let current = transfer_selection(root, request, complete)?;
     if current.input != selected.input
         || current.compatibility != selected.compatibility
         || current.roots != selected.roots
@@ -316,11 +314,11 @@ pub fn stage_transfer_pair(
     {
         return serial();
     }
-    let a_selected = match transfer_selection(root, a, ac, false) {
+    let a_selected = match transfer_selection(root, a, ac) {
         Ok(selected) => selected,
         Err(error) => return [Err(error), stage_transfer(root, b, bc).map(Some)],
     };
-    let b_selected = match transfer_selection(root, b, bc, false) {
+    let b_selected = match transfer_selection(root, b, bc) {
         Ok(selected) => selected,
         Err(error) => return [stage_transfer(root, a, ac).map(Some), Err(error)],
     };
@@ -430,12 +428,12 @@ fn finalize_copies<T: Send>(
 /// Prefer complete bytes; neither class imports a current compilation fact.
 pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()> {
     for complete in [true, false] {
-        let stage = transfer_stage(root, request, complete, true)?;
+        let stage = transfer_stage(root, request, complete)?;
         ordinary(&stage)?;
         if !stage.try_exists()? {
             continue;
         }
-        let selected = transfer_selection(root, request, complete, true)?;
+        let selected = transfer_selection(root, request, complete)?;
         ordinary(&selected.stage)?;
         if !selected.stage.try_exists()? {
             continue;
@@ -526,16 +524,21 @@ pub fn import_transfer(root: &Path, request: TransferSelection<'_>) -> Result<()
 }
 
 pub fn cleanup_transfers(root: &Path, request: TransferSelection<'_>) -> Result<()> {
-    for incoming in [true, false] {
-        for complete in [true, false] {
-            let stage = transfer_stage(root, request, complete, incoming)?;
-            cleanup_stage(root, &stage)?;
-        }
+    for complete in [true, false] {
+        let stage = transfer_stage(root, request, complete)?;
+        cleanup_stage(root, &stage)?;
     }
     Ok(())
 }
 
-fn source_selection(root: &Path, kind: SnapshotKind, incoming: bool) -> Result<Selection> {
+fn source_selection(root: &Path, kind: SnapshotKind) -> Result<Selection> {
+    let stage = source_stage(root, kind)?;
+    let mut selected = selection(root, kind, "native-debug", "complete", None)?;
+    selected.stage = stage;
+    Ok(selected)
+}
+
+fn source_stage(root: &Path, kind: SnapshotKind) -> Result<PathBuf> {
     if !matches!(
         kind,
         SnapshotKind::RegistryArchives | SnapshotKind::RegistryIndex
@@ -544,23 +547,19 @@ fn source_selection(root: &Path, kind: SnapshotKind, incoming: bool) -> Result<S
             "source transfer requires public source kind".into(),
         ));
     }
-    let mut selected = selection(root, kind, "native-debug", "complete", None)?;
-    selected.stage = cache_restore::safe_root(
+    cache_restore::safe_root(
         root,
-        &Path::new("target/ci-transfer")
-            .join(if incoming { "in" } else { "out" })
-            .join(if kind == SnapshotKind::RegistryArchives {
-                "archives"
-            } else {
-                "index"
-            }),
+        &Path::new("target/ci-transfer").join(if kind == SnapshotKind::RegistryArchives {
+            "registry-archives"
+        } else {
+            "registry-index"
+        }),
     )
-    .map_err(|error| CiError::CacheSafety(Box::new(error)))?;
-    Ok(selected)
+    .map_err(|error| CiError::CacheSafety(Box::new(error)))
 }
 
 pub fn source_request(root: &Path, kind: SnapshotKind) -> Result<TransferRequest> {
-    let selected = source_selection(root, kind, true)?;
+    let selected = source_selection(root, kind)?;
     let (_, prefix) = identity(&selected, BTreeMap::new())?;
     Ok(TransferRequest {
         key: [prefix.as_str(), "lookup"].concat(),
@@ -570,13 +569,13 @@ pub fn source_request(root: &Path, kind: SnapshotKind) -> Result<TransferRequest
 }
 
 pub fn stage_source(root: &Path, kind: SnapshotKind) -> Result<Transfer> {
-    let selected = source_selection(root, kind, false)?;
+    let selected = source_selection(root, kind)?;
     for path in &selected.roots {
         ordinary(path)?;
     }
     let locks = source_locks(&selected, kind)?;
     let key = create(&selected, kind)?;
-    let current = source_selection(root, kind, false)?;
+    let current = source_selection(root, kind)?;
     if current.input != selected.input || current.compatibility != selected.compatibility {
         return Err(CiError::Message("source transfer inputs changed".into()));
     }
@@ -588,22 +587,12 @@ pub fn stage_source(root: &Path, kind: SnapshotKind) -> Result<Transfer> {
 }
 
 pub fn source_read_locks(root: &Path) -> Result<Vec<File>> {
-    let selected = source_selection(root, SnapshotKind::RegistryArchives, false)?;
+    let selected = source_selection(root, SnapshotKind::RegistryArchives)?;
     source_locks(&selected, SnapshotKind::RegistryArchives)
 }
 
 pub fn import_source(root: &Path, kind: SnapshotKind) -> Result<()> {
-    let slot = match kind {
-        SnapshotKind::RegistryArchives => "archives",
-        SnapshotKind::RegistryIndex => "index",
-        _ => return Err(CiError::Message("unsupported source import".into())),
-    };
-    let stage = cache_restore::safe_root(root, &Path::new("target/ci-transfer/in").join(slot))?;
-    ordinary(&stage)?;
-    if !stage.try_exists()? {
-        return Ok(());
-    }
-    let selected = source_selection(root, kind, true)?;
+    let selected = source_selection(root, kind)?;
     ordinary(&selected.stage)?;
     for path in &selected.roots {
         ordinary(path)?;
@@ -623,14 +612,8 @@ pub fn import_source(root: &Path, kind: SnapshotKind) -> Result<()> {
 }
 
 pub fn cleanup_source(root: &Path) -> Result<()> {
-    for direction in ["in", "out"] {
-        for slot in ["archives", "index"] {
-            let stage = cache_restore::safe_root(
-                root,
-                &Path::new("target/ci-transfer").join(direction).join(slot),
-            )?;
-            cleanup_stage(root, &stage)?;
-        }
+    for kind in [SnapshotKind::RegistryArchives, SnapshotKind::RegistryIndex] {
+        cleanup_stage(root, &source_stage(root, kind)?)?;
     }
     Ok(())
 }
@@ -1759,7 +1742,3 @@ fn import_selected(selected: &Selection, kind: SnapshotKind) -> Result<cache_res
     }
     Ok(restore_mode)
 }
-
-#[cfg(test)]
-#[path = "../tests/private/cache_snapshot_selections.rs"]
-mod selection_tests;

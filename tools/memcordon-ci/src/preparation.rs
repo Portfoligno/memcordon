@@ -1281,3 +1281,7 @@ fn prepare_selected_until(
 #[cfg(test)]
 #[path = "../tests/private/auxiliary_promotion.rs"]
 mod auxiliary_promotion;
+
+#[cfg(all(test, unix))]
+#[path = "../tests/private/cancellation_operation_fixture.rs"]
+pub(crate) mod cancellation_fixture;

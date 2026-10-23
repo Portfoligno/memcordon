@@ -7,7 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ABI: u32 = 1;
+pub const ABI: u32 = 2;
+pub const PROTOCOL_IDENTITY: &str = "bootstrap-abi-v2";
 const FORMAT: u32 = 1;
 const METADATA_LIMIT: u64 = 1024 * 1024;
 const IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -16,11 +17,74 @@ const MANIFEST: &str = "image.json";
 const CANDIDATE: &str = "target/ci-bootstrap-in";
 const BOOTSTRAP: &str = "target/ci-runtime/bootstrap";
 const CURRENT: &str = "target/ci-runtime/current";
-const IMAGE_IN: &str = "target/ci-transfer/in/driver-image";
-const IMAGE_OUT: &str = "target/ci-transfer/out/driver-image";
-const BOOTSTRAP_OUT: &str = "target/ci-transfer/out/driver-bootstrap";
+const IMAGE_TRANSPORT: &str = "target/ci-transfer/driver-image";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum DriverFeedback {
+    RepositoryPolicy,
+    DeepPlan,
+    BackendPlan,
+}
+
+impl DriverFeedback {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::RepositoryPolicy => "repository-policy",
+            Self::DeepPlan => "deep-plan",
+            Self::BackendPlan => "backend-plan",
+        }
+    }
+
+    fn allowance(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::RepositoryPolicy => 62 * 60,
+            Self::DeepPlan | Self::BackendPlan => 12 * 60,
+        })
+    }
+
+    pub fn run(self, root: &Path) -> Result<()> {
+        crate::workflow_definitions::run(root, false)?;
+        match self {
+            Self::RepositoryPolicy => crate::policy::run(root),
+            Self::DeepPlan | Self::BackendPlan => {
+                let scope = crate::workflow_scope::read_from_github()?;
+                crate::workflow_scope::emit(scope)?;
+                if matches!(self, Self::DeepPlan) || scope.standalone_common() {
+                    crate::performance_plan::PerformancePlan::read(root)?.emit()?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn feedback(root: &Path, selected: Option<DriverFeedback>) -> crate::work_outcome::WorkOutcome<()> {
+    use crate::work_outcome::WorkOutcome;
+    let Some(selected) = selected else {
+        return WorkOutcome::not_started(());
+    };
+    let started = crate::workflow_output::write(&[("feedback-started", "true".into())]);
+    let outcome = WorkOutcome::from_result(started).then_owned(|()| {
+        CommandSpec::new(
+            root.join(CURRENT).join(executable()),
+            root,
+            selected.allowance(),
+        )
+        .args(["ci", "feedback", selected.argument()])
+        .run_owned()
+        .map(|_| ())
+    });
+    if !outcome.is_ok() {
+        eprintln!("required driver feedback failed: {outcome:?}");
+    }
+    let status = if outcome.is_ok() { "passed" } else { "failed" };
+    outcome.postcondition(crate::workflow_output::write(&[(
+        "feedback-status",
+        status.into(),
+    )]))
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Recipe {
     abi: u32,
@@ -270,6 +334,16 @@ fn validate_image(
     let directory = image_directory(root, relative)?;
     let image: Image =
         serde_json::from_slice(&bounded_file(&directory.join(MANIFEST), METADATA_LIMIT)?)?;
+    validate_parsed_image(&directory, recipe, class, source, image)
+}
+
+fn validate_parsed_image(
+    directory: &Path,
+    recipe: &Recipe,
+    class: ImageClass,
+    source: Option<&str>,
+    image: Image,
+) -> Result<Image> {
     if image.format != FORMAT
         || image.abi != ABI
         || image.class != class
@@ -308,7 +382,7 @@ fn validate_image(
             return Err(error("driver image member hash/size mismatch"));
         }
     }
-    let actual: BTreeSet<String> = std::fs::read_dir(&directory)?
+    let actual: BTreeSet<String> = std::fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()?;
     let expected: BTreeSet<String> = expected
@@ -352,6 +426,42 @@ pub(crate) fn preparation_members(root: &Path) -> Result<Vec<PathBuf>> {
         image.class,
         selected.as_ref().map(|value| value.key.as_str()),
     )?;
+    Ok(image
+        .members
+        .into_iter()
+        .map(|member| Path::new(CURRENT).join(member.name))
+        .chain(std::iter::once(Path::new(CURRENT).join(MANIFEST)))
+        .collect())
+}
+
+/// Check exact image bytes transported by a required same-run preparation producer.
+/// The caller must first match the preparation record's source and invocation.
+/// Its manifest digest is an internal byte binding, not independent authentication;
+/// trusted producer admission and exact workflow artifact routing supply authority.
+pub(crate) fn transported_preparation_members(
+    root: &Path,
+    manifest_size: u64,
+    manifest_sha256: &str,
+) -> Result<Vec<PathBuf>> {
+    if manifest_size == 0 || manifest_size > METADATA_LIMIT {
+        return Err(error(
+            "transported preparation manifest size exceeds bounds",
+        ));
+    }
+    let recipe = read_recipe(root)?;
+    let directory = image_directory(root, CURRENT)?;
+    let bytes = bounded_file(&directory.join(MANIFEST), METADATA_LIMIT)?;
+    if bytes.len() as u64 != manifest_size || artifacts::checksum(&bytes) != manifest_sha256 {
+        return Err(error("transported preparation manifest hash/size mismatch"));
+    }
+    let image: Image = serde_json::from_slice(&bytes)?;
+    if image.class == ImageClass::Bootstrap && !image.source.is_empty() {
+        return Err(error("cold preparation image has an unexpected source key"));
+    }
+    // Current source admission remains on the producer's strict preparation_members
+    // path. Here the matched record binds those admitted manifest bytes without
+    // resolving a Cargo graph before the consumer's required workspace fetch.
+    let image = validate_parsed_image(&directory, &recipe, image.class, None, image)?;
     Ok(image
         .members
         .into_iter()
@@ -717,13 +827,17 @@ fn bootstrap_key(root: &Path, image: &Image) -> Result<String> {
         _ => return Err(error("unsupported bootstrap architecture")),
     };
     Ok(format!(
-        "mc-ci-bootstrap-v1-{os}-{arch}-{}-{}",
+        "mc-ci-bootstrap-v2-{os}-{arch}-{}-{}",
         hex::encode(discovery.finalize()),
         artifacts::checksum(&serde_json::to_vec(image)?)
     ))
 }
 
 fn unavailable() -> Result<()> {
+    crate::workflow_output::write(&[
+        ("feedback-started", "false".into()),
+        ("feedback-status", "not-run".into()),
+    ])?;
     crate::workflow_output::write(&[
         ("current-ready", "false".into()),
         ("build-required", "true".into()),
@@ -781,6 +895,7 @@ fn context_current(root: &Path) -> Result<()> {
     let recipe = read_recipe(root)?;
     let selection = compiler_selection();
     context_requests(
+        root,
         || optional_identity(root, &recipe),
         |complete| crate::cache_snapshot::transfer_request(root, selection, complete),
         crate::workflow_output::write,
@@ -788,6 +903,7 @@ fn context_current(root: &Path) -> Result<()> {
 }
 
 fn context_requests(
+    root: &Path,
     image: impl FnOnce() -> Result<Option<Identity>>,
     mut compiled: impl FnMut(bool) -> Result<crate::cache_snapshot::TransferRequest>,
     mut emit: impl FnMut(&[(&str, String)]) -> Result<()>,
@@ -807,7 +923,7 @@ fn context_requests(
                 .as_ref()
                 .map_or_else(String::new, |identity| format!("{}-", identity.key)),
         ),
-        ("image-inbox", IMAGE_IN.into()),
+        ("image-path", IMAGE_TRANSPORT.into()),
     ])?;
     for complete in [true, false] {
         let prefix = if complete {
@@ -844,11 +960,11 @@ fn context_requests(
                 ),
                 (
                     if complete {
-                        "compiled-complete-inbox"
+                        "compiled-complete-path"
                     } else {
-                        "compiled-partial-inbox"
+                        "compiled-partial-path"
                     },
-                    crate::workflow_output::action_path(&request.path)?,
+                    crate::workflow_output::workspace_action_path(root, &request.path)?,
                 ),
             ])?,
             Err(error)
@@ -873,27 +989,67 @@ fn context_requests(
     Ok(())
 }
 
-pub fn select(root: &Path) -> Result<()> {
-    bounded(240, || select_owned(root))
+pub fn select(root: &Path, continuation: Option<DriverFeedback>) -> Result<()> {
+    let started = Instant::now();
+    match bounded(240, || select_owned(root))? {
+        Selection::Miss => Ok(()),
+        Selection::Active(selection) => {
+            let (recipe, identity) = *selection;
+            let remaining = Duration::from_secs(240).saturating_sub(started.elapsed());
+            let outcome = feedback(root, continuation);
+            if continuation.is_none() {
+                return outcome.into_result();
+            }
+            let validation = if outcome.writers().permits_reading() {
+                crate::preparation::with_operation(
+                    crate::failure_mode::FailureMode::CollectAll,
+                    Instant::now() + remaining,
+                    || {
+                        if read_recipe(root)? != recipe {
+                            return Err(error("selected driver recipe changed during feedback"));
+                        }
+                        let current = optional_identity(root, &recipe)?;
+                        if !current.is_some_and(|current| {
+                            current.key == identity.key && current.recipe == identity.recipe
+                        }) {
+                            return Err(error("selected driver source changed during feedback"));
+                        }
+                        Ok(())
+                    },
+                )
+            } else {
+                Err(error("selected driver feedback ownership unresolved"))
+            };
+            if validation.is_err() {
+                crate::workflow_output::write(&[("current-ready", "false".into())])?;
+            }
+            outcome.post_finalization(validation).into_result()
+        }
+    }
 }
 
-fn select_owned(root: &Path) -> Result<()> {
+enum Selection {
+    Miss,
+    Active(Box<(Recipe, Identity)>),
+}
+
+fn select_owned(root: &Path) -> Result<Selection> {
     unavailable()?;
     let recipe = read_recipe(root)?;
     let Some(identity) = optional_identity(root, &recipe)? else {
-        return Ok(());
+        return Ok(Selection::Miss);
     };
-    if !root.join(IMAGE_IN).try_exists()? {
-        return Ok(());
+    if !root.join(IMAGE_TRANSPORT).try_exists()? {
+        return Ok(Selection::Miss);
     }
     // Unsafe roots must remain errors; malformed ordinary cache bytes are misses.
-    let directory = image_directory(root, IMAGE_IN)?;
+    let directory = image_directory(root, IMAGE_TRANSPORT)?;
     for entry in std::fs::read_dir(directory)? {
         ordinary(&entry?.path())?;
     }
     if let Err(error) = validate_image(
         root,
-        IMAGE_IN,
+        IMAGE_TRANSPORT,
         &recipe,
         ImageClass::Current,
         Some(&identity.key),
@@ -902,11 +1058,11 @@ fn select_owned(root: &Path) -> Result<()> {
             return Err(error);
         }
         eprintln!("driver image rejected; source build required: {error}");
-        return Ok(());
+        return Ok(Selection::Miss);
     }
     let activation = activate(
         root,
-        &root.join(IMAGE_IN),
+        &root.join(IMAGE_TRANSPORT),
         CURRENT,
         &recipe,
         ImageClass::Current,
@@ -919,13 +1075,14 @@ fn select_owned(root: &Path) -> Result<()> {
             return Err(error);
         }
         eprintln!("driver image failed native startup; source build required: {error}");
-        return Ok(());
+        return Ok(Selection::Miss);
     }
     crate::workflow_output::write(&[
         ("current-ready", "true".into()),
         ("build-required", "false".into()),
         ("driver-origin", "restored-exact".into()),
-    ])
+    ])?;
+    Ok(Selection::Active(Box::new((recipe, identity))))
 }
 
 fn compiler_selection() -> crate::cache_snapshot::TransferSelection<'static> {
@@ -948,9 +1105,9 @@ fn offer_image(
         return Ok(());
     }
     let path = if class == ImageClass::Current {
-        IMAGE_OUT
+        IMAGE_TRANSPORT
     } else {
-        BOOTSTRAP_OUT
+        CANDIDATE
     };
     let image = copy_image(root, from, path, recipe, class, source)?;
     let key = if class == ImageClass::Current {
@@ -990,7 +1147,13 @@ fn offer_image(
 }
 
 /// Cold adoption does not claim a supervised complete compiler/image identity.
-pub fn adopt_cold(root: &Path) -> Result<()> {
+pub fn adopt_cold(root: &Path, continuation: Option<DriverFeedback>) -> Result<()> {
+    unavailable()?;
+    let seal_started = Instant::now();
+    let source_seal = bounded(120, || {
+        crate::cache_inputs::local_files(root, "ci-driver-build")
+    })?;
+    let seal_remaining = Duration::from_secs(120).saturating_sub(seal_started.elapsed());
     let mut budget = crate::segment_cache::OptionalBudget::default();
     let source = budget.run(|| {
         Ok(crate::segment_cache::SourceSession::begin(
@@ -1007,36 +1170,63 @@ pub fn adopt_cold(root: &Path) -> Result<()> {
             ),
         );
     }
-    let mut outcome =
+    let activated =
         crate::work_outcome::WorkOutcome::from_result(bounded(180, || adopt_cold_owned(root)));
-    if outcome.is_ok() {
-        let offered = budget.run(|| {
-            let recipe = read_recipe(root)?;
-            offer_image(
-                root,
-                &recipe,
-                &root.join("target/ci-driver-cold/release"),
-                ImageClass::Bootstrap,
-                "",
-            )
-        });
-        if let Err(error) = offered {
-            let mut result = Ok(());
-            optional_failure(&mut result, error);
-            outcome = outcome.post_finalization(result);
+    let mut source_writers = crate::work_outcome::WriterSettlement::NotStarted;
+    let mut recipe = None;
+    let mut outcome = activated.then_owned(|original| {
+        recipe = Some(original);
+        let outcome = feedback(root, continuation);
+        source_writers = outcome.writers();
+        outcome
+    });
+    if let Some(recipe) = recipe.as_ref().filter(|_| source_writers.permits_reading()) {
+        let validation = crate::preparation::with_operation(
+            crate::failure_mode::FailureMode::CollectAll,
+            Instant::now() + seal_remaining,
+            || {
+                if &read_recipe(root)? != recipe {
+                    return Err(error("driver recipe changed after cold activation"));
+                }
+                if crate::cache_inputs::local_files(root, "ci-driver-build")? != source_seal {
+                    return Err(error("driver source changed after cold activation"));
+                }
+                Ok(())
+            },
+        );
+        if validation.is_err() {
+            crate::workflow_output::write(&[("current-ready", "false".into())])?;
+            outcome = outcome.post_finalization(validation);
+        } else {
+            let offered = budget.run(|| {
+                offer_image(
+                    root,
+                    recipe,
+                    &root.join("target/ci-driver-cold/release"),
+                    ImageClass::Bootstrap,
+                    "",
+                )
+            });
+            if let Err(error) = offered {
+                let mut result = Ok(());
+                optional_failure(&mut result, error);
+                outcome = outcome.post_finalization(result);
+            }
         }
     }
-    // Activation only owns an image probe, not the Cargo source roots. A failed
-    // loader is independent of previously established public downloads.
-    finish_with_source(
-        outcome,
-        crate::work_outcome::WriterSettlement::NotStarted,
-        |owner| optional(&mut budget, || source.finish(root, owner)).map(|_| ()),
-    )
+    if recipe.is_some() && !source_writers.permits_reading() {
+        outcome = outcome.postcondition(crate::workflow_output::write(&[(
+            "current-ready",
+            "false".into(),
+        )]));
+    }
+    // The feedback child shares source roots; preserve its actual settlement.
+    finish_with_source(outcome, source_writers, |owner| {
+        optional(&mut budget, || source.finish(root, owner)).map(|_| ())
+    })
 }
 
-fn adopt_cold_owned(root: &Path) -> Result<()> {
-    unavailable()?;
+fn adopt_cold_owned(root: &Path) -> Result<Recipe> {
     let recipe = read_recipe(root)?;
     let cold = root.join("target/ci-driver-cold/release");
     if std::env::current_exe()?.canonicalize()? != cold.join(executable()).canonicalize()? {
@@ -1051,7 +1241,7 @@ fn adopt_cold_owned(root: &Path) -> Result<()> {
         "",
     ));
     if !outcome.is_ok() {
-        return outcome.into_result();
+        return outcome.map(|_| recipe).into_result();
     }
     outcome
         .postcondition(crate::workflow_output::write(&[
@@ -1059,10 +1249,12 @@ fn adopt_cold_owned(root: &Path) -> Result<()> {
             ("build-required", "false".into()),
             ("driver-origin", "built-cold".into()),
         ]))
+        .map(|_| recipe)
         .into_result()
 }
 
-pub fn build(root: &Path) -> Result<()> {
+pub fn build(root: &Path, continuation: Option<DriverFeedback>) -> Result<()> {
+    unavailable()?;
     crate::download_cache::prepare_job_home(root)?;
     let mut budget = crate::segment_cache::OptionalBudget::default();
     let source = budget.run(|| {
@@ -1085,6 +1277,7 @@ pub fn build(root: &Path) -> Result<()> {
         root,
         &mut source_writers,
         &mut budget,
+        continuation,
     ));
     finish_with_source(outcome, source_writers, |owner| {
         optional(&mut budget, || source.finish(root, owner)).map(|_| ())
@@ -1105,12 +1298,14 @@ fn build_owned(
     root: &Path,
     source_writers: &mut crate::work_outcome::WriterSettlement,
     budget: &mut crate::segment_cache::OptionalBudget,
+    continuation: Option<DriverFeedback>,
 ) -> Result<()> {
-    unavailable()?;
     let recipe = read_recipe(root)?;
+    let seal_started = Instant::now();
     let source_seal = bounded(120, || {
         crate::cache_inputs::local_files(root, "ci-driver-build")
     })?;
+    let mut seal_remaining = Duration::from_secs(120).saturating_sub(seal_started.elapsed());
     let before = optional(budget, || {
         for kind in [
             crate::cache_snapshot::SnapshotKind::RegistryArchives,
@@ -1158,10 +1353,15 @@ fn build_owned(
     let mut assembly = crate::work_outcome::WorkSequence::after_settled();
     let mut result = assembly.observe(outcome.map(|_| ()));
     if settled {
-        let seal = assembly.observe(crate::work_outcome::WorkOutcome::from_result(bounded(
-            120,
-            || crate::cache_inputs::local_files(root, "ci-driver-build"),
-        )));
+        let seal_started = Instant::now();
+        let seal = assembly.observe(crate::work_outcome::WorkOutcome::from_result(
+            crate::preparation::with_operation(
+                crate::failure_mode::FailureMode::CollectAll,
+                seal_started + seal_remaining,
+                || crate::cache_inputs::local_files(root, "ci-driver-build"),
+            ),
+        ));
+        seal_remaining = seal_remaining.saturating_sub(seal_started.elapsed());
         let source_unchanged = seal.as_ref().is_ok_and(|after| after == &source_seal);
         if !source_unchanged {
             secondary(
@@ -1218,6 +1418,7 @@ fn build_owned(
                         }
                     };
                 let mut ready = false;
+                let mut retention_verified = true;
                 if succeeded && !changed && source_unchanged {
                     let source = after.as_ref().map_or("", |identity| identity.key.as_str());
                     match bounded(180, || {
@@ -1229,6 +1430,85 @@ fn build_owned(
                         Err(error) => secondary(&mut result, error),
                     }
                     if ready {
+                        retention_verified = continuation.is_none();
+                        crate::workflow_output::write(&[
+                            ("current-ready", "true".into()),
+                            ("build-required", "false".into()),
+                            ("driver-origin", "built-managed".into()),
+                        ])?;
+                        let check = feedback(root, continuation);
+                        *source_writers = source_writers.join(check.writers());
+                        let feedback_settled = check.writers().permits_reading();
+                        if let Err(error) = assembly.observe(check) {
+                            secondary(&mut result, error);
+                        }
+                        let postcheck = if continuation.is_none() {
+                            Ok(true)
+                        } else if feedback_settled {
+                            let seal_started = Instant::now();
+                            let check = crate::preparation::with_operation(
+                                crate::failure_mode::FailureMode::CollectAll,
+                                seal_started + seal_remaining,
+                                || {
+                                    if crate::cache_inputs::local_files(root, "ci-driver-build")?
+                                        != source_seal
+                                    {
+                                        return Err(error("driver source changed during feedback"));
+                                    }
+                                    Ok(())
+                                },
+                            );
+                            check.and_then(|()| {
+                                optional(budget, || {
+                                    if read_recipe(root)? != recipe {
+                                        return Err(safety(
+                                            "driver recipe changed during feedback",
+                                        ));
+                                    }
+                                    crate::cache::with_driver_context(root, || {
+                                        let current = optional_identity(root, &recipe)?;
+                                        if current.as_ref().map(|value| (&value.key, &value.recipe))
+                                            != after
+                                                .as_ref()
+                                                .map(|value| (&value.key, &value.recipe))
+                                        {
+                                            return Err(safety(
+                                                "driver source identity changed during feedback",
+                                            ));
+                                        }
+                                        let compiled = crate::cache_snapshot::transfer_request(
+                                            root,
+                                            compiler_selection(),
+                                            true,
+                                        )?;
+                                        if Some(&compiled.key) != after_compiled.as_ref()
+                                            || !modeled_depinfo(root, &from.join("memcordon-ci.d"))?
+                                        {
+                                            return Err(safety(
+                                                "driver compiler identity changed during feedback",
+                                            ));
+                                        }
+                                        Ok(())
+                                    })
+                                })
+                                .map(|verified| verified.is_some())
+                            })
+                        } else {
+                            Err(error("driver feedback ownership unresolved"))
+                        };
+                        match postcheck {
+                            Ok(verified) => retention_verified = verified,
+                            Err(error) => {
+                                ready = false;
+                                crate::workflow_output::write(&[(
+                                    "current-ready",
+                                    "false".into(),
+                                )])?;
+                                secondary(&mut result, error);
+                            }
+                        }
+                    }
+                    if ready && retention_verified {
                         if unchanged
                             && modeled
                             && let Err(error) = budget.run(|| {
@@ -1247,7 +1527,7 @@ fn build_owned(
                 // Invalid executables can still leave a useful partial target.
                 let decision = crate::segment_cache::compilation_retention(
                     trusted_write(),
-                    compiled_unchanged,
+                    compiled_unchanged && retention_verified,
                     modeled,
                     writers,
                     succeeded && ready,
@@ -1274,7 +1554,10 @@ fn build_owned(
                                         } else {
                                             "compiled-partial-path"
                                         },
-                                        crate::workflow_output::action_path(&transfer.path)?,
+                                        crate::workflow_output::workspace_action_path(
+                                            root,
+                                            &transfer.path,
+                                        )?,
                                     ),
                                     (
                                         if complete {
@@ -1345,7 +1628,7 @@ fn managed_compilation(root: &Path, recipe: &Recipe) -> crate::work_outcome::Wor
 pub fn cleanup(root: &Path) -> Result<()> {
     bounded(120, || {
         let mut result = Ok(());
-        for relative in [IMAGE_IN, IMAGE_OUT, BOOTSTRAP_OUT, CANDIDATE] {
+        for relative in [IMAGE_TRANSPORT, CANDIDATE] {
             let removed = (|| -> Result<()> {
                 budget_check()?;
                 let path = crate::cache_restore::safe_root(root, Path::new(relative))
@@ -1370,7 +1653,3 @@ pub fn cleanup(root: &Path) -> Result<()> {
         result
     })
 }
-
-#[cfg(test)]
-#[path = "../tests/private/driver_cache.rs"]
-mod tests;

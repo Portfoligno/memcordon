@@ -84,43 +84,5 @@ fn support_diagnostic_requires_separate_settled_producer_and_non_authority_artif
             .unwrap()
             .remove(cleanup);
         assert!(check(&changed).is_err());
-        for (index, step) in steps.iter().enumerate() {
-            if step["uses"].as_str()
-                == Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
-            {
-                let mut changed = baseline.clone();
-                let condition = step["if"].as_str().unwrap();
-                assert!(
-                    index < acceptance,
-                    "{job}: frozen build/source transfers must precede native readiness and its separate diagnostic"
-                );
-                assert!(!condition.contains("support_loader_diagnostic"));
-                assert!(!condition.contains("native_readiness"));
-                let reference = step["with"]["key"]
-                    .as_str()
-                    .unwrap()
-                    .strip_prefix("${{ steps.")
-                    .and_then(|value| value.strip_suffix("-key }}"))
-                    .unwrap();
-                let (owner, slot) = reference.split_once(".outputs.").unwrap();
-                let readiness = format!("steps.{owner}.outputs.{slot}-save == 'true'");
-                let ready = format!("always() && {readiness}");
-                let expected = if slot.ends_with("partial") {
-                    ready
-                } else {
-                    format!("{ready} && steps.{owner}-{slot}-probe.outputs.cache-hit != 'true'")
-                };
-                assert_eq!(condition, expected, "{job}: exact Rust owner/class guard");
-                assert_eq!(
-                    step["with"]["path"],
-                    format!("${{{{ steps.{owner}.outputs.{slot}-path }}}}")
-                );
-                assert!(find(owner) < index);
-                let altered = condition.replace(&readiness, "true");
-                assert_ne!(condition, altered);
-                changed["jobs"][job]["steps"][index]["if"] = altered.into();
-                assert!(check(&changed).is_err());
-            }
-        }
     }
 }

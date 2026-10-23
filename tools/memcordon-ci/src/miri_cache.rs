@@ -283,7 +283,3 @@ pub fn prepare(root: &Path) -> Result<()> {
     let pins = crate::config::toolchains(root)?;
     ensure(root, &pins.miri, Instant::now() + Duration::from_secs(900)).map(|_| ())
 }
-
-#[cfg(test)]
-#[path = "../tests/private/miri_cache.rs"]
-mod tests;

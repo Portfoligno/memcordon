@@ -62,7 +62,6 @@ fn canonical_final_union_exports_later_case_and_revalidates_during_copy() {
     assert!(publish(&path, &selected, cutoff()).is_err());
     let incomplete: CellEvidence =
         serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
-    assert!(!incomplete.cache_quiescent);
     assert!(
         incomplete
             .cleanup_failures
@@ -145,7 +144,6 @@ fn selected_projection_preserves_private_originals_and_failed_verdict() {
     assert!(publish(&path, &selected, cutoff()).is_err());
     let failed: CellEvidence =
         serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
-    assert!(!failed.cache_quiescent);
     assert_eq!(
         failed.cleanup_failures.first(),
         selected.cleanup_failures.first()
@@ -158,18 +156,15 @@ fn selected_projection_preserves_private_originals_and_failed_verdict() {
 
     std::fs::write(path.join("private/selected.bin"), b"approved").unwrap();
     let mut successful = selected.clone();
-    successful.cache_quiescent = true;
     successful.cleanup_failures.clear();
     publish(&path, &successful, cutoff()).unwrap();
     let before: CellEvidence =
         serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
-    assert!(before.cache_quiescent);
     assert!(before.cleanup_failures.is_empty());
     std::fs::write(path.join("private/selected.bin"), b"replaced").unwrap();
     assert!(publish(&path, &successful, cutoff()).is_err());
     let interrupted: CellEvidence =
         serde_json::from_slice(&std::fs::read(path.join("producer/cell.json")).unwrap()).unwrap();
-    assert!(!interrupted.cache_quiescent);
     assert!(!interrupted.cleanup_failures.is_empty());
     assert_eq!(
         serde_json::to_value(&interrupted.identity).unwrap(),

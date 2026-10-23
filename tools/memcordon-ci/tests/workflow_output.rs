@@ -46,26 +46,6 @@ fn invalid_batch_never_opens_or_partially_changes_output() {
 }
 
 #[test]
-fn unavailable_and_multiple_cache_paths_use_standard_output_records() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    write_to(
-        Some(file.path()),
-        &[
-            ("consumer-key", String::new()),
-            (
-                "product-paths",
-                "target/ci/quality\ntarget/ci/quality-doc".into(),
-            ),
-        ],
-    )
-    .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(file.path()).unwrap(),
-        "consumer-key=\nproduct-paths<<MEMCORDON_CI_OUTPUT\ntarget/ci/quality\ntarget/ci/quality-doc\nMEMCORDON_CI_OUTPUT\n"
-    );
-}
-
-#[test]
 fn multiline_delimiter_collision_and_invalid_control_are_handled_before_append() {
     let file = tempfile::NamedTempFile::new().unwrap();
     write_to(

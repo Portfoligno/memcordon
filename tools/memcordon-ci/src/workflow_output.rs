@@ -44,6 +44,35 @@ pub fn action_paths(paths: &[std::path::PathBuf]) -> Result<String> {
         .map(|paths| paths.join("\n"))
 }
 
+/// Stable provider spelling for repository-owned transport directories.
+pub fn workspace_action_path(root: &std::path::Path, path: &std::path::Path) -> Result<String> {
+    use std::path::Component;
+    let root = root.canonicalize()?;
+    let selected = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        root.join(path)
+    };
+    let relative = selected
+        .strip_prefix(&root)
+        .map_err(|_| CiError::Message("transport path escapes workspace".into()))?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .ok_or_else(|| CiError::Message("transport path is not UTF-8".into())),
+            _ => Err(CiError::Message(
+                "transport path has a non-normal component".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(CiError::Message("transport path is workspace root".into()));
+    }
+    Ok(components.join("/"))
+}
+
 pub fn compiled_in_invocation(fact: &str) -> bool {
     COMPILATION
         .lock()

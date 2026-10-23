@@ -2,8 +2,6 @@
 //!
 //! This checks repository workflow structure; it does not execute workflows.
 
-use std::collections::BTreeSet;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
     Value(String),
@@ -205,102 +203,6 @@ impl Parser {
             }
             Some(Token::Word(value)) => Ok(Expr::Value(value)),
             _ => Err("unsupported cache guard operand".into()),
-        }
-    }
-}
-
-impl Expr {
-    /// A required fact must occur on every disjunction branch. Negations and
-    /// comparisons are atoms, so a mentioned fact inside an unsafe OR is not proof.
-    pub fn requires(&self, required: &Self) -> bool {
-        self == required
-            || match self {
-                Self::And(a, b) => a.requires(required) || b.requires(required),
-                Self::Or(a, b) => a.requires(required) && b.requires(required),
-                _ => false,
-            }
-    }
-
-    pub fn references(&self) -> BTreeSet<String> {
-        let mut values = BTreeSet::new();
-        self.visit(&mut |item| {
-            if let Self::Value(value) = item {
-                values.insert(value.clone());
-            }
-        });
-        values
-    }
-
-    pub fn contains_status(&self, name: &str) -> bool {
-        let mut found = false;
-        self.visit(&mut |item| {
-            found |= matches!(item, Self::Status(value) if value == name);
-        });
-        found
-    }
-
-    pub fn visit(&self, visitor: &mut impl FnMut(&Self)) {
-        visitor(self);
-        match self {
-            Self::Not(value) => value.visit(visitor),
-            Self::And(a, b) | Self::Or(a, b) | Self::Equal(a, b) | Self::Unequal(a, b) => {
-                a.visit(visitor);
-                b.visit(visitor);
-            }
-            _ => {}
-        }
-    }
-
-    /// Finite scenario evaluator. Callers supply field and status values; outputs
-    /// remain strings, including the truthy string `false` used by Actions.
-    pub fn evaluate(
-        &self,
-        field: &impl Fn(&str) -> String,
-        status: &impl Fn(&str) -> bool,
-    ) -> bool {
-        self.value(field, status).truthy()
-    }
-
-    fn value(&self, field: &impl Fn(&str) -> String, status: &impl Fn(&str) -> bool) -> Value {
-        match self {
-            Self::Value(name) => Value::String(field(name)),
-            Self::Literal(value) => Value::String(value.clone()),
-            Self::Bool(value) => Value::Bool(*value),
-            Self::Status(name) => Value::Bool(status(name)),
-            Self::Not(value) => Value::Bool(!value.value(field, status).truthy()),
-            Self::Equal(a, b) => Value::Bool(a.value(field, status) == b.value(field, status)),
-            Self::Unequal(a, b) => Value::Bool(a.value(field, status) != b.value(field, status)),
-            Self::And(a, b) => {
-                let a = a.value(field, status);
-                if a.truthy() {
-                    b.value(field, status)
-                } else {
-                    a
-                }
-            }
-            Self::Or(a, b) => {
-                let a = a.value(field, status);
-                if a.truthy() {
-                    a
-                } else {
-                    b.value(field, status)
-                }
-            }
-        }
-    }
-}
-
-#[derive(Eq, PartialEq)]
-enum Value {
-    String(String),
-    Bool(bool),
-}
-
-impl Value {
-    fn truthy(&self) -> bool {
-        match self {
-            Self::Bool(value) => *value,
-            Self::String(value) => !value.is_empty(),
         }
     }
 }

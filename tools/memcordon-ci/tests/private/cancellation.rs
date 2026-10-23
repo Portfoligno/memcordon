@@ -51,60 +51,67 @@ fn signal_admission_child() {
     use crate::{CiError, cancellation::Scope, command::CommandSpec, failure_mode::FailureMode};
     let scope = Scope::install().unwrap();
     let owner_cutoff = Instant::now() + Duration::from_secs(20);
-    let expired_work = Instant::now() + Duration::from_millis(50);
-    let result = crate::preparation::with_operation(FailureMode::CollectAll, expired_work, || {
-        assert!(
-            std::process::Command::new("kill")
-                .args(["-INT", &std::process::id().to_string()])
-                .status()
+    let result = crate::preparation::with_operation(FailureMode::CollectAll, owner_cutoff, || {
+        let expired_work = Instant::now() + Duration::from_millis(50);
+        crate::preparation::cancellation_fixture::with_work_deadline(expired_work, || {
+            assert_eq!(
+                crate::preparation::active_group().unwrap().deadline(),
+                expired_work
+            );
+            assert!(
+                std::process::Command::new("kill")
+                    .args(["-INT", &std::process::id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let signal_cutoff = Instant::now() + Duration::from_secs(1);
+            while crate::cancellation::observed()
+                != Some(memcordon_platform::test_support::CiInterrupt::UnixInterrupt)
+            {
+                assert!(
+                    Instant::now() < signal_cutoff,
+                    "real SIGINT was not observed before the signal synchronization cutoff: {:?}",
+                    crate::cancellation::observed()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            while Instant::now() < expired_work {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(Instant::now() >= crate::preparation::active_group().unwrap().deadline());
+            crate::preparation::active_group()
                 .unwrap()
-                .success()
-        );
-        let signal_cutoff = Instant::now() + Duration::from_secs(1);
-        while crate::cancellation::observed()
-            != Some(memcordon_platform::test_support::CiInterrupt::UnixInterrupt)
-        {
+                .requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            let command = || {
+                CommandSpec::new(
+                    std::env::current_exe().unwrap(),
+                    &std::env::current_dir().unwrap(),
+                    Duration::from_secs(2),
+                )
+                .peer_stop_policy(crate::command::PeerStopPolicy::CancelAndSettle)
+                .args([
+                    "cancellation::tests::retirement_command_child",
+                    "--exact",
+                    "--ignored",
+                ])
+            };
+            let refusal = command().output_quiet().unwrap_err();
             assert!(
-                Instant::now() < signal_cutoff,
-                "real SIGINT was not observed before the signal synchronization cutoff: {:?}",
-                crate::cancellation::observed()
+                refusal.to_string().contains("external interruption"),
+                "{refusal}"
             );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        while Instant::now() < expired_work {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        crate::preparation::active_group()
-            .unwrap()
-            .requested
-            .store(true, std::sync::atomic::Ordering::Release);
-        let command = || {
-            CommandSpec::new(
-                std::env::current_exe().unwrap(),
-                &std::env::current_dir().unwrap(),
-                Duration::from_secs(2),
-            )
-            .peer_stop_policy(crate::command::PeerStopPolicy::CancelAndSettle)
-            .args([
-                "cancellation::tests::retirement_command_child",
-                "--exact",
-                "--ignored",
-            ])
-        };
-        let refusal = command().output_quiet().unwrap_err();
-        assert!(
-            refusal.to_string().contains("external interruption"),
-            "{refusal}"
-        );
-        {
-            let _retirement = retirement_scope(owner_cutoff);
-            assert!(
-                command().output_quiet()?.status.success(),
-                "expired work cutoff must not erase reserved retirement"
-            );
-        }
-        assert!(command().output_quiet().is_err());
-        Err::<(), _>(CiError::Message("original native assertion".into()))
+            {
+                let _retirement = retirement_scope(owner_cutoff);
+                assert!(
+                    command().output_quiet()?.status.success(),
+                    "expired work cutoff must not erase reserved retirement"
+                );
+            }
+            assert!(command().output_quiet().is_err());
+            Err::<(), _>(CiError::Message("original native assertion".into()))
+        })
     });
     assert_eq!(
         scope.finish(result).unwrap_err().to_string(),

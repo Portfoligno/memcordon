@@ -125,12 +125,7 @@ fn deleting_each_standard_job_rejects_with_other_native_jobs_intact() {
 fn standard_suite_cannot_be_removed_substituted_skipped_or_ignore_failure() {
     for (path, job) in JOBS {
         let original = fixture(path);
-        for mutation in [
-            "delete",
-            "sealed-substitution",
-            "cache-skip",
-            "continue-on-error",
-        ] {
+        for mutation in ["delete", "sealed-substitution", "continue-on-error"] {
             let mut changed = original.clone();
             let steps = steps(&mut changed, job);
             let suite = suite_index(steps);
@@ -142,10 +137,6 @@ fn standard_suite_cannot_be_removed_substituted_skipped_or_ignore_failure() {
                     steps[suite]["run"] = Value::String(
                         "./target/ci/release/memcordon-ci suite backend-linux-sealed-v2".into(),
                     )
-                }
-                "cache-skip" => {
-                    steps[suite]["if"] =
-                        Value::String("steps.standard-deps.outputs.cache-hit != 'true'".into())
                 }
                 "continue-on-error" => steps[suite]["continue-on-error"] = Value::Bool(true),
                 _ => unreachable!(),

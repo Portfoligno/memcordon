@@ -4,7 +4,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn distributed_owner_uses_the_original_window_and_rejects_changed_or_expired_admission() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     std::fs::create_dir(root.path().join(".release")).unwrap();
     let source = BuildSourceIdentity::Working {
         version: "0.5.8-dev".parse().unwrap(),

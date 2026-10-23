@@ -89,9 +89,23 @@ fn validate(value: &Value) -> Result<(), String> {
     ] {
         let preparation = format!("readiness-tools-{host}");
         let native = format!("native-{host}");
+        let mut expected_native = BTreeSet::from(["select".to_owned(), preparation.clone()]);
+        if host == "macos-x64" {
+            expected_native.extend(
+                [
+                    "native-macos-x64-plan",
+                    "native-macos-x64-product",
+                    "native-macos-x64-shard-0",
+                    "native-macos-x64-shard-1",
+                    "native-macos-x64-shard-2",
+                    "native-macos-x64-shard-3",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
         if graph.get(&preparation) != Some(&select_only)
-            || graph.get(&native)
-                != Some(&BTreeSet::from(["select".to_owned(), preparation.clone()]))
+            || graph.get(&native) != Some(&expected_native)
         {
             return Err(format!(
                 "{native} must require its selected-source helper preparation"
@@ -141,6 +155,8 @@ fn validate(value: &Value) -> Result<(), String> {
     }
     let final_ancestors = ancestors("assemble", &graph, &mut BTreeSet::new())?;
     for required in [
+        "format",
+        "source-policy",
         "source-checks",
         "source-docs",
         "msrv",
@@ -155,6 +171,12 @@ fn validate(value: &Value) -> Result<(), String> {
         "readiness-tools-macos-arm64",
         "readiness-tools-windows-x64",
         "readiness-tools-windows-arm64",
+        "native-macos-x64-plan",
+        "native-macos-x64-product",
+        "native-macos-x64-shard-0",
+        "native-macos-x64-shard-1",
+        "native-macos-x64-shard-2",
+        "native-macos-x64-shard-3",
         "rehearse",
         "assemble-payload",
         "candidate-linux-x64-native",
@@ -218,12 +240,20 @@ fn validate(value: &Value) -> Result<(), String> {
         }
         if writer == "recovery-publish"
             && [
+                "format",
+                "source-policy",
                 "source-checks",
                 "source-docs",
                 "msrv",
                 "supply-chain-audit",
                 "supply-chain-deny",
                 "fuzz-setup",
+                "native-macos-x64-plan",
+                "native-macos-x64-product",
+                "native-macos-x64-shard-0",
+                "native-macos-x64-shard-1",
+                "native-macos-x64-shard-2",
+                "native-macos-x64-shard-3",
                 "assemble-payload",
                 "assemble",
             ]
@@ -269,7 +299,10 @@ fn actual_graph_preserves_complete_finalization_closure_and_original_recovery() 
 #[test]
 fn every_required_final_dependency_is_individually_enforced() {
     let value = workflow();
+    validate(&value).expect("current workflow graph must be valid before mutation");
     for parent in [
+        "format",
+        "source-policy",
         "source-checks",
         "source-docs",
         "msrv",
@@ -289,6 +322,12 @@ fn every_required_final_dependency_is_individually_enforced() {
         "native-linux-x64",
         "native-linux-arm64",
         "native-macos-x64",
+        "native-macos-x64-plan",
+        "native-macos-x64-product",
+        "native-macos-x64-shard-0",
+        "native-macos-x64-shard-1",
+        "native-macos-x64-shard-2",
+        "native-macos-x64-shard-3",
         "native-macos-arm64",
         "native-windows-x64",
         "native-windows-arm64",
@@ -311,6 +350,7 @@ fn every_required_final_dependency_is_individually_enforced() {
                 needs.retain(|value| value.as_str() != Some(parent));
             }
         }
+        assert_ne!(changed, value, "dependency removal must change {parent}");
         assert!(validate(&changed).is_err(), "removed {parent}");
     }
 }
@@ -318,6 +358,7 @@ fn every_required_final_dependency_is_individually_enforced() {
 #[test]
 fn cycle_and_success_bypass_mutations_are_rejected() {
     let value = workflow();
+    validate(&value).expect("current workflow graph must be valid before mutation");
     let mut cycle = value.clone();
     cycle["jobs"]["rehearse"]["needs"] =
         serde_yaml::to_value(["select", "assemble", "rehearsal-tool"]).unwrap();

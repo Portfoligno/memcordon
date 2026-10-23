@@ -647,34 +647,6 @@ impl PackageConsumer {
         Ok(inputs)
     }
 
-    /// Cargo's package IDs, rather than fingerprint filenames, select every local unit.
-    pub fn ordinary_build_layout_for_transport(&self) -> Result<()> {
-        self.verify_packaged_sources()?;
-        self.ordinary_slot()
-            .ok_or_else(|| CiError::Message("ordinary layout requires live stable owner".into()))?
-            .mark_build_layout()
-    }
-
-    pub fn sanitize_ordinary_build(&self, root: &Path) -> Result<()> {
-        let slot = self.ordinary_slot().ok_or_else(|| {
-            CiError::Message("ordinary sanitation requires live stable owner".into())
-        })?;
-        let _safe = crate::cache_restore::safe_root(
-            root,
-            slot.build()
-                .strip_prefix(root.canonicalize()?)
-                .map_err(|_| CiError::Message("ordinary build escaped checkout".into()))?,
-        )?;
-        let locks = crate::cache_restore::settled_locks(&[slot.build().to_owned()])?;
-        drop(locks);
-        if !super::ordinary_consumer_cache::build_ready(slot.build())? {
-            return Err(CiError::Message(
-                "ordinary sanitation rejects another cache family/layout".into(),
-            ));
-        }
-        self.clean_ordinary_locals(root, slot.build())
-    }
-
     pub(crate) fn clean_ordinary_locals(&self, root: &Path, target: &Path) -> Result<()> {
         self.verify_packaged_sources()?;
         let toolchain = crate::config::toolchains(root)?.stable;

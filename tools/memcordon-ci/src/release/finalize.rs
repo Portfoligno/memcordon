@@ -14,9 +14,17 @@ fn failure(message: &str) -> CiError {
 }
 
 pub fn check_preparation(root: &Path, build_source: &Path, consumer_readiness: bool) -> Result<()> {
+    crate::policy::run(root)?;
+    check_selected_inputs(root, build_source, consumer_readiness)
+}
+
+pub fn check_selected_inputs(
+    root: &Path,
+    build_source: &Path,
+    consumer_readiness: bool,
+) -> Result<()> {
     let selected: BuildSourceIdentity = source::read_json(build_source)?;
     selected.recheck(root)?;
-    crate::policy::run(root)?;
     let metadata = crate::policy::workspace_metadata(root)?;
     let distribution = Distribution::read(root)?;
     let distribution = if consumer_readiness {

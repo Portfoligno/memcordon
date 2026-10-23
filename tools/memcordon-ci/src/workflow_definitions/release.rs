@@ -169,7 +169,10 @@ fn node_17() -> Value {
 
 fn node_18() -> Value {
     let mut values = serde_yaml::Mapping::new();
-    values.insert(text("group"), text("memcordon-release-${{ github.ref }}"));
+    values.insert(
+        text("group"),
+        text("memcordon-release-${{ github.event_name }}-${{ github.ref }}"),
+    );
     values.insert(
         text("cancel-in-progress"),
         text("${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}"),

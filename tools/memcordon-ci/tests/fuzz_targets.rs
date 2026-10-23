@@ -71,124 +71,12 @@ fn malformed_or_empty_inventory_cannot_silently_lose_coverage() {
 }
 
 #[test]
-fn typed_fuzz_cache_write_permission_requires_trusted_events_and_refs() {
-    use memcordon_ci::segment_cache::write_event_for;
-    for event in ["push", "workflow_dispatch"] {
-        assert!(write_event_for(Some(event), Some("refs/heads/main")));
-        assert_eq!(
-            write_event_for(Some(event), Some("refs/tags/release")),
-            event == "push"
-        );
-        for reference in [
-            None,
-            Some(""),
-            Some("refs/heads/"),
-            Some("refs/tags/"),
-            Some("refs/pull/1/merge"),
-        ] {
-            assert!(!write_event_for(Some(event), reference));
-        }
-    }
-    for event in [
-        None,
-        Some(""),
-        Some("pull_request"),
-        Some("merge_group"),
-        Some("schedule"),
-    ] {
-        for reference in ["refs/heads/main", "refs/tags/release"] {
-            assert!(!write_event_for(event, Some(reference)));
-        }
-    }
-}
-
-#[test]
-fn workflow_requires_complete_static_shards_and_cache_inputs() {
+fn workflow_requires_complete_static_shards_and_execution() {
     let workflow = include_str!("../../../.github/workflows/deep-ci.yml");
     let yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
     let baseline = yaml["jobs"]["fuzz"].as_mapping().unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let configuration = memcordon_ci::config::policy(&root).unwrap();
-    let fixture = tempfile::tempdir().unwrap();
-    let canonical_fixture_root = fixture.path().canonicalize().unwrap();
-    let fixture_root = canonical_fixture_root.as_path();
-    let fixture_home = fixture_root.join("cargo-home");
-    std::fs::create_dir(&fixture_home).unwrap();
-    for (name, bytes) in [
-        ("Cargo.toml", "[workspace]\nmembers = [\"fuzz\"]\n"),
-        ("Cargo.lock", "version = 4\n"),
-        (
-            "fuzz/Cargo.toml",
-            "[package]\nname = \"fuzz-inputs\"\nversion = \"0.1.0\"\n",
-        ),
-        ("fuzz/Cargo.lock", "version = 4\n"),
-        ("ci/toolchains.toml", "miri = \"nightly-2026-07-31\"\n"),
-        (".cargo/config.toml", "profile.release.opt-level=1\n"),
-    ] {
-        let path = fixture_root.join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-    }
-    let git = memcordon_ci::release::git::Git::new(fixture_root).unwrap();
-    git.text(["init", "--quiet"]).unwrap();
-    git.text([
-        "update-index",
-        "--add",
-        "--",
-        "Cargo.toml",
-        "Cargo.lock",
-        "fuzz/Cargo.toml",
-        "fuzz/Cargo.lock",
-        "ci/toolchains.toml",
-        ".cargo/config.toml",
-    ])
-    .unwrap();
-    let inputs = memcordon_ci::cache_inputs::local_files(fixture_root, "fuzz").unwrap();
-    for input in [
-        "Cargo.lock",
-        "Cargo.toml",
-        "fuzz/Cargo.lock",
-        "fuzz/Cargo.toml",
-        "ci/toolchains.toml",
-        ".cargo/config.toml",
-    ] {
-        assert!(inputs.contains_key(input), "fuzz cache omitted {input}");
-    }
-    let key_inputs = memcordon_ci::cache_inputs::KeyInputs {
-        family: "compiled-transfer".into(),
-        layout_revision: 1,
-        compatibility: memcordon_ci::cache_inputs::cargo_configs_with_home(
-            fixture_root,
-            &fixture_home,
-            None,
-        )
-        .unwrap(),
-        content: inputs,
-    };
-    let initial = memcordon_ci::cache_inputs::keys(&key_inputs).unwrap();
-    for input in [
-        "Cargo.lock",
-        "fuzz/Cargo.lock",
-        "Cargo.toml",
-        "fuzz/Cargo.toml",
-        "ci/toolchains.toml",
-        ".cargo/config.toml",
-    ] {
-        let mut changed = key_inputs.clone();
-        changed
-            .content
-            .insert(input.into(), "changed input digest".into());
-        assert_ne!(
-            memcordon_ci::cache_inputs::keys(&changed).unwrap(),
-            initial,
-            "fuzz cache ignored {input}"
-        );
-    }
-    let mut changed = key_inputs.clone();
-    changed
-        .compatibility
-        .insert("profile.release.opt-level".into(), "3".into());
-    assert_ne!(memcordon_ci::cache_inputs::keys(&changed).unwrap(), initial);
     let validate = |job: &serde_yaml::Mapping| {
         let mut document = yaml.clone();
         document["jobs"]["fuzz"] = serde_yaml::Value::Mapping(job.clone());
@@ -268,17 +156,6 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             .position(|step| step["id"].as_str() == Some(id))
             .unwrap()
     };
-    let source_restore = step_id("shard-fuzz-fetch-request-source-restore");
-    let source_save = steps
-        .iter()
-        .position(|step| {
-            step["uses"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("actions/cache/save@"))
-                && step["with"]["key"].as_str()
-                    == Some("${{ steps.shard-fuzz-fetch.outputs.source-complete-key }}")
-        })
-        .unwrap();
     for (index, field, from, to) in [
         (
             step_id("fuzz-two"),
@@ -292,13 +169,6 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             "ci segment fuzz-execute-quarter-two",
             "ci segment fuzz-execute-quarter-one",
         ),
-        (
-            source_restore,
-            "if",
-            "steps.shard-fuzz-fetch-request.outputs.source-restore == 'true'",
-            "true",
-        ),
-        (source_save, "if", "always()", "success()"),
     ] {
         let original = steps[index][field].as_str().unwrap();
         assert!(original.contains(from));
@@ -307,37 +177,30 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             original.replace(from, to).into();
         reject(job);
     }
-    for (field, from, to) in [
-        (
-            "key",
-            "steps.shard-fuzz-fetch-request.outputs.source-key",
-            "steps.unowned.outputs.source-key",
-        ),
-        (
-            "path",
-            "${{ steps.shard-fuzz-fetch-request.outputs.source-path }}",
-            "target/ci",
-        ),
-    ] {
-        let original = steps[source_restore]["with"][field].as_str().unwrap();
-        assert!(original.contains(from));
-        let mut job = baseline.clone();
-        job.get_mut(&steps_key).unwrap().as_sequence_mut().unwrap()[source_restore]["with"]
-            [field] = original.replace(from, to).into();
-        reject(job);
-    }
     for (index, step) in steps.iter().enumerate() {
+        let required_work = step["run"].as_str().is_some_and(|run| {
+            run.contains(" ci segment ")
+                || run.ends_with(" release fuzz-setup-check")
+                || run.ends_with(" release fuzz-setup-extract")
+                || run.ends_with(" release fuzz-setup-validate")
+                || run.ends_with(" release fuzz-current-probe")
+        });
+        let artifact_or_checkout = step["uses"].as_str().is_some_and(|uses| {
+            uses.starts_with("actions/checkout@")
+                || uses.starts_with("actions/download-artifact@")
+                || uses.starts_with("actions/upload-artifact@")
+        });
+        if !required_work && !artifact_or_checkout {
+            continue;
+        }
         let mut job = baseline.clone();
         job.get_mut(&steps_key)
             .unwrap()
             .as_sequence_mut()
             .unwrap()
             .remove(index);
-        // The complete authored adapter inventory is now checked before the
-        // legacy projection; optional cache failure does not permit drift.
         reject(job);
         if step["run"].as_str().is_none() {
-            // Cache transfers and retained diagnostics intentionally remain optional.
             continue;
         }
         let mut job = baseline.clone();

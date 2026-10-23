@@ -129,6 +129,12 @@ pub enum ReleaseCommand {
         #[arg(long)]
         consumer_readiness: bool,
     },
+    CheckSelectedInputs {
+        #[arg(long)]
+        build_source: PathBuf,
+        #[arg(long)]
+        consumer_readiness: bool,
+    },
     FinalizePreparation {
         #[arg(long)]
         build_source: PathBuf,
@@ -365,6 +371,10 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
             build_source,
             consumer_readiness,
         } => finalize::check_preparation(root, &build_source, consumer_readiness),
+        ReleaseCommand::CheckSelectedInputs {
+            build_source,
+            consumer_readiness,
+        } => finalize::check_selected_inputs(root, &build_source, consumer_readiness),
         ReleaseCommand::FinalizePreparation {
             build_source,
             input,

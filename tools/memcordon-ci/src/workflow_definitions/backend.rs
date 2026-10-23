@@ -34,7 +34,7 @@ fn node_3() -> Value {
     let mut values = serde_yaml::Mapping::new();
     values.insert(
         text("group"),
-        text("backend-certification-${{ github.ref }}"),
+        text("backend-certification-${{ github.event_name }}-${{ github.ref }}"),
     );
     values.insert(
         text("cancel-in-progress"),

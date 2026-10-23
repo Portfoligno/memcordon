@@ -1,5 +1,5 @@
 # Finite same-program bootstrap recipe. Changes invalidate bootstrap discovery.
-abi = 1
+abi = 2
 image_format = 1
 package = "memcordon-ci"
 binary = "memcordon-ci"

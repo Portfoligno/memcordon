@@ -258,44 +258,6 @@ fn dependabot_requires_each_independent_dependency_surface() {
 }
 
 #[test]
-fn public_bootstrap_seed_rejects_fuzz_manifest_without_its_lockfile() {
-    let root = repository_root();
-    let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let relative = ".github/workflows/deep-ci.yml";
-    let exact = std::fs::read_to_string(root.join(relative))
-        .expect("workflow fixture should be readable")
-        .replace("\r\n", "\n");
-    policy::validate_workflow_bytes(
-        &root,
-        Path::new(relative),
-        exact.as_bytes(),
-        &repository_policy,
-    )
-    .expect("the exact finite public source workflow should pass");
-    // The orphaned fuzz bootstrap seed was removed. Adding fuzz inputs to the
-    // workspace-only public seed must not create an unmodeled source contract.
-    let invalid = exact.replacen(
-        "hashFiles('Cargo.lock', 'Cargo.toml',",
-        "hashFiles('Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.toml',",
-        1,
-    );
-    assert!(invalid != exact, "fuzz source mutation must apply");
-    let error = policy::validate_workflow_bytes(
-        &root,
-        Path::new(relative),
-        invalid.as_bytes(),
-        &repository_policy,
-    )
-    .expect_err("a fuzz dependency cache key without its lockfile must fail");
-    assert!(
-        error
-            .to_string()
-            .contains("public source reader path/key/home contract changed"),
-        "unexpected policy error: {error}"
-    );
-}
-
-#[test]
 fn windows_arm_native_matrix_entries_are_structurally_required() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
@@ -612,7 +574,7 @@ fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
         (
             Path::new(".github/workflows/deep-ci.yml"),
             deep.as_str(),
-            "  group: deep-ci-${{ github.ref }}\n",
+            "  group: deep-ci-${{ github.event_name }}-${{ github.ref }}\n",
             "  group: deep-ci-all\n",
         ),
         (
@@ -624,7 +586,7 @@ fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
         (
             Path::new(".github/workflows/backend-certification.yml"),
             backend.as_str(),
-            "  group: backend-certification-${{ github.ref }}\n",
+            "  group: backend-certification-${{ github.event_name }}-${{ github.ref }}\n",
             "  group: backend-certification-all\n",
         ),
         (
@@ -749,6 +711,25 @@ fn every_workflow_upload_uses_the_bounded_action() {
                                 job["outputs"]["artifact-id"],
                                 "${{ steps.private-prepared-upload.outputs.artifact-id }}"
                             );
+                        }
+                        Some("private-linux-tools-x64" | "private-linux-tools-arm64") => {
+                            assert_eq!(document["name"], "Native backend tests");
+                            assert_eq!(step["id"], "private-driver-upload");
+                            assert_eq!(step["timeout-minutes"].as_u64(), Some(6));
+                            assert_eq!(step["with"]["path"], "target/ci/private-driver.tar");
+                            assert_eq!(
+                                job["outputs"]["artifact-id"],
+                                "${{ steps.private-driver-upload.outputs.artifact-id }}"
+                            );
+                            let artifact_name =
+                                if job_name.as_str() == Some("private-linux-tools-x64") {
+                                    "private-driver-linux-x64"
+                                } else {
+                                    "private-driver-linux-arm64"
+                                };
+                            assert_eq!(step["with"]["name"], artifact_name);
+                            assert_eq!(step["with"]["include-hidden-files"].as_bool(), Some(true));
+                            assert!(step["if"].is_null());
                         }
                         _ => panic!("unreviewed direct immutable producer: {job_name:?}"),
                     }

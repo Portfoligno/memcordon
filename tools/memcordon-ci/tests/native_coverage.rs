@@ -19,37 +19,32 @@ fn target(package: &str, name: &str, kind: TargetKind, source: &str) -> TargetSp
 }
 fn spec() -> WorkspaceSpec {
     let mut targets = Vec::new();
-    for package in ["one", "two"] {
-        let manifest = std::path::Path::new(package).join("Cargo.toml");
-        let manifest = manifest.to_str().unwrap();
-        targets.push(target(
-            manifest,
-            package,
-            TargetKind::Lib,
-            std::path::Path::new(package)
-                .join("src/lib.rs")
-                .to_str()
-                .unwrap(),
-        ));
-        let mut binary = target(
-            manifest,
-            package,
-            TargetKind::Bin,
-            std::path::Path::new(package)
-                .join("src/main.rs")
-                .to_str()
-                .unwrap(),
-        );
+    // These are canonical plan members, independent of native filesystem separators.
+    for (package, manifest, library, binary_source, duplicate_source) in [
+        (
+            "one",
+            "one/Cargo.toml",
+            "one/src/lib.rs",
+            "one/src/main.rs",
+            "one/tests/duplicate.rs",
+        ),
+        (
+            "two",
+            "two/Cargo.toml",
+            "two/src/lib.rs",
+            "two/src/main.rs",
+            "two/tests/duplicate.rs",
+        ),
+    ] {
+        targets.push(target(manifest, package, TargetKind::Lib, library));
+        let mut binary = target(manifest, package, TargetKind::Bin, binary_source);
         binary.test = false;
         targets.push(binary);
         targets.push(target(
             manifest,
             "duplicate",
             TargetKind::Test,
-            std::path::Path::new(package)
-                .join("tests/duplicate.rs")
-                .to_str()
-                .unwrap(),
+            duplicate_source,
         ));
     }
     let mut custom = target(

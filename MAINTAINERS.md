@@ -46,6 +46,12 @@ test recipes. Release additionally identifies selected product features and
 binaries. Preserve split restore/save, valid-context and quiescence conditions;
 do not cache reports, installed state or prepared release bytes.
 
+CI dependency, tool-image, sysroot and compilation caches remain operational.
+This repository does not maintain CI-cache regression, mutation, round-trip or
+native-qualification test cases. Keep actual path, source, credential,
+compatibility and owner checks at their operational boundaries. Do not replace
+removed cases with a cache approval or test-absence gate.
+
 Native CI executes the selected test binaries on matching hosts. Installed
 consumers exercise the selected package and archive bytes and report execution,
 collection and cleanup failures separately. Special loader experiments remain
@@ -94,6 +100,6 @@ source/target/job/boot timing inputs cannot be cached or renewed on resume.
 The standalone macOS native and acceptance callbacks run on separate selected
 runners; the shared-host Release callback remains sequential. Existing Miri
 quarters, stress iterations, runtime scenarios and rehearsal requirements stay
-required. Native ownership/timing acceptance and cache-service round trips must
-be reported only when actually executed; portable or source-level results do
+required. Native ownership/timing acceptance must be reported only when actually
+executed; portable or source-level results do
 not establish cross-platform support or a measured speedup.
