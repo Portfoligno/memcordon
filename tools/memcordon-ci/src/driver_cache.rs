@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const ABI: u32 = 2;
-pub const PROTOCOL_IDENTITY: &str = "bootstrap-abi-v2";
+pub const ABI: u32 = 3;
+pub const PROTOCOL_IDENTITY: &str = "bootstrap-abi-v3";
 const FORMAT: u32 = 1;
 const METADATA_LIMIT: u64 = 1024 * 1024;
 const IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -404,12 +404,14 @@ pub(crate) fn preparation_members(root: &Path) -> Result<Vec<PathBuf>> {
         &root.join(CURRENT).join(MANIFEST),
         METADATA_LIMIT,
     )?)?;
-    // The supported cold source path deliberately adopts Bootstrap at CURRENT
-    // for a cold source build. Its fresh-build provenance
+    // Identity-less fresh source builds deliberately adopt Bootstrap at CURRENT.
+    // Their fresh-build provenance
     // comes from the required same-run producer and preparation input record,
     // never from a fabricated Current cache identity.
     if image.class == ImageClass::Bootstrap && !image.source.is_empty() {
-        return Err(error("cold preparation image has an unexpected source key"));
+        return Err(error(
+            "bootstrap preparation image has an unexpected source key",
+        ));
     }
     let selected = if image.class == ImageClass::Current {
         Some(
@@ -827,7 +829,7 @@ fn bootstrap_key(root: &Path, image: &Image) -> Result<String> {
         _ => return Err(error("unsupported bootstrap architecture")),
     };
     Ok(format!(
-        "mc-ci-bootstrap-v2-{os}-{arch}-{}-{}",
+        "mc-ci-bootstrap-v3-{os}-{arch}-{}-{}",
         hex::encode(discovery.finalize()),
         artifacts::checksum(&serde_json::to_vec(image)?)
     ))
@@ -1420,9 +1422,13 @@ fn build_owned(
                 let mut ready = false;
                 let mut retention_verified = true;
                 if succeeded && !changed && source_unchanged {
-                    let source = after.as_ref().map_or("", |identity| identity.key.as_str());
+                    let (class, source) = after
+                        .as_ref()
+                        .map_or((ImageClass::Bootstrap, ""), |identity| {
+                            (ImageClass::Current, identity.key.as_str())
+                        });
                     match bounded(180, || {
-                        activate(root, &from, CURRENT, &recipe, ImageClass::Current, source)
+                        activate(root, &from, CURRENT, &recipe, class, source)
                     }) {
                         Ok(()) => {
                             ready = true;

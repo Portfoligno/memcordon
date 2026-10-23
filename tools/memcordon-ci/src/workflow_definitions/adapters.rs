@@ -630,8 +630,8 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
     if source_build.is_none() {
         let cache = id("bootstrap-cache");
         steps.push(action(&cache,true,host.clone(),object(&[("path",text("target/ci-bootstrap-in")),
-            ("key",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
-            ("restore-keys",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
+            ("key",text("mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
+            ("restore-keys",text("mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
         steps.push(driver_step(&probe,DriverOperation::Probe,windows,format!("{host} && steps.{cache}.outcome == 'success' && steps.{cache}.outputs.cache-matched-key != ''"),2,true));
         steps.push(driver_step(
             &context,
