@@ -943,7 +943,7 @@ fn put_optional(output: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
-fn monotonic_millis() -> Result<u64, String> {
+pub(super) fn monotonic_millis() -> Result<u64, String> {
     let mut value = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

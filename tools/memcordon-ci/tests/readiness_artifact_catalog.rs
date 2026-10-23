@@ -1,9 +1,64 @@
-use memcordon_ci::release::readiness_artifact_catalog::{CanonicalCatalog, preflight_unique};
+use memcordon_ci::release::readiness_artifact_catalog::{
+    CanonicalCatalog, PackedCatalog, VerifiedCapture, preflight_unique,
+};
 use memcordon_readiness_verifier::{Artifact, MAX_ARTIFACT_BYTES, MAX_PRODUCER_BYTES};
 use std::time::{Duration, Instant};
 
 fn cutoff() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+#[test]
+fn packed_capture_reads_each_actual_source_before_sharing_and_rejects_changed_later_source() {
+    use memcordon_readiness_verifier::{retain_artifact_bytes, sha256};
+    for corrupt_second in [false, true] {
+        let source = if cfg!(unix) {
+            tempfile::tempdir_in("/tmp").unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
+        let destination = if cfg!(unix) {
+            tempfile::tempdir_in("/tmp").unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
+        for name in ["first", "second"] {
+            std::fs::write(source.path().join(name), b"same").unwrap();
+        }
+        let records: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|path| Artifact {
+                path: path.into(),
+                length: b"same".len() as u64,
+                sha256: sha256(b"same"),
+            })
+            .collect();
+        let mut captures = Vec::new();
+        let catalog = PackedCatalog::capture(
+            &records,
+            0,
+            cutoff(),
+            |logical| {
+                captures.push(logical.path.clone());
+                if corrupt_second && logical.path == "second" {
+                    std::fs::write(source.path().join("second"), b"fake").unwrap();
+                }
+                VerifiedCapture::read(source.path(), logical)
+            },
+            |object, bytes, existing| {
+                retain_artifact_bytes(destination.path(), object, bytes, existing)
+                    .map_err(memcordon_ci::CiError::Message)
+            },
+        );
+        assert_eq!(captures, ["first", "second"]);
+        if corrupt_second {
+            assert!(catalog.is_err());
+        } else {
+            let catalog = catalog.unwrap();
+            assert_eq!(catalog.objects.len(), 1);
+            assert_eq!(catalog.bindings.len(), 2);
+        }
+    }
 }
 fn record(path: &str) -> Artifact {
     Artifact {

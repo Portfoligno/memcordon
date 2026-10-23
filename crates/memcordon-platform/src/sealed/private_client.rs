@@ -390,12 +390,14 @@ struct NativeFrontendExecution {
     relay_drained: bool,
     interruption: Option<i32>,
     relay_error: Option<String>,
+    observation_error: Option<String>,
 }
 pub(crate) struct MixedFrontendExecution {
     pub terminal: memcordon_core::result_v2::MixedRuntimeCarrierV2,
     pub relay_drained: bool,
     pub interruption: Option<i32>,
     pub relay_error: Option<String>,
+    pub observation_error: Option<String>,
 }
 pub(crate) fn mixed_run_at(
     policy: &memcordon_core::Policy,
@@ -422,6 +424,7 @@ pub(crate) fn mixed_run_at(
         relay_drained: receipt.relay_drained,
         interruption: receipt.interruption,
         relay_error: receipt.relay_error,
+        observation_error: receipt.observation_error,
     })
 }
 
@@ -468,8 +471,21 @@ pub(crate) fn mixed_backend_run(
             })
             .transpose()
             .map_err(|error| failure(error.to_owned()))?,
+        observation_error: receipt
+            .observation_error
+            .as_ref()
+            .map(|detail| {
+                memcordon_core::BoundedText::new(if detail.len() <= 4096 {
+                    detail
+                } else {
+                    "mixed retirement observation error exceeded diagnostic bound"
+                })
+            })
+            .transpose()
+            .map_err(|error| failure(error.to_owned()))?,
     };
     let mut errors = receipt.relay_error.into_iter().collect::<Vec<_>>();
+    errors.extend(receipt.observation_error);
     if !receipt.relay_drained {
         errors.push("frontend mixed byte relay was not completely drained/restored".into());
     }
@@ -1056,6 +1072,8 @@ fn native_run_at(
     let mut mixed_observation_seen = false;
     let mut mixed_prepared = None;
     let mut mixed_release_observation_seen = false;
+    let mut retirement_exchange: Option<mixed_observation_client::RetirementExchange> = None;
+    let mut observation_error = None;
     loop {
         if return_deadline.is_some_and(|end| Instant::now() >= end) {
             return Err("private frontend original deadline elapsed; provider retirement must be observed independently".into());
@@ -1109,8 +1127,35 @@ fn native_run_at(
                         end.min(started + Duration::from_secs(30))
                     }),
                 )?;
-                let ack = encoded_frame_for_version(4, 18, challenge, attempt, &[])?;
-                send_nonblocking(&stream, &ack, &[], deadline)?;
+                retirement_exchange = mixed_observation_client::RetirementExchange::prepare(
+                    &observation,
+                    &response.payload,
+                )?;
+                let ack = if let Some(exchange) = &retirement_exchange {
+                    return_deadline =
+                        Some(return_deadline.map_or(exchange.cleanup_deadline, |limit| {
+                            limit.min(exchange.cleanup_deadline)
+                        }));
+                    encoded_frame_for_version(
+                        4,
+                        20,
+                        challenge,
+                        attempt,
+                        &exchange.enrollment_bytes,
+                    )?
+                } else {
+                    encoded_frame_for_version(4, 18, challenge, attempt, &[])?
+                };
+                send_nonblocking(
+                    &stream,
+                    &ack,
+                    &[],
+                    if retirement_exchange.is_some() {
+                        return_deadline
+                    } else {
+                        deadline
+                    },
+                )?;
                 mixed_observation_seen = true;
                 mixed_prepared = Some(observation);
                 continue;
@@ -1121,6 +1166,15 @@ fn native_run_at(
                 };
                 if !mixed_observation_seen || mixed_release_observation_seen {
                     return Err("mixed release observation ordering differs".into());
+                }
+                if retirement_exchange
+                    .as_ref()
+                    .is_some_and(|exchange| !exchange.release_allowed())
+                {
+                    return Err(
+                        "mixed release omitted original worker retirement enrollment receipt"
+                            .into(),
+                    );
                 }
                 memcordon_core::workload_contract::reject_duplicate_json_keys(&response.payload)?;
                 let observation: memcordon_core::mixed_observation::MixedReleaseObservationV2 =
@@ -1135,13 +1189,79 @@ fn native_run_at(
                 mixed_observation_client::observe_release(
                     &response.payload,
                     &observation,
-                    deadline.map_or(started + Duration::from_secs(30), |end| {
+                    (if retirement_exchange.is_some() {
+                        return_deadline
+                    } else {
+                        deadline
+                    })
+                    .map_or(started + Duration::from_secs(30), |end| {
                         end.min(started + Duration::from_secs(30))
                     }),
                 )?;
                 let ack = encoded_frame_for_version(4, 19, challenge, attempt, &[])?;
-                send_nonblocking(&stream, &ack, &[], deadline)?;
+                send_nonblocking(
+                    &stream,
+                    &ack,
+                    &[],
+                    if retirement_exchange.is_some() {
+                        return_deadline
+                    } else {
+                        deadline
+                    },
+                )?;
                 mixed_release_observation_seen = true;
+                continue;
+            }
+            if matches!(response.kind, 120..=122) {
+                let Some(exchange) = retirement_exchange.as_mut() else {
+                    return Err("unenrolled invocation received retirement extension".into());
+                };
+                match response.kind {
+                    122 => {
+                        if mixed_release_observation_seen {
+                            return Err("retirement enrollment arrived after release".into());
+                        }
+                        exchange.accepted(&response.payload)?;
+                    }
+                    120 => {
+                        if !mixed_release_observation_seen {
+                            return Err("retirement witness preceded release".into());
+                        }
+                        let observed = exchange.observe(
+                            mixed_prepared
+                                .as_ref()
+                                .ok_or("retirement prepared binding absent")?,
+                            &response.payload,
+                            return_deadline,
+                        );
+                        return_deadline =
+                            Some(return_deadline.map_or(exchange.cleanup_deadline, |limit| {
+                                limit.min(exchange.cleanup_deadline)
+                            }));
+                        match observed {
+                            Ok((payload, cutoff)) => {
+                                let ack =
+                                    encoded_frame_for_version(4, 21, challenge, attempt, &payload)?;
+                                if let Err(error) =
+                                    send_nonblocking(&stream, &ack, &[], Some(cutoff))
+                                {
+                                    observation_error = Some(error);
+                                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                                }
+                            }
+                            Err(error) => {
+                                observation_error = Some(error);
+                                let _ = stream.shutdown(std::net::Shutdown::Write);
+                            }
+                        }
+                    }
+                    121 => {
+                        if let Err(error) = exchange.finished(&response.payload) {
+                            observation_error = Some(error);
+                        }
+                    }
+                    _ => unreachable!("finite retirement response"),
+                }
                 continue;
             }
             if response.kind == 106 {
@@ -1289,6 +1409,8 @@ fn native_run_at(
                 relay_drained: drained && relay_error.is_none(),
                 interruption,
                 relay_error,
+                observation_error: observation_error
+                    .or_else(|| retirement_exchange.and_then(|exchange| exchange.terminal_error())),
             });
         }
         if interruption.is_none() {
@@ -1487,7 +1609,31 @@ impl Incoming {
         let wanted = self.total.unwrap_or(HEADER_LENGTH);
         let mut chunk = [0; 8192];
         let length = chunk.len().min(wanted - self.bytes.len());
-        match stream.read(&mut chunk[..length]) {
+        let mut iov = libc::iovec {
+            iov_base: chunk.as_mut_ptr().cast(),
+            iov_len: length,
+        };
+        // No response in this exchange transfers descriptor authority. With no
+        // ancillary buffer the kernel closes any truncated SCM_RIGHTS payload.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        let received = unsafe {
+            libc::recvmsg(
+                stream.as_raw_fd(),
+                &raw mut message,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+            return Err("private response forbids ancillary descriptors".into());
+        }
+        let read = if received < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(received as usize)
+        };
+        match read {
             Ok(0) => return Err("private provider closed before complete terminal".into()),
             Ok(count) => self.bytes.extend_from_slice(&chunk[..count]),
             Err(error)
@@ -1504,6 +1650,14 @@ impl Incoming {
             let total =
                 u32::from_be_bytes(self.bytes[4..8].try_into().expect("fixed native header"))
                     as usize;
+            let kind = u16::from_be_bytes(self.bytes[2..4].try_into().expect("fixed native kind"));
+            if matches!(kind, 120..=122)
+                && total
+                    > HEADER_LENGTH
+                        + memcordon_core::mixed_observation::RETIREMENT_OBSERVATION_BYTES
+            {
+                return Err("retirement response exceeds finite payload bound".into());
+            }
             if !(HEADER_LENGTH
                 ..=HEADER_LENGTH + memcordon_core::workload_limits::CONTRACT_ENVELOPE_BYTES)
                 .contains(&total)

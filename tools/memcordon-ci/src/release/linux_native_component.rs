@@ -31,6 +31,8 @@ pub struct NativeTestOwner {
     image_sha256: String,
     input_delivered: bool,
     delivery_started: bool,
+    admission_refusal: Option<Vec<u8>>,
+    admission_refused: bool,
     crash_helpers: Vec<(
         memcordon_core::result_v2::NativeProcessV2,
         std::os::fd::OwnedFd,
@@ -1724,8 +1726,10 @@ impl NativeRecipeBatch {
                 Ok(owner) => owner,
                 Err(failure) => {
                     batch.failures.push(format!("{test}: {}", failure.detail));
-                    if let Some(owner) = failure.owner {
-                        batch.owners.push((test.to_owned(), owner));
+                    if let Some(owner) = failure.owner
+                        && !batch.settle_refused(test, owner, cleanup_deadline)
+                    {
+                        break;
                     }
                     continue;
                 }
@@ -1744,6 +1748,7 @@ impl NativeRecipeBatch {
             }
             if !owner.all_native_publications_settled() {
                 batch.owners.push((test.to_owned(), owner));
+                break;
             } else if let Some(Err(error)) = matches!(
                 test,
                 "native_mixed_recovery::native_account_retirement_boundary_emit_actual_receipt"
@@ -1782,6 +1787,28 @@ impl NativeRecipeBatch {
             ));
         }
         Ok(())
+    }
+
+    fn settle_refused(
+        &mut self,
+        test: &str,
+        mut owner: NativeTestOwner,
+        deadline: Instant,
+    ) -> bool {
+        if let Err(error) = owner.stop() {
+            self.failures
+                .push(format!("{test}: refused native stop: {error}"));
+        }
+        if let Err(error) = owner.finish(deadline) {
+            self.failures
+                .push(format!("{test}: refused native settlement: {error}"));
+        }
+        if owner.all_native_publications_settled() {
+            true
+        } else {
+            self.owners.push((test.to_owned(), owner));
+            false
+        }
     }
 }
 
@@ -1954,12 +1981,13 @@ impl NativeTestOwner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            Ok((image, child, ancestry))
+            Ok((image, child, ancestry, metadata))
         })();
-        let (image, mut child, ancestry) = before.map_err(|error| OwnedNativeTestFailure {
-            detail: error.to_string(),
-            owner: None,
-        })?;
+        let (image, mut child, ancestry, held_image) =
+            before.map_err(|error| OwnedNativeTestFailure {
+                detail: error.to_string(),
+                owner: None,
+            })?;
         let process_id = child.id();
         let stdout = child.stdout.take().map(capture);
         let stderr = child.stderr.take().map(capture);
@@ -1982,32 +2010,58 @@ impl NativeTestOwner {
             image_sha256: harness.sha256.clone(),
             input_delivered: false,
             delivery_started: false,
+            admission_refusal: None,
+            admission_refused: false,
             crash_helpers: Vec::new(),
             crash_failures: Vec::new(),
         };
+        let mut refusal = serde_json::json!({
+            "format":"memcordon.linux-native-test-admission-refusal","revision":1,
+            "process_id":process_id,"test_name":test,"image_sha256":harness.sha256,
+            "held_image":{"device":held_image.dev(),"inode":held_image.ino(),"size":held_image.len()},
+            "observed_image":null,"birth_before":null,"birth_after":null,
+            "image_mismatch":null,"birth_mismatch":null,
+            "stage":"native-pid-range","input_delivered":false,"admission":false
+        });
         let observed = (|| -> Result<()> {
             let pid =
                 rustix::process::Pid::from_raw(i32::try_from(process_id).map_err(|_| {
                     CiError::Message("native harness PID exceeds native range".into())
                 })?)
                 .ok_or_else(|| CiError::Message("native harness PID absent".into()))?;
+            refusal["stage"] = serde_json::json!("pidfd-open");
             owner.pidfd = Some(
                 rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
                     .map_err(std::io::Error::from)?,
             );
+            refusal["stage"] = serde_json::json!("birth-before");
             let observed_birth = birth(process_id)?;
-            let executable =
-                File::open(Path::new("/proc").join(process_id.to_string()).join("exe"))?
-                    .metadata()?;
+            refusal["birth_before"] = serde_json::json!(observed_birth);
+            refusal["stage"] = serde_json::json!("proc-executable-open");
+            let executable_file =
+                File::open(Path::new("/proc").join(process_id.to_string()).join("exe"))?;
+            refusal["stage"] = serde_json::json!("proc-executable-metadata");
+            let executable = executable_file.metadata()?;
+            refusal["observed_image"] = serde_json::json!({"device":executable.dev(),"inode":executable.ino(),"size":executable.len()});
+            refusal["stage"] = serde_json::json!("held-image-metadata");
             let image = owner.image.metadata()?;
-            if (executable.dev(), executable.ino()) != (image.dev(), image.ino())
-                || birth(process_id)? != observed_birth
-            {
+            refusal["compared_held_image"] =
+                serde_json::json!({"device":image.dev(),"inode":image.ino(),"size":image.len()});
+            refusal["stage"] = serde_json::json!("birth-after");
+            let final_birth = birth(process_id)?;
+            refusal["birth_after"] = serde_json::json!(final_birth);
+            let image_mismatch = (executable.dev(), executable.ino()) != (image.dev(), image.ino());
+            let birth_mismatch = final_birth != observed_birth;
+            refusal["image_mismatch"] = serde_json::json!(image_mismatch);
+            refusal["birth_mismatch"] = serde_json::json!(birth_mismatch);
+            refusal["stage"] = serde_json::json!("compare-held-image-and-birth");
+            if image_mismatch || birth_mismatch {
                 return Err(CiError::Message(
                     "native harness exec/birth differs from held selected image".into(),
                 ));
             }
             owner.birth = Some(observed_birth);
+            refusal["stage"] = serde_json::json!("pre-input-publication");
             source::write_json(
                 &output.join("native-pre-input.json"),
                 &serde_json::json!({"process_id":process_id,"birth":observed_birth,
@@ -2016,10 +2070,38 @@ impl NativeTestOwner {
         })();
         match observed {
             Ok(()) => Ok(owner),
-            Err(error) => Err(OwnedNativeTestFailure {
-                detail: error.to_string(),
-                owner: Some(owner),
-            }),
+            Err(error) => {
+                let mut detail = error.to_string();
+                owner.admission_refused = true;
+                const ERROR_SAMPLE_LIMIT: usize = 4096;
+                refusal["error_bytes"] = serde_json::json!(
+                    detail
+                        .as_bytes()
+                        .iter()
+                        .copied()
+                        .take(ERROR_SAMPLE_LIMIT)
+                        .collect::<Vec<_>>()
+                );
+                refusal["error_length"] = serde_json::json!(detail.len());
+                refusal["pidfd_acquired"] = serde_json::json!(owner.pidfd.is_some());
+                let publication = (|| -> Result<()> {
+                    let bytes = serde_json::to_vec(&refusal)?;
+                    if bytes.len() > 65536 {
+                        return Err(CiError::Message(
+                            "native admission refusal exceeds diagnostic bound".into(),
+                        ));
+                    }
+                    owner.admission_refusal = Some(bytes.clone());
+                    owner.publish_owned("native-admission-refusal.json", &bytes)
+                })();
+                if let Err(error) = publication {
+                    detail.push_str(&format!("; native refusal publication: {error}"));
+                }
+                Err(OwnedNativeTestFailure {
+                    detail,
+                    owner: Some(owner),
+                })
+            }
         }
     }
 
@@ -2055,12 +2137,16 @@ impl NativeTestOwner {
         Ok(())
     }
 
-    fn exited(&self) -> Result<bool> {
+    fn exited(&mut self) -> Result<bool> {
         use rustix::event::{PollFd, PollFlags, Timespec};
-        let fd = self
-            .pidfd
-            .as_ref()
-            .ok_or_else(|| CiError::Message("native harness pidfd ownership missing".into()))?;
+        let Some(fd) = self.pidfd.as_ref() else {
+            // Setup can fail before pidfd acquisition. Only the original unreaped
+            // Child may observe/reap this process; no PID lookup replaces it.
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            return Ok(self.status.is_some());
+        };
         let mut descriptors = [PollFd::new(fd, PollFlags::IN)];
         let count = rustix::event::poll(
             &mut descriptors,
@@ -2200,11 +2286,12 @@ impl NativeTestOwner {
     pub fn stop(&mut self) -> Result<()> {
         self.child.stdin.take();
         if !self.exited()? {
-            rustix::process::pidfd_send_signal(
-                self.pidfd.as_ref().expect("checked pidfd"),
-                rustix::process::Signal::KILL,
-            )
-            .map_err(std::io::Error::from)?;
+            if let Some(pidfd) = &self.pidfd {
+                rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL)
+                    .map_err(std::io::Error::from)?;
+            } else {
+                self.child.kill()?;
+            }
         }
         Ok(())
     }
@@ -2279,15 +2366,24 @@ impl NativeTestOwner {
                 }
             }
         }
-        let mut capture_outstanding = false;
+        while self
+            .stdout
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            || self
+                .stderr
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            if Instant::now() >= deadline {
+                return Err(CiError::Message("native harness capture worker remains outstanding at original retirement deadline".into()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         for (handle, captured) in [
             (&mut self.stdout, &mut self.stdout_bytes),
             (&mut self.stderr, &mut self.stderr_bytes),
         ] {
-            if handle.as_ref().is_some_and(|worker| !worker.is_finished()) {
-                capture_outstanding = true;
-                continue;
-            }
             if let Some(worker) = handle.take() {
                 match worker.join() {
                     Ok(Ok(bytes)) => *captured = Some(bytes),
@@ -2331,10 +2427,8 @@ impl NativeTestOwner {
         self.native_quiescent = self.crash_helpers.iter().all(|entry| entry.3);
         // Capture failures remain the operation's original failure, while
         // native process settlement and every remaining capture owner proceed.
-        if capture_outstanding {
-            return Err(CiError::Message(
-                "native harness capture worker remains outstanding".into(),
-            ));
+        if let Some(bytes) = self.admission_refusal.clone() {
+            self.publish_owned("native-admission-refusal.json", &bytes)?;
         }
         for (name, bytes) in [
             ("stdout.bin", self.stdout_bytes.clone()),
@@ -2350,6 +2444,16 @@ impl NativeTestOwner {
             "birth":self.birth,"image_sha256":self.image_sha256,"held_before_input_delivery":self.birth.is_some(),
             "retirement_observed":true,"same_image_helpers_absent":true}))?)?;
         }
+        use std::os::unix::process::ExitStatusExt;
+        if self.admission_refused {
+            self.publish_owned("native-refusal-exit.json", &serde_json::to_vec(&serde_json::json!({
+                "format":"memcordon.linux-native-test-refusal-exit","revision":1,
+                "process_id":self.process_id,"birth":self.birth,"image_sha256":self.image_sha256,
+                "native_status":self.status.and_then(|status|status.code()),
+                "native_signal":self.status.and_then(|status|status.signal()),
+                "raw_wait_status":self.status.map(|status|status.into_raw()),"input_delivered":self.input_delivered
+            }))?)?;
+        }
         self.publish_owned("native-exit.json",&serde_json::to_vec(&serde_json::json!({"native_status":self.status.and_then(|status|status.code()),
             "input_delivered":self.input_delivered,"capture_complete":self.stdout_bytes.is_some() && self.stderr_bytes.is_some() && self.capture_failure.is_none()}))?)?;
         let crash = self
@@ -2362,7 +2466,8 @@ impl NativeTestOwner {
                 .status
                 .ok_or_else(|| CiError::Message("native crash lacks actual wait status".into()))?;
             if self.native_quiescent {
-                self.publish_owned("native-crash-exit.json",&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-native-crash-exit","revision":1,"worker_pid":self.process_id,"worker_birth":self.birth,"worker_image_sha256":self.image_sha256,"raw_wait_status":status.into_raw(),"native_signal":status.signal(),"native_exit_code":status.code(),"worker_pidfd_retirement_observed":self.exited()?,"caller_pidfd_retirements":self.crash_helpers.iter().filter(|entry|entry.3).map(|(identity,_,_,_)|identity).collect::<Vec<_>>()}))?)?;
+                let worker_retired = self.exited()?;
+                self.publish_owned("native-crash-exit.json",&serde_json::to_vec(&serde_json::json!({"format":"memcordon.linux-native-crash-exit","revision":1,"worker_pid":self.process_id,"worker_birth":self.birth,"worker_image_sha256":self.image_sha256,"raw_wait_status":status.into_raw(),"native_signal":status.signal(),"native_exit_code":status.code(),"worker_pidfd_retirement_observed":worker_retired,"caller_pidfd_retirements":self.crash_helpers.iter().filter(|entry|entry.3).map(|(identity,_,_,_)|identity).collect::<Vec<_>>()}))?)?;
             }
         }
         if let Some(error) = &self.capture_failure {
@@ -2371,7 +2476,6 @@ impl NativeTestOwner {
         if !self.crash_failures.is_empty() {
             return Err(CiError::Message(self.crash_failures.join("; ")));
         }
-        use std::os::unix::process::ExitStatusExt;
         if self.status.is_none_or(|status| {
             if crash {
                 status.signal() != Some(libc::SIGKILL)
@@ -2395,6 +2499,16 @@ impl NativeTestOwner {
 
     fn all_native_publications_settled(&self) -> bool {
         self.native_and_capture_owners_retired()
+            && (!self.admission_refused
+                || (self.admission_refusal.is_some()
+                    && self
+                        .publications
+                        .get("native-refusal-exit.json")
+                        .is_some_and(|publication| publication.settled)
+                    && self
+                        .publications
+                        .get("native-admission-refusal.json")
+                        .is_some_and(|publication| publication.settled)))
             && self
                 .publications
                 .get("native-retirement.json")
@@ -2429,6 +2543,8 @@ impl NativeTestOwner {
                 | "native-exit.json"
                 | "native-crash-controller.json"
                 | "native-crash-exit.json"
+                | "native-admission-refusal.json"
+                | "native-refusal-exit.json"
         ) {
             return Err(CiError::Message(
                 "native component publication name is not owned".into(),
@@ -2529,3 +2645,7 @@ impl NativeTestOwner {
 }
 
 use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(test)]
+#[path = "../../tests/private/native_recipe_owner.rs"]
+mod owner_tests;

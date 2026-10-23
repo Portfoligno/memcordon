@@ -8,13 +8,40 @@ use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct Custody {
-    bytes: BTreeMap<String, Vec<u8>>,
+    bytes: BTreeMap<String, std::sync::Arc<[u8]>>,
     hashes: BTreeMap<String, String>,
     archives: BTreeMap<String, Collected>,
     root: PathBuf,
 }
 
 impl Custody {
+    pub(crate) fn for_storage(
+        root: &Path,
+        artifacts: &[Artifact],
+        origins: &[ProducerOrigin],
+        plan: &crate::storage::StoragePlan,
+        metadata_bytes: u64,
+    ) -> VerificationResult<Self> {
+        plan.check_budget(metadata_bytes)?;
+        plan.validate_directory(root)?;
+        let physical: Vec<_> = plan.physical_artifacts().cloned().collect();
+        let mut held = Self::for_evidence(root, &physical, origins)?;
+        let mut bytes = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
+        for logical in artifacts {
+            let object = plan.resolve(&logical.path)?;
+            if logical.length != object.length || logical.sha256 != object.sha256 {
+                return Err("logical evidence differs from held storage object".into());
+            }
+            hashes.insert(logical.path.clone(), logical.sha256.clone());
+            if let Some(value) = held.bytes.get(&object.path) {
+                bytes.insert(logical.path.clone(), value.clone());
+            }
+        }
+        held.bytes = bytes;
+        held.hashes = hashes;
+        Ok(held)
+    }
     pub(crate) fn new(root: &Path, artifacts: &[Artifact]) -> VerificationResult<Self> {
         Self::for_evidence(root, artifacts, &[])
     }
@@ -89,7 +116,7 @@ impl Custody {
             } else {
                 bytes.insert(
                     artifact.path.clone(),
-                    collected.bytes.ok_or("raw artifact buffer absent")?,
+                    std::sync::Arc::from(collected.bytes.ok_or("raw artifact buffer absent")?),
                 );
             }
         }
@@ -125,7 +152,7 @@ impl Custody {
         validate_path(path)?;
         self.bytes
             .get(path)
-            .map(Vec::as_slice)
+            .map(|bytes| bytes.as_ref())
             .ok_or_else(|| format!("artifact not bound in evidence index: {path}"))
     }
     pub(crate) fn hash(&self, path: &str) -> VerificationResult<&str> {
@@ -159,6 +186,152 @@ pub fn validate_path(path: &str) -> VerificationResult<()> {
         return Err("artifact reference is not a finite relative ordinary path".into());
     }
     Ok(())
+}
+
+/// Exclusively publish one physical member, then independently collect its named bytes.
+pub(crate) fn retain_bytes(
+    root: &Path,
+    artifact: &Artifact,
+    bytes: &[u8],
+    existing: bool,
+) -> VerificationResult<()> {
+    validate_path(&artifact.path)?;
+    if bytes.len() as u64 != artifact.length || crate::sha256(bytes) != artifact.sha256 {
+        return Err("retained evidence differs from actual capture".into());
+    }
+    if !existing {
+        write_confined(root, &artifact.path, bytes)?;
+    }
+    let held = collect_confined(root, &artifact.path, artifact.length, true)?;
+    if held.length != artifact.length
+        || held.hash != artifact.sha256
+        || held.bytes.as_deref() != Some(bytes)
+    {
+        return Err("equal evidence digest key has unequal retained bytes".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_confined(root: &Path, relative: &str, bytes: &[u8]) -> VerificationResult<()> {
+    use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let mut parents = vec![File::from(
+        open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| e.to_string())?,
+    )];
+    let parts: Vec<_> = relative.split('/').collect();
+    for part in &parts[..parts.len() - 1] {
+        let parent = parents.last().ok_or("held publication parent absent")?;
+        match mkdirat(parent, *part, Mode::from_bits_truncate(0o755)) {
+            Ok(()) => (),
+            Err(rustix::io::Errno::EXIST) => (),
+            Err(e) => return Err(e.to_string()),
+        }
+        parents.push(File::from(
+            openat(
+                parent,
+                *part,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| e.to_string())?,
+        ));
+    }
+    let parent = parents.last().ok_or("held publication parent absent")?;
+    let mut file = File::from(
+        openat(
+            parent,
+            parts[parts.len() - 1],
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o644),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    parent.sync_all().map_err(|e| e.to_string())?;
+    let named = File::from(
+        openat(
+            parent,
+            parts[parts.len() - 1],
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    let original = file.metadata().map_err(|e| e.to_string())?;
+    let current = named.metadata().map_err(|e| e.to_string())?;
+    if original.nlink() != 1 || (original.dev(), original.ino()) != (current.dev(), current.ino()) {
+        return Err("new evidence member named identity changed".into());
+    }
+    let collected = collect_confined(root, relative, bytes.len() as u64, false)?;
+    if collected.identity != (original.dev(), original.ino()) {
+        return Err("new evidence publication ancestor changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_confined(root: &Path, relative: &str, bytes: &[u8]) -> VerificationResult<()> {
+    use std::io::Write;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    };
+    let mut parents = Vec::new();
+    let mut current = root.to_path_buf();
+    let parts: Vec<_> = relative.split('/').collect();
+    for part in std::iter::once(None).chain(parts[..parts.len() - 1].iter().map(|p| Some(*p))) {
+        if let Some(part) = part {
+            current.push(part);
+            match std::fs::create_dir(&current) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let directory = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&current)
+            .map_err(|e| e.to_string())?;
+        let metadata = directory.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("publication ancestor is not held ordinary directory".into());
+        }
+        parents.push(directory);
+    }
+    current.push(parts[parts.len() - 1]);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&current)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    let identity = windows_identity(&file)?;
+    drop(file);
+    if collect_confined(root, relative, bytes.len() as u64, false)?.identity != identity {
+        return Err("new evidence member named identity changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_confined(_: &Path, _: &str, _: &[u8]) -> VerificationResult<()> {
+    Err("native evidence custody unavailable on this host".into())
 }
 
 struct Collected {

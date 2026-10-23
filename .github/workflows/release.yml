@@ -2475,7 +2475,7 @@ jobs:
         timeout-minutes: 20
       - &shared_step_102
         if: '!cancelled() && matrix.producer-job != '''''
-        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell
+        run: ./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
         timeout-minutes: 10
       - &shared_step_103
         id: readiness-upload
@@ -2483,7 +2483,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell/producer
+          path: .release/readiness-cell/producer-packed
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false
@@ -3301,7 +3301,7 @@ jobs:
         timeout-minutes: 20
       - &shared_step_133
         if: (!cancelled()) && runner.os != 'Windows'
-        run: ./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell
+        run: ./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell
         timeout-minutes: 10
       - &shared_step_134
         id: readiness-upload
@@ -3309,7 +3309,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: readiness-${{ matrix.producer-job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .release/readiness-cell/producer
+          path: .release/readiness-cell/producer-packed
           if-no-files-found: error
           include-hidden-files: true
           overwrite: false

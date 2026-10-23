@@ -79,6 +79,7 @@ pub fn validate_linux_lifecycle_intervention(
             "release_knowledge",
             "journal_sha256",
             "release_barrier",
+            "retirement_barrier",
             "native_image",
             "selected_image_sha256",
             "native_operation",
@@ -264,6 +265,77 @@ pub fn validate_linux_lifecycle_intervention(
         }
     } else if !intent["release_barrier"].is_null() {
         return Err("lifecycle phase adopts another release barrier".into());
+    }
+    if phase == "drain" {
+        let witness = &intent["retirement_barrier"];
+        closed(
+            witness,
+            &[
+                "format",
+                "revision",
+                "binding",
+                "enrollment_sha256",
+                "boot_identity",
+                "caller",
+                "target",
+                "namespace_init",
+                "guardian",
+                "worker",
+                "phase",
+                "release_knowledge",
+                "journal",
+                "cleanup_deadline_monotonic_millis",
+                "observation_deadline_monotonic_millis",
+                "authorizes_launch",
+                "retirement_completed",
+            ],
+        )?;
+        closed(
+            &witness["binding"],
+            &["attempt_id", "admission_nonce", "prepared_sha256"],
+        )?;
+        closed(
+            &witness["journal"],
+            &["device", "inode", "length", "sha256"],
+        )?;
+        closed(&witness["worker"], &["pid", "birth"])?;
+        crate::digest(
+            witness["enrollment_sha256"]
+                .as_str()
+                .ok_or("drain enrollment digest absent")?,
+        )?;
+        if witness["format"] != "memcordon.mixed-retirement-observation"
+            || witness["revision"] != 1
+            || witness["phase"] != "retiring"
+            || witness["release_knowledge"] != "exec-observed"
+            || witness["authorizes_launch"] != false
+            || witness["retirement_completed"] != false
+            || witness["binding"]["attempt_id"] != attempt
+            || witness["binding"]["admission_nonce"] != prepared["admission"]["admission_nonce"]
+            || witness["caller"] != prepared["caller"]
+            || witness["target"] != prepared["target"]
+            || witness["namespace_init"] != prepared["namespace_init"]
+            || witness["guardian"] != prepared["guardian"]
+            || witness["worker"]["pid"] != worker["pid"]
+            || witness["worker"]["birth"] != worker["birth"]
+            || witness["journal"]["sha256"] != sha256(journal_bytes)
+            || witness["journal"]["length"] != journal_bytes.len() as u64
+            || witness["journal"]["inode"].as_u64().is_none_or(|v| v == 0)
+            || witness["journal"]["device"].as_u64().is_none()
+            || witness["observation_deadline_monotonic_millis"]
+                .as_u64()
+                .is_none_or(|v| {
+                    v == 0
+                        || witness["cleanup_deadline_monotonic_millis"]
+                            .as_u64()
+                            .is_none_or(|cleanup| v >= cleanup)
+                })
+            || witness["boot_identity"] != journal["boot_identity"]
+        {
+            return Err("lifecycle drain witness replaces original retiring journal/family".into());
+        }
+    } else if !intent["retirement_barrier"].is_null() {
+        return Err("non-drain phase adopts retirement witness".into());
     }
     Ok(())
 }
@@ -1267,6 +1339,38 @@ fn validate_boundary(
             }
         } else if context.peers.contains_key("release-prepared.json") {
             return Err("lifecycle adopts release receipt outside selected final barrier".into());
+        }
+        if context.input.key.scenario.ends_with("-drain") {
+            let witness: Value =
+                crate::wire::json(custody.bytes(path("retirement-prepared.json")?)?)?;
+            let enrolled: Value =
+                crate::wire::json(custody.bytes(path("retirement-enrolled.json")?)?)?;
+            closed(
+                &enrolled,
+                &[
+                    "format",
+                    "revision",
+                    "binding",
+                    "enrollment_sha256",
+                    "phase",
+                ],
+            )?;
+            if intent["retirement_barrier"] != witness
+                || enrolled["format"] != "memcordon.mixed-retirement-enrolled"
+                || enrolled["revision"] != 1
+                || enrolled["phase"] != "retiring"
+                || enrolled["binding"] != witness["binding"]
+                || enrolled["enrollment_sha256"] != witness["enrollment_sha256"]
+                || witness["binding"]["prepared_sha256"] != custody.hash(path("prepared.json")?)?
+            {
+                return Err(
+                    "lifecycle drain witness differs from retained original worker frames".into(),
+                );
+            }
+        } else if context.peers.contains_key("retirement-prepared.json")
+            || context.peers.contains_key("retirement-enrolled.json")
+        {
+            return Err("non-drain lifecycle adopts retirement observations".into());
         }
         validate_linux_lifecycle_intervention(
             &context.input.key,
@@ -2329,6 +2433,8 @@ fn original_context(
         "selected-agent-image.bin",
         "actual-result.json",
         "release-prepared.json",
+        "retirement-prepared.json",
+        "retirement-enrolled.json",
         "export-receipt.json",
         "report-destination.json",
         "provider-terminal.json",

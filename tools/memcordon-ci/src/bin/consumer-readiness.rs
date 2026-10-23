@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use memcordon_ci::command::CommandSpec;
 use memcordon_ci::consumer_readiness_ledger::{self as ledger, CellEvidence, SourceIdentity};
-use memcordon_readiness_verifier::{EvidenceIndex, JobOutcome, ProducerOrigin};
+use memcordon_readiness_verifier::{JobOutcome, ProducerOrigin};
 use std::{fs, path::PathBuf, process::ExitCode};
 
 fn cleanup_failures(
@@ -599,7 +599,7 @@ fn run(operation: Operation) -> Result<(), String> {
             let bytes = serde_json::to_vec_pretty(&sealed).map_err(|e| e.to_string())?;
             #[cfg(target_os = "linux")]
             if let Some((scope, _, _)) = &scoped {
-                return scope.publish(&bytes);
+                return scope.publish_packed(&sealed);
             }
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -919,7 +919,14 @@ fn run(operation: Operation) -> Result<(), String> {
             jobs,
             origins,
         } => {
-            let mut index: EvidenceIndex = read(&plan)?;
+            let plan_value: serde_json::Value = read(&plan)?;
+            let (mut index, _) = memcordon_readiness_verifier::storage::decode_evidence(
+                &serde_json::to_vec(&plan_value).map_err(|e| e.to_string())?,
+            )?;
+            if !index.artifacts.is_empty() {
+                return Err("merge requires an empty acquisition plan, not a previously retained evidence root".into());
+            }
+            let mut packed = ledger::PackedLedger::default();
             let mut failures = Vec::new();
             if let Err(error) = read::<Vec<JobOutcome>>(&jobs)
                 .and_then(|observed| ledger::record_job_outcomes(&mut index, observed))
@@ -953,6 +960,27 @@ fn run(operation: Operation) -> Result<(), String> {
             for directory in cells {
                 let result =
                     read::<CellEvidence>(&directory.join("cell.json")).and_then(|mut cell| {
+                        let producer_path = directory.join("producer-manifest.json");
+                        let storage = match fs::symlink_metadata(&producer_path) {
+                            Ok(_) => {
+                                let value: serde_json::Value = read(&producer_path)?;
+                                let (producer, storage) =
+                                    memcordon_readiness_verifier::storage::decode_producer(
+                                        &serde_json::to_vec(&value).map_err(|e| e.to_string())?,
+                                    )?;
+                                memcordon_readiness_verifier::storage::validate_cell(
+                                    &producer,
+                                    &serde_json::to_vec(&cell).map_err(|e| e.to_string())?,
+                                )?;
+                                storage
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                memcordon_readiness_verifier::storage::StoragePlan::legacy(
+                                    &cell.artifacts,
+                                )?
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        };
                         if directory.join("acquisition-failure.json").exists()
                             || directory.join("always-cleanup-failure.json").exists()
                         {
@@ -960,7 +988,7 @@ fn run(operation: Operation) -> Result<(), String> {
                                 "acquisition wrapper recorded native runner/cleanup failure".into(),
                             );
                         }
-                        ledger::ingest(&mut index, cell, &directory, &artifact_root)
+                        packed.ingest(&mut index, cell, &directory, &artifact_root, &storage)
                     });
                 if let Err(error) = result {
                     failures.push(format!("{}: {error}", directory.display()));
@@ -973,7 +1001,7 @@ fn run(operation: Operation) -> Result<(), String> {
             } else {
                 index.assessment_failures.extend(failures.clone());
             }
-            ledger::persist(&index, &output)?;
+            packed.persist(&index, &output, &artifact_root)?;
             if failures.is_empty() {
                 Ok(())
             } else {

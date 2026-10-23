@@ -11,6 +11,39 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn retiring_witness_rejects_rehashed_original_owner_and_journal_substitution() {
+    use sha2::{Digest, Sha256};
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    for field in [
+        "guardian",
+        "worker",
+        "journal",
+        "binding",
+        "enrollment_sha256",
+        "observation_deadline_monotonic_millis",
+        "authorizes_launch",
+        "retirement_completed",
+    ] {
+        let mut case = linux_lifecycle_case::loss_case("guardian", "drain");
+        case.validate().unwrap();
+        case.mutate(&format!("{prefix}/retirement-prepared.json"), |value| {
+            value[field] = json!(null);
+        });
+        assert!(
+            case.validate().is_err(),
+            "accepted substituted retiring witness {field}"
+        );
+    }
+    let mut case = linux_lifecycle_case::loss_case("guardian", "drain");
+    case.validate().unwrap();
+    case.mutate(&format!("{prefix}/controller-intent.json"), |value| {
+        value["retirement_barrier"]["journal"]["sha256"] =
+            json!(hex::encode(Sha256::digest(b"substituted original journal")));
+    });
+    assert!(case.validate().is_err());
+}
+
+#[test]
 fn lifecycle_derived_image_budget_preserves_headroom_and_rejects_rehashed_changes() {
     let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
     let receipt = format!("{prefix}/fixture-memory-budget.json");

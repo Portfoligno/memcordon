@@ -949,6 +949,13 @@ impl DurablePrivateAttempt {
     }
     #[cfg(test)]
     pub fn component_native_observation(&self) -> Result<(Vec<u8>, serde_json::Value), String> {
+        self.held_native_observation()
+            .map(|(_, bytes, observation)| (bytes, observation))
+    }
+
+    pub(super) fn held_native_observation(
+        &self,
+    ) -> Result<(File, Vec<u8>, serde_json::Value), String> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -968,7 +975,7 @@ impl DurablePrivateAttempt {
             .take((MAX_PRIVATE_RECORD_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
-        if PrivateAttemptRecordV4::parse(&bytes)? != self.record {
+        if PrivateAttemptRecordV4::parse(&bytes)? != self.record || bytes != self.record.encode()? {
             return Err("component native journal differs from actual owner".into());
         }
         let stamp = |m: &std::fs::Metadata| {
@@ -1021,6 +1028,6 @@ impl DurablePrivateAttempt {
         }
         let observation = serde_json::json!({"path":self.path,"device":before.dev(),"inode":before.ino(),"length":before.len(),"links":before.nlink(),"uid":before.uid(),"mode":before.mode(),
             "parent_path":self.path.parent(),"parent_device":held.dev(),"parent_inode":held.ino(),"parent_uid":held.uid(),"parent_mode":held.mode()});
-        Ok((bytes, observation))
+        Ok((file, bytes, observation))
     }
 }

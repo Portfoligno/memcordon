@@ -1215,7 +1215,7 @@ pub(super) fn apply(workflow: &mut Value, name: &str) -> Result<()> {
                     set(
                         &mut step["with"],
                         "path",
-                        text(".release/readiness-cell/producer"),
+                        text(".release/readiness-cell/producer-packed"),
                     );
                     uploaded = true;
                 }

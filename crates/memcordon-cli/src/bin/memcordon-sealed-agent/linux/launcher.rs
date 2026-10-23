@@ -393,7 +393,15 @@ pub(super) fn forward_private(
     write_frame(&mut bytes, &frame).map_err(|error| error.to_string())?;
     super::transport::send(&stream, &bytes, descriptors)?;
     let mut cancelled = false;
+    let mut retirement: Option<super::mixed_retirement::RetirementRelay> = None;
     loop {
+        if retirement
+            .as_ref()
+            .is_some_and(|exchange| std::time::Instant::now() >= exchange.deadline)
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            return Err("original retirement relay cleanup cutoff expired".into());
+        }
         let mut sockets = [
             libc::pollfd {
                 fd: stream.as_raw_fd(),
@@ -410,7 +418,23 @@ pub(super) fn forward_private(
                 revents: 0,
             },
         ];
-        let ready = unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, 100) };
+        let poll_millis = retirement.as_ref().map_or(100, |exchange| {
+            i32::try_from(
+                exchange
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(100)
+            .min(100)
+        });
+        let ready = unsafe {
+            libc::poll(
+                sockets.as_mut_ptr(),
+                sockets.len() as libc::nfds_t,
+                poll_millis,
+            )
+        };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -445,10 +469,26 @@ pub(super) fn forward_private(
             } else {
                 crate::protocol::PROTOCOL_VERSION
             };
-            let response = crate::protocol::read_frame_version(&mut stream, version)
-                .map_err(|error| error.to_string())?;
+            let response = if let Some(retirement) = retirement.as_ref() {
+                super::mixed_retirement::receive_until(&stream, retirement.deadline)?
+            } else {
+                crate::protocol::read_frame_version(&mut stream, version)
+                    .map_err(|error| error.to_string())?
+            };
             if response.nonce != request.nonce || response.attempt_id != request.attempt_id {
                 return Err("network worker response association differs".into());
+            }
+            if let Some(retirement) = retirement.as_mut() {
+                if retirement.forward(frontend_stream, &stream, &response)? {
+                    continue;
+                }
+                if response.kind == MessageKind::MixedReleaseObservation
+                    && !retirement.release_allowed()
+                {
+                    return Err(
+                        "mixed release preceded original retirement enrollment acceptance".into(),
+                    );
+                }
             }
             if request.kind == MessageKind::MixedLaunch
                 && matches!(
@@ -459,32 +499,61 @@ pub(super) fn forward_private(
                 if cancelled {
                     return Err("mixed observation arrived after cancellation".into());
                 }
-                write_frame(&mut &*frontend_stream, &response)
-                    .map_err(|error| error.to_string())?;
-                frontend_stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                    .map_err(|error| error.to_string())?;
-                let ack = super::transport::receive_public(frontend_stream);
-                let restore = frontend_stream
-                    .set_read_timeout(None)
-                    .map_err(|error| error.to_string());
-                let (ack, ack_fds, ack_version) = ack?;
-                restore?;
+                let (ack, ack_fds, ack_version) = if let Some(exchange) = retirement.as_ref() {
+                    super::mixed_retirement::send_until(
+                        frontend_stream,
+                        &response,
+                        exchange.deadline,
+                    )?;
+                    (
+                        super::mixed_retirement::receive_until(frontend_stream, exchange.deadline)?,
+                        Vec::new(),
+                        crate::protocol::MIXED_PROTOCOL_VERSION,
+                    )
+                } else {
+                    write_frame(&mut &*frontend_stream, &response)
+                        .map_err(|error| error.to_string())?;
+                    frontend_stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                        .map_err(|error| error.to_string())?;
+                    let ack = super::transport::receive_public(frontend_stream);
+                    let restore = frontend_stream
+                        .set_read_timeout(None)
+                        .map_err(|error| error.to_string());
+                    let received = ack?;
+                    restore?;
+                    received
+                };
                 let expected = if response.kind == MessageKind::MixedPreparedObservation {
                     MessageKind::MixedPreparedAck
                 } else {
                     MessageKind::MixedReleaseAck
                 };
                 if ack_version != version
-                    || ack.kind != expected
+                    || (ack.kind != expected
+                        && !(response.kind == MessageKind::MixedPreparedObservation
+                            && ack.kind == MessageKind::MixedPreparedRetirementAck))
                     || ack.nonce != request.nonce
                     || ack.attempt_id != request.attempt_id
-                    || !ack.payload.is_empty()
+                    || (ack.kind != MessageKind::MixedPreparedRetirementAck
+                        && !ack.payload.is_empty())
                     || !ack_fds.is_empty()
                 {
                     return Err("public mixed observation acknowledgement differs".into());
                 }
-                write_frame(&mut stream, &ack).map_err(|error| error.to_string())?;
+                if ack.kind == MessageKind::MixedPreparedRetirementAck {
+                    if retirement.is_some() {
+                        return Err("mixed retirement enrollment repeated".into());
+                    }
+                    retirement = Some(super::mixed_retirement::RetirementRelay::enroll(
+                        &response, &ack,
+                    )?);
+                }
+                if let Some(exchange) = retirement.as_ref() {
+                    super::mixed_retirement::send_until(&stream, &ack, exchange.deadline)?;
+                } else {
+                    write_frame(&mut stream, &ack).map_err(|error| error.to_string())?;
+                }
                 continue;
             }
             let accepted = if request.kind == MessageKind::MixedLaunch {

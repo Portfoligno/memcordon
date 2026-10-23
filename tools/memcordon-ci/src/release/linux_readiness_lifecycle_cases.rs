@@ -820,6 +820,11 @@ pub fn intervene(
     let (journal, record) = retain_phase_journal(
         observer.observation.admission.attempt_id.as_str(), context.work_deadline, &mut report.files,
     ).map_err(|primary| CiError::Message(format!("selected lifecycle phase={phase}; {primary}; existing context retention={diagnostic_errors:?}")))?;
+    let journal_metadata = report
+        .files
+        .last()
+        .expect("retained original phase journal")
+        .metadata()?;
     // Preserve the authenticated observation even if the selected barrier fails.
     let journal_capture = super::linux_lifecycle_diagnostics::publish(
         context.publication,
@@ -856,6 +861,7 @@ pub fn intervene(
         diagnostic_errors.push(error.to_string());
     }
     let mut barrier = None;
+    let mut retirement_barrier = None;
     match phase {
         "allocation"
             if record["phase"] == "release-intent"
@@ -890,7 +896,74 @@ pub fn intervene(
         "drain"
             if record["phase"] == "retiring"
                 && record["release_knowledge"] == "exec-observed"
-                && observer.target.exited().map_err(CiError::Message)? => {}
+                && observer.target.exited().map_err(CiError::Message)? =>
+        {
+            use memcordon_core::mixed_observation::*;
+            let bytes = read_caller_observation(
+                &owner
+                    .launch
+                    .observation_directory
+                    .join(observer.observation.admission.attempt_id.as_str())
+                    .with_extension("retirement-prepared.json"),
+                context.work_deadline,
+                &mut report.files,
+            )?;
+            let witness: MixedRetirementObservationV1 =
+                parse_retirement(&bytes).map_err(CiError::Message)?;
+            witness.validate().map_err(CiError::Message)?;
+            let prepared = read_caller_observation(
+                &owner
+                    .launch
+                    .observation_directory
+                    .join(observer.observation.admission.attempt_id.as_str())
+                    .with_extension("prepared.json"),
+                context.work_deadline,
+                &mut report.files,
+            )?;
+            let accepted = read_caller_observation(
+                &owner
+                    .launch
+                    .observation_directory
+                    .join(observer.observation.admission.attempt_id.as_str())
+                    .with_extension("retirement-enrolled.json"),
+                context.work_deadline,
+                &mut report.files,
+            )?;
+            let receipt: MixedRetirementEnrolledV1 =
+                parse_retirement(&accepted).map_err(CiError::Message)?;
+            if !witness.binding.matches(&observer.observation, &prepared)
+                || receipt.binding != witness.binding
+                || receipt.enrollment_sha256 != witness.enrollment_sha256
+                || witness.caller.pid != observer.caller.process_id
+                || witness.caller.birth != observer.caller.birth
+                || witness.target != observer.observation.target
+                || witness.namespace_init != observer.observation.namespace_init
+                || witness.guardian.pid != observer.guardian.process_id
+                || witness.guardian.birth != observer.guardian.birth
+                || witness.worker.pid != worker.process_id
+                || witness.worker.birth != worker.birth
+                || witness.journal.sha256 != retirement_digest(&journal)
+                || witness.journal.length != journal.len() as u64
+                || witness.journal.device != journal_metadata.dev()
+                || witness.journal.inode != journal_metadata.ino()
+                || monotonic_millis()? >= witness.observation_deadline_monotonic_millis
+                || witness.boot_identity.as_str()
+                    != std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
+            {
+                return Err(CiError::Message("retirement witness differs from original admitted native journal/owners/cutoff".into()));
+            }
+            retain_bytes(
+                &directory.join("retirement-prepared.json"),
+                &bytes,
+                &mut report.files,
+            )?;
+            retain_bytes(
+                &directory.join("retirement-enrolled.json"),
+                &accepted,
+                &mut report.files,
+            )?;
+            retirement_barrier = Some(serde_json::to_value(witness)?);
+        }
         _ => {
             return Err(CiError::Message(format!(
                 "actual native lifecycle phase has not reached selected {phase} intervention barrier: phase={} release_knowledge={}; diagnostic capture errors={diagnostic_errors:?}",
@@ -957,7 +1030,7 @@ pub fn intervene(
         "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"key":owner.key,
         "attempt_id":observer.observation.admission.attempt_id,"actor":identity,"phase":record["phase"],
         "release_knowledge":record["release_knowledge"],"journal_sha256":super::artifacts::checksum(&journal),
-        "release_barrier":barrier,"native_image":image,"selected_image_sha256":selected_image,
+        "release_barrier":barrier,"retirement_barrier":retirement_barrier,"native_image":image,"selected_image_sha256":selected_image,
         "native_operation":if actor=="control"{"socket-shutdown"}else{"pidfd-sigkill"}});
     retain_bytes(
         &directory.join("controller-intent.json"),
@@ -1110,6 +1183,45 @@ fn read_caller_observation(
     Ok(bytes)
 }
 
+#[allow(unsafe_code)] // Read only the native monotonic scalar used by the enrolled original owner.
+fn monotonic_millis() -> Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: CLOCK_MONOTONIC writes one valid initialized native timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let seconds = u64::try_from(time.tv_sec).map_err(|e| CiError::Message(e.to_string()))?;
+    let nanos = u64::try_from(time.tv_nsec).map_err(|e| CiError::Message(e.to_string()))?;
+    seconds
+        .checked_mul(1000)
+        .and_then(|v| v.checked_add(nanos / 1_000_000))
+        .ok_or_else(|| CiError::Message("controller monotonic clock overflow".into()))
+}
+
+fn write_retirement_member(
+    path: &std::path::Path,
+    bytes: &[u8],
+    owners: &mut Vec<File>,
+) -> Result<()> {
+    use std::io::Write;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    rustix::fs::fchown(&file, Some(rustix::process::Uid::from_raw(65534)), None)
+        .map_err(|e| CiError::Message(e.to_string()))?;
+    File::open(path.parent().expect("fixed observer directory"))?.sync_all()?;
+    owners.push(file);
+    Ok(())
+}
+
 pub fn run_case(
     report: &mut LifecycleReport,
     context: &super::linux_readiness_limits_cases::LimitsContext<'_>,
@@ -1178,9 +1290,94 @@ pub fn run_case(
     } else if phase == "drain" {
         let owner = &mut report.native.owners[index];
         let observer = owner.observer.as_ref().expect("retained native observer");
+        use memcordon_core::mixed_observation::*;
+        let now = monotonic_millis()?;
+        let sampled = Instant::now();
+        let deadline = |cutoff: Instant| -> Result<u64> {
+            now.checked_add(
+                u64::try_from(cutoff.saturating_duration_since(sampled).as_millis())
+                    .map_err(|e| CiError::Message(e.to_string()))?,
+            )
+            .ok_or_else(|| CiError::Message("controller original cutoff overflow".into()))
+        };
+        let configuration = MixedRetirementObserverV1 {
+            format: "memcordon.mixed-retirement-observer".into(),
+            revision: 1,
+            observer: memcordon_core::result_v2::NativeProcessV2 {
+                pid: std::process::id(),
+                birth: crate::linux_consumer_readiness::process_birth(std::process::id())
+                    .map_err(CiError::Message)?,
+            },
+            boot_identity: memcordon_core::BoundedText::new(
+                std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
+            )
+            .map_err(|e| CiError::Message(e.into()))?,
+            observer_work_deadline_monotonic_millis: deadline(context.work_deadline)?,
+            observer_cleanup_deadline_monotonic_millis: deadline(context.cleanup_deadline)?,
+            phase: MixedRetirementPhaseV1::Retiring,
+        };
+        configuration.validate().map_err(CiError::Message)?;
+        write_retirement_member(
+            &owner
+                .launch
+                .observation_directory
+                .join("retirement-observer.json"),
+            &encode_retirement(&configuration).map_err(CiError::Message)?,
+            &mut report.files,
+        )?;
         observer
             .acknowledge(&owner.launch.observation_directory)
             .map_err(CiError::Message)?;
+        let accepted_path = owner
+            .launch
+            .observation_directory
+            .join(observer.observation.admission.attempt_id.as_str())
+            .with_extension("retirement-enrolled.json");
+        while !accepted_path.try_exists()? {
+            if Instant::now() >= context.work_deadline
+                || observer.caller.exited().map_err(CiError::Message)?
+                || observer.guardian.exited().map_err(CiError::Message)?
+            {
+                return Err(CiError::Message(
+                    "original worker did not accept retirement observation before fixture release"
+                        .into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let accepted =
+            read_caller_observation(&accepted_path, context.work_deadline, &mut report.files)?;
+        let receipt: MixedRetirementEnrolledV1 =
+            parse_retirement(&accepted).map_err(CiError::Message)?;
+        let prepared_bytes = read_caller_observation(
+            &owner
+                .launch
+                .observation_directory
+                .join(observer.observation.admission.attempt_id.as_str())
+                .with_extension("prepared.json"),
+            context.work_deadline,
+            &mut report.files,
+        )?;
+        let enrollment = MixedRetirementEnrollmentV1 {
+            format: "memcordon.mixed-retirement-enrollment".into(),
+            revision: 1,
+            binding: MixedRetirementBindingV1 {
+                attempt_id: observer.observation.admission.attempt_id.clone(),
+                admission_nonce: observer.observation.admission.admission_nonce,
+                prepared_sha256: retirement_digest(&prepared_bytes),
+            },
+            observer: configuration,
+        };
+        if receipt.format != "memcordon.mixed-retirement-enrolled"
+            || receipt.revision != 1
+            || receipt.binding != enrollment.binding
+            || receipt.enrollment_sha256
+                != retirement_digest(&encode_retirement(&enrollment).map_err(CiError::Message)?)
+        {
+            return Err(CiError::Message(
+                "original worker retirement acceptance differs from exact enrollment".into(),
+            ));
+        }
         loop {
             if Instant::now() >= context.work_deadline {
                 return Err(CiError::Message(
@@ -1223,21 +1420,25 @@ pub fn run_case(
                     "original native drain phase cutoff exhausted".into(),
                 ));
             }
-            let probe_owners = report.files.len();
-            let (_, record) = retain_phase_journal(
-                observer.observation.admission.attempt_id.as_str(),
-                context.work_deadline,
-                &mut report.files,
-            )?;
-            if record["phase"] == "retiring"
-                && record["release_knowledge"] == "exec-observed"
-                && observer.target.exited().map_err(CiError::Message)?
-            {
+            let observation = owner
+                .launch
+                .observation_directory
+                .join(observer.observation.admission.attempt_id.as_str())
+                .with_extension("retirement-prepared.json");
+            if observation.try_exists()? {
                 break;
             }
-            // Unselected transient observations establish no receipt. Closing
-            // those readonly probes cannot release a native cleanup owner.
-            report.files.truncate(probe_owners);
+            if owner
+                .launch
+                .observation_directory
+                .join(observer.observation.admission.attempt_id.as_str())
+                .with_extension("retirement-result.json")
+                .try_exists()?
+            {
+                return Err(CiError::Message(
+                    "original retirement observation failed before witness publication".into(),
+                ));
+            }
             std::thread::yield_now();
         }
     }
@@ -1264,7 +1465,54 @@ pub fn run_case(
         )?;
         report.files.push(destination);
     } else {
-        intervene(report, context, index, &root)?;
+        let intervention = intervene(report, context, index, &root);
+        if phase == "drain" {
+            let owner = &report.native.owners[index];
+            let observer = owner.observer.as_ref().expect("original drain observer");
+            // A deliberately killed frontend cannot acknowledge. Native loss
+            // containment and independent retirement remain the actual proof.
+            if !observer.caller.exited().map_err(CiError::Message)? {
+                use memcordon_core::mixed_observation::*;
+                let witness_bytes = read_caller_observation(
+                    &owner
+                        .launch
+                        .observation_directory
+                        .join(observer.observation.admission.attempt_id.as_str())
+                        .with_extension("retirement-prepared.json"),
+                    context.work_deadline,
+                    &mut report.files,
+                )?;
+                let witness: MixedRetirementObservationV1 =
+                    parse_retirement(&witness_bytes).map_err(CiError::Message)?;
+                let disposition = match &intervention {
+                    Ok(()) => MixedRetirementDispositionV1::Completed,
+                    Err(_) => MixedRetirementDispositionV1::Aborted {
+                        detail: memcordon_core::BoundedText::new(
+                            "original controller intervention failed",
+                        )
+                        .expect("fixed detail"),
+                    },
+                };
+                let ack = MixedRetirementAcknowledgmentV1 {
+                    format: "memcordon.mixed-retirement-acknowledgment".into(),
+                    revision: 1,
+                    binding: witness.binding,
+                    enrollment_sha256: witness.enrollment_sha256,
+                    witness_sha256: retirement_digest(&witness_bytes),
+                    disposition,
+                };
+                write_retirement_member(
+                    &owner
+                        .launch
+                        .observation_directory
+                        .join(observer.observation.admission.attempt_id.as_str())
+                        .with_extension("retirement-observer-ack.json"),
+                    &encode_retirement(&ack).map_err(CiError::Message)?,
+                    &mut report.files,
+                )?;
+            }
+        }
+        intervention?;
     }
     let owner = &mut report.native.owners[index];
     owner.launch.frontend.stdin.take();
@@ -2092,6 +2340,8 @@ pub fn normalize_completed(
         for name in [
             "actual-result.json",
             "release-prepared.json",
+            "retirement-prepared.json",
+            "retirement-enrolled.json",
             "report-destination.json",
             "provider-terminal.json",
             "report-delivery-failure.json",

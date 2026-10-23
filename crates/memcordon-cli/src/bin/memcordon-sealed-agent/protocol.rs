@@ -30,6 +30,8 @@ pub enum MessageKind {
     MixedDiscovery = 17,
     MixedPreparedAck = 18,
     MixedReleaseAck = 19,
+    MixedPreparedRetirementAck = 20,
+    MixedRetirementAck = 21,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -49,6 +51,9 @@ pub enum MessageKind {
     MixedDiscoveryReceipt = 117,
     MixedPreparedObservation = 118,
     MixedReleaseObservation = 119,
+    MixedRetirementObservation = 120,
+    MixedRetirementObserverResult = 121,
+    MixedRetirementEnrolled = 122,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -75,6 +80,8 @@ impl TryFrom<u16> for MessageKind {
             17 => Ok(Self::MixedDiscovery),
             18 => Ok(Self::MixedPreparedAck),
             19 => Ok(Self::MixedReleaseAck),
+            20 => Ok(Self::MixedPreparedRetirementAck),
+            21 => Ok(Self::MixedRetirementAck),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -94,6 +101,9 @@ impl TryFrom<u16> for MessageKind {
             117 => Ok(Self::MixedDiscoveryReceipt),
             118 => Ok(Self::MixedPreparedObservation),
             119 => Ok(Self::MixedReleaseObservation),
+            120 => Ok(Self::MixedRetirementObservation),
+            121 => Ok(Self::MixedRetirementObserverResult),
+            122 => Ok(Self::MixedRetirementEnrolled),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }
@@ -161,6 +171,17 @@ pub(crate) fn read_frame_version(
     if total > MAX_FRAME_LENGTH {
         return Err(ProtocolError::FrameTooLarge(total));
     }
+    if matches!(
+        kind,
+        MessageKind::MixedPreparedRetirementAck
+            | MessageKind::MixedRetirementAck
+            | MessageKind::MixedRetirementObservation
+            | MessageKind::MixedRetirementObserverResult
+            | MessageKind::MixedRetirementEnrolled
+    ) && total > HEADER_LENGTH + memcordon_core::mixed_observation::RETIREMENT_OBSERVATION_BYTES
+    {
+        return Err(ProtocolError::FrameTooLarge(total));
+    }
     let mut nonce = [0_u8; 16];
     nonce.copy_from_slice(&header[8..24]);
     let mut attempt_id = [0_u8; 16];
@@ -194,12 +215,17 @@ impl MessageKind {
             | Self::MixedDiscovery
             | Self::MixedPreparedAck
             | Self::MixedReleaseAck
+            | Self::MixedPreparedRetirementAck
+            | Self::MixedRetirementAck
             | Self::MixedTerminal
             | Self::MixedRejected
             | Self::MixedPlanReceipt
             | Self::MixedDiscoveryReceipt
             | Self::MixedPreparedObservation
-            | Self::MixedReleaseObservation => MIXED_PROTOCOL_VERSION,
+            | Self::MixedReleaseObservation
+            | Self::MixedRetirementObservation
+            | Self::MixedRetirementObserverResult
+            | Self::MixedRetirementEnrolled => MIXED_PROTOCOL_VERSION,
             _ => PROTOCOL_VERSION,
         }
     }

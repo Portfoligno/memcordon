@@ -25,11 +25,16 @@ fn combined_envelope_has_independent_revision_and_rejects_cross_version_kinds() 
         MessageKind::MixedPlan,
         MessageKind::MixedDiscovery,
         MessageKind::MixedPreparedAck,
+        MessageKind::MixedPreparedRetirementAck,
+        MessageKind::MixedRetirementAck,
         MessageKind::MixedTerminal,
         MessageKind::MixedRejected,
         MessageKind::MixedPlanReceipt,
         MessageKind::MixedDiscoveryReceipt,
         MessageKind::MixedPreparedObservation,
+        MessageKind::MixedRetirementObservation,
+        MessageKind::MixedRetirementObserverResult,
+        MessageKind::MixedRetirementEnrolled,
     ] {
         let frame = Frame {
             kind,
@@ -67,6 +72,32 @@ fn combined_envelope_has_independent_revision_and_rejects_cross_version_kinds() 
         read_frame_version(&mut bytes.as_slice(), MIXED_PROTOCOL_VERSION).is_err(),
         "legacy kind must not enter combined envelope"
     );
+}
+
+#[test]
+fn retirement_extension_rejects_oversized_payload_before_reading_it() {
+    use crate::protocol::{MIXED_PROTOCOL_VERSION, read_frame_version};
+    for kind in [
+        MessageKind::MixedPreparedRetirementAck,
+        MessageKind::MixedRetirementAck,
+        MessageKind::MixedRetirementObservation,
+        MessageKind::MixedRetirementObserverResult,
+        MessageKind::MixedRetirementEnrolled,
+    ] {
+        let frame = Frame {
+            kind,
+            nonce: [7; 16],
+            attempt_id: [9; 16],
+            payload: Vec::new(),
+        };
+        let mut header = Vec::new();
+        write_frame(&mut header, &frame).unwrap();
+        let oversized =
+            header.len() + memcordon_core::mixed_observation::RETIREMENT_OBSERVATION_BYTES + 1;
+        header[4..8].copy_from_slice(&u32::try_from(oversized).unwrap().to_be_bytes());
+        let error = read_frame_version(&mut header.as_slice(), MIXED_PROTOCOL_VERSION).unwrap_err();
+        assert_eq!(error, ProtocolError::FrameTooLarge(oversized));
+    }
 }
 
 #[test]

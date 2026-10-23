@@ -403,6 +403,7 @@ pub(super) fn execute_brokered(
     let mut executed = false;
     let mut origin = MixedOutcomeOriginV2::NativeExit;
     let mut setup_rejection = MixedAdmissionRejectionV2::NativeSetupFailed;
+    let mut retirement_observer = None;
     let setup = (|| -> Result<(), String> {
         owner.create_boundary(
             admission.launch.policy.memory_limit_bytes,
@@ -470,13 +471,28 @@ pub(super) fn execute_brokered(
         let (ack, ack_fds, version) = acknowledged?;
         restore?;
         if version != crate::protocol::MIXED_PROTOCOL_VERSION
-            || ack.kind != MessageKind::MixedPreparedAck
+            || !matches!(
+                ack.kind,
+                MessageKind::MixedPreparedAck | MessageKind::MixedPreparedRetirementAck
+            )
             || ack.nonce != request.nonce
             || ack.attempt_id != request.attempt_id
-            || !ack.payload.is_empty()
+            || (ack.kind == MessageKind::MixedPreparedAck && !ack.payload.is_empty())
             || !ack_fds.is_empty()
         {
             return Err("mixed observation barrier acknowledgement association differs".into());
+        }
+        if ack.kind == MessageKind::MixedPreparedRetirementAck {
+            retirement_observer = Some(
+                super::mixed_retirement::RetirementObservationChannel::enroll(
+                    stream,
+                    request,
+                    observation,
+                    &frame.payload,
+                    &ack,
+                    setup_deadline,
+                )?,
+            );
         }
         if super::private_runtime::cancellation_requested(stream)? {
             origin = MixedOutcomeOriginV2::ControlledCancellation;
@@ -568,6 +584,10 @@ pub(super) fn execute_brokered(
     })();
     let cleanup_budget =
         Duration::from_millis(admission.launch.policy.limit_grace_millis.max(5000));
+    let cleanup_deadline = Instant::now() + cleanup_budget;
+    if let Some(observer) = retirement_observer.as_mut() {
+        observer.capture_window(cleanup_deadline);
+    }
     let authorization = if release.is_some() {
         MixedAuthorizationKnowledgeV2::Authorized
     } else if owner.possibly_released() {
@@ -581,40 +601,51 @@ pub(super) fn execute_brokered(
             MixedAuthorizationKnowledgeV2::NeverAuthorized
         )
     {
-        return match owner
-            .retire_mixed_unreleased_without_root(&mut admission, Instant::now() + cleanup_budget)
-        {
-            Ok(()) => terminal(
-                request,
-                MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
-                    request_sha256: request_digest,
-                    request_bytes_sha256: envelope.public_request_sha256,
-                    detail: rejection_detail(
-                        setup
-                            .as_ref()
-                            .err()
-                            .map_or("native target was not authorized", String::as_str),
-                    ),
-                    reason: if matches!(origin, MixedOutcomeOriginV2::ControlledCancellation) {
-                        MixedAdmissionRejectionV2::ControlledCancellation
-                    } else {
-                        setup_rejection
+        let response =
+            match owner.retire_mixed_unreleased_without_root(&mut admission, cleanup_deadline) {
+                Ok(()) => terminal(
+                    request,
+                    MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
+                        request_sha256: request_digest,
+                        request_bytes_sha256: envelope.public_request_sha256,
+                        detail: rejection_detail(
+                            setup
+                                .as_ref()
+                                .err()
+                                .map_or("native target was not authorized", String::as_str),
+                        ),
+                        reason: if matches!(origin, MixedOutcomeOriginV2::ControlledCancellation) {
+                            MixedAdmissionRejectionV2::ControlledCancellation
+                        } else {
+                            setup_rejection
+                        },
+                        allocation: outstanding(
+                            MixedAuthorizationKnowledgeV2::NeverAuthorized,
+                            Vec::new(),
+                        ),
                     },
-                    allocation: outstanding(
-                        MixedAuthorizationKnowledgeV2::NeverAuthorized,
-                        Vec::new(),
-                    ),
-                },
-            ),
-            Err(error) => indeterminate(
-                setup.err().into_iter().chain([error]).collect(),
-                MixedAuthorizationKnowledgeV2::NeverAuthorized,
-            ),
-        };
+                ),
+                Err(error) => indeterminate(
+                    setup.err().into_iter().chain([error]).collect(),
+                    MixedAuthorizationKnowledgeV2::NeverAuthorized,
+                ),
+            };
+        if let Some(observer) = retirement_observer.as_ref() {
+            // Delivery failure cannot replace the actual native cleanup result.
+            let _ = observer.finish(cleanup_deadline);
+        }
+        return response;
     }
-    let cleanup = owner
-        .retire_mixed(&mut admission, Instant::now() + cleanup_budget)
-        .map_err(|error| format!("retire mixed native execution: {error}"));
+    let cleanup = match retirement_observer.as_mut() {
+        Some(observer) => owner.retire_mixed_observed(&mut admission, cleanup_deadline, observer),
+        None => owner.retire_mixed(&mut admission, cleanup_deadline),
+    }
+    .map_err(|error| format!("retire mixed native execution: {error}"));
+    if let Some(observer) = retirement_observer.as_ref() {
+        // Observation status is distinct from and precedes the real terminal.
+        // Missing status remains a required frontend observation failure.
+        let _ = observer.finish(cleanup_deadline);
+    }
     match (setup, cleanup) {
         (Err(error), Ok(_))
             if matches!(

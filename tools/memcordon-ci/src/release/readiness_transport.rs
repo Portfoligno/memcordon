@@ -9,8 +9,7 @@ use crate::{
     consumer_readiness_ledger::{CellEvidence, SourceIdentity},
 };
 use memcordon_readiness_verifier::{
-    Artifact, JobOutcome, JobResult, MAX_PRODUCER_ARCHIVE_BYTES, MAX_PRODUCER_BYTES,
-    ProducerManifest, ProducerOrigin,
+    Artifact, JobOutcome, JobResult, MAX_PRODUCER_ARCHIVE_BYTES, ProducerOrigin,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,6 +25,8 @@ pub struct DownloadedProducer {
     pub cell: CellEvidence,
     pub directory: PathBuf,
     pub archive: Artifact,
+    pub storage: memcordon_readiness_verifier::storage::StoragePlan,
+    pub metadata_bytes: u64,
 }
 
 fn copy_hashed(
@@ -88,21 +89,19 @@ pub fn retain_downloaded_archive(
 }
 
 pub fn check_evidence_budget(existing: &[Artifact], producer: &DownloadedProducer) -> Result<()> {
-    let mut total = producer.archive.length;
-    for artifact in existing.iter().chain(&producer.cell.artifacts) {
-        total = total
-            .checked_add(artifact.length)
-            .filter(|total| *total <= MAX_PRODUCER_BYTES)
-            .ok_or_else(|| {
-                CiError::Message("producer custody exceeds total evidence budget".into())
-            })?;
-    }
-    if total > MAX_PRODUCER_BYTES {
-        return Err(CiError::Message(
-            "producer custody exceeds total evidence budget".into(),
-        ));
-    }
-    Ok(())
+    let overhead = producer
+        .archive
+        .length
+        .checked_add(producer.metadata_bytes)
+        .ok_or_else(|| CiError::Message("producer physical overhead overflow".into()))?;
+    let producer_bytes = producer
+        .storage
+        .check_budget(overhead)
+        .map_err(CiError::Message)?;
+    memcordon_readiness_verifier::storage::StoragePlan::legacy(existing)
+        .and_then(|plan| plan.check_budget(producer_bytes))
+        .map(|_| ())
+        .map_err(CiError::Message)
 }
 
 fn positive(value: &serde_json::Value, field: &str) -> Result<u64> {
@@ -420,9 +419,12 @@ pub fn download_producer(
         let name = member.name()?.into_owned();
         artifacts::safe_relative(Path::new(name.trim_end_matches('/')))?;
         if !zip_names.insert(name.to_owned())
-            || member
-                .unix_mode()
-                .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o100000 | 0o040000))
+            || member.unix_mode().is_some_and(|mode| {
+                let kind = mode & 0o170000;
+                !matches!(kind, 0 | 0o100000 | 0o040000)
+                    || (kind == 0o040000 && !member.is_dir())
+                    || (kind == 0o100000 && member.is_dir())
+            })
         {
             return Err(CiError::Message(
                 "producer ZIP contains duplicate or special member".into(),
@@ -450,7 +452,9 @@ pub fn download_producer(
     };
     memcordon_core::canonical_json::reject_duplicate_json_keys(&manifest_bytes)
         .map_err(CiError::Message)?;
-    let manifest: ProducerManifest = serde_json::from_slice(&manifest_bytes)?;
+    let (manifest, storage) =
+        memcordon_readiness_verifier::storage::decode_producer(&manifest_bytes)
+            .map_err(CiError::Message)?;
     if manifest.format != "memcordon.consumer-readiness.producer"
         || manifest.revision != 1
         || manifest.job != job
@@ -475,25 +479,25 @@ pub fn download_producer(
             "producer payload collections exceed finite bounds".into(),
         ));
     }
-    let mut total = 0u64;
+    let mut physical_members = Vec::new();
+    // The same physical accounting is independently enforced by the standalone verifier.
+    for ordinal in 0..zip.len() {
+        let member = zip
+            .by_index(ordinal)
+            .map_err(|e| CiError::Message(e.to_string()))?;
+        physical_members.push(memcordon_readiness_verifier::storage::ZipMember {
+            name: member.name()?.into_owned(),
+            length: member.size(),
+            directory: member.is_dir(),
+        });
+    }
+    storage
+        .validate_zip(&physical_members, declared_length)
+        .map_err(CiError::Message)?;
     for artifact in &manifest.artifacts {
-        total = total
-            .checked_add(artifact.length)
-            .filter(|total| *total <= 4 * 1024 * 1024 * 1024)
-            .ok_or_else(|| {
-                CiError::Message("producer decoded payload exceeds aggregate bound".into())
-            })?;
         if artifact.length > 512 * 1024 * 1024 {
             return Err(CiError::Message("producer raw file exceeds bound".into()));
         }
-    }
-    if total
-        .checked_add(declared_length)
-        .is_none_or(|total| total > MAX_PRODUCER_BYTES)
-    {
-        return Err(CiError::Message(
-            "producer archive and decoded artifacts exceed total evidence budget".into(),
-        ));
     }
     for artifact in &manifest.artifacts {
         let relative = artifacts::safe_relative(Path::new(&artifact.path))?;
@@ -507,6 +511,9 @@ pub fn download_producer(
                 "producer original artifact inventory duplicate, reserved or excessive".into(),
             ));
         }
+    }
+    for artifact in storage.physical_artifacts() {
+        let relative = artifacts::safe_relative(Path::new(&artifact.path))?;
         let member = zip.by_name(&artifact.path).map_err(|_| {
             CiError::Message("original raw artifact missing from producer ZIP".into())
         })?;
@@ -556,6 +563,10 @@ pub fn download_producer(
     memcordon_core::canonical_json::reject_duplicate_json_keys(&cell_bytes)
         .map_err(CiError::Message)?;
     let cell: CellEvidence = serde_json::from_slice(&cell_bytes)?;
+    if storage.is_packed() {
+        memcordon_readiness_verifier::storage::validate_cell(&manifest, &cell_bytes)
+            .map_err(CiError::Message)?;
+    }
     if cell.format != "memcordon.consumer-readiness.cell"
         || cell.revision != 1
         || cell.identity.run_id != manifest.run_id
@@ -601,5 +612,9 @@ pub fn download_producer(
             length,
             sha256,
         },
+        storage,
+        metadata_bytes: (manifest_bytes.len() as u64)
+            .checked_add(cell_bytes.len() as u64)
+            .ok_or_else(|| CiError::Message("producer metadata byte total overflow".into()))?,
     })
 }

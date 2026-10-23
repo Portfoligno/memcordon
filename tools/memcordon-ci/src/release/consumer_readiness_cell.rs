@@ -693,9 +693,9 @@ pub fn cell_record_path(destination: &Path) -> PathBuf {
     }
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(unix)]
 #[path = "readiness_public_projection.rs"]
-mod public_projection;
+pub(crate) mod public_projection;
 
 pub fn cleanup(root: &Path, arguments: &CellArguments) -> Result<()> {
     let deadline = remaining(arguments)?;

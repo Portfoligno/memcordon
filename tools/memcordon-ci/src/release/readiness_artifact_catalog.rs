@@ -46,6 +46,7 @@ fn plan(
         }
         let relative = super::artifacts::safe_relative(Path::new(&record.path))?;
         if relative.starts_with("producer")
+            || relative.starts_with("objects")
             || relative.starts_with("cell.json")
             || relative.starts_with("producer-manifest.json")
         {
@@ -139,4 +140,102 @@ impl CanonicalCatalog {
 /// Projection consumes a canonical union, and still rejects accidental duplicates.
 pub fn preflight_unique(records: &[Artifact], overhead: u64, deadline: Instant) -> Result<()> {
     plan(records, overhead, deadline, true).map(|_| ())
+}
+
+/// Every occurrence is captured before choosing a shared physical object.
+pub struct VerifiedCapture {
+    record: Artifact,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedCapture {
+    /// General evidence readers retain real named-file custody before constructing a capture.
+    pub fn read(root: &Path, record: &Artifact) -> Result<Self> {
+        let bytes = memcordon_readiness_verifier::read_artifact_bytes(root, record)
+            .map_err(CiError::Message)?;
+        Ok(Self {
+            record: record.clone(),
+            bytes,
+        })
+    }
+
+    /// Used only after the privileged projection's stricter held-root source read.
+    #[cfg(unix)]
+    pub(crate) fn selected(record: &Artifact, bytes: Vec<u8>) -> Self {
+        Self {
+            record: record.clone(),
+            bytes,
+        }
+    }
+}
+
+pub struct PackedCatalog {
+    pub objects: Vec<Artifact>,
+    pub bindings: Vec<memcordon_readiness_verifier::storage::ArtifactBinding>,
+}
+
+impl PackedCatalog {
+    pub fn capture(
+        records: &[Artifact],
+        overhead: u64,
+        deadline: Instant,
+        mut capture: impl FnMut(&Artifact) -> Result<VerifiedCapture>,
+        mut retain: impl FnMut(&Artifact, &[u8], bool) -> Result<()>,
+    ) -> Result<Self> {
+        let canonical = plan(records, overhead, deadline, false)?;
+        let mut objects: BTreeMap<String, Artifact> = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        for record in records {
+            live(deadline)?;
+            let captured = capture(record)?;
+            let bytes = captured.bytes;
+            live(deadline)?;
+            if captured.record.path != record.path
+                || captured.record.length != record.length
+                || captured.record.sha256 != record.sha256
+                || bytes.len() as u64 != record.length
+                || super::artifacts::checksum(&bytes) != record.sha256
+            {
+                return Err(failure("captured logical artifact bytes differ"));
+            }
+            let path = memcordon_readiness_verifier::storage::object_path(&record.sha256)
+                .map_err(CiError::Message)?;
+            let object = Artifact {
+                path: path.clone(),
+                length: record.length,
+                sha256: record.sha256.clone(),
+            };
+            let existing = objects.contains_key(&path);
+            if objects
+                .get(&path)
+                .is_some_and(|old| old.length != object.length || old.sha256 != object.sha256)
+            {
+                return Err(failure("physical digest key conflicts with captured bytes"));
+            }
+            // Retain must read back and compare complete bytes even for an existing object.
+            retain(&object, &bytes, existing)?;
+            live(deadline)?;
+            objects.entry(path.clone()).or_insert(object);
+            bindings.insert(
+                record.path.clone(),
+                memcordon_readiness_verifier::storage::ArtifactBinding {
+                    logical_path: record.path.clone(),
+                    object_path: path,
+                },
+            );
+        }
+        let result = Self {
+            objects: objects.into_values().collect(),
+            bindings: bindings.into_values().collect(),
+        };
+        let storage = memcordon_readiness_verifier::storage::StoragePlan::packed(
+            &canonical,
+            &result.objects,
+            &result.bindings,
+            &BTreeSet::new(),
+        )
+        .map_err(CiError::Message)?;
+        storage.check_budget(overhead).map_err(CiError::Message)?;
+        Ok(result)
+    }
 }

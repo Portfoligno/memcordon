@@ -172,6 +172,28 @@ pub fn ingest(
     source: &Path,
     destination: &Path,
 ) -> LedgerResult<()> {
+    ingest_resolved(index, cell, |artifact| {
+        let bytes = memcordon_readiness_verifier::read_artifact_bytes(source, artifact)?;
+        let target = destination.join(&artifact.path);
+        fs::create_dir_all(target.parent().ok_or("artifact parent absent")?)
+            .map_err(|e| e.to_string())?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Storage callbacks must independently read, verify and retain each logical member.
+pub fn ingest_resolved(
+    index: &mut EvidenceIndex,
+    cell: CellEvidence,
+    mut retain: impl FnMut(&Artifact) -> LedgerResult<()>,
+) -> LedgerResult<()> {
     if cell.format != "memcordon.consumer-readiness.cell"
         || cell.revision != 1
         || cell.identity.run_id.is_empty()
@@ -236,41 +258,8 @@ pub fn ingest(
         {
             return Err("duplicate persisted artifact".into());
         }
-        let mut current = source.to_path_buf();
-        for part in artifact.path.split('/') {
-            current.push(part);
-            if fs::symlink_metadata(&current)
-                .map_err(|e| e.to_string())?
-                .file_type()
-                .is_symlink()
-            {
-                return Err("artifact contains symlink".into());
-            }
-        }
-        let metadata = fs::metadata(&current).map_err(|e| e.to_string())?;
-        if !metadata.is_file() || metadata.len() > 512 * 1024 * 1024 {
-            return Err("artifact is not bounded regular file".into());
-        }
-        let bytes = fs::read(&current).map_err(|e| e.to_string())?;
-        if bytes.len() as u64 != artifact.length || hash(&bytes) != artifact.sha256 {
-            return Err("acquired artifact changed before ledger custody".into());
-        }
-        let target = destination.join(&artifact.path);
-        fs::create_dir_all(target.parent().ok_or("artifact parent absent")?)
-            .map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-            .map_err(|e| e.to_string())?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| e.to_string())?;
-        artifacts.push(Artifact {
-            path: artifact.path.clone(),
-            length: bytes.len() as u64,
-            sha256: hash(&bytes),
-        });
+        retain(artifact)?;
+        artifacts.push(artifact.clone());
     }
     let cleanup_ok = cell.cleanup_failures.is_empty() && cell.cache_quiescent;
     for mut record in cell.records {
@@ -325,6 +314,143 @@ pub fn persist(index: &EvidenceIndex, path: &Path) -> LedgerResult<()> {
         .and_then(|_| output.write_all(b"\n"))
         .and_then(|_| output.sync_all())
         .map_err(|e| e.to_string())
+}
+
+#[derive(Default)]
+pub struct PackedLedger {
+    objects: std::collections::BTreeMap<String, Artifact>,
+    bindings:
+        std::collections::BTreeMap<String, memcordon_readiness_verifier::storage::ArtifactBinding>,
+}
+
+impl PackedLedger {
+    pub fn check_archive(&self, index: &EvidenceIndex, archive: &Artifact) -> LedgerResult<()> {
+        let mut logical = index.artifacts.clone();
+        logical.push(archive.clone());
+        let mut archives: BTreeSet<_> = index
+            .producer_origins
+            .iter()
+            .map(|origin| origin.bundle_artifact.clone())
+            .collect();
+        archives.insert(archive.path.clone());
+        memcordon_readiness_verifier::storage::StoragePlan::packed(
+            &logical,
+            &self.objects.values().cloned().collect::<Vec<_>>(),
+            &self.bindings.values().cloned().collect::<Vec<_>>(),
+            &archives,
+        )
+        .map(|_| ())
+    }
+
+    pub fn ingest(
+        &mut self,
+        index: &mut EvidenceIndex,
+        cell: CellEvidence,
+        source: &Path,
+        destination: &Path,
+        storage: &memcordon_readiness_verifier::storage::StoragePlan,
+    ) -> LedgerResult<()> {
+        use memcordon_readiness_verifier::{
+            read_artifact_bytes, retain_artifact_bytes,
+            storage::{ArtifactBinding, StoragePlan, object_path},
+        };
+        let previous = index.artifacts.clone();
+        let archives: BTreeSet<_> = index
+            .producer_origins
+            .iter()
+            .map(|origin| origin.bundle_artifact.clone())
+            .collect();
+        let mut captured = Vec::new();
+        let result = ingest_resolved(index, cell, |logical| {
+            // Always re-read the new producer's own verified member before sharing.
+            let physical = storage.resolve(&logical.path)?;
+            let bytes = read_artifact_bytes(source, physical)?;
+            if bytes.len() as u64 != logical.length || hash(&bytes) != logical.sha256 {
+                return Err("producer logical capture differs from physical bytes".into());
+            }
+            let object = Artifact {
+                path: object_path(&logical.sha256)?,
+                length: logical.length,
+                sha256: logical.sha256.clone(),
+            };
+            let binding = ArtifactBinding {
+                logical_path: logical.path.clone(),
+                object_path: object.path.clone(),
+            };
+            let mut objects = self.objects.clone();
+            if objects
+                .get(&object.path)
+                .is_some_and(|old| old.length != object.length || old.sha256 != object.sha256)
+            {
+                return Err("report object digest key conflicts".into());
+            }
+            objects.insert(object.path.clone(), object.clone());
+            let mut bindings = self.bindings.clone();
+            if bindings
+                .insert(logical.path.clone(), binding.clone())
+                .is_some()
+            {
+                return Err("report logical binding already exists".into());
+            }
+            let logical_plan: Vec<_> = previous
+                .iter()
+                .chain(&captured)
+                .chain(std::iter::once(logical))
+                .cloned()
+                .collect();
+            StoragePlan::packed(
+                &logical_plan,
+                &objects.into_values().collect::<Vec<_>>(),
+                &bindings.into_values().collect::<Vec<_>>(),
+                &archives,
+            )?;
+            retain_artifact_bytes(
+                destination,
+                &object,
+                &bytes,
+                self.objects.contains_key(&object.path),
+            )?;
+            self.objects.insert(object.path.clone(), object);
+            self.bindings.insert(logical.path.clone(), binding);
+            captured.push(logical.clone());
+            Ok(())
+        });
+        if result.is_err() {
+            // Keep every successfully captured byte and association in failed assessments.
+            // No product or successful row is manufactured for the incomplete cell.
+            index.artifacts.extend(captured);
+        }
+        result
+    }
+
+    pub fn persist(
+        &self,
+        index: &EvidenceIndex,
+        path: &Path,
+        artifact_root: &Path,
+    ) -> LedgerResult<()> {
+        use memcordon_readiness_verifier::storage::{PackedEvidenceIndexV1, decode_evidence};
+        let envelope = PackedEvidenceIndexV1 {
+            format: "memcordon.consumer-readiness.packed-evidence".into(),
+            revision: 1,
+            evidence: index.clone(),
+            objects: self.objects.values().cloned().collect(),
+            bindings: self.bindings.values().cloned().collect(),
+        };
+        let mut bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        let (_, storage) = decode_evidence(&bytes)?;
+        storage.validate_directory(artifact_root)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        output
+            .write_all(&bytes)
+            .and_then(|_| output.sync_all())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// The aggregator receives actual upload IDs and producer attempts from the

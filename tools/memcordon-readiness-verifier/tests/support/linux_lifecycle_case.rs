@@ -232,8 +232,29 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
             &serde_json::to_vec(&release).unwrap(),
         );
     }
+    let retirement = if phase == "drain" {
+        let binding = json!({"attempt_id":attempt,"admission_nonce":graph.prepared["admission"]["admission_nonce"],"prepared_sha256":sha256(&serde_json::to_vec(&graph.prepared).unwrap())});
+        let enrolled = json!({"format":"memcordon.mixed-retirement-enrolled","revision":1,"binding":binding,"enrollment_sha256":"d".repeat(64),"phase":"retiring"});
+        let witness = json!({"format":"memcordon.mixed-retirement-observation","revision":1,"binding":binding,"enrollment_sha256":enrolled["enrollment_sha256"],"boot_identity":phase_journal["boot_identity"],
+            "caller":graph.prepared["caller"],"target":graph.prepared["target"],"namespace_init":graph.prepared["namespace_init"],"guardian":graph.prepared["guardian"],"worker":{"pid":101,"birth":300},
+            "phase":"retiring","release_knowledge":"exec-observed","journal":{"device":1,"inode":42,"length":phase_bytes.len(),"sha256":sha256(&phase_bytes)},
+            "cleanup_deadline_monotonic_millis":200,"observation_deadline_monotonic_millis":100,"authorizes_launch":false,"retirement_completed":false});
+        persist(
+            &mut case,
+            "retirement-enrolled.json",
+            &serde_json::to_vec(&enrolled).unwrap(),
+        );
+        persist(
+            &mut case,
+            "retirement-prepared.json",
+            &serde_json::to_vec(&witness).unwrap(),
+        );
+        witness
+    } else {
+        Value::Null
+    };
     let intent = json!({"format":"memcordon.linux-lifecycle-controller-intent","revision":1,"identity":identity,"cell":cell,"lease_id":"original-lease","key":key,"attempt_id":attempt,
-        "actor":prepared::held(pid,birth,false),"phase":phase_journal["phase"],"release_knowledge":phase_journal["release_knowledge"],"journal_sha256":sha256(&phase_bytes),"release_barrier":release,
+        "actor":prepared::held(pid,birth,false),"phase":phase_journal["phase"],"release_knowledge":phase_journal["release_knowledge"],"journal_sha256":sha256(&phase_bytes),"release_barrier":release,"retirement_barrier":retirement,
         "native_image":{"device":1,"inode":500,"length":selected.len(),"sha256":sha256(selected)},"selected_image_sha256":sha256(selected),"native_operation":if actor=="control"{"socket-shutdown"}else{"pidfd-sigkill"}});
     let action = if actor == "control" {
         json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":1,"worker":{"pid":101,"birth":300},"caller":{"pid":102,"birth":301},

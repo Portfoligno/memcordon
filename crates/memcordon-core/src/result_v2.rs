@@ -180,6 +180,8 @@ pub struct MixedFrontendEvidenceV2 {
     pub relay_drained: bool,
     pub interruption: Option<i32>,
     pub relay_error: Option<BoundedText<4096>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<BoundedText<4096>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

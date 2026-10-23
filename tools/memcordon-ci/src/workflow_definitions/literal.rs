@@ -1769,10 +1769,10 @@ impl LiteralRun {
                 "./target/ci-runtime/current/memcordon-ci.exe release cleanup-installed-loader-support --destination target/ci/windows-installed/cargo"
             }
             Self::LinuxProjectedProducerSeal => {
-                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell"
+                "./target/ci/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
             }
             Self::LinuxProjectedProducerColdSeal => {
-                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer/producer-manifest.json --acquisition-root .release/readiness-cell"
+                "./target/ci-driver-cold/release/consumer-readiness seal-producer --github-context --identity .release/readiness-identity.json --manifest ci/consumer-readiness-v1.toml --cell .release/readiness-cell/producer/cell.json --output .release/readiness-cell/producer-packed/producer-manifest.json --acquisition-root .release/readiness-cell"
             }
             Self::R0 => "rustup toolchain install 1.97.1 --profile minimal",
             Self::R1 => {

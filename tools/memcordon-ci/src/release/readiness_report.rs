@@ -98,6 +98,7 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
     let manifest = root.join("ci/consumer-readiness-v1.toml");
     let mut index = consumer_readiness_ledger::initialize(&manifest, identity.clone())
         .map_err(CiError::Message)?;
+    let mut packed = consumer_readiness_ledger::PackedLedger::default();
     index.repository = Some(repository.clone());
     if matches!(args.scope, Scope::CandidateBeforePublication) {
         for row in &mut index.records {
@@ -228,15 +229,14 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
                 Err(error) => failure(&mut index, error),
                 Ok(mut producer) => {
                     let result = (|| -> Result<()> {
-                        readiness_transport::check_evidence_budget(&index.artifacts, &producer)?;
-                        consumer_readiness_ledger::ingest(
-                            &mut index,
-                            producer.cell,
-                            &producer.directory,
-                            &custody,
-                        )
-                        .map_err(CiError::Message)?;
                         let relative = format!("origins/{job}/{}", producer.archive.path);
+                        let retained_archive = Artifact {
+                            path: relative.clone(),
+                            ..producer.archive.clone()
+                        };
+                        packed
+                            .check_archive(&index, &retained_archive)
+                            .map_err(CiError::Message)?;
                         let path = custody.join(&relative);
                         fs::create_dir_all(path.parent().expect("origin parent"))?;
                         readiness_transport::retain_downloaded_archive(
@@ -247,11 +247,17 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
                         )?;
                         fs::File::open(path.parent().expect("origin parent"))?.sync_all()?;
                         producer.origin.bundle_artifact = relative.clone();
-                        index.artifacts.push(Artifact {
-                            path: relative,
-                            ..producer.archive
-                        });
+                        index.artifacts.push(retained_archive);
                         consumer_readiness_ledger::record_origin(&mut index, producer.origin)
+                            .map_err(CiError::Message)?;
+                        packed
+                            .ingest(
+                                &mut index,
+                                producer.cell,
+                                &producer.directory,
+                                &custody,
+                                &producer.storage,
+                            )
                             .map_err(CiError::Message)
                     })();
                     if let Err(error) = result {
@@ -264,7 +270,9 @@ pub fn run(root: &Path, args: &ReportArguments) -> Result<()> {
     consumer_readiness_ledger::record_job_outcomes(&mut index, outcomes)
         .map_err(CiError::Message)?;
     let evidence = args.destination.join("evidence.json");
-    consumer_readiness_ledger::persist(&index, &evidence).map_err(CiError::Message)?;
+    packed
+        .persist(&index, &evidence, &custody)
+        .map_err(CiError::Message)?;
     let scope = match args.scope {
         Scope::CandidateBeforePublication => "candidate-before-publication",
         Scope::CompleteProfile => "complete-profile",

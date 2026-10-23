@@ -18,6 +18,7 @@ pub mod launcher;
 pub(crate) mod mixed_admission;
 pub(crate) mod mixed_advisory;
 pub(crate) mod mixed_recovery;
+pub(crate) mod mixed_retirement;
 pub(crate) mod mixed_runtime;
 pub mod namespace;
 pub(crate) mod network_filter;

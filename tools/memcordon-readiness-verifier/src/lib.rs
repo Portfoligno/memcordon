@@ -2,6 +2,7 @@
 //! No producer library, expected-set generator, or result validation is linked.
 mod anchors;
 mod custody;
+pub mod storage;
 mod wire;
 pub use wire::{
     validate_mixed_public_arguments as validate_linux_mixed_public_arguments,
@@ -201,7 +202,36 @@ fn validate_producer_bundle(
         }
         bytes
     };
-    let manifest: ProducerManifest = wire::decode(&manifest_bytes)?;
+    let (manifest, storage) = storage::decode_producer(&manifest_bytes)?;
+    let archive_length = index
+        .artifacts
+        .iter()
+        .find(|a| a.path == origin.bundle_artifact)
+        .ok_or("producer archive lacks indexed length")?
+        .length;
+    let mut physical_members = Vec::new();
+    for ordinal in 0..archive.len() {
+        let member = archive.by_index(ordinal).map_err(|e| e.to_string())?;
+        physical_members.push(storage::ZipMember {
+            name: member.name().map_err(|e| e.to_string())?.into_owned(),
+            length: member.size(),
+            directory: member.is_dir(),
+        });
+    }
+    storage.validate_zip(&physical_members, archive_length)?;
+    if storage.is_packed() {
+        let member = archive.by_name("cell.json").map_err(|e| e.to_string())?;
+        let declared = member.size();
+        let mut bytes = Vec::new();
+        member
+            .take(MAX_INDEX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 != declared {
+            return Err("packed original cell decoded length differs".into());
+        }
+        storage::validate_cell(&manifest, &bytes)?;
+    }
     header(
         &manifest.format,
         manifest.revision,
@@ -239,13 +269,25 @@ fn validate_producer_bundle(
         if expected.len() as u64 != artifact.length || sha256(expected) != artifact.sha256 {
             return Err("producer raw artifact table differs from assessed bytes".into());
         }
+    }
+    for physical in storage.physical_artifacts() {
+        let logical = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                storage
+                    .resolve(&artifact.path)
+                    .is_ok_and(|object| object.path == physical.path)
+            })
+            .ok_or("producer physical object has no logical witness")?;
+        let expected = custody.bytes(&logical.path)?;
         let member = archive
-            .by_name(&artifact.path)
+            .by_name(&physical.path)
             .map_err(|_| "assessed raw artifact absent from actual producer ZIP")?;
-        if member.is_dir() || member.size() != artifact.length {
+        if member.is_dir() || member.size() != physical.length {
             return Err("producer member type/length differs".into());
         }
-        let mut member = member.take(artifact.length + 1);
+        let mut member = member.take(physical.length + 1);
         let mut offset = 0usize;
         let mut buffer = [0u8; 64 * 1024];
         loop {
@@ -2605,6 +2647,21 @@ pub fn validate_artifact_custody(root: &Path, artifacts: &[Artifact]) -> Verific
     custody::Custody::new(root, artifacts).map(|_| ())
 }
 
+/// Read one independently held, named, ordinary evidence member with full custody.
+pub fn read_artifact_bytes(root: &Path, artifact: &Artifact) -> VerificationResult<Vec<u8>> {
+    let custody = custody::Custody::new(root, std::slice::from_ref(artifact))?;
+    Ok(custody.bytes(&artifact.path)?.to_vec())
+}
+
+pub fn retain_artifact_bytes(
+    root: &Path,
+    artifact: &Artifact,
+    bytes: &[u8],
+    existing: bool,
+) -> VerificationResult<()> {
+    custody::retain_bytes(root, artifact, bytes, existing)
+}
+
 /// Independent wire assessment for retained Windows terminal controller vectors.
 /// This function alone cannot establish any installed readiness row.
 pub fn validate_windows_terminal_observation(
@@ -2956,7 +3013,7 @@ pub fn verify_scoped(
     let manifest_bytes = custody::read_external(manifest_path, 1024 * 1024)?;
     let expected = validate_manifest(&manifest_bytes)?;
     let index_bytes = custody::read_external(report_path, MAX_INDEX_BYTES as u64)?;
-    let index: EvidenceIndex = wire::decode(&index_bytes)?;
+    let (index, storage) = storage::decode_evidence(&index_bytes)?;
     verify_index(
         &manifest_bytes,
         &expected,
@@ -2964,6 +3021,7 @@ pub fn verify_scoped(
         &index,
         artifact_root,
         scope,
+        &storage,
     )
 }
 
@@ -3024,6 +3082,7 @@ fn verify_index(
     index: &EvidenceIndex,
     artifact_root: &Path,
     scope: VerificationScope,
+    storage: &storage::StoragePlan,
 ) -> VerificationResult<Verdict> {
     let manifest: Manifest =
         toml::from_str(std::str::from_utf8(manifest_bytes).map_err(|e| e.to_string())?)
@@ -3106,8 +3165,13 @@ fn verify_index(
         identifier(&origin.run_id)?;
         digest(&origin.artifact_sha256)?;
     }
-    let custody =
-        custody::Custody::for_evidence(artifact_root, &index.artifacts, &index.producer_origins)?;
+    let custody = custody::Custody::for_storage(
+        artifact_root,
+        &index.artifacts,
+        &index.producer_origins,
+        storage,
+        index_bytes.len() as u64,
+    )?;
     for origin in &index.producer_origins {
         validate_producer_bundle(index, origin, &custody)?;
     }
@@ -4033,6 +4097,40 @@ pub fn validate_case_record(
         return Err("duplicate native component build target".into());
     }
     verify_record(index, record, &products, &builds, &custody)
+}
+
+/// Assess one original logical row from either explicit storage document format.
+/// This does not establish hosted provenance or replace complete `verify_scoped`.
+pub fn validate_case_document(bytes: &[u8], key: &CaseKey, root: &Path) -> VerificationResult<()> {
+    let (index, storage) = storage::decode_evidence(bytes)?;
+    let mut rows = index.records.iter().filter(|record| &record.key == key);
+    let record = rows
+        .next()
+        .ok_or("logical row absent from evidence document")?;
+    if rows.next().is_some() {
+        return Err("duplicate logical row in evidence document".into());
+    }
+    let custody = custody::Custody::for_storage(
+        root,
+        &index.artifacts,
+        &index.producer_origins,
+        &storage,
+        bytes.len() as u64,
+    )?;
+    let products = index
+        .products
+        .iter()
+        .map(|product| (product.key.clone(), product))
+        .collect();
+    let builds: BTreeMap<_, _> = index
+        .component_builds
+        .iter()
+        .map(|build| (build.target.clone(), build))
+        .collect();
+    if builds.len() != index.component_builds.len() {
+        return Err("duplicate native component build target".into());
+    }
+    verify_record(&index, record, &products, &builds, &custody)
 }
 
 fn verify_linux_policy_refusal(

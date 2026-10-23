@@ -137,7 +137,7 @@ pub fn selected_paths(
 ) -> Result<(), String> {
     if acquisition != workspace.join(".release/readiness-cell")
         || cell != acquisition.join("producer/cell.json")
-        || output != acquisition.join("producer/producer-manifest.json")
+        || output != acquisition.join("producer-packed/producer-manifest.json")
     {
         return Err("publication paths differ from selected acquisition projection".into());
     }
@@ -288,15 +288,95 @@ impl Scope {
         Ok(())
     }
 
-    pub fn publish(&self, bytes: &[u8]) -> Result<(), String> {
+    pub fn publish_packed(
+        &self,
+        producer: &memcordon_readiness_verifier::ProducerManifest,
+    ) -> Result<(), String> {
+        use super::readiness_artifact_catalog::PackedCatalog;
+        use crate::release::consumer_readiness_cell::public_projection as projection;
         self.verify_named()?;
-        publish_held(
-            &self.producer,
-            bytes,
-            self.producer_uid,
+        memcordon_readiness_verifier::storage::validate_cell(producer, &self.cell_bytes)?;
+        // Only this fresh derivative is writable; original captures remain untouched.
+        native(rustix::fs::mkdirat(
+            &self.acquisition,
+            "producer-packed",
+            Mode::from_bits_truncate(0o755),
+        ))?;
+        let packed = directory(&self.acquisition, std::ffi::OsStr::new("producer-packed"))?;
+        native(rustix::fs::fchmod(&packed, Mode::from_bits_truncate(0o755)))?;
+        let stamp = packed.metadata().map_err(|e| e.to_string())?;
+        if stamp.uid() != self.producer_uid || stamp.mode() & 0o7777 != 0o755 {
+            return Err("packed derivative ownership differs".into());
+        }
+        let catalog = PackedCatalog::capture(
+            &producer.artifacts,
+            self.cell_bytes.len() as u64,
             self.deadline,
-            || self.verify_named(),
+            |record| {
+                self.verify_named().map_err(crate::CiError::Message)?;
+                let relative = Path::new(&record.path);
+                let parent = projection::parent(&self.producer, relative, false)?;
+                projection::capture_selected(
+                    &parent,
+                    relative.file_name().ok_or_else(|| {
+                        crate::CiError::Message("logical member name absent".into())
+                    })?,
+                    record,
+                )
+            },
+            |object, bytes, existing| {
+                projection::retain_packed_object(&packed, object, bytes, existing)
+            },
         )
+        .map_err(|e| e.to_string())?;
+        projection::write_new(&packed, std::ffi::OsStr::new("cell.json"), &self.cell_bytes)
+            .map_err(|e| e.to_string())?;
+        let envelope = memcordon_readiness_verifier::storage::PackedProducerManifestV1 {
+            format: "memcordon.consumer-readiness.packed-producer".into(),
+            revision: 1,
+            producer: producer.clone(),
+            objects: catalog.objects,
+            bindings: catalog.bindings,
+        };
+        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())?;
+        let (_, storage) = memcordon_readiness_verifier::storage::decode_producer(&bytes)?;
+        storage.check_budget(self.cell_bytes.len() as u64 + bytes.len() as u64 + 1)?;
+        // Check every selected source again before sealing; never substitute an earlier object.
+        for record in &producer.artifacts {
+            live(self.deadline)?;
+            let relative = Path::new(&record.path);
+            let parent =
+                projection::parent(&self.producer, relative, false).map_err(|e| e.to_string())?;
+            projection::read_selected(
+                &parent,
+                relative.file_name().ok_or("logical member name absent")?,
+                record,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for record in &envelope.objects {
+            live(self.deadline)?;
+            let relative = Path::new(&record.path);
+            let parent = projection::parent(&packed, relative, false).map_err(|e| e.to_string())?;
+            projection::read_selected(
+                &parent,
+                relative.file_name().ok_or("physical member name absent")?,
+                record,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        publish_held(&packed, &bytes, self.producer_uid, self.deadline, || {
+            self.verify_named()?;
+            let named = directory(&self.acquisition, std::ffi::OsStr::new("producer-packed"))?;
+            let current = named.metadata().map_err(|e| e.to_string())?;
+            if current.dev() != stamp.dev()
+                || current.ino() != stamp.ino()
+                || current.uid() != stamp.uid()
+            {
+                return Err("packed derivative named identity changed".into());
+            }
+            Ok(())
+        })
     }
 }
 

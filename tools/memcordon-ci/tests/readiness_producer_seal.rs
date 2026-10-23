@@ -15,7 +15,7 @@ fn only_exact_selected_projection_paths_are_admitted() {
     let workspace = Path::new("/selected/workspace");
     let acquisition = workspace.join(".release/readiness-cell");
     let cell = acquisition.join("producer/cell.json");
-    let output = acquisition.join("producer/producer-manifest.json");
+    let output = acquisition.join("producer-packed/producer-manifest.json");
     selected_paths(workspace, &acquisition, &cell, &output).unwrap();
     for changed in [
         workspace.join("elsewhere"),
@@ -144,7 +144,7 @@ fn publication_cutoff_and_root_projection_custody_fail_closed() {
     let acquisition = directory.path().join(".release/readiness-cell");
     let cell = acquisition.join("producer/cell.json");
     std::fs::write(&cell, b"{}").unwrap();
-    let output = acquisition.join("producer/producer-manifest.json");
+    let output = acquisition.join("producer-packed/producer-manifest.json");
     assert!(
         Scope::open(
             directory.path(),

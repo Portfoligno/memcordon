@@ -29,13 +29,13 @@ fn linux_uploads_only_finite_projection_and_windows_keeps_original_boundary() {
                         linux += 1;
                         assert_eq!(
                             uploads[0]["with"]["path"],
-                            ".release/readiness-cell/producer"
+                            ".release/readiness-cell/producer-packed"
                         );
                         assert!(
                             seals[0].contains("--cell .release/readiness-cell/producer/cell.json")
                         );
                         assert!(seals[0].contains(
-                            "--output .release/readiness-cell/producer/producer-manifest.json"
+                            "--output .release/readiness-cell/producer-packed/producer-manifest.json"
                         ));
                         assert!(seals[0].ends_with("--acquisition-root .release/readiness-cell"));
                     } else {

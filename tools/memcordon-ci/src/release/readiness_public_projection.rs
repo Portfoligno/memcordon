@@ -66,7 +66,7 @@ fn root(path: &Path) -> Result<File> {
     }
     Ok(held)
 }
-fn parent(root: &File, relative: &Path, create: bool) -> Result<File> {
+pub(crate) fn parent(root: &File, relative: &Path, create: bool) -> Result<File> {
     let mut held = root.try_clone()?;
     for component in relative.parent().unwrap_or(Path::new("")).components() {
         let Component::Normal(name) = component else {
@@ -92,7 +92,11 @@ fn metadata_key(m: &std::fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i6
         m.ctime_nsec(),
     )
 }
-fn read_selected(parent: &File, name: &std::ffi::OsStr, record: &Artifact) -> Result<Vec<u8>> {
+pub(crate) fn read_selected(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    record: &Artifact,
+) -> Result<Vec<u8>> {
     let mut file: File = native(openat(
         parent,
         name,
@@ -134,7 +138,16 @@ fn read_selected(parent: &File, name: &std::ffi::OsStr, record: &Artifact) -> Re
     }
     Ok(bytes)
 }
-fn write_new(parent: &File, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> {
+
+pub(crate) fn capture_selected(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    record: &Artifact,
+) -> Result<crate::release::readiness_artifact_catalog::VerifiedCapture> {
+    let bytes = read_selected(parent, name, record)?;
+    Ok(crate::release::readiness_artifact_catalog::VerifiedCapture::selected(record, bytes))
+}
+pub(crate) fn write_new(parent: &File, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> {
     let file: File = native(openat(
         parent,
         name,
@@ -146,6 +159,50 @@ fn write_new(parent: &File, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> 
     let mut file = file;
     file.write_all(bytes)?;
     file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn retain_packed_object(
+    root: &File,
+    object: &Artifact,
+    bytes: &[u8],
+    existing: bool,
+) -> Result<()> {
+    let relative = Path::new(&object.path);
+    let parent = parent(root, relative, true)?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| error("packed object name absent"))?;
+    let held = if existing {
+        None
+    } else {
+        let mut file = File::from(native(openat(
+            &parent,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o644),
+        ))?);
+        native(rustix::fs::fchmod(&file, Mode::from_bits_truncate(0o644)))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        parent.sync_all()?;
+        Some(file)
+    };
+    let actual = read_selected(&parent, name, object)?;
+    if actual != bytes {
+        return Err(error("equal digest key has unequal captured object bytes"));
+    }
+    if let Some(held) = held {
+        let named = File::from(native(openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))?);
+        if metadata_key(&held.metadata()?) != metadata_key(&named.metadata()?) {
+            return Err(error("new packed object named identity changed"));
+        }
+    }
     Ok(())
 }
 fn write_cell(bundle: &File, cell: &CellEvidence) -> Result<()> {

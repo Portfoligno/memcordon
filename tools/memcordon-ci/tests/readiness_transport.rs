@@ -207,6 +207,172 @@ fn payload(original_attempt: u64, mismatched_cell: bool) -> (SourceIdentity, Rep
     let metadata=serde_json::to_vec(&serde_json::json!({"id":42,"expired":false,"name":"readiness-candidate-linux-x64-native-12-3","workflow_run":{"id":12,"head_sha":identity.source_commit},"digest":format!("sha256:{}",artifacts::checksum(&zip)),"size_in_bytes":zip.len()})).unwrap();
     (identity, Replies { metadata, zip })
 }
+
+fn packed_payload(omit_object: bool) -> (SourceIdentity, Replies) {
+    use memcordon_readiness_verifier::{
+        Artifact,
+        storage::{ArtifactBinding, PackedProducerManifestV1, object_path},
+    };
+    use std::io::Read;
+    let (identity, original) = payload(3, false);
+    let mut original = zip::ZipArchive::new(Cursor::new(original.zip)).unwrap();
+    let mut cell_bytes = Vec::new();
+    original
+        .by_name("cell.json")
+        .unwrap()
+        .read_to_end(&mut cell_bytes)
+        .unwrap();
+    let mut cell: CellEvidence = serde_json::from_slice(&cell_bytes).unwrap();
+    let mut manifest_bytes = Vec::new();
+    original
+        .by_name("producer-manifest.json")
+        .unwrap()
+        .read_to_end(&mut manifest_bytes)
+        .unwrap();
+    let mut producer: ProducerManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    producer.manifest_sha256 = artifacts::checksum(b"packed-fixture-manifest");
+    let digest = artifacts::checksum(b"same");
+    let objects = vec![Artifact {
+        path: object_path(&digest).unwrap(),
+        length: b"same".len() as u64,
+        sha256: digest.clone(),
+    }];
+    cell.artifacts = ["first", "second"]
+        .into_iter()
+        .map(|name| Artifact {
+            path: format!("x86_64-unknown-linux-gnu/candidate-native/{name}"),
+            length: b"same".len() as u64,
+            sha256: digest.clone(),
+        })
+        .collect();
+    producer.artifacts = cell.artifacts.clone();
+    let envelope = PackedProducerManifestV1 {
+        format: "memcordon.consumer-readiness.packed-producer".into(),
+        revision: 1,
+        bindings: cell
+            .artifacts
+            .iter()
+            .map(|logical| ArtifactBinding {
+                logical_path: logical.path.clone(),
+                object_path: objects[0].path.clone(),
+            })
+            .collect(),
+        objects: objects.clone(),
+        producer,
+    };
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer
+        .start_file("producer-manifest.json", options)
+        .unwrap();
+    writer
+        .write_all(&serde_json::to_vec(&envelope).unwrap())
+        .unwrap();
+    writer.start_file("cell.json", options).unwrap();
+    writer
+        .write_all(&serde_json::to_vec(&cell).unwrap())
+        .unwrap();
+    if !omit_object {
+        writer.start_file(&objects[0].path, options).unwrap();
+        writer.write_all(b"same").unwrap();
+    }
+    let zip = writer.finish().unwrap().into_inner();
+    let metadata = serde_json::to_vec(&serde_json::json!({"id":42,"expired":false,"name":"readiness-candidate-linux-x64-native-12-3",
+        "workflow_run":{"id":12,"head_sha":identity.source_commit},"digest":format!("sha256:{}",artifacts::checksum(&zip)),"size_in_bytes":zip.len()})).unwrap();
+    (identity, Replies { metadata, zip })
+}
+
+#[test]
+fn packed_transport_and_report_keep_logical_custody_and_every_original_archive() {
+    use memcordon_ci::consumer_readiness_ledger::{self as ledger, PackedLedger};
+    let root = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let (identity, replies) = packed_payload(false);
+    let manifest_digest = artifacts::checksum(b"packed-fixture-manifest");
+    let producer = readiness_transport::download_producer(
+        &replies,
+        &budget(),
+        &[],
+        "owner/repository",
+        12,
+        3,
+        42,
+        "candidate-linux-x64-native",
+        &identity,
+        &manifest_digest,
+        &root.path().join("producer"),
+    )
+    .unwrap();
+    assert_eq!(producer.storage.physical_artifacts().count(), 1);
+    assert_eq!(producer.cell.artifacts.len(), 2);
+    for logical in &producer.cell.artifacts {
+        assert!(!producer.directory.join(&logical.path).exists());
+    }
+    let output = root.path().join("report-artifacts");
+    std::fs::create_dir(&output).unwrap();
+    let mut index = ledger::initialize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ci/consumer-readiness-v1.toml")
+            .as_path(),
+        identity.clone(),
+    )
+    .unwrap();
+    index.manifest_sha256 = manifest_digest.clone();
+    let mut packed = PackedLedger::default();
+    packed.check_archive(&index, &producer.archive).unwrap();
+    readiness_transport::retain_downloaded_archive(
+        &producer.directory,
+        &producer.archive,
+        &output.join(&producer.archive.path),
+        budget().deadline(),
+    )
+    .unwrap();
+    index.artifacts.push(producer.archive.clone());
+    ledger::record_origin(&mut index, producer.origin).unwrap();
+    packed
+        .ingest(
+            &mut index,
+            producer.cell,
+            &producer.directory,
+            &output,
+            &producer.storage,
+        )
+        .unwrap();
+    let evidence = root.path().join("evidence.json");
+    packed.persist(&index, &evidence, &output).unwrap();
+    let bytes = std::fs::read(evidence).unwrap();
+    let (logical, storage) =
+        memcordon_readiness_verifier::storage::decode_evidence(&bytes).unwrap();
+    assert_eq!(logical.artifacts.len(), 3);
+    assert_eq!(logical.producer_origins.len(), 1);
+    assert_eq!(storage.physical_artifacts().count(), 2);
+    assert_eq!(
+        std::fs::read(output.join(&producer.archive.path)).unwrap(),
+        replies.zip
+    );
+    // This transport-only cell has no readiness rows; storage cannot invent a pass.
+    assert!(logical.products.is_empty());
+    let (_, missing) = packed_payload(true);
+    assert!(
+        readiness_transport::download_producer(
+            &missing,
+            &budget(),
+            &[],
+            "owner/repository",
+            12,
+            3,
+            42,
+            "candidate-linux-x64-native",
+            &identity,
+            &manifest_digest,
+            &root.path().join("missing-own-object")
+        )
+        .is_err()
+    );
+}
 #[test]
 fn immutable_original_bundle_transport_rejects_attempt_relabel_and_cell_substitution() {
     // This checks transport custody only; an empty cell cannot pass readiness.

@@ -1520,9 +1520,93 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         self.retire_mixed_inner(
             admission,
             deadline,
+            None,
             #[cfg(test)]
             None,
         )
+    }
+
+    pub(super) fn retire_mixed_observed(
+        &mut self,
+        admission: &mut super::mixed_admission::MixedOperationalAdmission,
+        deadline: Instant,
+        observer: &mut super::mixed_retirement::RetirementObservationChannel<'_>,
+    ) -> Result<MixedNativeRetirement, String> {
+        self.retire_mixed_inner(
+            admission,
+            deadline,
+            Some(observer),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    pub(super) fn retirement_observation_snapshot(
+        &self,
+        prepared: &memcordon_core::mixed_observation::MixedPreparedObservationV2,
+        admission: &super::mixed_admission::MixedOperationalAdmission,
+    ) -> Result<
+        (
+            File,
+            memcordon_core::mixed_observation::MixedRetirementJournalV1,
+            memcordon_core::result_v2::NativeProcessV2,
+        ),
+        String,
+    > {
+        use memcordon_core::mixed_observation::retirement_digest;
+        use memcordon_core::result_v2::NativeProcessV2;
+        let record = self
+            .record
+            .as_ref()
+            .ok_or("original retirement journal absent")?;
+        if record.record().phase != PrivateAttemptPhase::Retiring
+            || record.record().release_knowledge != ReleaseKnowledge::ExecObserved
+            || self.mixed_prepared_observation(admission, prepared.provider.clone())? != *prepared
+            || !pidfd_exited(
+                self.target_pidfd
+                    .as_ref()
+                    .ok_or("original target pidfd absent")?
+                    .as_fd(),
+            )?
+            || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
+        {
+            return Err("original retiring native family is not eligible for observation".into());
+        }
+        let worker = record
+            .record()
+            .mixed_worker
+            .as_ref()
+            .ok_or("original mixed worker absent")?;
+        if worker.pid != std::process::id()
+            || worker.start_time != super::envelope::process_start_time(worker.pid as libc::pid_t)?
+            || self
+                .guardian
+                .as_ref()
+                .ok_or("original guardian absent")?
+                .identity()?
+                != *record
+                    .record()
+                    .guardian
+                    .as_ref()
+                    .ok_or("original guardian identity absent")?
+        {
+            return Err("retirement observer is not the original worker".into());
+        }
+        let (file, bytes, metadata) = record.held_native_observation()?;
+        let journal = memcordon_core::mixed_observation::MixedRetirementJournalV1 {
+            device: metadata["device"].as_u64().ok_or("journal device absent")?,
+            inode: metadata["inode"].as_u64().ok_or("journal inode absent")?,
+            length: bytes.len() as u64,
+            sha256: retirement_digest(&bytes),
+        };
+        Ok((
+            file,
+            journal,
+            NativeProcessV2 {
+                pid: worker.pid,
+                birth: worker.start_time,
+            },
+        ))
     }
 
     /// Internal native-harness boundary only. No provider request selects it.
@@ -1536,7 +1620,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
             &super::mixed_admission::MixedOperationalAdmission,
         ) -> Result<(), String>,
     ) -> Result<MixedNativeRetirement, String> {
-        self.retire_mixed_inner(admission, deadline, Some(callback))
+        self.retire_mixed_inner(admission, deadline, None, Some(callback))
     }
 
     #[cfg(test)]
@@ -1750,6 +1834,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         &mut self,
         admission: &mut super::mixed_admission::MixedOperationalAdmission,
         deadline: Instant,
+        observer: Option<&mut super::mixed_retirement::RetirementObservationChannel<'_>>,
         #[cfg(test)] mut before_account: Option<
             &mut dyn FnMut(
                 &Self,
@@ -1758,6 +1843,11 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         >,
     ) -> Result<MixedNativeRetirement, String> {
         self.record_mut().begin_mixed_retirement()?;
+        if let Some(observer) = observer {
+            // The observer result is retained separately; no observation failure
+            // can skip or replace the original owned native settlement below.
+            observer.observe(self, admission, deadline);
+        }
         let cleanup = (|| -> Result<_, String> {
             if self.mixed_native_retired.is_none() {
                 let candidate_exit_code = self
