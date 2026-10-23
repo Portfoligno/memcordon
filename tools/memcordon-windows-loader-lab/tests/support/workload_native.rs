@@ -174,15 +174,11 @@ fn retained_spawn_resume_fixture(
         .as_os_str()
         .encode_wide()
         .collect();
-    let output = std::env::temp_dir().join(format!(
-        "memcordon-resume-{}-{debug}-{fault:?}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&output).unwrap();
+    let output = tempfile::Builder::new()
+        .prefix("memcordon-resume-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let mut process = None;
     let mut owner = None;
     let mut resume_observation = None;
