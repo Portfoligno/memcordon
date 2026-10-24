@@ -2,6 +2,14 @@ use super::LiteralRun;
 pub(super) fn translate(command: &str, flavor: u8) -> Option<LiteralRun> {
     match (command, flavor) {
         (
+            "./target/ci/release/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json",
+            0 | 4,
+        ) => Some(LiteralRun::R1725),
+        (
+            "./target/ci/release/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json",
+            1 | 5,
+        ) => Some(LiteralRun::R1726),
+        (
             "./.release/rehearsal-tool/memcordon-release-rehearsal run --publisher .release/tool/memcordon-ci --input .release/rehearsal-input --report-dir .release/rehearsal-results --jobs 2",
             0,
         ) => Some(LiteralRun::R543),

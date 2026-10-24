@@ -112,6 +112,7 @@ pub(crate) fn fixture() -> (
         vec![archive],
         directory.path(),
         fixture,
+        None,
         &directory.path().join("installed"),
         directory.path().join("observations"),
     )

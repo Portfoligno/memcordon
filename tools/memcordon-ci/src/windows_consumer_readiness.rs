@@ -1272,6 +1272,7 @@ pub(crate) mod native {
         config: &crate::windows_installed_cases::InstalledWindowsPayload,
         work_deadline: Instant,
     ) -> Result<()> {
+        config.require_workload_diagnostic()?;
         use memcordon_core::workload_contract::*;
         use memcordon_core::workload_registry::*;
         use std::num::NonZeroU64;

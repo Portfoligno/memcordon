@@ -1444,6 +1444,19 @@ fn prepare_windows_support_until(
         path: fixture_path,
         sha256: bundle.fixture.sha256.clone(),
     };
+    let workload_diagnostic = bundle
+        .workload_diagnostic_input(&root.join(".release/target"))?
+        .map(|mut diagnostic| {
+            let path = selected.join("memcordon-windows-loader-lab.exe");
+            custody.push(crate::windows_readiness_adapter::copy_owned_artifact(
+                &diagnostic.executable.path,
+                &path,
+                &diagnostic.executable.sha256,
+            )?);
+            diagnostic.executable.path = path;
+            Ok::<_, CiError>(diagnostic)
+        })
+        .transpose()?;
     let agent = measured
         .iter()
         .find(|item| {
@@ -1468,6 +1481,7 @@ fn prepare_windows_support_until(
         measured,
         &selected,
         fixture,
+        workload_diagnostic,
         &removal.binary_root,
         lifetime.join("observations"),
     )?;

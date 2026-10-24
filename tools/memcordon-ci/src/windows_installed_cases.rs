@@ -278,6 +278,53 @@ pub struct SelectedArtifact {
     pub sha256: String,
 }
 
+/// Independently measured diagnostic code, never a production runtime component.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadDiagnosticInput {
+    pub source: crate::release::source::BuildSourceIdentity,
+    pub target: String,
+    pub executable: SelectedArtifact,
+    pub byte_len: u64,
+}
+
+impl WorkloadDiagnosticInput {
+    pub fn validate_for(
+        &self,
+        source: &crate::release::source::BuildSourceIdentity,
+        target: &str,
+    ) -> Result<()> {
+        use crate::release::{artifacts, target as native};
+        self.source.validate()?;
+        if &self.source != source
+            || self.target != target
+            || !target.ends_with("-pc-windows-msvc")
+            || !self.executable.path.is_absolute()
+            || self
+                .executable
+                .path
+                .file_name()
+                .is_none_or(|name| name != "memcordon-windows-loader-lab.exe")
+            || self.byte_len == 0
+            || self.byte_len > 128 * 1024 * 1024
+            || std::fs::metadata(&self.executable.path)?.len() != self.byte_len
+        {
+            return Err(CiError::Message(
+                "qualified workload diagnostic source, target, role or length differs".into(),
+            ));
+        }
+        let bytes = artifacts::read_file(&self.executable.path)?;
+        if bytes.len() as u64 != self.byte_len
+            || artifacts::checksum(&bytes) != self.executable.sha256
+        {
+            return Err(CiError::Message(
+                "qualified workload diagnostic bytes changed".into(),
+            ));
+        }
+        native::validate_executable(&bytes, target)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledWindowsPayload {
@@ -291,6 +338,8 @@ pub struct InstalledWindowsPayload {
     pub components: Vec<SelectedArtifact>,
     pub installed_components: Vec<SelectedArtifact>,
     pub fixture: SelectedArtifact,
+    #[serde(default)]
+    pub workload_diagnostic: Option<WorkloadDiagnosticInput>,
     pub installed_agent: SelectedArtifact,
     pub installed_manifest: SelectedArtifact,
     pub provider: memcordon_core::PublicProviderBindingV1,
@@ -454,6 +503,7 @@ impl InstalledWindowsPayload {
         artifacts: Vec<SelectedArtifact>,
         payload_directory: &std::path::Path,
         fixture: SelectedArtifact,
+        workload_diagnostic: Option<WorkloadDiagnosticInput>,
         installed_directory: &std::path::Path,
         output_directory: PathBuf,
     ) -> Result<Self> {
@@ -461,6 +511,9 @@ impl InstalledWindowsPayload {
         use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifest};
         source.validate()?;
         distribution.validate()?;
+        if let Some(diagnostic) = &workload_diagnostic {
+            diagnostic.validate_for(source, &distribution.target)?;
+        }
         if !distribution.target.ends_with("-pc-windows-msvc")
             || !distribution
                 .features
@@ -590,9 +643,27 @@ impl InstalledWindowsPayload {
             components,
             installed_components,
             fixture,
+            workload_diagnostic,
             provider: manifest.public_binding(&bytes).map_err(CiError::Message)?,
             output_directory,
         })
+    }
+
+    pub fn require_workload_diagnostic(&self) -> Result<&WorkloadDiagnosticInput> {
+        let diagnostic = self.workload_diagnostic.as_ref().ok_or_else(|| {
+            CiError::Message(
+                "current Windows payload lacks its qualified workload diagnostic".into(),
+            )
+        })?;
+        if diagnostic.source.commit() != self.source_commit
+            || diagnostic.source.version().to_string() != self.version
+        {
+            return Err(CiError::Message(
+                "workload diagnostic differs from selected installed source".into(),
+            ));
+        }
+        diagnostic.validate_for(&diagnostic.source, &self.target)?;
+        Ok(diagnostic)
     }
 }
 

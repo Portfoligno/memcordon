@@ -278,28 +278,24 @@ pub fn copy_compiler_artifact(
 /// Select an independently published diagnostic executable, never a Cargo alias.
 #[cfg(windows)]
 pub fn prepare_workload_executable(
-    build_root: &Path,
+    source: &Path,
+    expected: &str,
     report: &Path,
 ) -> crate::Result<(PathBuf, HeldWindowsArtifact)> {
     const BOUND: usize = 128 * 1024 * 1024;
-    let source = build_root.join("release/memcordon-windows-loader-lab.exe");
+    let build_root = source.parent().ok_or_else(|| {
+        crate::CiError::Message("qualified diagnostic source parent absent".into())
+    })?;
     let destination = report.with_extension("workload-lab.exe");
     if !build_root.is_absolute() || !report.is_absolute() || destination.starts_with(build_root) {
         return Err(crate::CiError::Message(
             "diagnostic executable destination crosses protected report boundary".into(),
         ));
     }
-    // This preliminary measurement grants no custody. The copier independently
-    // pins native source/ancestors and must reproduce this exact bounded digest.
-    let bytes = crate::windows_consumer_readiness::native::read(&source, BOUND)?;
-    if bytes.is_empty() {
-        return Err(crate::CiError::Message(
-            "diagnostic compiler source is empty".into(),
-        ));
-    }
-    let expected = crate::windows_causal_acceptance::sha256(&bytes);
+    // The expected digest comes from the qualified producer input, never a
+    // fresh measurement of whatever named executable happens to be present.
     let held =
-        copy_compiler_artifact_bounded(&source, build_root, &destination, &expected, BOUND as u64)?;
+        copy_compiler_artifact_bounded(source, build_root, &destination, expected, BOUND as u64)?;
     Ok((destination, held))
 }
 

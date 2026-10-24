@@ -123,6 +123,10 @@ pub enum ConsumerChannel {
 pub enum ReleaseCommand {
     ConsumerReadinessReport(readiness_report::ReportArguments),
     SelectPreparation,
+    PrepareReadinessTools {
+        #[arg(long)]
+        build_source: PathBuf,
+    },
     CheckPreparation {
         #[arg(long)]
         build_source: PathBuf,
@@ -367,6 +371,9 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
+        ReleaseCommand::PrepareReadinessTools { build_source } => {
+            target::prepare_readiness_tools(root, &build_source)
+        }
         ReleaseCommand::CheckPreparation {
             build_source,
             consumer_readiness,

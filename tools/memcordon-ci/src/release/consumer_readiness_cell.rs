@@ -147,6 +147,7 @@ fn select(
         ));
     }
     if key.channel.starts_with("public-") && !root.join(".release/target").exists() {
+        let diagnostic = root.join("target/ci/native/release/workload-diagnostic.json");
         super::installed_consumer::retain_original_public_inputs(
             &root.join(".release/prepared"),
             &key.target,
@@ -156,6 +157,9 @@ fn select(
                     "memcordon-test-fixture",
                     &key.target,
                 )),
+            key.target
+                .ends_with("-pc-windows-msvc")
+                .then_some(diagnostic.as_path()),
             &root.join(".release/target"),
             &root.join(".release/packages"),
         )?;

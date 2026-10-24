@@ -169,33 +169,14 @@ pub(super) fn observe(
             "diagnostic workspace source differs from selected provider".into(),
         ));
     }
-    let toolchain = crate::config::toolchains(&workspace)?.stable;
-    // Reuse the existing cached native release tree; introduce no separate
-    // unvalidated cache or optimization profile for this diagnostic.
-    let target = workspace.join("target/ci/native");
-    crate::command::rustup_cargo(
-        &workspace,
-        &toolchain,
-        [
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "-p",
-            "memcordon-windows-loader-lab",
-            "--bin",
-            "memcordon-windows-loader-lab",
-            "--target-dir",
-        ],
-        Duration::from_secs(180),
-    )
-    .arg(target.as_os_str())
-    .bounded_until(work)
-    .defer_group_failure()
-    .run()?;
+    let diagnostic = config.require_workload_diagnostic()?;
     let (executable, held_executable) =
-        crate::windows_readiness_adapter::prepare_workload_executable(&target, report)?;
-    // Compilation and materialization consume original time; neither can
+        crate::windows_readiness_adapter::prepare_workload_executable(
+            &diagnostic.executable.path,
+            &diagnostic.executable.sha256,
+            report,
+        )?;
+    // Materialization consumes original time; it cannot
     // silently renew the caller's deadline or the experiment's finite slice.
     let now = Instant::now();
     let ticks = uptime();
@@ -235,10 +216,15 @@ pub(super) fn observe(
         crate::windows_readiness_adapter::hold_artifact(&result_path, None, 32 * 1024 * 1024)
             .map(|record| serde_json::json!({"path":result_path,"sha256":record.sha256}))
             .map_err(|error| error.to_string());
+    let probes_path = request_path.with_extension("startup-access-probes.json");
+    let probes = crate::windows_readiness_adapter::hold_artifact(&probes_path, None, 256 * 1024)
+        .map(|record| serde_json::json!({"path":probes_path,"sha256":record.sha256}))
+        .map_err(|error| error.to_string());
     Ok(
         serde_json::json!({"authority":"diagnostic-only","original_failure_unchanged":true,
         "source_commit":config.source_commit,"executable_path":executable,"executable_sha256":held_executable.sha256,
-        "request":request_path,"observation":observation,"command":launched.map(|output|serde_json::json!({"status":output.status.code()})).map_err(|error|error.to_string()),
+        "qualified_diagnostic":diagnostic,"request":request_path,"observation":observation,"startup_access_probes":probes,
+        "command":launched.map(|output|serde_json::json!({"status":output.status.code()})).map_err(|error|error.to_string()),
         "equivalence":"startup policy with recorded fresh descriptor/objects and debugger/creator differences; never original authority"}),
     )
 }

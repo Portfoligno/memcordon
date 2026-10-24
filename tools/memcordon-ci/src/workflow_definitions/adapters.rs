@@ -1444,6 +1444,13 @@ pub(super) fn operation_recipe(command: &str) -> Option<&str> {
 /// supplied here. Unknown commands fail generation instead of inheriting an
 /// unrelated whole-job planning envelope.
 fn reviewed_step_minutes(step: &Value) -> Option<u64> {
+    if matches!(
+        field(step, "run"),
+        "./target/ci-runtime/current/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json"
+            | "./target/ci-runtime/current/memcordon-ci.exe release prepare-readiness-tools --build-source .release/build-source.json"
+    ) {
+        return Some(60); // same original public support-producer cutoff
+    }
     if let Some(minutes) = step["timeout-minutes"]
         .as_u64()
         .filter(|minutes| *minutes > 0)
