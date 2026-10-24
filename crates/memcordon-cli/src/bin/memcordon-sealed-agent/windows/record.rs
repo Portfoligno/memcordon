@@ -567,7 +567,9 @@ impl WindowsAttemptRecordV1 {
             phase = next;
             Ok(())
         })
-        .map_err(|error| format!("publication phase={phase:?}: {error}"))
+        .map_err(|error| {
+            format!("publication phase={phase:?}; attempt={}; expected-revision={expected_revision}; candidate-revision={}: {error}", self.attempt_id, self.record_revision)
+        })
     }
 
     fn publish_at(
@@ -6072,12 +6074,14 @@ fn process_identity_is_live(expected: WindowsProcessIdentityV1) -> Result<bool, 
 pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
-    let source = source
+    let source_path = source;
+    let destination_path = destination;
+    let source = source_path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let destination = destination
+    let destination = destination_path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -6092,9 +6096,110 @@ pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), Strin
         )
     } == 0
     {
-        Err(publication_io_error(std::io::Error::last_os_error()))
+        // Capture the original causal event before any diagnostic API can
+        // replace the thread's last-error value. Never retry this mutation.
+        let error = std::io::Error::last_os_error();
+        let native_error = error.raw_os_error();
+        let original = publication_io_error(error);
+        Err(replacement_failure_context(
+            &original,
+            native_error,
+            source_path,
+            destination_path,
+        ))
     } else {
         Ok(())
+    }
+}
+
+fn replacement_failure_context(
+    original: &str,
+    native_error: Option<i32>,
+    source: &Path,
+    destination: &Path,
+) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::ERROR_NO_TOKEN,
+        Security::TOKEN_QUERY,
+        Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
+        System::Threading::{
+            GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId,
+            OpenProcessToken, OpenThreadToken,
+        },
+    };
+
+    fn close_token(handle: windows_sys::Win32::Foundation::HANDLE) -> serde_json::Value {
+        match OwnedHandle::new(handle) {
+            Ok(mut owned) => match owned.close_checked() {
+                Ok(()) => serde_json::json!({"closed":true}),
+                Err(error) => serde_json::json!({"closed":false,"error":error}),
+            },
+            Err(error) => serde_json::json!({"owned":false,"error":error}),
+        }
+    }
+
+    fn path_facts(path: &Path) -> serde_json::Value {
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        // Allocate a finite fraction of the existing publisher-error carrier
+        // to each path, including worst-case JSON escaping/number encoding.
+        let prefix = units
+            .iter()
+            .take(MAX_TERMINALIZATION_DETAIL_BYTES / 32)
+            .copied()
+            .collect::<Vec<_>>();
+        let native = units
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: native is a live NUL-terminated path; this only queries attributes.
+        let attributes = unsafe { GetFileAttributesW(native.as_ptr()) };
+        let probe = if attributes == INVALID_FILE_ATTRIBUTES {
+            serde_json::json!({"error":io::Error::last_os_error().raw_os_error()})
+        } else {
+            serde_json::json!({"value":attributes})
+        };
+        serde_json::json!({"utf16":prefix,"units":units.len(),
+            "truncated":prefix.len()!=units.len(),"absolute":path.is_absolute(),
+            "attributes":probe})
+    }
+
+    let mut token = ptr::null_mut();
+    // SAFETY: current-thread pseudo handle and a live output pointer; query only.
+    let thread_ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    let token_context = if thread_ok != 0 {
+        serde_json::json!({"thread":"present","handle":close_token(token)})
+    } else {
+        let thread_error = io::Error::last_os_error().raw_os_error();
+        if thread_error == Some(ERROR_NO_TOKEN as i32) {
+            // Only an explicit NO_TOKEN result permits process-context observation.
+            let mut process_token = ptr::null_mut();
+            // SAFETY: query-only access to this process and a live output pointer.
+            let ok =
+                unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) };
+            if ok != 0 {
+                serde_json::json!({"thread":"absent","process":"present","handle":close_token(process_token)})
+            } else {
+                serde_json::json!({"thread":"absent","process_error":io::Error::last_os_error().raw_os_error()})
+            }
+        } else {
+            serde_json::json!({"thread":"unknown","error":thread_error})
+        }
+    };
+    let context = serde_json::json!({"format_revision":1,"api":"MoveFileExW","native_error":native_error,
+        "flags":MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH,
+        "source":path_facts(source),"destination":path_facts(destination),
+        "same_parent":source.parent()==destination.parent(),
+        "process":unsafe {GetCurrentProcessId()},"thread":unsafe {GetCurrentThreadId()},
+        "token":token_context,"security_identity":"not-collected"});
+    let message = format!("{original}; replacement-context={context}");
+    if message.len() <= MAX_TERMINALIZATION_DETAIL_BYTES * 3 / 4 {
+        message
+    } else {
+        format!(
+            "{original}; replacement-context={{\"revision\":1,\"api\":\"MoveFileExW\",\"omitted\":\"context exceeds existing carrier allocation\"}}"
+        )
     }
 }
 

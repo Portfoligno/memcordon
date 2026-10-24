@@ -904,6 +904,32 @@ fn both_native_disk_full_codes_are_captured_before_formatting() {
 }
 
 #[test]
+fn replacement_diagnostics_fit_original_carrier_and_preserve_native_cause() {
+    let _capture = super::super::diagnostics::AttemptDiagnosticScope::enter();
+    let error = io::Error::from_raw_os_error(5);
+    let original = publication_io_error(error);
+    let long_name = "界😀".repeat(MAX_TERMINALIZATION_DETAIL_BYTES);
+    let source = PathBuf::from("C:\\missing-publication-source").join(&long_name);
+    let destination = PathBuf::from("C:\\missing-publication-destination").join(long_name);
+    let message = replacement_failure_context(&original, Some(5), &source, &destination);
+    assert!(message.starts_with(&original));
+    assert!(message.len() <= MAX_TERMINALIZATION_DETAIL_BYTES * 3 / 4);
+    let (_, json) = message.split_once("; replacement-context=").unwrap();
+    let context: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(context["api"], "MoveFileExW");
+    assert!(context.get("omitted").is_some() || context["source"]["truncated"] == true);
+    let mut journal = memcordon_core::WindowsCausalDiagnosticsV1::default();
+    super::super::diagnostics::merge_into(&mut journal);
+    let memcordon_core::OriginalFailureV1::Observed { event } = journal.original else {
+        panic!("original replacement failure absent");
+    };
+    assert_eq!(
+        event.native_code,
+        Some(memcordon_core::NativeFailureCodeV1::Win32(5))
+    );
+}
+
+#[test]
 fn frozen_native_publication_does_not_own_workload_job_cleanup() {
     let receipt = super::super::readiness_receipt::begin(
         "windows::record::record_fault_tests::frozen_native_publication_does_not_own_workload_job_cleanup",
