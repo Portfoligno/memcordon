@@ -7,6 +7,200 @@ use tempfile::TempDir;
 
 const IDENTITY: &str = "abababababababababababababababab";
 
+fn mixed_pending_predecessor() -> crate::linux::private_attempt::PrivateAttemptRecordV4 {
+    use memcordon_core::workload_contract::{AuthorizationRef, LogicalId, Nonce128, PolicyEpoch};
+    use memcordon_core::workload_contract_v3::*;
+    use memcordon_core::{BoundedText, DiagnosticSha256};
+    use std::num::NonZeroU64;
+    let id = |name: &str| LogicalId::new(name.into()).unwrap();
+    let object = |name: &str| BoundObjectRef {
+        id: id(name),
+        digest: DiagnosticSha256::from_bytes([3; 32]),
+    };
+    let request = WorkloadContractV3 {
+        schema_version: ContractVersionThree::default(),
+        workload_plan_digest: DiagnosticSha256::from_bytes([1; 32]),
+        authorized_profile: memcordon_core::workload_registry_v3::profile_reference(),
+        authorization: AuthorizationRef {
+            grant_id: id("pending-recovery-grant"),
+            grant_revision: NonZeroU64::new(1).unwrap(),
+            approved_plan_digest: DiagnosticSha256::from_bytes([1; 32]),
+        },
+        ceiling: MixedPrivateCeiling::FreshRootIpv4TcpUnixStreamsIntraAttemptNoGain,
+        requirements: Default::default(),
+        execution_identity: ExclusiveAdministratorIdentityRef {
+            identity: object("account"),
+            exclusive_use_policy: object("exclusive"),
+        },
+        runtime_image: object("runtime"),
+        input_image: object("input"),
+        root_layout: object("root"),
+        launch: ImageLaunchV1 {
+            entrypoint: id("run"),
+            working_directory: RootRelativePath::new("work".into()).unwrap(),
+        },
+        expected_epoch: PolicyEpoch {
+            service_instance: Nonce128([8; 16]),
+            revision: NonZeroU64::new(1).unwrap(),
+        },
+    };
+    let metadata = memcordon_core::workload_admission_v3::RuntimeMixedAdmissionSnapshot {
+        format: "memcordon.private-admission-metadata".into(),
+        revision: 2,
+        attempt_id: BoundedText::new(IDENTITY).unwrap(),
+        request_sha256: request.digest().unwrap(),
+        invocation_sha256: DiagnosticSha256::from_bytes([9; 32]),
+        caller_uid: 65534,
+        registry_digest: DiagnosticSha256::from_bytes([10; 32]),
+        epoch: request.expected_epoch.clone(),
+        admission_nonce: Nonce128([11; 16]),
+        profile_id: request.authorized_profile.clone(),
+        request,
+    };
+    let mut record = crate::linux::private_attempt::PrivateAttemptRecordV4::allocated(
+        BoundedText::new(IDENTITY).unwrap(),
+        BoundedText::new("pending-parser-fixture-boot").unwrap(),
+        crate::linux::private_attempt::ProcessIdentityV4 {
+            pid: 101,
+            start_time: 201,
+        },
+        DiagnosticSha256::from_bytes([12; 32]),
+    )
+    .unwrap();
+    record.mixed_admission_metadata = Some(metadata);
+    record.validate().unwrap();
+    record
+}
+
+#[test]
+fn mixed_pending_successor_keeps_original_authority_and_all_resource_obligations() {
+    use crate::linux::private_attempt::{
+        MixedDirectoryIdentityV2, PrivateAttemptPhase as Phase, ProcessIdentityV4,
+    };
+    let current = mixed_pending_predecessor();
+    let mut pending = current.clone();
+    pending.phase = Phase::BoundaryCreated;
+    crate::linux::recovery::validate_mixed_pending_transition(&current, &pending).unwrap();
+    for field in [
+        "attempt_id",
+        "boot_identity",
+        "frontend",
+        "caller_envelope_digest",
+        "mixed_admission_metadata",
+    ] {
+        let mut changed = serde_json::to_value(&pending).unwrap();
+        changed[field] = serde_json::Value::Null;
+        if let Ok(changed) = serde_json::from_value(changed) {
+            assert!(
+                crate::linux::recovery::validate_mixed_pending_transition(&current, &changed)
+                    .is_err(),
+                "accepted changed {field}"
+            );
+        }
+    }
+    let boundary = pending.clone();
+    pending.mixed_cgroup_identity = Some(MixedDirectoryIdentityV2 {
+        device: 1,
+        inode: 9,
+    });
+    crate::linux::recovery::validate_mixed_pending_transition(&boundary, &pending).unwrap();
+    let owned = pending.clone();
+    pending.mixed_cgroup_identity = None;
+    assert!(crate::linux::recovery::validate_mixed_pending_transition(&owned, &pending).is_err());
+    pending = owned.clone();
+    pending.mixed_cgroup_identity.as_mut().unwrap().inode += 1;
+    assert!(crate::linux::recovery::validate_mixed_pending_transition(&owned, &pending).is_err());
+    let mut control = current.clone();
+    control.mixed_control = Some(ProcessIdentityV4 {
+        pid: 102,
+        start_time: 202,
+    });
+    crate::linux::recovery::validate_mixed_pending_transition(&current, &control).unwrap();
+    let mut replaced = control.clone();
+    replaced.mixed_control.as_mut().unwrap().start_time += 1;
+    assert!(
+        crate::linux::recovery::validate_mixed_pending_transition(&control, &replaced).is_err()
+    );
+    let mut skipped = current.clone();
+    skipped.phase = Phase::Retired;
+    assert!(crate::linux::recovery::validate_mixed_pending_transition(&current, &skipped).is_err());
+}
+
+#[test]
+#[ignore = "requires native Linux root-owned pending journal custody"]
+fn mixed_pending_snapshot_retains_torn_foreign_and_unsafe_original_files() {
+    use crate::linux::private_attempt::PrivateAttemptPhase;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let state = tempfile::tempdir_in("/tmp").unwrap();
+    let canonical = state.path().join(IDENTITY);
+    let pending_path = canonical.with_extension("new");
+    let current = mixed_pending_predecessor();
+    let encode = |record: &crate::linux::private_attempt::PrivateAttemptRecordV4| {
+        let body = format!(
+            "format=memcordon.private-native-journal\nrevision=1\ncgroup={}\npayload={}\n",
+            record.attempt_id.as_str(),
+            serde_json::to_string(record).unwrap()
+        );
+        let digest = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{body}digest={digest}\n").into_bytes()
+    };
+    let original_bytes = encode(&current);
+    std::fs::write(&canonical, &original_bytes).unwrap();
+    std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let original_inode = std::fs::metadata(&canonical).unwrap().ino();
+    assert!(
+        crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current)
+            .unwrap()
+            .is_none()
+    );
+    let mut successor = current.clone();
+    successor.phase = PrivateAttemptPhase::BoundaryCreated;
+    let valid = encode(&successor);
+    std::fs::write(&pending_path, &valid).unwrap();
+    std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current).unwrap(),
+        Some(successor.clone())
+    );
+    for bytes in [
+        b"interrupted partial V4 write".as_slice(),
+        &valid[..valid.len() / 2],
+    ] {
+        std::fs::write(&pending_path, bytes).unwrap();
+        let error = crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current)
+            .unwrap_err();
+        assert!(error.contains("pending-parse="));
+        assert!(error.contains("sha256="));
+        assert_eq!(std::fs::read(&pending_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&canonical).unwrap(), original_bytes);
+        assert_eq!(std::fs::metadata(&canonical).unwrap().ino(), original_inode);
+    }
+    successor.frontend.start_time += 1;
+    std::fs::write(&pending_path, encode(&successor)).unwrap();
+    assert!(
+        crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current)
+            .unwrap_err()
+            .contains("transition=")
+    );
+    std::fs::write(&pending_path, &valid).unwrap();
+    std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current).is_err()
+    );
+    std::fs::set_permissions(&pending_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let alias = state.path().join("held-pending-alias");
+    std::fs::hard_link(&pending_path, &alias).unwrap();
+    assert!(
+        crate::linux::recovery::inspect_mixed_pending_for_test(&pending_path, &current).is_err()
+    );
+    assert_eq!(std::fs::metadata(&canonical).unwrap().ino(), original_inode);
+    assert_eq!(std::fs::read(&canonical).unwrap(), original_bytes);
+}
+
 fn write_record(path: &std::path::Path, body: &str) {
     let digest: String = Sha256::digest(body.as_bytes())
         .iter()

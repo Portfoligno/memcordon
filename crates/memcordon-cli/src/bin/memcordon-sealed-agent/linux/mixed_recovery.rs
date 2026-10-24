@@ -168,11 +168,15 @@ fn unallocated_directory_absent(path: &Path) -> Result<(), String> {
 
 /// Settle the kernel family and private filesystem allocations. The caller
 /// retains the journal/account/reference until its remaining owners are settled.
-pub(super) fn settle_native(
+pub(super) fn settle_native_until(
     record: &PrivateAttemptRecordV4,
     cgroup_root: &Path,
     output_files: &[memcordon_core::workload_contract_v3::RootRelativePath],
+    deadline: Instant,
 ) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("mixed original recovery settlement deadline exhausted".into());
+    }
     record.validate()?;
     if record.mixed_admission_metadata.is_none() {
         return Err("recovery lacks mixed ownership".into());
@@ -183,6 +187,7 @@ pub(super) fn settle_native(
     for (role, owner) in [
         ("frontend", Some(&record.frontend)),
         ("mixed-worker", record.mixed_worker.as_ref()),
+        ("mixed-control", record.mixed_control.as_ref()),
     ]
     .into_iter()
     .filter_map(|(role, owner)| owner.map(|owner| (role, owner)))
@@ -216,7 +221,6 @@ pub(super) fn settle_native(
         .map(HeldProcess::acquire)
         .transpose()?
         .flatten();
-    let deadline = Instant::now() + Duration::from_secs(5);
     let path = cgroup_root.join(record.attempt_id.as_str());
     if !same_boot
         && !matches!(fs::symlink_metadata(&path),Err(error)if error.kind()==std::io::ErrorKind::NotFound)
