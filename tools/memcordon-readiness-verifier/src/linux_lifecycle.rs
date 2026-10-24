@@ -162,6 +162,7 @@ pub fn validate_linux_lifecycle_intervention(
                 "caller",
                 "control",
                 "control_status_bytes",
+                "control_endpoint",
                 "caller_image",
                 "worker_image_check",
                 "control_image_check",
@@ -183,9 +184,11 @@ pub fn validate_linux_lifecycle_intervention(
         )?;
         closed(&action["worker"], &["pid", "birth"])?;
         closed(&action["caller"], &["pid", "birth"])?;
+        let control_gid =
+            crate::linux_frontend_access::endpoint_group(&action["control_endpoint"])?;
         if intent["native_operation"] != "socket-shutdown"
             || action["format"] != "memcordon.linux-lifecycle-control-shutdown"
-            || action["revision"] != 2
+            || action["revision"] != 3
             || action["worker"]["pid"] != selected.pid
             || action["worker"]["birth"] != selected.birth
             || action["caller"]["pid"] != prepared["caller"]["pid"]
@@ -194,7 +197,7 @@ pub fn validate_linux_lifecycle_intervention(
                 .as_u64()
                 .is_none_or(|number| number > i32::MAX as u64)
             || action["peer_uid"] != 0
-            || action["peer_gid"] != 0
+            || action["peer_gid"] != control_gid
             || prepared["admission"]["caller_uid"] != 65534
             || ["device", "inode"]
                 .iter()
@@ -273,7 +276,7 @@ pub fn validate_linux_lifecycle_intervention(
         }
         let control_status =
             std::str::from_utf8(&control_status).map_err(|error| error.to_string())?;
-        for field in ["Uid:", "Gid:"] {
+        for (field, expected) in [("Uid:", 0), ("Gid:", control_gid)] {
             let values = control_status
                 .lines()
                 .find_map(|line| line.strip_prefix(field))
@@ -282,7 +285,7 @@ pub fn validate_linux_lifecycle_intervention(
                 .map(str::parse::<u32>)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
-            if values != vec![0; 4] {
+            if values != vec![expected; 4] {
                 return Err(
                     "native socket peer is not the authenticated root control worker".into(),
                 );
@@ -1434,6 +1437,11 @@ fn validate_boundary(
         let intent: Value = crate::wire::json(custody.bytes(path("controller-intent.json")?)?)?;
         let action: Value = crate::wire::json(custody.bytes(path("controller-action.json")?)?)?;
         if context.input.key.scenario.starts_with("control-") {
+            if action["control_endpoint"] != command["endpoint_access"] {
+                return Err(
+                    "control credentials replace original frontend endpoint custody".into(),
+                );
+            }
             let original_bytes: Vec<u8> =
                 serde_json::from_value(allocation["worker_source"]["journal_bytes"].clone())
                     .map_err(|error| error.to_string())?;

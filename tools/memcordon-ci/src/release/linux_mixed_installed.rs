@@ -6339,6 +6339,22 @@ struct FrontendFileAccess {
     contract_stamp: (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64),
     directory_stamp: (u64, u64, u32, u32, u32),
 }
+
+/// A view of the original package endpoint, available only after rechecking
+/// its retained socket inode and both retained/named directory ancestors.
+#[derive(Clone)]
+pub struct RetainedControlEndpoint {
+    group: std::num::NonZeroU32,
+    observation: serde_json::Value,
+}
+impl RetainedControlEndpoint {
+    pub fn group(&self) -> u32 {
+        self.group.get()
+    }
+    pub fn observation(&self) -> &serde_json::Value {
+        &self.observation
+    }
+}
 impl FrontendFileAccess {
     fn observe_endpoint(&self) -> Result<serde_json::Value> {
         use std::os::unix::ffi::OsStrExt;
@@ -6490,6 +6506,12 @@ impl FrontendFileAccess {
     }
 }
 impl InstalledMixedLaunch {
+    pub fn retained_control_endpoint(&self) -> Result<RetainedControlEndpoint> {
+        let observation = self.file_access.observe_endpoint()?;
+        let group = std::num::NonZeroU32::new(self.file_access.endpoint_stamp.3)
+            .ok_or_else(|| CiError::Message("original installed control group is zero".into()))?;
+        Ok(RetainedControlEndpoint { group, observation })
+    }
     pub fn retained_frontend_wait(&self) -> Result<serde_json::Value> {
         use std::os::unix::process::ExitStatusExt;
         let status = self.frontend_status.ok_or_else(|| {

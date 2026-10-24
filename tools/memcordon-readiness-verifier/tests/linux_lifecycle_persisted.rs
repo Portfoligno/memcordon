@@ -38,6 +38,7 @@ fn control_shutdown_requires_original_authenticated_two_hop_chain() {
         for field in [
             "control",
             "control_status_bytes",
+            "control_endpoint",
             "caller_status_bytes",
             "caller_image",
             "worker_image_check",
@@ -57,6 +58,8 @@ fn control_shutdown_requires_original_authenticated_two_hop_chain() {
             ("peer_pid", json!(102)),
             ("peer_uid", json!(65534)),
             ("peer_gid", json!(65534)),
+            ("peer_gid", json!(0)),
+            ("peer_gid", json!(1235)),
             ("revision", json!(1)),
         ] {
             let mut case = linux_lifecycle_case::loss_case("control", phase);
@@ -76,6 +79,20 @@ fn control_shutdown_requires_original_authenticated_two_hop_chain() {
                 "accepted substituted control {field} at {phase}"
             );
         }
+        let mut case = linux_lifecycle_case::loss_case("control", phase);
+        case.validate().unwrap();
+        mutate_action(&mut case, |value| {
+            value["peer_gid"] = json!(1235);
+            value["control_endpoint"]["gid"] = json!(1235);
+            value["control_endpoint"]["supplementary_groups"] = json!([1235]);
+            value["control_endpoint"]["group_argument"] = json!(b"--groups=1235".as_slice());
+            value["control_status_bytes"] =
+                json!(b"Uid:\t0\t0\t0\t0\nGid:\t1235\t1235\t1235\t1235\n".as_slice());
+        });
+        assert!(
+            case.validate().is_err(),
+            "accepted coherent foreign endpoint group at {phase}"
+        );
     }
 }
 

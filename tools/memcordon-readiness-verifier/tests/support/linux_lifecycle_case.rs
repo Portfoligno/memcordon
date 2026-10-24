@@ -210,8 +210,16 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         b"--".to_vec(),
     ]);
     arguments.extend(argv.clone());
-    let command = json!({"format":"memcordon.linux-owned-frontend-invocation","revision":1,"program":b"/usr/bin/setpriv","arguments":arguments,
+    let mut command = json!({"format":"memcordon.linux-owned-frontend-invocation","revision":1,"program":b"/usr/bin/setpriv","arguments":arguments,
         "environment_cleared":true,"caller_uid":65534,"caller_gid":65534,"selected_cli_sha256":sha256(cli)});
+    let control_group = 1234_u32;
+    if actor == "control" {
+        let group_argument = format!("--groups={control_group}").into_bytes();
+        command["arguments"][4] = json!(group_argument);
+        command["endpoint_access"] = json!({"format":"memcordon.linux-owned-frontend-endpoint-access","revision":1,
+            "path":b"/run/memcordon/sealed-agent.sock","device":1,"inode":450,"uid":0,"gid":control_group,
+            "mode":0o140660,"links":1,"supplementary_groups":[control_group],"group_argument":group_argument});
+    }
     let command_bytes = serde_json::to_vec(&command).unwrap();
     persist(&mut case, "frontend-invocation.json", &command_bytes);
     let preinput = json!({"format":"memcordon.linux-lifecycle-frontend-preinput","revision":1,"identity":identity,"cell":cell,"lease_id":"original-lease","key":key,
@@ -271,12 +279,13 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         let control_image =
             json!({"device":1,"inode":501,"length":agent.len(),"sha256":sha256(agent)});
         let caller_image = json!({"device":1,"inode":502,"length":cli.len(),"sha256":sha256(cli)});
-        json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":2,"worker":{"pid":101,"birth":300},"caller":{"pid":102,"birth":301},
+        json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":3,"worker":{"pid":101,"birth":300},"caller":{"pid":102,"birth":301},
         "control":{"pid":106,"birth":305,"native_image":control_image,"journal_sha256":sha256(&graph.journal_bytes)},
-        "control_status_bytes":b"Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n".as_slice(),
+        "control_endpoint":command["endpoint_access"],
+        "control_status_bytes":format!("Uid:\t0\t0\t0\t0\nGid:\t{control_group}\t{control_group}\t{control_group}\t{control_group}\n").as_bytes(),
         "worker_image_check":image_check(101,300,&intent["native_image"]),"control_image_check":image_check(106,305,&control_image),
         "caller_image":caller_image,"caller_image_check":image_check(102,301,&caller_image),
-        "source_descriptor":13,"device":1,"inode":700,"peer_pid":106,"peer_uid":0,"peer_gid":0,"socket_type":1,"socket_domain":1,
+        "source_descriptor":13,"device":1,"inode":700,"peer_pid":106,"peer_uid":0,"peer_gid":control_group,"socket_type":1,"socket_domain":1,
         "caller_status_bytes":b"Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\n".as_slice(),"native_how":2,"native_status":0,"native_errno":null})
     } else {
         json!({"format":"memcordon.linux-lifecycle-pidfd-kill","revision":1,"actor":intent["actor"],"signal":9,"native_status":0,"native_errno":null})
