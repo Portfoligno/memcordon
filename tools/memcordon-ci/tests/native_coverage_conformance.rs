@@ -83,7 +83,7 @@ fn binary_harness_owner_builds_ordinary_sibling_before_both_phases() {
 #[test] fn launches_ordinary_sibling() {
     let current = std::env::current_exe().unwrap();
     let ordinary = current.parent().unwrap().parent().unwrap()
-        .join(format!("owned-sibling{}", std::env::consts::EXE_SUFFIX));
+        .join("owned-sibling").with_extension(std::env::consts::EXE_EXTENSION);
     assert!(std::process::Command::new(ordinary).status().unwrap().success());
 }
 "#,
