@@ -174,6 +174,46 @@ struct CreationInput<'a> {
     arguments: &'a [Vec<u16>],
 }
 
+fn unselected_creation_error(
+    created: &super::toolchain_debug::Created,
+    inputs: &super::descriptor::Toolchain,
+    original_rustc_sha256: &str,
+) -> io::Error {
+    use std::os::windows::ffi::OsStrExt;
+    let path_context = |path: &Path| {
+        let total = path.as_os_str().encode_wide().count();
+        let prefix: Vec<_> = path
+            .as_os_str()
+            .encode_wide()
+            .take(
+                memcordon_core::workload_limits::ENTRYPOINT_PATH_BYTES / std::mem::size_of::<u16>(),
+            )
+            .collect();
+        serde_json::json!({
+            "display_prefix":String::from_utf16_lossy(&prefix),
+            "utf16_units_total":total,"truncated":prefix.len() < total,
+            "utf16_prefix":prefix,
+        })
+    };
+    let context = serde_json::json!({
+        "format":"memcordon.windows-unselected-compiler-creation","revision":1,
+        "diagnostic_only":true,"child":created.identity,
+        "parent_pid":created.parent_pid,"parent_birth":created.parent_birth,
+        "held_created_image":{"path":path_context(&created.image),"sha256":created.image_sha256},
+        "selected_rustc":{"path":path_context(&inputs.rustc),"original_held_sha256":original_rustc_sha256},
+        "selected_linker":{"path":path_context(&inputs.native_linker),"held_sha256":null,
+            "digest_observation":"selected linker digest is not retained in this creation callback"},
+    });
+    match serde_json::to_string(&context) {
+        Ok(context) => io::Error::other(format!(
+            "unselected real compiler descendant image; context={context}"
+        )),
+        Err(_) => io::Error::other(
+            "unselected real compiler descendant image; diagnostic serialization failed",
+        ),
+    }
+}
+
 fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Result<Output> {
     let CreationInput {
         root,
@@ -280,9 +320,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                     original = Some((identity, live));
                 }
                 if created.image != inputs.rustc && created.image != inputs.native_linker {
-                    return Err(io::Error::other(
-                        "unselected real compiler descendant image",
-                    ));
+                    return Err(unselected_creation_error(created, inputs, image_sha256));
                 }
                 let path = output_root.join(format!(
                     "native-toolchain-{}-{}.ack.json",

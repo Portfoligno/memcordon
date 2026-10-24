@@ -2831,6 +2831,64 @@ pub(crate) mod native {
         )
     }
 
+    fn toolchain_completion_published(
+        transcript: &Path,
+        root_pid: u32,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        let published = super::live_events(
+            &read(transcript, 16 * 1024 * 1024)
+                .map_err(io::Error::other)
+                .map_err(|error| {
+                    toolchain_observation_error("read fixture transcript", transcript, error)
+                })?,
+        )
+        .map_err(io::Error::other)?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "native compiler descendant observer deadline expired",
+            ));
+        }
+        Ok(published.iter().any(|event| {
+            event.pid == root_pid && event.stage == "toolchain-test-child-dll-complete"
+        }))
+    }
+
+    fn toolchain_observation_complete(
+        transcript: &Path,
+        root_pid: u32,
+        family: &Arc<Mutex<Vec<WindowsImageProcess>>>,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        if toolchain_completion_published(transcript, root_pid, deadline)? {
+            return Ok(true);
+        }
+        let retired = {
+            let held = family
+                .lock()
+                .map_err(|_| io::Error::other("compiler family ownership poisoned"))?;
+            // The original root is retained first; descendants are only appended.
+            // Never reacquire ownership from a numeric PID after retirement.
+            let root = held
+                .first()
+                .filter(|root| root.identity.pid == root_pid)
+                .ok_or_else(|| {
+                    io::Error::other("native compiler observer lost its held fixture root")
+                })?;
+            root.has_exited()?
+        };
+        if retired {
+            // A final durable event may have raced the native retirement read.
+            if toolchain_completion_published(transcript, root_pid, deadline)? {
+                return Ok(true);
+            }
+            return Err(io::Error::other(
+                "native compiler fixture retired before publishing toolchain completion",
+            ));
+        }
+        Ok(false)
+    }
+
     fn observe_toolchain_descendants(
         directory: &Path,
         output_root: &Path,
@@ -2844,7 +2902,13 @@ pub(crate) mod native {
         let deadline = work_deadline.min(Instant::now() + Duration::from_secs(600));
         let mut ordinal = 0u32;
         loop {
+            if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
+                return Ok(());
+            }
             for image in images {
+                if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
+                    return Ok(());
+                }
                 let processes =
                     memcordon_testkit::windows_processes_for_image_until(&image.path, deadline)
                         .map_err(|error| {
@@ -2992,17 +3056,7 @@ pub(crate) mod native {
                     );
                 }
             }
-            let published = super::live_events(
-                &read(transcript, 16 * 1024 * 1024)
-                    .map_err(io::Error::other)
-                    .map_err(|error| {
-                        toolchain_observation_error("read fixture transcript", transcript, error)
-                    })?,
-            )
-            .map_err(io::Error::other)?;
-            if published.iter().any(|event| {
-                event.pid == root_pid && event.stage == "toolchain-test-child-dll-complete"
-            }) {
+            if toolchain_observation_complete(transcript, root_pid, family, deadline)? {
                 return Ok(());
             }
             if Instant::now() >= deadline {
