@@ -281,26 +281,46 @@ pub(super) fn execute_brokered(
         }
         let held = unsafe { OwnedFd::from_raw_fd(raw) };
         let worker = super::private_attempt::ProcessIdentityV4::observe(pid, held.as_fd())?;
-        Ok::<_, String>((execution_deadline, record, worker, held))
-    })();
-    let (mut execution_deadline, record, worker, _held_worker) = match preallocation {
-        Ok(value) => value,
-        Err(error) => {
-            return terminal(
-                request,
-                MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
-                    request_sha256: request_digest,
-                    request_bytes_sha256: envelope.public_request_sha256,
-                    detail: rejection_detail(&error),
-                    reason: MixedAdmissionRejectionV2::NativeSetupFailed,
-                    allocation: outstanding(
-                        MixedAuthorizationKnowledgeV2::NeverAuthorized,
-                        Vec::new(),
-                    ),
-                },
-            );
+        // SAFETY: pidfd_open receives the already authenticated positive broker PID and no flags.
+        let raw_control = unsafe { libc::syscall(libc::SYS_pidfd_open, control_pid, 0) } as i32;
+        if raw_control < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
         }
-    };
+        // SAFETY: successful pidfd_open returned a newly owned descriptor.
+        let held_control = unsafe { OwnedFd::from_raw_fd(raw_control) };
+        let control =
+            super::private_attempt::ProcessIdentityV4::observe(control_pid, held_control.as_fd())?;
+        if control.start_time != control_birth {
+            return Err("mixed authenticated control birth changed".into());
+        }
+        Ok::<_, String>((
+            execution_deadline,
+            record,
+            worker,
+            held,
+            control,
+            held_control,
+        ))
+    })();
+    let (mut execution_deadline, record, worker, _held_worker, control, _held_control) =
+        match preallocation {
+            Ok(value) => value,
+            Err(error) => {
+                return terminal(
+                    request,
+                    MixedRuntimeOutcomeV2::RejectedBeforeAuthorization {
+                        request_sha256: request_digest,
+                        request_bytes_sha256: envelope.public_request_sha256,
+                        detail: rejection_detail(&error),
+                        reason: MixedAdmissionRejectionV2::NativeSetupFailed,
+                        allocation: outstanding(
+                            MixedAuthorizationKnowledgeV2::NeverAuthorized,
+                            Vec::new(),
+                        ),
+                    },
+                );
+            }
+        };
     let mut retained_journal = None;
     let mut admission = match MixedOperationalAdmission::authenticate(
         envelope.contract,
@@ -308,6 +328,13 @@ pub(super) fn execute_brokered(
         captured,
         request.attempt_id,
         |metadata| {
+            if super::private_attempt::ProcessIdentityV4::observe(
+                control_pid,
+                _held_control.as_fd(),
+            )? != control
+            {
+                return Err("mixed authenticated control changed before journal allocation".into());
+            }
             retained_journal = Some(super::private_attempt::DurablePrivateAttempt::create(
                 record,
             )?);
@@ -319,6 +346,10 @@ pub(super) fn execute_brokered(
                 .as_mut()
                 .expect("original mixed ownership journal retained")
                 .record_mixed_worker(worker)?;
+            retained_journal
+                .as_mut()
+                .expect("original mixed ownership journal retained")
+                .record_mixed_control(control)?;
             Ok(())
         },
     ) {

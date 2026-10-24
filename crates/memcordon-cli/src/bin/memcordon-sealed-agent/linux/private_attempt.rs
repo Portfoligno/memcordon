@@ -126,6 +126,8 @@ pub struct PrivateAttemptRecordV4 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixed_worker: Option<ProcessIdentityV4>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_control: Option<ProcessIdentityV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixed_cgroup_identity: Option<MixedDirectoryIdentityV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixed_staging_identity: Option<MixedDirectoryIdentityV2>,
@@ -192,6 +194,7 @@ impl PrivateAttemptRecordV4 {
             mixed_export_identity: None,
             mixed_root_staging_intent: None,
             mixed_worker: None,
+            mixed_control: None,
             mixed_cgroup_identity: None,
             mixed_staging_identity: None,
             phase: PrivateAttemptPhase::Allocated,
@@ -222,6 +225,7 @@ impl PrivateAttemptRecordV4 {
             return Err("native journal has conflicting admission revisions".into());
         }
         if self.mixed_worker.is_some()
+            || self.mixed_control.is_some()
             || self.mixed_cgroup_identity.is_some()
             || self.mixed_staging_identity.is_some()
         {
@@ -232,6 +236,21 @@ impl PrivateAttemptRecordV4 {
                 worker.validate()?;
                 if worker == &self.frontend {
                     return Err("mixed worker aliases frontend".into());
+                }
+            }
+            if let Some(control) = &self.mixed_control {
+                control.validate()?;
+                if control.pid == self.frontend.pid
+                    || self
+                        .mixed_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.pid == control.pid)
+                    || [&self.guardian, &self.namespace_init, &self.target]
+                        .into_iter()
+                        .flatten()
+                        .any(|actor| actor.pid == control.pid)
+                {
+                    return Err("mixed authenticated control aliases another actor".into());
                 }
             }
             if [&self.mixed_cgroup_identity, &self.mixed_staging_identity]
@@ -770,6 +789,26 @@ impl DurablePrivateAttempt {
         }
         let mut next = self.record.clone();
         next.mixed_worker = Some(worker);
+        self.replace(next)
+    }
+    pub(crate) fn record_mixed_control(
+        &mut self,
+        control: ProcessIdentityV4,
+    ) -> Result<(), String> {
+        if self.record.phase != PrivateAttemptPhase::Allocated
+            || self.record.mixed_admission_metadata.is_none()
+        {
+            return Err("mixed authenticated control must precede native allocation".into());
+        }
+        if let Some(original) = &self.record.mixed_control {
+            return if original == &control {
+                Ok(())
+            } else {
+                Err("mixed authenticated control changed".into())
+            };
+        }
+        let mut next = self.record.clone();
+        next.mixed_control = Some(control);
         self.replace(next)
     }
     pub(super) fn record_mixed_export_identity(

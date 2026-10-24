@@ -95,7 +95,7 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
     if delivery {
         argv.push(b"0".to_vec());
     }
-    let graph = prepared::prepared_graph(
+    let mut graph = prepared::prepared_graph(
         &contract,
         &activation,
         &original["provider"],
@@ -105,6 +105,12 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         300000,
         agent,
     );
+    if actor == "control" {
+        graph.journal["mixed_control"] = json!({"pid":106,"start_time":305});
+        graph.journal_bytes = prepared::durable_journal(&graph.journal);
+        graph.worker["journal_bytes"] = json!(graph.journal_bytes);
+        graph.worker["journal_sha256"] = json!(sha256(&graph.journal_bytes));
+    }
     let attempt = graph.prepared["admission"]["attempt_id"].as_str().unwrap();
     let identity = original["identity"].clone();
     let cell = original["cell"].clone();
@@ -256,13 +262,26 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
     let intent = json!({"format":"memcordon.linux-lifecycle-controller-intent","revision":1,"identity":identity,"cell":cell,"lease_id":"original-lease","key":key,"attempt_id":attempt,
         "actor":prepared::held(pid,birth,false),"phase":phase_journal["phase"],"release_knowledge":phase_journal["release_knowledge"],"journal_sha256":sha256(&phase_bytes),"release_barrier":release,"retirement_barrier":retirement,
         "native_image":{"device":1,"inode":500,"length":selected.len(),"sha256":sha256(selected)},"selected_image_sha256":sha256(selected),"native_operation":if actor=="control"{"socket-shutdown"}else{"pidfd-sigkill"}});
-    let action = if actor == "control" {
-        json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":1,"worker":{"pid":101,"birth":300},"caller":{"pid":102,"birth":301},
-        "source_descriptor":13,"device":1,"inode":700,"peer_uid":65534,"peer_gid":65534,"socket_type":1,"socket_domain":1,
+    let image_check = |pid: u32, birth: u64, image: &Value| {
+        json!({"current_image_verified":true,"pid":pid,"birth":birth,
+        "device":image["device"],"inode":image["inode"],"length":image["length"],"original_held_metadata_unchanged":true,
+        "rehash":"not repeated; unchanged original measured executable remains held"})
+    };
+    let mut action = if actor == "control" {
+        let control_image =
+            json!({"device":1,"inode":501,"length":agent.len(),"sha256":sha256(agent)});
+        let caller_image = json!({"device":1,"inode":502,"length":cli.len(),"sha256":sha256(cli)});
+        json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":2,"worker":{"pid":101,"birth":300},"caller":{"pid":102,"birth":301},
+        "control":{"pid":106,"birth":305,"native_image":control_image,"journal_sha256":sha256(&graph.journal_bytes)},
+        "control_status_bytes":b"Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n".as_slice(),
+        "worker_image_check":image_check(101,300,&intent["native_image"]),"control_image_check":image_check(106,305,&control_image),
+        "caller_image":caller_image,"caller_image_check":image_check(102,301,&caller_image),
+        "source_descriptor":13,"device":1,"inode":700,"peer_pid":106,"peer_uid":0,"peer_gid":0,"socket_type":1,"socket_domain":1,
         "caller_status_bytes":b"Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\n".as_slice(),"native_how":2,"native_status":0,"native_errno":null})
     } else {
         json!({"format":"memcordon.linux-lifecycle-pidfd-kill","revision":1,"actor":intent["actor"],"signal":9,"native_status":0,"native_errno":null})
     };
+    action["current_image_check"] = image_check(pid, birth, &intent["native_image"]);
     if !delivery {
         persist(
             &mut case,

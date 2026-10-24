@@ -11,6 +11,75 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn control_shutdown_requires_original_authenticated_two_hop_chain() {
+    fn mutate_action(
+        case: &mut persisted_case::PersistedCase,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+        let action_path = format!("{prefix}/controller-action.json");
+        case.mutate(&action_path, edit);
+        let action: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(case.root.path().join(&action_path)).unwrap())
+                .unwrap();
+        case.mutate(&format!("{prefix}/lifecycle-loss-raw.json"), |raw| {
+            let observation = raw["observations"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|observation| {
+                    observation["format"] == "memcordon.linux-lifecycle-intervention"
+                })
+                .unwrap();
+            observation["action"] = action;
+        });
+    }
+    for phase in ["allocation", "release", "drain"] {
+        for field in [
+            "control",
+            "control_status_bytes",
+            "caller_status_bytes",
+            "caller_image",
+            "worker_image_check",
+            "control_image_check",
+            "caller_image_check",
+            "current_image_check",
+        ] {
+            let mut case = linux_lifecycle_case::loss_case("control", phase);
+            case.validate().unwrap();
+            mutate_action(&mut case, |value| value[field] = json!(null));
+            assert!(
+                case.validate().is_err(),
+                "accepted missing {field} at {phase}"
+            );
+        }
+        for (field, replacement) in [
+            ("peer_pid", json!(102)),
+            ("peer_uid", json!(65534)),
+            ("peer_gid", json!(65534)),
+            ("revision", json!(1)),
+        ] {
+            let mut case = linux_lifecycle_case::loss_case("control", phase);
+            case.validate().unwrap();
+            mutate_action(&mut case, |value| value[field] = replacement);
+            assert!(
+                case.validate().is_err(),
+                "accepted substituted {field} at {phase}"
+            );
+        }
+        for field in ["pid", "birth", "journal_sha256", "native_image"] {
+            let mut case = linux_lifecycle_case::loss_case("control", phase);
+            case.validate().unwrap();
+            mutate_action(&mut case, |value| value["control"][field] = json!(null));
+            assert!(
+                case.validate().is_err(),
+                "accepted substituted control {field} at {phase}"
+            );
+        }
+    }
+}
+
+#[test]
 fn retiring_witness_rejects_rehashed_original_owner_and_journal_substitution() {
     use sha2::{Digest, Sha256};
     let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
@@ -282,7 +351,7 @@ fn persisted_twelve_losses_require_original_phase_transport_and_descendant_custo
             let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
             if actor == "control" {
                 let path = format!("{prefix}/controller-action.json");
-                case.mutate(&path, |raw| raw["peer_uid"] = json!(0));
+                case.mutate(&path, |raw| raw["peer_uid"] = json!(65534));
                 let action: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(case.root.path().join(path)).unwrap())
                         .unwrap();

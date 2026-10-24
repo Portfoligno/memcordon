@@ -1904,6 +1904,7 @@ pub fn retain_prepared_worker(
         ));
     }
     for (field, process) in [
+        ("frontend", &observer.caller),
         ("target", &observer.target),
         ("namespace_init", &observer.namespace_init),
         ("guardian", &observer.guardian),
@@ -2028,6 +2029,78 @@ pub fn retain_prepared_worker(
         "attempt_id":attempt,"provider":observer.observation.provider,"admission":observer.observation.admission,
         "journal_path":path,"journal_device":before.dev(),"journal_inode":before.ino(),"journal_sha256":hex(&Sha256::digest(&bytes)),
         "journal_bytes":bytes,"worker":{"pid":pid,"birth":birth,"image_sha256":expected_agent_sha256},"native_image":image}),
+    )
+}
+
+/// Pin the authenticated public control worker from the same protected journal
+/// already retained for this prepared execution worker. This is a separate
+/// native owner; it never substitutes for the unprivileged frontend.
+pub fn retain_prepared_control(
+    source: &serde_json::Value,
+    observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
+    expected_agent_sha256: &str,
+    deadline: Instant,
+    workers: &mut Vec<crate::linux_consumer_readiness::HeldLinuxProcess>,
+) -> Result<serde_json::Value> {
+    remaining(deadline)?;
+    let bytes: Vec<u8> = serde_json::from_value(source["journal_bytes"].clone())?;
+    if source["journal_sha256"] != hex(&Sha256::digest(&bytes)) {
+        return Err(CiError::Message(
+            "control source journal checksum differs".into(),
+        ));
+    }
+    let attempt = observer.observation.admission.attempt_id.as_str();
+    let record = super::linux_phase_journal::decode(&bytes, attempt).map_err(CiError::Message)?;
+    if record["mixed_admission_metadata"] != serde_json::to_value(&observer.observation.admission)?
+        || record["frontend"]
+            != serde_json::json!({"pid":observer.caller.process_id,"start_time":observer.caller.birth})
+    {
+        return Err(CiError::Message(
+            "control original caller/admission association differs".into(),
+        ));
+    }
+    let identity = &record["mixed_control"];
+    let pid = identity["pid"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
+        .ok_or_else(|| CiError::Message("authenticated control PID absent".into()))?;
+    let birth = identity["start_time"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CiError::Message("authenticated control birth absent".into()))?;
+    if identity.as_object().is_none_or(|object| object.len() != 2)
+        || [
+            observer.caller.process_id,
+            observer.target.process_id,
+            observer.namespace_init.process_id,
+            observer.guardian.process_id,
+        ]
+        .contains(&pid)
+        || workers.iter().any(|owner| owner.process_id == pid)
+    {
+        return Err(CiError::Message(
+            "authenticated control aliases original family".into(),
+        ));
+    }
+    workers.push(
+        crate::linux_consumer_readiness::HeldLinuxProcess::acquire(pid, birth)
+            .map_err(CiError::Message)?,
+    );
+    let owner = workers
+        .last_mut()
+        .expect("original authenticated control retained");
+    let image = owner
+        .hold_executable_image(deadline)
+        .map_err(CiError::Message)?;
+    if image["sha256"] != expected_agent_sha256 {
+        return Err(CiError::Message(
+            "authenticated control image differs from selected agent".into(),
+        ));
+    }
+    remaining(deadline)?;
+    Ok(
+        serde_json::json!({"pid":pid,"birth":birth,"native_image":image,"journal_sha256":source["journal_sha256"]}),
     )
 }
 
