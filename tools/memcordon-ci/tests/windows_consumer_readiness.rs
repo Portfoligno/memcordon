@@ -1,9 +1,9 @@
 use memcordon_ci::windows_consumer_readiness::descriptor::{
-    CHURN_CREATIONS, CHURN_LIVE, Case, Descriptor, Toolchain,
+    self, CHURN_CREATIONS, CHURN_LIVE, Case, Descriptor, Toolchain,
 };
 use memcordon_ci::windows_consumer_readiness::{
     CaseAssessment, SuiteInput, accepted, check_positive_barrier_result, positive_keys,
-    validate_suite,
+    validate_suite, validate_toolchain_inventory,
 };
 
 #[test]
@@ -121,6 +121,15 @@ fn descriptor() -> Descriptor {
             native_work_frequency: 1,
             rustc: root.join("rustc.exe"),
             native_linker: root.join("link.exe"),
+            selected_images: descriptor::project_toolchain_images(
+                ["rustc.exe", "link.exe"].into_iter().map(|name| {
+                    (
+                        root.join(name),
+                        String::from(memcordon_core::DiagnosticSha256::from_bytes([7; 32])),
+                    )
+                }),
+            )
+            .unwrap(),
             native_library_directories: ["vc", "ucrt", "um"]
                 .into_iter()
                 .map(|name| root.join(name))
@@ -133,6 +142,75 @@ fn descriptor() -> Descriptor {
             target: "x86_64-pc-windows-msvc".into(),
         }),
     }
+}
+
+#[test]
+fn compiler_creation_uses_the_exact_frozen_measured_executable_inventory() {
+    let mut input = descriptor();
+    input.validate().unwrap();
+    let toolchain = input.toolchain.as_mut().unwrap();
+    let root = toolchain.rustc.parent().unwrap().to_owned();
+    let helper = root.join("compiler-helper.exe");
+    let helper_digest = String::from(memcordon_core::DiagnosticSha256::from_bytes([9; 32]));
+    let mut measured: Vec<_> = toolchain
+        .selected_images
+        .iter()
+        .map(|image| (image.path.clone(), image.sha256.clone()))
+        .collect();
+    measured.push((helper.clone(), helper_digest.clone()));
+    measured.push((root.join("library.rs"), helper_digest.clone()));
+    let frozen = descriptor::project_toolchain_images(measured).unwrap();
+    toolchain.selected_images = frozen.clone();
+    validate_toolchain_inventory(toolchain, &frozen).unwrap();
+    assert!(toolchain.admits_created_image(&helper, &helper_digest));
+    let changed_digest = String::from(memcordon_core::DiagnosticSha256::from_bytes([10; 32]));
+    assert!(!toolchain.admits_created_image(&helper, &changed_digest));
+    assert!(!toolchain.admits_created_image(&root.join("foreign.exe"), &helper_digest));
+    let mut omitted = frozen.clone();
+    omitted.retain(|image| image.path != helper);
+    assert!(validate_toolchain_inventory(toolchain, &omitted).is_err());
+    let mut rehashed = frozen.clone();
+    rehashed
+        .iter_mut()
+        .find(|image| image.path == helper)
+        .unwrap()
+        .sha256 = changed_digest;
+    assert!(validate_toolchain_inventory(toolchain, &rehashed).is_err());
+    let valid = toolchain.clone();
+    for malformed in [
+        Vec::new(),
+        vec![frozen[0].clone(), frozen[0].clone()],
+        frozen
+            .iter()
+            .filter(|image| image.path != valid.rustc)
+            .cloned()
+            .collect(),
+        frozen
+            .iter()
+            .filter(|image| image.path != valid.native_linker)
+            .cloned()
+            .collect(),
+    ] {
+        toolchain.selected_images = malformed;
+        assert!(toolchain.validate_selected_images().is_err());
+    }
+    toolchain.selected_images = frozen;
+    toolchain.selected_images[0].sha256 = "invalid".into();
+    assert!(toolchain.validate_selected_images().is_err());
+    let overflow = (0..=descriptor::MAX_TOOLCHAIN_IMAGES).map(|index| {
+        (
+            root.join(index.to_string()).with_extension("exe"),
+            helper_digest.clone(),
+        )
+    });
+    assert!(descriptor::project_toolchain_images(overflow).is_err());
+    assert!(
+        descriptor::project_toolchain_images([(
+            root.join("..").join("foreign.exe"),
+            helper_digest.clone()
+        ),])
+        .is_err()
+    );
 }
 
 #[test]

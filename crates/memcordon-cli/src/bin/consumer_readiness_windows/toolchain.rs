@@ -195,14 +195,23 @@ fn unselected_creation_error(
             "utf16_prefix":prefix,
         })
     };
+    let selected_digest = |path: &Path| {
+        inputs
+            .selected_images
+            .iter()
+            .find(|image| image.path == path)
+            .map(|image| image.sha256.as_str())
+    };
     let context = serde_json::json!({
         "format":"memcordon.windows-unselected-compiler-creation","revision":1,
         "diagnostic_only":true,"child":created.identity,
         "parent_pid":created.parent_pid,"parent_birth":created.parent_birth,
         "held_created_image":{"path":path_context(&created.image),"sha256":created.image_sha256},
-        "selected_rustc":{"path":path_context(&inputs.rustc),"original_held_sha256":original_rustc_sha256},
+        "selected_rustc":{"path":path_context(&inputs.rustc),"original_held_sha256":original_rustc_sha256,
+            "frozen_selected_sha256":selected_digest(&inputs.rustc)},
         "selected_linker":{"path":path_context(&inputs.native_linker),"held_sha256":null,
-            "digest_observation":"selected linker digest is not retained in this creation callback"},
+            "frozen_selected_sha256":selected_digest(&inputs.native_linker),
+            "digest_observation":"a selected linker file handle is not retained in this creation callback"},
     });
     match serde_json::to_string(&context) {
         Ok(context) => io::Error::other(format!(
@@ -319,7 +328,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                     })?;
                     original = Some((identity, live));
                 }
-                if created.image != inputs.rustc && created.image != inputs.native_linker {
+                if !inputs.admits_created_image(&created.image, &created.image_sha256) {
                     return Err(unselected_creation_error(created, inputs, image_sha256));
                 }
                 let path = output_root.join(format!(

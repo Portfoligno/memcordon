@@ -13,6 +13,21 @@ use std::time::Duration;
 #[path = "../../../crates/memcordon-cli/src/bin/consumer_readiness_windows/descriptor.rs"]
 pub mod descriptor;
 
+pub fn validate_toolchain_inventory(
+    toolchain: &descriptor::Toolchain,
+    measured: &[descriptor::ToolchainImage],
+) -> Result<()> {
+    toolchain
+        .validate_selected_images()
+        .map_err(CiError::Message)?;
+    if toolchain.selected_images != measured {
+        return Err(CiError::Message(
+            "native compiler descriptor differs from measured executable inventory".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[path = "windows_loader_event_diagnostics.rs"]
 pub mod loader_event_diagnostics;
 
@@ -1334,6 +1349,7 @@ pub(crate) mod native {
             native_work_frequency,
             rustc: compiler,
             native_linker: PathBuf::new(),
+            selected_images: Vec::new(),
             native_library_directories: Vec::new(),
             library_source: sources.join("library.rs"),
             test_source: sources.join("tests.rs"),
@@ -1448,6 +1464,15 @@ pub(crate) mod native {
             });
             *source = destination;
         }
+        toolchain.selected_images = descriptor::project_toolchain_images(
+            copied_measurements
+                .iter()
+                .map(|image| (image.path.clone(), image.sha256.clone())),
+        )
+        .map_err(CiError::Message)?;
+        toolchain
+            .validate_selected_images()
+            .map_err(CiError::Message)?;
         fs::write(
             directory.join("windows-owned-inputs.json"),
             serde_json::to_vec_pretty(&copied_measurements)?,
@@ -2896,7 +2921,7 @@ pub(crate) mod native {
         transcript: &Path,
         root_pid: u32,
         family: &Arc<Mutex<Vec<WindowsImageProcess>>>,
-        images: &[crate::windows_installed_cases::SelectedArtifact],
+        images: &[descriptor::ToolchainImage],
         work_deadline: Instant,
     ) -> io::Result<()> {
         let deadline = work_deadline.min(Instant::now() + Duration::from_secs(600));
@@ -3203,18 +3228,17 @@ pub(crate) mod native {
                     &config.output_directory.join("windows-owned-inputs.json"),
                     64 * 1024 * 1024,
                 )?)?;
-            for image in measured.into_iter().filter(|image| {
-                image
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-            }) {
-                if toolchain_images.len() >= 256
-                    || crate::windows_causal_acceptance::sha256(&read(
-                        &image.path,
-                        512 * 1024 * 1024,
-                    )?) != image.sha256
+            let selected = descriptor::project_toolchain_images(
+                measured.into_iter().map(|image| (image.path, image.sha256)),
+            )
+            .map_err(CiError::Message)?;
+            let toolchain = input.descriptor.toolchain.as_ref().ok_or_else(|| {
+                CiError::Message("native compiler descriptor inventory absent".into())
+            })?;
+            super::validate_toolchain_inventory(toolchain, &selected)?;
+            for image in selected {
+                if crate::windows_causal_acceptance::sha256(&read(&image.path, 512 * 1024 * 1024)?)
+                    != image.sha256
                 {
                     return Err(CiError::Message("native compiler observer input image is unmeasured or exceeds finite closure".into()));
                 }

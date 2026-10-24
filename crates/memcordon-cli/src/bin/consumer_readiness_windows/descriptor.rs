@@ -1,12 +1,64 @@
 //! Private owned workload inputs. These are never provider authorization.
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 pub const CHURN_CREATIONS: u32 = 4096;
 // One TCP peer remains live alongside the cohort, so 63 leaves preserve the
 // profile's maximum of 64 simultaneous workload descendants.
 pub const CHURN_LIVE: u32 = 63;
+pub const MAX_TOOLCHAIN_IMAGES: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainImage {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// Freeze only executable members of the already measured owned-input catalog.
+/// Both the descriptor producer and native controller use this projection.
+pub fn project_toolchain_images(
+    measured: impl IntoIterator<Item = (PathBuf, String)>,
+) -> Result<Vec<ToolchainImage>, String> {
+    let mut images = std::collections::BTreeMap::new();
+    for (path, sha256) in measured {
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        {
+            continue;
+        }
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || path
+                .as_os_str()
+                .to_str()
+                .is_none_or(|text| text.contains('\0'))
+        {
+            return Err("selected compiler image path is not an absolute ordinary path".into());
+        }
+        memcordon_core::BoundedText::<64>::new(&sha256)
+            .and_then(memcordon_core::DiagnosticSha256::try_from)
+            .map_err(str::to_owned)?;
+        if images.len() >= MAX_TOOLCHAIN_IMAGES
+            || images
+                .insert(path.clone(), ToolchainImage { path, sha256 })
+                .is_some()
+        {
+            return Err(
+                "selected compiler image inventory repeats a path or exceeds its bound".into(),
+            );
+        }
+    }
+    if images.is_empty() {
+        return Err("selected compiler image inventory is empty".into());
+    }
+    Ok(images.into_values().collect())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,6 +90,7 @@ pub struct Toolchain {
     pub native_work_frequency: u64,
     pub rustc: PathBuf,
     pub native_linker: PathBuf,
+    pub selected_images: Vec<ToolchainImage>,
     pub native_library_directories: Vec<PathBuf>,
     pub library_source: PathBuf,
     pub test_source: PathBuf,
@@ -45,6 +98,30 @@ pub struct Toolchain {
     pub dll_source: PathBuf,
     pub loader_source: PathBuf,
     pub target: String,
+}
+
+impl Toolchain {
+    pub fn validate_selected_images(&self) -> Result<(), String> {
+        let projected = project_toolchain_images(
+            self.selected_images
+                .iter()
+                .map(|image| (image.path.clone(), image.sha256.clone())),
+        )?;
+        if projected != self.selected_images
+            || [&self.rustc, &self.native_linker]
+                .iter()
+                .any(|path| !projected.iter().any(|image| &image.path == *path))
+        {
+            return Err("selected compiler image inventory is not canonical or omits the original compiler/linker".into());
+        }
+        Ok(())
+    }
+
+    pub fn admits_created_image(&self, path: &Path, sha256: &str) -> bool {
+        self.selected_images
+            .binary_search_by(|image| image.path.as_path().cmp(path))
+            .is_ok_and(|index| self.selected_images[index].sha256 == sha256)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,6 +258,16 @@ impl Descriptor {
                 return Err("invalid Windows toolchain paths/target".into());
             }
             _ => {}
+        }
+        if let Some(toolchain) = &self.toolchain {
+            toolchain.validate_selected_images()?;
+        }
+        if serde_json::to_vec(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_DESCRIPTOR_BYTES
+        {
+            return Err("fixture descriptor exceeds byte bound".into());
         }
         Ok(())
     }
