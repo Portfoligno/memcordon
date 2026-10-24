@@ -1130,6 +1130,7 @@ pub fn run_case(
         let backpressure = key.family == "L-LIFE-05" && key.scenario == "relay-backpressure";
         let launch = InstalledMixedLaunch::start_with_delivery_controls(
             InstalledMixedLaunchInput {
+                lifetime: memcordon_core::Lifetime::Command,
                 directory,
                 contract: context.contract_path,
                 caller_uid: 65534,

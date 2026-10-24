@@ -60,6 +60,7 @@ pub struct InstalledMixedLaunch {
 }
 
 pub struct InstalledMixedLaunchInput<'a> {
+    pub lifetime: memcordon_core::Lifetime,
     pub directory: &'a Path,
     pub contract: &'a Path,
     pub caller_uid: u32,
@@ -2817,6 +2818,14 @@ impl InstalledMixedDriver {
                     None
                 };
                 let launch_input = InstalledMixedLaunchInput {
+                    lifetime: if (key.family == "L-LIFE-01"
+                        && key.scenario == "root-first-resource-descendant")
+                        || (key.family == "C-LIFETIME" && key.scenario == "root-first")
+                    {
+                        memcordon_core::Lifetime::Workload
+                    } else {
+                        memcordon_core::Lifetime::Command
+                    },
                     directory: &directory.join("frontend"),
                     contract: &directory.join("mixed.contract.json"),
                     caller_uid: 65534,
@@ -6679,6 +6688,11 @@ impl InstalledMixedLaunch {
             .arg("/proc/self/fd/130/observations")
             .arg("--image-entrypoint")
             .arg("owned-readiness")
+            .arg("--wait-for")
+            .arg(match input.lifetime {
+                memcordon_core::Lifetime::Command => "command",
+                memcordon_core::Lifetime::Workload => "workload",
+            })
             .arg("--")
             .args(input.target_arguments)
             .env_clear()

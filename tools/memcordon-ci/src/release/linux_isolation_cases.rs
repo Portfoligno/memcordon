@@ -1481,6 +1481,7 @@ impl AccountRefusalReport {
         self.launches
             .push(super::linux_mixed_installed::InstalledMixedLaunch::start(
                 super::linux_mixed_installed::InstalledMixedLaunchInput {
+                    lifetime: memcordon_core::Lifetime::Command,
                     directory: &directory.join("frontend"),
                     contract: &directory.join(if scenario == "account-alias" {
                         "alias.contract.json"

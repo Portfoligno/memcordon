@@ -593,6 +593,11 @@ pub fn begin_case(
     });
     let launch = InstalledMixedLaunch::start_with_delivery_controls(
         InstalledMixedLaunchInput {
+            lifetime: if phase == "drain" {
+                memcordon_core::Lifetime::Workload
+            } else {
+                memcordon_core::Lifetime::Command
+            },
             directory,
             contract: context.contract_path,
             caller_uid: 65534,

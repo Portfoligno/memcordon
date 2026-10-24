@@ -1120,6 +1120,7 @@ fn probe_loader_closure(
         remaining(context.deadline)?.as_millis().min(60_000)
     );
     let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+        lifetime: memcordon_core::Lifetime::Command,
         directory: &directory.join("launch"),
         contract: &contract,
         caller_uid: 65534,
@@ -1406,6 +1407,7 @@ fn export_case(
         remaining(context.deadline)?.as_millis().min(60_000)
     );
     let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+        lifetime: memcordon_core::Lifetime::Command,
         directory: &directory.join("launch"),
         contract: &contract_path,
         caller_uid: 65534,

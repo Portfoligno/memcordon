@@ -1148,6 +1148,7 @@ pub fn restart_fresh_admission(
                 .max(1)
         ));
         let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+            lifetime: memcordon_core::Lifetime::Command,
             directory: &directory.join("frontend"),
             contract: &request,
             caller_uid: 65534,
@@ -1524,6 +1525,7 @@ fn execute_transition(
                 .max(1)
         ));
         let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+            lifetime: memcordon_core::Lifetime::Command,
             directory: &directory.join("frontend"),
             contract: &request,
             caller_uid: 65534,
@@ -1713,6 +1715,7 @@ fn execute_transition(
             ));
             let fresh_directory = directory.join("fresh-frontend");
             let fresh = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+                lifetime: memcordon_core::Lifetime::Command,
                 directory: &fresh_directory,
                 contract: &fresh_path,
                 caller_uid: 65534,
@@ -2220,6 +2223,7 @@ fn execute_binding(
                 .max(1)
         ));
         let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+            lifetime: memcordon_core::Lifetime::Command,
             directory: &directory.join("frontend"),
             contract: &path,
             caller_uid: caller,
