@@ -540,6 +540,8 @@ fn loader_preparation(
         format!("{directory}/observations"),
         "--image-entrypoint".into(),
         "owned-readiness".into(),
+        "--wait-for".into(),
+        "command".into(),
         "--".into(),
         "bytes-argv-status".into(),
         "0".into(),

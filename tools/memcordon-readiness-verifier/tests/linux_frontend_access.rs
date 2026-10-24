@@ -20,7 +20,7 @@ fn receipt() -> (Value, Vec<u8>) {
           b"--workload-contract",b"/proc/self/fd/129",b"--report-format",b"result-v2",
           b"--report",b"/proc/self/fd/130/result.json",
           b"--mixed-observation-directory",b"/proc/self/fd/130/observations",
-          b"--image-entrypoint",b"owned-readiness",b"--",b"tcp-http",b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".as_slice()],
+          b"--image-entrypoint",b"owned-readiness",b"--wait-for",b"command",b"--",b"tcp-http",b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".as_slice()],
         "file_access":{"format":"memcordon.linux-frontend-file-access","revision":1,
           "contract":source,"output_directory":{"descriptor":130,
           "path":b"/protected/case/frontend","device":1,"inode":4,

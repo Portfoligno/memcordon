@@ -903,7 +903,7 @@ pub(crate) fn validate_export_execution_graph(
         || command["caller_uid"] != 65534
         || command["caller_gid"] != 65534
         || command["selected_cli_sha256"] != cli.installed_sha256
-        || args.len() != 24
+        || args.len() != 26
         || wait["format"] != "memcordon.linux-policy-frontend-exit"
         || wait["revision"] != 1
         || wait["process_id"] != prepared["caller"]["pid"]
@@ -932,8 +932,10 @@ pub(crate) fn validate_export_execution_graph(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "export-object"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "export-object"),
     ] {
         if args[index] != text.as_bytes() {
             return Err("export frontend invoked unrelated authority/work".into());
@@ -954,8 +956,8 @@ pub(crate) fn validate_export_execution_graph(
         crate::linux_path::parent(row["result"].as_str().ok_or("export result path absent")?)
             .ok_or("export result parent absent")?;
     if args[17] != crate::linux_path::join(&result_parent, "observations").as_bytes()
-        || args[22] != challenge_hex.as_bytes()
-        || args[23] != scenario.as_bytes()
+        || args[24] != challenge_hex.as_bytes()
+        || args[25] != scenario.as_bytes()
     {
         return Err("export public argv/observation scope differs".into());
     }

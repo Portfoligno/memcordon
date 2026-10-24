@@ -552,7 +552,7 @@ fn validate_original_frontend(
         || command["caller_uid"] != 65534
         || command["caller_gid"] != 65534
         || command["selected_cli_sha256"] != cli.installed_sha256
-        || args.len() != 23
+        || args.len() != 25
     {
         return Err("ingress original request frontend/source differs".into());
     }
@@ -572,8 +572,10 @@ fn validate_original_frontend(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "tcp-http"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "tcp-http"),
     ] {
         if args[position] != expected.as_bytes() {
             return Err("ingress original qualified frontend recipe differs".into());
@@ -582,8 +584,8 @@ fn validate_original_frontend(
     if [11, 15, 17]
         .into_iter()
         .any(|position| !args[position].starts_with(b"/") || args[position].contains(&0))
-        || args[22].len() != 64
-        || !args[22]
+        || args[24].len() != 64
+        || !args[24]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
     {
@@ -597,7 +599,8 @@ pub(crate) fn validate_owned_frontend_launch(
     request: &Value,
     args: &[Vec<u8>],
 ) -> VerificationResult<()> {
-    if args.len() != 23 {
+    if args.len() != 25 || args[20] != b"--wait-for" || args[21] != b"command" || args[22] != b"--"
+    {
         return Err("owned original frontend argument cardinality differs".into());
     }
     let deadline = std::str::from_utf8(&args[8])
@@ -636,8 +639,8 @@ pub(crate) fn validate_owned_frontend_launch(
         || number(&launch, &mut offset, 8)? != 0
         || operand(&launch, &mut offset)? != args[19]
         || number(&launch, &mut offset, 4)? != 2
-        || operand(&launch, &mut offset)? != args[21]
-        || operand(&launch, &mut offset)? != args[22]
+        || operand(&launch, &mut offset)? != args[23]
+        || operand(&launch, &mut offset)? != args[24]
         || number(&launch, &mut offset, 4)? != 0
         || number(&launch, &mut offset, 1)? != 1
         || number(&launch, &mut offset, 8)? != 256 * 1024 * 1024

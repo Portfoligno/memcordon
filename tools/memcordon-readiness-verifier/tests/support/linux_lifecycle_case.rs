@@ -207,6 +207,12 @@ fn case_graph(actor: &str, phase: &str, delivery: bool) -> PersistedCase {
         format!("{frontend_directory}/frontend/observations").into_bytes(),
         b"--image-entrypoint".to_vec(),
         b"owned-readiness".to_vec(),
+        b"--wait-for".to_vec(),
+        if !delivery && phase == "drain" {
+            b"workload".to_vec()
+        } else {
+            b"command".to_vec()
+        },
         b"--".to_vec(),
     ]);
     arguments.extend(argv.clone());

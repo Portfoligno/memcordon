@@ -1156,7 +1156,22 @@ fn validate_frontend(
         NativeArguments::UnixBytes(values) => values,
         _ => return Err("lifecycle original argv is not native Unix bytes".into()),
     };
-    if arguments.len() != 21 + target.len()
+    let lifetime = if context.input.key.family == "L-LIFE-02"
+        && context.input.key.scenario.ends_with("-drain")
+    {
+        "workload"
+    } else {
+        "command"
+    };
+    let suffix = [
+        "--image-entrypoint",
+        "owned-readiness",
+        "--wait-for",
+        lifetime,
+        "--",
+    ];
+    let target_start = 18 + suffix.len();
+    if arguments.len() != target_start + target.len()
         || program != b"/usr/bin/setpriv"
         || command["format"] != "memcordon.linux-owned-frontend-invocation"
         || command["revision"] != 1
@@ -1186,15 +1201,16 @@ fn validate_frontend(
         (13, "result-v2"),
         (14, "--report"),
         (16, "--mixed-observation-directory"),
-        (18, "--image-entrypoint"),
-        (19, "owned-readiness"),
-        (20, "--"),
     ] {
         if arguments[index] != text.as_bytes() {
             return Err("lifecycle native frontend invokes unrelated authority/budgets".into());
         }
     }
-    if arguments[21..] != *target
+    if arguments[18..target_start]
+        .iter()
+        .zip(suffix)
+        .any(|(actual, expected)| actual != expected.as_bytes())
+        || arguments[target_start..] != *target
         || arguments[11].is_empty()
         || arguments[15].is_empty()
         || [11, 15, 17]

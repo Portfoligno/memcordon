@@ -1836,7 +1836,7 @@ fn verify_preparation(
         || command["caller_uid"] != 65534
         || command["caller_gid"] != 65534
         || command["selected_cli_sha256"] != cli.installed_sha256
-        || arguments.len() != 24
+        || arguments.len() != 26
     {
         return Err("loader actual frontend native command differs".into());
     }
@@ -1856,10 +1856,12 @@ fn verify_preparation(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "bytes-argv-status"),
-        (22, "0"),
-        (23, "loader-closure-probe"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "bytes-argv-status"),
+        (24, "0"),
+        (25, "loader-closure-probe"),
     ] {
         if arguments[index] != text.as_bytes() {
             return Err("loader preparation invoked unrelated work".into());

@@ -11,6 +11,73 @@ mod persisted_case;
 use serde_json::json;
 
 #[test]
+fn original_frontend_lifetime_rejects_coherently_rehashed_wrong_or_moved_options() {
+    use sha2::{Digest, Sha256};
+    let prefix = "x86_64-unknown-linux-gnu/candidate-native/linux-mixed/recipe-0";
+    for phase in ["allocation", "drain", "delivery"] {
+        for mutation in ["wrong", "missing", "duplicate", "moved"] {
+            let mut case = if phase == "delivery" {
+                linux_lifecycle_case::delivery_case()
+            } else {
+                linux_lifecycle_case::loss_case("frontend", phase)
+            };
+            case.validate().unwrap();
+            let command_path = format!("{prefix}/frontend-invocation.json");
+            let mut command: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(case.root.path().join(&command_path)).unwrap(),
+            )
+            .unwrap();
+            let mut args: Vec<Vec<u8>> =
+                serde_json::from_value(command["arguments"].clone()).unwrap();
+            let mode = args.iter().position(|arg| arg == b"--wait-for").unwrap();
+            match mutation {
+                "wrong" => {
+                    args[mode + 1] = if phase == "drain" {
+                        b"command".to_vec()
+                    } else {
+                        b"workload".to_vec()
+                    }
+                }
+                "missing" => {
+                    args.drain(mode..mode + ["--wait-for", "command"].len());
+                }
+                "duplicate" => {
+                    let pair = args[mode..mode + ["--wait-for", "command"].len()].to_vec();
+                    args.splice(mode..mode, pair);
+                }
+                "moved" => {
+                    let pair: Vec<_> = args
+                        .drain(mode..mode + ["--wait-for", "command"].len())
+                        .collect();
+                    args.extend(pair);
+                }
+                _ => unreachable!(),
+            }
+            command["arguments"] = json!(args);
+            let bytes = serde_json::to_vec(&command).unwrap();
+            let digest = hex::encode(Sha256::digest(&bytes));
+            case.write(&command_path, &bytes);
+            case.mutate(&format!("{prefix}/frontend-preinput.json"), |raw| {
+                raw["invocation_sha256"] = json!(digest)
+            });
+            case.mutate(&format!("{prefix}/frontend-wait.json"), |raw| {
+                raw["invocation_sha256"] = json!(digest)
+            });
+            case.mutate(&format!("{prefix}/lifecycle-loss-raw.json"), |raw| {
+                raw["observations"][0]["frontend_invocation"] = command;
+                raw["frontend_wait"]["invocation_sha256"] = json!(digest);
+            });
+            let error = case.validate().unwrap_err();
+            assert!(
+                error == "lifecycle actual frontend command/selected image differs"
+                    || error == "lifecycle original frontend paths/target arguments differ",
+                "{phase}/{mutation} failed outside the exact argv grammar: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn control_shutdown_requires_original_authenticated_two_hop_chain() {
     fn mutate_action(
         case: &mut persisted_case::PersistedCase,

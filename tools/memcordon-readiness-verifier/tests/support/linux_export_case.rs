@@ -120,6 +120,8 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         format!("{directory}/launch/observations"),
         "--image-entrypoint".into(),
         "owned-readiness".into(),
+        "--wait-for".into(),
+        "command".into(),
         "--".into(),
         "export-object".into(),
         challenge_hex.clone(),

@@ -120,6 +120,8 @@ fn frontend_public_projection_preserves_actual_budget_syntax_and_argv() {
         "/owned/observations",
         "--image-entrypoint",
         "owned-readiness",
+        "--wait-for",
+        "command",
         "--",
         "tcp-http",
         token.as_str(),
@@ -158,6 +160,34 @@ fn frontend_public_projection_preserves_actual_budget_syntax_and_argv() {
         )
     };
     assert!(check(&command, &public).is_ok());
+    for mutation in ["wrong", "missing", "duplicate", "moved"] {
+        let mut changed = command.clone();
+        let args = changed["arguments"].as_array_mut().unwrap();
+        let mode = args
+            .iter()
+            .position(|arg| *arg == json!(b"--wait-for".to_vec()))
+            .unwrap();
+        let width = ["--wait-for", "command"].len();
+        match mutation {
+            "wrong" => args[mode + 1] = json!(b"workload".to_vec()),
+            "missing" => {
+                args.drain(mode..mode + width);
+            }
+            "duplicate" => {
+                let pair = args[mode..mode + width].to_vec();
+                args.splice(mode..mode, pair);
+            }
+            "moved" => {
+                let pair: Vec<_> = args.drain(mode..mode + width).collect();
+                args.extend(pair);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            check(&changed, &public).is_err(),
+            "accepted {mutation} lifetime option"
+        );
+    }
     let mut changed = command.clone();
     changed["arguments"][7] = serde_json::to_value(b"256M".to_vec()).unwrap();
     assert!(check(&changed, &public).is_err());

@@ -337,6 +337,9 @@ fn validate_credential_fields(
 #[path = "../../tests/private/lifecycle_control_credentials.rs"]
 mod control_credential_tests;
 
+#[path = "lifecycle_frontend_arguments.rs"]
+mod frontend_arguments;
+
 fn require_live(
     worker: &HeldLinuxProcess,
     caller: &HeldLinuxProcess,
@@ -2325,22 +2328,6 @@ pub fn normalize_completed(
                 65536,
             )?)?;
         let arguments: Vec<Vec<u8>> = serde_json::from_value(invocation["arguments"].clone())?;
-        let marker = arguments
-            .windows(3)
-            .enumerate()
-            .filter(|(_, values)| {
-                values[0] == b"--image-entrypoint"
-                    && values[1] == b"owned-readiness"
-                    && values[2] == b"--"
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if marker.len() != 1 {
-            return Err(CiError::Message(
-                "actual lifecycle frontend entrypoint argument association differs".into(),
-            ));
-        }
-        let target = arguments[marker[0] + 3..].to_vec();
         let delivery = key.family == "L-LIFE-05";
         let phase = key
             .scenario
@@ -2360,11 +2347,13 @@ pub fn normalize_completed(
         if delivery {
             expected.push(b"0".to_vec());
         }
-        if target != expected {
-            return Err(CiError::Message(
-                "actual lifecycle native target arguments changed".into(),
-            ));
-        }
+        let lifetime: &[u8] = if !delivery && phase == "drain" {
+            b"workload"
+        } else {
+            b"command"
+        };
+        let target = frontend_arguments::normalize(&arguments, lifetime, &expected)
+            .map_err(|error| CiError::Message(error.into()))?;
         let descriptor = FixtureInput {
             format: "memcordon.consumer-readiness.input".into(),
             revision: 1,
