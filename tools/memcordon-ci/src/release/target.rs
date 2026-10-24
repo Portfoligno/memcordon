@@ -1158,9 +1158,9 @@ pub fn prepare_readiness_tools(root: &Path, source_path: &Path) -> Result<()> {
             )
             .bounded_until(deadline)
             .phase(crate::command::CiPhase::NativeCompile)
-            .selection(&selected, Some(&target))
+            .selection(&selected, Some(target))
             .run()?;
-            if let Some(diagnostic) = build_workload_diagnostic(root, &selected, &target, deadline)?
+            if let Some(diagnostic) = build_workload_diagnostic(root, &selected, target, deadline)?
             {
                 let directory = root.join("target/ci/native/release");
                 source::write_json(
