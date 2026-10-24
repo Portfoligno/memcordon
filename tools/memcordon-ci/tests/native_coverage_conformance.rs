@@ -65,6 +65,85 @@ fn units(root: &Path, directory: &str, selectors: &[&str], execute: bool) -> BTr
 }
 
 #[test]
+fn binary_harness_owner_builds_ordinary_sibling_before_both_phases() {
+    let root = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[package]\nname='owned-sibling'\nversion='0.0.0'\nedition='2021'\n",
+    );
+    write(
+        root.path(),
+        "src/main.rs",
+        r#"fn main() {}
+#[test] fn launches_ordinary_sibling() {
+    let current = std::env::current_exe().unwrap();
+    let ordinary = current.parent().unwrap().parent().unwrap()
+        .join(format!("owned-sibling{}", std::env::consts::EXE_SUFFIX));
+    assert!(std::process::Command::new(ordinary).status().unwrap().success());
+}
+"#,
+    );
+    cargo(root.path())
+        .args(["generate-lockfile", "--offline"])
+        .run()
+        .unwrap();
+    let selectors: Vec<String> = [
+        "--workspace",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "--release",
+        "--bin",
+        "owned-sibling",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let cutoff = Instant::now() + Duration::from_secs(60);
+    for compile in [true, false] {
+        let output = memcordon_ci::release::native_coverage_owner::support_command(
+            root.path(),
+            "1.97.1",
+            Path::new("owned"),
+            &selectors,
+            compile,
+            memcordon_ci::failure_mode::FailureMode::StopAfterFailure,
+            cutoff,
+        )
+        .output_owned()
+        .into_result()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            bounded_excerpt(&output.stderr)
+        );
+        let output = memcordon_ci::release::native_coverage_owner::selection_command(
+            root.path(),
+            "1.97.1",
+            Path::new("owned"),
+            &selectors,
+            compile,
+            memcordon_ci::failure_mode::FailureMode::StopAfterFailure,
+            cutoff,
+        )
+        .output_owned()
+        .into_result()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            bounded_excerpt(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn pinned_workspace_selectors_preserve_full_units_and_execute_the_same_selection() {
     let root = if cfg!(unix) {
         tempfile::tempdir_in("/tmp").unwrap()

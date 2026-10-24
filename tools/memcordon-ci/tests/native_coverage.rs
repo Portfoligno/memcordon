@@ -193,7 +193,7 @@ fn canonical_groups_preserve_global_names_custom_harness_and_ordinary_support() 
             if plan.requirements.iter().any(|requirement| {
                 &requirement.id == id && requirement.variant == Variant::OrdinaryBinarySupport
             }) {
-                assert!(matches!(group.selector, Selector::Test(_)));
+                assert!(matches!(group.selector, Selector::Bin(_)));
             }
         }
     }
@@ -404,11 +404,42 @@ fn dependencies_keep_distinct_feature_variants_but_source_plan_mutations_fail() 
     without_integration
         .targets
         .retain(|target| target.kind != TargetKind::Test);
-    assert!(
-        Plan::build(without_integration, 2)
-            .unwrap()
+    let standalone = Plan::build(without_integration, 2).unwrap();
+    assert_eq!(
+        standalone
             .requirements
             .iter()
-            .all(|requirement| requirement.variant != Variant::OrdinaryBinarySupport)
+            .filter(|requirement| requirement.variant == Variant::OrdinaryBinarySupport)
+            .count(),
+        2
     );
+    for shard in &standalone.shards {
+        let support = standalone.support_selectors(shard.id).unwrap();
+        for name in support
+            .windows(2)
+            .filter(|pair| pair[0] == "--bin")
+            .map(|pair| &pair[1])
+        {
+            assert!(
+                standalone
+                    .selectors(shard.id)
+                    .unwrap()
+                    .windows(2)
+                    .any(|pair| pair == ["--bin", name])
+            );
+        }
+    }
+}
+
+#[test]
+fn real_phase_unit_merge_deduplicates_identical_support_and_rejects_conflicts() {
+    let plan = Plan::build(spec(), 4).unwrap();
+    let unit = observation(&plan, &plan.requirements[0]);
+    assert_eq!(
+        merge_units(vec![unit.clone()], vec![unit.clone()]).unwrap(),
+        vec![unit.clone()]
+    );
+    let mut changed = unit.clone();
+    changed.executable.as_mut().unwrap().length += 1;
+    assert!(merge_units(vec![unit], vec![changed]).is_err());
 }

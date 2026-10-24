@@ -169,6 +169,37 @@ pub fn selection_command(
     command
 }
 
+pub fn support_command(
+    root: &Path,
+    toolchain: &str,
+    directory: &Path,
+    selectors: &[String],
+    compile: bool,
+    failure_mode: crate::failure_mode::FailureMode,
+    cutoff: Instant,
+) -> CommandSpec {
+    let recipes = crate::native_test_plan::commands_for_platform(
+        true,
+        failure_mode,
+        crate::native_test_plan::NativePlatform::MacOs,
+    );
+    cargo(
+        root,
+        toolchain,
+        recipes[usize::from(!compile)].deadline,
+        cutoff,
+    )
+    .args(["build", "--target-dir"])
+    .arg(directory)
+    .args(selectors)
+    .arg("--message-format=json-render-diagnostics")
+    .phase(if compile {
+        CiPhase::NativeCompile
+    } else {
+        CiPhase::NativeExecute
+    })
+}
+
 /// Project only measured Cargo metadata and selected manifest/configuration bytes.
 pub fn prepare(
     root: &Path,
@@ -624,6 +655,10 @@ pub fn run_shard(
         let prepared = prepare(root, selected, target, cutoff)?;
         validate_original_plan(root, &prepared.plan)?;
         let selectors = prepared.plan.selectors(shard).map_err(CiError::Message)?;
+        let support_selectors = prepared
+            .plan
+            .support_selectors(shard)
+            .map_err(CiError::Message)?;
         let selection_sha256 = prepared
             .plan
             .selection_sha256(shard)
@@ -636,6 +671,31 @@ pub fn run_shard(
         let mut inventories = Vec::new();
         let mut phases = Vec::new();
         for compile in [true, false] {
+            let started = Instant::now();
+            let supporting_units = if support_selectors.is_empty() {
+                Vec::new()
+            } else {
+                let outcome = support_command(
+                    root,
+                    &prepared.plan.spec.identity.toolchain,
+                    Path::new("target/ci/native"),
+                    &support_selectors,
+                    compile,
+                    failure_mode,
+                    cutoff,
+                )
+                .selection(selected, Some(target))
+                .run_owned();
+                let settled = outcome.writers().permits_reading();
+                let bytes = outcome.into_result()?;
+                if !settled || Instant::now() >= cutoff {
+                    return Err(error(
+                        "coverage support did not settle under its original cutoff",
+                    ));
+                }
+                selected.recheck(root)?;
+                ledger(root, &prepared, &bytes)?
+            };
             let command = selection_command(
                 root,
                 &prepared.plan.spec.identity.toolchain,
@@ -646,7 +706,6 @@ pub fn run_shard(
                 cutoff,
             )
             .selection(selected, Some(target));
-            let started = Instant::now();
             let outcome = command.run_owned();
             let settled = outcome.writers().permits_reading();
             let bytes = outcome.into_result()?;
@@ -656,7 +715,10 @@ pub fn run_shard(
                     "coverage owner did not complete under its original cutoff",
                 ));
             }
-            inventories.push(ledger(root, &prepared, &bytes)?);
+            inventories.push(
+                merge_units(supporting_units, ledger(root, &prepared, &bytes)?)
+                    .map_err(CiError::Message)?,
+            );
             phases.push(PhaseReceipt {
                 selection_sha256: selection_sha256.clone(),
                 success: true,

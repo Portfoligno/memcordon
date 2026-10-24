@@ -293,17 +293,9 @@ impl Plan {
                 execution_required: target.kind != TargetKind::Example || target.test,
             });
             grouped.entry(selector.clone()).or_default().push(id);
-            let support_selector = if target.kind == TargetKind::Bin {
-                spec.targets
-                    .iter()
-                    .find(|candidate| {
-                        candidate.package == target.package && candidate.kind == TargetKind::Test
-                    })
-                    .map(|candidate| Selector::Test(candidate.name.clone()))
-            } else {
-                None
-            };
-            if let Some(support_selector) = support_selector {
+            // A binary harness may launch its ordinary sibling even without an
+            // integration target. Its own selector owns that prerequisite.
+            if target.kind == TargetKind::Bin {
                 let id = digest(&(target, Variant::OrdinaryBinarySupport))?;
                 requirements.push(Requirement {
                     id: id.clone(),
@@ -312,7 +304,7 @@ impl Plan {
                     executable_required: true,
                     execution_required: false,
                 });
-                grouped.entry(support_selector).or_default().push(id);
+                grouped.entry(selector).or_default().push(id);
             }
         }
         let groups: Vec<_> = grouped
@@ -388,8 +380,84 @@ impl Plan {
         Ok(arguments)
     }
     pub fn selection_sha256(&self, shard: usize) -> Result<String> {
-        digest(&(&self.sha256, self.selectors(shard)?))
+        digest(&(
+            &self.sha256,
+            self.selectors(shard)?,
+            self.support_selectors(shard)?,
+        ))
     }
+    pub fn support_selectors(&self, shard: usize) -> Result<Vec<String>> {
+        let shard = self
+            .shards
+            .get(shard)
+            .filter(|entry| entry.id == shard)
+            .ok_or("native coverage shard is absent")?;
+        let owned: BTreeSet<_> = shard
+            .groups
+            .iter()
+            .flat_map(|index| self.groups[*index].requirements.iter())
+            .collect();
+        let names: BTreeSet<_> = self
+            .requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.variant == Variant::OrdinaryBinarySupport
+                    && owned.contains(&requirement.id)
+            })
+            .map(|requirement| requirement.target.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut arguments = vec![
+            "--workspace".into(),
+            "--all-features".into(),
+            "--locked".into(),
+            "--release".into(),
+        ];
+        for name in names {
+            arguments.extend(["--bin".into(), name]);
+        }
+        Ok(arguments)
+    }
+}
+
+/// Merge real Cargo phase observations, admitting repeated identical supporting
+/// units but rejecting divergent executable bytes for the same compiler unit.
+pub fn merge_units(
+    first: Vec<UnitObservation>,
+    second: Vec<UnitObservation>,
+) -> Result<Vec<UnitObservation>> {
+    let mut merged = BTreeMap::new();
+    for units in [first, second] {
+        if !units.is_empty() {
+            unit_inventory(&units)?;
+        }
+        for unit in units {
+            let key = digest(&(
+                &unit.package,
+                &unit.target_name,
+                &unit.target_kind,
+                &unit.source,
+                &unit.raw_target,
+                &unit.profile,
+                &unit.features,
+            ))?;
+            if let Some(existing) = merged.get(&key) {
+                if existing != &unit {
+                    return Err("native coverage supporting unit observations conflict".into());
+                }
+            } else {
+                merged.insert(key, unit);
+            }
+            if merged.len() > memcordon_readiness_verifier::MAX_PRODUCER_ARTIFACTS {
+                return Err("native coverage merged unit inventory exceeds bound".into());
+            }
+        }
+    }
+    let units: Vec<_> = merged.into_values().collect();
+    unit_inventory(&units)?;
+    Ok(units)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
