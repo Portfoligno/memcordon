@@ -309,6 +309,30 @@ fn desktop_resultant_requires_protected_present_unrequested_single_label_policy(
 }
 
 #[test]
+fn startup_probe_uses_selected_creation_and_pins_the_held_resultant() {
+    use memcordon_windows_loader_lab::startup_probe_contract::verify_observed_policy;
+    use snapshot::{ComparisonOutcome, Domain};
+    let creation = Fixture::selected();
+    let selected = snapshot::capture(&creation.bytes([0, 1, 2, 3])).unwrap();
+    let mut resultant = creation;
+    resultant.control |= 0x800;
+    let held = snapshot::capture(&resultant.bytes([3, 2, 1, 0])).unwrap();
+    let reread = snapshot::capture(&resultant.bytes([3, 2, 1, 0])).unwrap();
+    assert_eq!(
+        verify_observed_policy(Domain::Desktop, &selected, &held, &reread)
+            .unwrap()
+            .comparison,
+        ComparisonOutcome::DesktopSaclAutoInherited
+    );
+    assert!(verify_observed_policy(Domain::Desktop, &held, &held, &reread).is_err());
+    // An equally valid but differently packed resultant is still a changed
+    // held observation and must not qualify for the diagnostic identity.
+    let repacked = snapshot::capture(&resultant.bytes([0, 1, 2, 3])).unwrap();
+    snapshot::verify_and_fingerprint(Domain::Desktop, &selected, &repacked).unwrap();
+    assert!(verify_observed_policy(Domain::Desktop, &selected, &held, &repacked).is_err());
+}
+
+#[test]
 fn desktop_resultant_bit_cannot_conceal_any_other_selected_policy_change() {
     let valid = Fixture::selected();
     let expected = snapshot::capture(&valid.bytes([0, 1, 2, 3])).unwrap();

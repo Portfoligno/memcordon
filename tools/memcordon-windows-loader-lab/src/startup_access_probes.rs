@@ -150,6 +150,42 @@ fn captured(result: Result<Value, String>) -> Value {
     }
 }
 
+pub(super) fn default_dacl(token: HANDLE) -> Value {
+    captured((|| {
+        let (words, extent) = info(token, TokenDefaultDacl)?;
+        if extent < size_of::<*const u8>() {
+            return Err("default DACL token header truncated".into());
+        }
+        // The TOKEN_DEFAULT_DACL header is one ACL pointer. Never dereference
+        // it until its entire bounded ACL extent belongs to this held buffer.
+        let raw = unsafe { words.as_ptr().cast::<*const u8>().read_unaligned() };
+        if raw.is_null() {
+            return memcordon_windows_loader_lab::startup_probe_contract::describe_default_dacl(
+                None,
+            );
+        }
+        let start = words.as_ptr() as usize;
+        let offset = (raw as usize)
+            .checked_sub(start)
+            .ok_or("default DACL precedes token buffer")?;
+        if offset < size_of::<*const u8>() || offset.checked_add(8).is_none_or(|end| end > extent) {
+            return Err("default DACL header escapes token buffer".into());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), extent) };
+        let length = usize::from(u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]));
+        if length > memcordon_windows_loader_lab::startup_probe_contract::DEFAULT_DACL_BYTES {
+            return Err("default DACL exceeds finite diagnostic byte bound".into());
+        }
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= extent)
+            .ok_or("default DACL escapes token buffer")?;
+        memcordon_windows_loader_lab::startup_probe_contract::describe_default_dacl(Some(
+            &bytes[offset..end],
+        ))
+    })())
+}
+
 pub(super) fn validate_probe_capability(probe: HANDLE, primary: HANDLE) -> Result<(), String> {
     #[repr(C)]
     struct Basic {
@@ -235,8 +271,9 @@ fn object_access(
     handle: HANDLE,
     token: HANDLE,
     station: bool,
-    expected: &selected_policy::Snapshot,
+    snapshots: (&selected_policy::Snapshot, &selected_policy::Snapshot),
 ) -> Result<Value, String> {
+    let (selected, held) = snapshots;
     let selection = 0x17;
     let mut needed = 0;
     unsafe {
@@ -273,9 +310,6 @@ fn object_access(
     }
     let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), actual as usize) };
     let observed = selected_policy::capture_selected(bytes, selection)?;
-    if observed.raw_sha256 != expected.raw_sha256 {
-        return Err("held USER descriptor changed before startup AccessCheck".into());
-    }
     let requested = if station {
         memcordon_windows_loader_lab::holder_creation::STATION_ACCESS
     } else {
@@ -283,7 +317,7 @@ fn object_access(
     };
     // Same finite object-specific mappings as production security.rs. The
     // requested masks are already concrete; no broader retry is performed.
-    let mut mapping = if station {
+    let mapping = if station {
         GENERIC_MAPPING {
             GenericRead: 0x0002_0000
                 | WINSTA_ENUMDESKTOPS
@@ -316,7 +350,7 @@ fn object_access(
             words.as_mut_ptr().cast(),
             token,
             requested,
-            &mut mapping,
+            &mapping,
             privilege_words.as_mut_ptr().cast(),
             &mut privilege_bytes,
             &mut granted,
@@ -328,17 +362,18 @@ fn object_access(
     } else {
         None
     };
-    let policy = selected_policy::verify_and_fingerprint(
+    let policy = memcordon_windows_loader_lab::startup_probe_contract::verify_observed_policy(
         if station {
             Domain::Station
         } else {
             Domain::Desktop
         },
-        expected,
+        selected,
+        held,
         &observed,
-    )?;
+    );
     Ok(
-        json!({"name":object_name(handle)?,"descriptor_sha256":observed.raw_sha256,"descriptor_length":observed.length,"selected_descriptor_sha256":expected.raw_sha256,"policy":policy,
+        json!({"name":captured(object_name(handle).map(Value::String)),"descriptor_sha256":observed.raw_sha256,"descriptor_length":observed.length,"selected_descriptor_sha256":selected.raw_sha256,"held_descriptor_sha256":held.raw_sha256,"policy":captured(policy.map(|value|json!(value))),
         "requested":requested,"granted":if called != 0 {Some(granted)} else {None},"api_succeeded":called != 0,
         "access_status":if called != 0 {Some(allowed != 0)} else {None},"native_code":native_code,"privilege_bytes":privilege_bytes}),
     )
@@ -415,7 +450,13 @@ impl Drop for OpenedUser {
     }
 }
 
-fn namespace_open(name: &str, expected_sha256: &str, station: bool, work: Instant) -> Value {
+fn namespace_open(
+    name: &str,
+    snapshots: (&selected_policy::Snapshot, &selected_policy::Snapshot),
+    station: bool,
+    work: Instant,
+) -> Value {
+    let (selected, held) = snapshots;
     let operation = (|| -> Result<Value, String> {
         live(work)?;
         let name_wide = wide(name);
@@ -441,18 +482,20 @@ fn namespace_open(name: &str, expected_sha256: &str, station: bool, work: Instan
             live(work)?;
             let observed_name = object_name(owner.raw)?;
             let policy = unsafe { selected_policy_native::read_user(owner.raw) }?;
-            if observed_name != name || policy.raw_sha256 != expected_sha256 {
+            if observed_name != name {
                 return Err("opened USER object differs from original held name/descriptor".into());
             }
-            let fingerprint = selected_policy::verify_and_fingerprint(
-                if station {
-                    Domain::Station
-                } else {
-                    Domain::Desktop
-                },
-                &policy,
-                &policy,
-            )?;
+            let fingerprint =
+                memcordon_windows_loader_lab::startup_probe_contract::verify_observed_policy(
+                    if station {
+                        Domain::Station
+                    } else {
+                        Domain::Desktop
+                    },
+                    selected,
+                    held,
+                    &policy,
+                )?;
             Ok(
                 json!({"name":observed_name,"descriptor_sha256":policy.raw_sha256,"policy":fingerprint}),
             )
@@ -469,7 +512,10 @@ fn namespace_open(name: &str, expected_sha256: &str, station: bool, work: Instan
 fn namespace_thread(
     token: Handle,
     names: (String, String),
-    digests: (String, String),
+    snapshots: (
+        (selected_policy::Snapshot, selected_policy::Snapshot),
+        (selected_policy::Snapshot, selected_policy::Snapshot),
+    ),
     expected_token_sha256: String,
     work: Instant,
 ) -> Value {
@@ -505,8 +551,8 @@ fn namespace_thread(
             );
         }
         Ok(
-            json!({"thread_id":unsafe { GetCurrentThreadId() },"active_thread_token_envelope_sha256":active_sha256,"process_station":names.0,"station":namespace_open(&names.0, &digests.0, true, work),
-            "desktop":namespace_open(&names.1, &digests.1, false, work)}),
+            json!({"thread_id":unsafe { GetCurrentThreadId() },"active_thread_token_envelope_sha256":active_sha256,"process_station":names.0,"station":namespace_open(&names.0, (&snapshots.0.0, &snapshots.0.1), true, work),
+            "desktop":namespace_open(&names.1, (&snapshots.1.0, &snapshots.1.1), false, work)}),
         )
     })();
     let restoration = guard.restore();
@@ -519,8 +565,8 @@ pub(super) fn collect(
     probe: Handle,
     objects: (HANDLE, HANDLE),
     names: (&str, &str),
-    station: &selected_policy::Snapshot,
-    desktop: &selected_policy::Snapshot,
+    station: (&selected_policy::Snapshot, &selected_policy::Snapshot),
+    desktop: (&selected_policy::Snapshot, &selected_policy::Snapshot),
     deadlines: (Instant, Instant),
 ) -> Result<Value, String> {
     let (work, cleanup) = deadlines;
@@ -547,6 +593,8 @@ pub(super) fn collect(
     facts["groups"] = captured(groups(primary, TokenGroups));
     live(work)?;
     facts["restricting_sids"] = captured(groups(primary, TokenRestrictedSids));
+    live(work)?;
+    facts["default_dacl"] = default_dacl(primary);
     let omissions: Vec<_> = [
         "user",
         "owner",
@@ -554,6 +602,7 @@ pub(super) fn collect(
         "integrity",
         "groups",
         "restricting_sids",
+        "default_dacl",
     ]
     .into_iter()
     .filter(|name| facts[*name]["captured"] != true)
@@ -570,7 +619,10 @@ pub(super) fn collect(
     }
     let raw = probe.0 as usize;
     let names = (names.0.to_owned(), names.1.to_owned());
-    let digests = (station.raw_sha256.clone(), desktop.raw_sha256.clone());
+    let snapshots = (
+        (station.0.clone(), station.1.clone()),
+        (desktop.0.clone(), desktop.1.clone()),
+    );
     let expected_token_sha256 =
         memcordon_windows_launch_core::token_envelope_sha256(&probe_envelope)?;
     let (send, receive) = std::sync::mpsc::sync_channel(1);
@@ -578,7 +630,7 @@ pub(super) fn collect(
         .name("startup-access-probe".into())
         .spawn(move || {
             let owned = Handle(raw as HANDLE);
-            let result = namespace_thread(owned, names, digests, expected_token_sha256, work);
+            let result = namespace_thread(owned, names, snapshots, expected_token_sha256, work);
             let _ = send.send(result);
         })
         .map_err(|error| error.to_string())?;

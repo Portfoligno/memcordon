@@ -26,7 +26,7 @@ struct Policy {
     dacl: Acl,
     label: Acl,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     pub raw_sha256: String,
     pub length: usize,

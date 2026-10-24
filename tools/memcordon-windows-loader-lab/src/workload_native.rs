@@ -1000,8 +1000,8 @@ fn desktop_holder_operation(
             target_probe_token,
             (station, desktop),
             (station_name, desktop_name),
-            &station_observed,
-            &desktop_observed,
+            (&station_expected, &station_observed),
+            (&desktop_expected, &desktop_observed),
             (work, cleanup),
         )?;
         live(work)?;
@@ -2100,6 +2100,20 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
         measured["startup_access_probes"] = json!({"record":probes,"record_sha256":hex::encode(Sha256::digest(&probe_bytes)),
             "actual_target":{"pid":target.pid,"birth":target.birth},"actual_target_token_envelope_sha256":digest,
             "same_exact_primary_envelope_observed":true,"diagnostic_only":true});
+        live(work)?;
+        let actual_default_dacl = startup_access_probes::default_dacl(actual_token.0);
+        live(work)?;
+        let source_default_dacl =
+            &measured["startup_access_probes"]["record"]["probes"]["token_facts"]["default_dacl"];
+        let default_dacl_equal =
+            memcordon_windows_loader_lab::startup_probe_contract::default_dacl_equality(
+                source_default_dacl,
+                &actual_default_dacl,
+            );
+        measured["startup_access_probes"]["default_dacl_comparison"] = json!({
+            "actual_suspended_primary":actual_default_dacl,"exact_null_and_raw_bytes_equal":default_dacl_equal,
+            "source":"retained primary in bound holder sidecar","actual_target":{"pid":target.pid,"birth":target.birth},
+            "actual_target_token_envelope_sha256":digest,"before_resume":true,"diagnostic_only":true,"inconclusive":true});
         let resumed = resume(
             target,
             "actual-workload-target",
