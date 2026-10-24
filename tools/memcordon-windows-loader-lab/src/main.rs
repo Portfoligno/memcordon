@@ -28,6 +28,8 @@ enum Role {
         stop: u64,
         #[arg(long)]
         target_token: u64,
+        #[arg(long)]
+        target_probe_token: u64,
     },
     RunWorkload {
         #[arg(long)]
@@ -104,7 +106,8 @@ fn main() {
             ready,
             stop,
             target_token,
-        } => run_workload_holder(&request, ready, stop, target_token),
+            target_probe_token,
+        } => run_workload_holder(&request, ready, stop, target_token, target_probe_token),
         Role::RunWorkload { request, result } => controller::run_workload(&request, &result),
         Role::ServiceWorkload {
             service_name,
@@ -166,12 +169,13 @@ fn run_workload_holder(
     ready: u64,
     stop: u64,
     target_token: u64,
+    target_probe_token: u64,
 ) -> Result<(), String> {
-    workload_native::run_desktop_holder(request, ready, stop, target_token)
+    workload_native::run_desktop_holder(request, ready, stop, target_token, target_probe_token)
 }
 
 #[cfg(not(windows))]
-fn run_workload_holder(_: &std::path::Path, _: u64, _: u64, _: u64) -> Result<(), String> {
+fn run_workload_holder(_: &std::path::Path, _: u64, _: u64, _: u64, _: u64) -> Result<(), String> {
     Err("actual-workload desktop holder requires native Windows".into())
 }
 

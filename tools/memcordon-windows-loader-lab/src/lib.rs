@@ -10,5 +10,6 @@ pub mod scenario;
 pub mod selected_policy;
 #[cfg(windows)]
 pub mod selected_policy_native;
+pub mod startup_probe_contract;
 pub mod target;
 pub mod workload;

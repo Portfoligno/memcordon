@@ -46,6 +46,8 @@ use windows_sys::Win32::{
 const LIMIT: usize = 256 * 1024;
 const EVENT_LIMIT: usize = 2048;
 const FAILURE: u32 = 0x4d43_0d01;
+#[path = "startup_access_probes.rs"]
+mod startup_access_probes;
 static STOP: AtomicBool = AtomicBool::new(false);
 
 fn error(api: &str) -> String {
@@ -745,6 +747,7 @@ pub fn run_desktop_holder(
     ready: u64,
     stop: u64,
     target_token: u64,
+    target_probe_token: u64,
 ) -> Result<(), String> {
     let ready =
         Handle::new(usize::try_from(ready).map_err(|_| "ready handle overflow")? as HANDLE)?;
@@ -760,8 +763,14 @@ pub fn run_desktop_holder(
         cleanup: Vec::new(),
         readiness_started: false,
     };
-    let result =
-        desktop_holder_operation(path, &ready, stop, target_token, &identity, &mut context);
+    let result = desktop_holder_operation(
+        path,
+        &ready,
+        stop,
+        (target_token, target_probe_token),
+        &identity,
+        &mut context,
+    );
     if let Err(primary) = &result
         && !context.readiness_started
     {
@@ -809,7 +818,7 @@ fn desktop_holder_operation(
     path: &Path,
     ready: &Handle,
     stop: u64,
-    target_token: u64,
+    target_tokens: (u64, u64),
     identity: &memcordon_core::WindowsProcessIdentityV1,
     context: &mut HolderContext,
 ) -> Result<(), String> {
@@ -817,10 +826,15 @@ fn desktop_holder_operation(
     clear(ready.0)?;
     clear(stop.0)?;
     let target_token = Handle::new(
-        usize::try_from(target_token).map_err(|_| "target query handle overflow")? as HANDLE,
+        usize::try_from(target_tokens.0).map_err(|_| "target query handle overflow")? as HANDLE,
     )?;
     clear(target_token.0)?;
     query_only_token(target_token.0)?;
+    let target_probe_token = Handle::new(
+        usize::try_from(target_tokens.1).map_err(|_| "target probe handle overflow")? as HANDLE,
+    )?;
+    clear(target_probe_token.0)?;
+    startup_access_probes::validate_probe_capability(target_probe_token.0, target_token.0)?;
     context.enter(Stage::Request, "read and validate holder request");
     let request = request(path)?;
     context.binding = Some(Binding {
@@ -830,7 +844,7 @@ fn desktop_holder_operation(
         )),
     });
     context.enter(Stage::Deadlines, "validate original holder deadlines");
-    let (_, cleanup) = deadlines(&request)?;
+    let (work, cleanup) = deadlines(&request)?;
     context.enter(Stage::HolderToken, "query holder token and session");
     let mut raw = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
@@ -981,6 +995,34 @@ fn desktop_holder_operation(
         }
         let station_policy = station_policy?;
         let desktop_policy = desktop_policy?;
+        let probes = startup_access_probes::collect(
+            target_token.0,
+            target_probe_token,
+            (station, desktop),
+            (station_name, desktop_name),
+            &station_observed,
+            &desktop_observed,
+            (work, cleanup),
+        )?;
+        live(work)?;
+        let probe_record = json!({"format":"memcordon.workload-startup-access-probes","revision":1,
+            "diagnostic_only":true,"certification_authority":false,"inconclusive":true,
+            "binding":context.binding,"holder":identity,"holder_session":envelope.session_id,
+            "target_envelope_sha256":memcordon_windows_launch_core::token_envelope_sha256(&target_envelope)?,"probes":probes});
+        if serde_json::to_vec(&probe_record)
+            .map_err(|error| error.to_string())?
+            .len()
+            > LIMIT
+        {
+            return Err(
+                "startup access probes exceed existing finite observation bound; inconclusive"
+                    .into(),
+            );
+        }
+        publish(
+            &path.with_extension("startup-access-probes.json"),
+            &probe_record,
+        )?;
         context.enter(Stage::GateSecurity, "parse original gate security");
         let gate_name = request.descriptor["start_gate"]
             .as_str()
@@ -1030,7 +1072,7 @@ fn desktop_holder_operation(
             outcome: Outcome::Ready {
                 policy: Box::new(ReadyPolicy {
                     session_id: envelope.session_id,
-                    desktop: name,
+                    desktop: name.clone(),
                     station_sha256: station_observed.raw_sha256,
                     desktop_sha256: desktop_observed.raw_sha256,
                     station_policy,
@@ -1781,6 +1823,23 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             return Err(error("duplicate inherited target query-only capability"));
         }
         let target_query = Handle::new(raw_query)?;
+        let mut raw_probe = ptr::null_mut();
+        if unsafe {
+            DuplicateTokenEx(
+                token.0,
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                &attributes,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut raw_probe,
+            )
+        } == 0
+        {
+            return Err(error(
+                "duplicate exact target impersonation diagnostic capability",
+            ));
+        }
+        let target_probe = Handle::new(raw_probe)?;
         let helper_image = std::env::current_exe().map_err(|e| e.to_string())?;
         let helper = memcordon_core::NativeWindowsCommandV1 {
             program: helper_image.as_os_str().encode_wide().collect(),
@@ -1803,6 +1862,11 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
                     .to_string()
                     .encode_utf16()
                     .collect(),
+                "--target-probe-token".encode_utf16().collect(),
+                (target_probe.0 as usize as u64)
+                    .to_string()
+                    .encode_utf16()
+                    .collect(),
             ],
         };
         holder = Some(spawn(SpawnSpec {
@@ -1812,13 +1876,14 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             cwd: &input.original_request.current_directory,
             desktop: None,
             job: holder_job.as_ref().expect("stored holder Job"),
-            handles: &[ready_write.0, stop.0, target_query.0],
+            handles: &[ready_write.0, stop.0, target_query.0, target_probe.0],
             standard: false,
             descriptors: None,
             cleanup,
             debug: DebugCreation::None,
         })?);
         drop(target_query);
+        drop(target_probe);
         clear(stop.0)?;
         holder_stop = Some(stop);
         drop(ready_write);
@@ -2013,6 +2078,28 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             return Err("actual process primary token envelope differs".into());
         }
         measured["target"] = json!({"pid":target.pid,"birth":target.birth,"new_identity":true,"creation_flags":target.creation_flags,"debug_creation":"only-this-process","stdio_roles":["stdin","stdout","stderr"],"stdin":"empty-live-pipe","actual_envelope":actual_envelope,"desktop":desktop_name(input),"debugger_perturbation":true});
+        live(work)?;
+        let probe_bytes = read(&path.with_extension("startup-access-probes.json"), LIMIT)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&probe_bytes)?;
+        let probes: Value =
+            serde_json::from_slice(&probe_bytes).map_err(|error| error.to_string())?;
+        if probes["format"] != "memcordon.workload-startup-access-probes"
+            || probes["revision"] != 1
+            || probes["diagnostic_only"] != true
+            || probes["certification_authority"] != false
+            || probes["inconclusive"] != true
+            || probes["binding"]
+                != serde_json::to_value(&expected_request).map_err(|error| error.to_string())?
+            || probes["holder"]
+                != serde_json::to_value(&expected_holder).map_err(|error| error.to_string())?
+            || probes["holder_session"] != actual_envelope.session_id
+            || probes["target_envelope_sha256"] != digest
+        {
+            return Err("startup probe binding differs from held request/holder/actual target token; inconclusive".into());
+        }
+        measured["startup_access_probes"] = json!({"record":probes,"record_sha256":hex::encode(Sha256::digest(&probe_bytes)),
+            "actual_target":{"pid":target.pid,"birth":target.birth},"actual_target_token_envelope_sha256":digest,
+            "same_exact_primary_envelope_observed":true,"diagnostic_only":true});
         let resumed = resume(
             target,
             "actual-workload-target",
