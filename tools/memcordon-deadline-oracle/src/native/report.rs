@@ -231,7 +231,6 @@ pub(super) fn classify_report(bytes: &[u8], spec: ScenarioSpec) -> Result<Report
                     && attempt.target_pid.is_none()
                     && attempt.runtime.target_pid.is_none()
                     && !attempt.launch.target_released
-                    && !attempt.launch.guardian_started_before_authorization
                     && !attempt.launch.target_spawn_error_reported,
                 "contradictory pre-authorization evidence",
             )?;

@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+#[path = "toolchain_inputs.rs"]
+mod qualified_inputs;
 
 fn observed_output(
     command: &mut Command,
@@ -11,6 +13,9 @@ fn observed_output(
     challenge: &[u8],
     creation: Option<&super::descriptor::Toolchain>,
 ) -> io::Result<Output> {
+    let qualified = creation
+        .map(|inputs| qualified_inputs::Qualified::new(inputs, command))
+        .transpose()?;
     use sha2::{Digest, Sha256};
     use std::io::Read;
     use std::os::windows::{
@@ -58,6 +63,10 @@ fn observed_output(
         .map(|argument| argument.encode_wide().collect())
         .collect();
     if let Some(inputs) = creation {
+        let qualified = qualified
+            .as_ref()
+            .expect("compiler inputs qualified before native launch");
+        qualified.verify(inputs, command)?;
         return creation_output(
             command,
             CreationInput {
@@ -70,6 +79,7 @@ fn observed_output(
                 parent,
                 program: &program,
                 arguments: &arguments,
+                qualified,
             },
         );
     }
@@ -172,6 +182,56 @@ struct CreationInput<'a> {
     parent: memcordon_core::WindowsProcessIdentityV1,
     program: &'a [u16],
     arguments: &'a [Vec<u16>],
+    qualified: &'a qualified_inputs::Qualified,
+}
+
+fn unselected_creation_error(
+    created: &super::toolchain_debug::Created,
+    inputs: &super::descriptor::Toolchain,
+    original_rustc_sha256: &str,
+) -> io::Error {
+    use std::os::windows::ffi::OsStrExt;
+    let path_context = |path: &Path| {
+        let total = path.as_os_str().encode_wide().count();
+        let prefix: Vec<_> = path
+            .as_os_str()
+            .encode_wide()
+            .take(
+                memcordon_core::workload_limits::ENTRYPOINT_PATH_BYTES / std::mem::size_of::<u16>(),
+            )
+            .collect();
+        serde_json::json!({
+            "display_prefix":String::from_utf16_lossy(&prefix),
+            "utf16_units_total":total,"truncated":prefix.len() < total,
+            "utf16_prefix":prefix,
+        })
+    };
+    let selected_digest = |path: &Path| {
+        inputs
+            .selected_images
+            .iter()
+            .find(|image| image.path == path)
+            .map(|image| image.sha256.as_str())
+    };
+    let context = serde_json::json!({
+        "format":"memcordon.windows-unselected-compiler-creation","revision":1,
+        "diagnostic_only":true,"child":created.identity,
+        "parent_pid":created.parent_pid,"parent_birth":created.parent_birth,
+        "held_created_image":{"path":path_context(&created.image),"sha256":created.image_sha256},
+        "selected_rustc":{"path":path_context(&inputs.rustc),"original_held_sha256":original_rustc_sha256,
+            "frozen_selected_sha256":selected_digest(&inputs.rustc)},
+        "selected_linker":{"path":path_context(&inputs.native_linker),"held_sha256":null,
+            "frozen_selected_sha256":selected_digest(&inputs.native_linker),
+            "digest_observation":"a selected linker file handle is not retained in this creation callback"},
+    });
+    match serde_json::to_string(&context) {
+        Ok(context) => io::Error::other(format!(
+            "unselected real compiler descendant image; context={context}"
+        )),
+        Err(_) => io::Error::other(
+            "unselected real compiler descendant image; diagnostic serialization failed",
+        ),
+    }
 }
 
 fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Result<Output> {
@@ -185,6 +245,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         parent,
         program,
         arguments,
+        qualified,
     } = input;
     use std::io::Read;
     use std::os::windows::{
@@ -202,6 +263,8 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         .creation_flags(windows_sys::Win32::System::Threading::DEBUG_PROCESS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    qualified.verify(inputs, command)?;
+    let compiler_inputs = qualified.receipt(inputs)?;
     let mut child = command.spawn()?;
     let mut debug_started = false;
     let operation = (|| {
@@ -232,6 +295,22 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 io::Error::other("compiler stderr pipe absent")
             })?))?;
         let held = super::native::retain_child_handle(&child)?;
+        let original_identity = super::native::child_identity(&child)?;
+        let diagnostics = super::toolchain_diagnostics::Publisher::new(
+            root,
+            serde_json::json!({
+                "role":role,"challenge":challenge,"parent":parent,"original_child":original_identity,
+                "selected_image_sha256":image_sha256,
+                "native_work_cutoff_ticks":inputs.native_work_cutoff_ticks,
+                "native_work_frequency":inputs.native_work_frequency
+                ,"compiler_inputs":compiler_inputs
+            }),
+        )?;
+        diagnostics.publish(
+            false,
+            "before-debug-run",
+            &serde_json::json!({"original_process_owner_retained":true}),
+        )?;
         let mut original = None;
         debug_started = true;
         super::toolchain_debug::run(
@@ -265,6 +344,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                     let receipt = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-created","revision":1,
                         "role":role,"challenge":challenge,"parent":parent,"child":identity,
                         "program_utf16":program,"argv_utf16":arguments,"image_sha256":image_sha256,
+                        "compiler_inputs":compiler_inputs,
                         "held_from_process_creation":true,"held_live_before_wait":live,"native_parent_edge_observed":true});
                     fs::write(
                         root.join(format!("native-child-{role}.created.json")),
@@ -279,10 +359,8 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                     })?;
                     original = Some((identity, live));
                 }
-                if created.image != inputs.rustc && created.image != inputs.native_linker {
-                    return Err(io::Error::other(
-                        "unselected real compiler descendant image",
-                    ));
+                if !inputs.admits_created_image(&created.image, &created.image_sha256) {
+                    return Err(unselected_creation_error(created, inputs, image_sha256));
                 }
                 let path = output_root.join(format!(
                     "native-toolchain-{}-{}.ack.json",
@@ -342,6 +420,11 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                                     "compiler acknowledgment length changed",
                                 ));
                             }
+                            diagnostics.publish(false, "creation-ack-received-before-validation", &serde_json::json!({
+                                "child":created.identity,"parent_pid":created.parent_pid,
+                                "parent_birth":created.parent_birth,"image_sha256":created.image_sha256,
+                                "ack_bytes":bytes.len(),"ack_validated":false,"continued":false
+                            }))?;
                             memcordon::toolchain_creation_ack::validate(
                                 &bytes,
                                 memcordon::toolchain_creation_ack::Expected {
@@ -371,6 +454,12 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                     }
                 }
             },
+            |phase, state| diagnostics.publish(true, phase, &state),
+        )?;
+        diagnostics.publish(
+            false,
+            "after-debug-run-before-wait-retired",
+            &serde_json::json!({"debug_active_inventory_empty":true}),
         )?;
         super::toolchain_debug::wait_retired(
             &held,
@@ -378,30 +467,67 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 inputs.native_work_cutoff_ticks,
                 inputs.native_work_frequency,
             )?,
+        )
+        .map_err(|error| {
+            super::toolchain_debug::operation_error(
+                "wait-original-retired",
+                Some(child.id()),
+                error,
+            )
+        })?;
+        diagnostics.publish(
+            false,
+            "after-wait-retired-before-child-wait",
+            &serde_json::json!({"original_native_retirement_signaled":true}),
         )?;
         super::toolchain_debug::remaining(
             inputs.native_work_cutoff_ticks,
             inputs.native_work_frequency,
         )?;
-        let status = child.wait()?;
-        let receive = |capture: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>| {
+        let status = child.wait().map_err(|error| {
+            super::toolchain_debug::operation_error(
+                "original-child-wait",
+                Some(original_identity.process_id),
+                error,
+            )
+        })?;
+        diagnostics.publish(
+            false,
+            "after-child-wait",
+            &serde_json::json!({"native_status":status.code()}),
+        )?;
+        let receive = |capture: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>, phase| {
+            diagnostics.publish(false, phase, &serde_json::json!({"native_status":status.code(),"original_native_retirement_signaled":true}))?;
             let milliseconds = super::toolchain_debug::remaining(
                 inputs.native_work_cutoff_ticks,
                 inputs.native_work_frequency,
             )?;
             capture
                 .recv_timeout(std::time::Duration::from_millis(u64::from(milliseconds)))
-                .map_err(io::Error::other)?
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "{error}; toolchain-operation={phase}; original-child={original_identity:?}"
+                    ))
+                })?
+                .map_err(|error| {
+                    super::toolchain_debug::operation_error(
+                        phase,
+                        Some(original_identity.process_id),
+                        error,
+                    )
+                })
         };
         let output = Output {
             status,
-            stdout: receive(stdout)?,
-            stderr: receive(stderr)?,
+            stdout: receive(stdout, "before-stdout-capture-receive")?,
+            stderr: receive(stderr, "before-stderr-capture-receive")?,
         };
+        diagnostics.publish(false, "output-capture-complete", &serde_json::json!({"stdout_bytes":output.stdout.len(),"stderr_bytes":output.stderr.len(),"native_status":output.status.code()}))?;
         let (identity, live) =
             original.ok_or_else(|| io::Error::other("compiler creation receipt absent"))?;
         let retired = serde_json::json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,
             "role":role,"challenge":challenge,"parent":parent,"child":identity,"image_sha256":image_sha256,
+            "compiler_inputs":compiler_inputs,
             "held_from_process_creation":true,"held_live_before_wait":live,"native_parent_edge_observed":true,
             "native_wait_completed":true,"native_status":output.status.code()});
         fs::write(
@@ -410,7 +536,7 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
         )?;
         Ok(output)
     })();
-    match operation {
+    let operation = match operation {
         Err(original) if !debug_started => {
             let cleanup = super::toolchain_debug::run(
                 inputs.native_work_cutoff_ticks,
@@ -418,12 +544,22 @@ fn creation_output(command: &mut Command, input: CreationInput<'_>) -> io::Resul
                 &parent,
                 &child,
                 |_| Err(io::Error::other("compiler setup failed before release")),
+                |_, _| Ok(()),
             );
             Err(io::Error::other(format!(
                 "{original}; creation-owner cleanup={cleanup:?}"
             )))
         }
         other => other,
+    };
+    let named = qualified.verify(inputs, command);
+    match (operation, named) {
+        (Err(original), Err(secondary)) => Err(io::Error::other(format!(
+            "{original}; secondary compiler input custody={secondary}"
+        ))),
+        (Err(original), _) => Err(original),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(output), Ok(())) => Ok(output),
     }
 }
 
@@ -455,24 +591,9 @@ fn compile(
     flags: &[&str],
     challenge: &[u8],
 ) -> io::Result<()> {
-    let mut linker = std::ffi::OsString::from("linker=");
-    linker.push(&inputs.native_linker);
-    let mut command = Command::new(&inputs.rustc);
-    command
-        .arg(source)
-        .args(flags)
-        .arg("--edition=2021")
-        .arg("--target")
-        .arg(&inputs.target)
-        .arg("-C")
-        .arg(linker)
-        .arg("-o")
-        .arg(output);
-    for directory in &inputs.native_library_directories {
-        let mut argument = std::ffi::OsString::from("native=");
-        argument.push(directory);
-        command.arg("-L").arg(argument);
-    }
+    let mut command =
+        super::descriptor::toolchain_command::compile_command(inputs, source, output, flags)
+            .map_err(io::Error::other)?;
     checked(
         &mut command,
         output
@@ -497,9 +618,9 @@ pub(super) fn execute(descriptor: &Descriptor, transcript: &mut Transcript) -> i
         None,
         &descriptor.challenge,
     )?;
-    super::native::wait_controller_gate(
-        std::ffi::OsStr::new(&format!("{start}-toolchain-observer")),
-        || Ok(()),
+    let observer_name = format!("{start}-toolchain-observer");
+    super::native::wait_controller_gate(std::ffi::OsStr::new(&observer_name), || Ok(())).map_err(
+        |error| super::toolchain_diagnostics::observer_gate_error(&observer_name, error),
     )?;
     let inputs = descriptor
         .toolchain

@@ -2,6 +2,8 @@ use memcordon_readiness_verifier::validate_linux_image_mutation;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[path = "support/linux_image_memory_case.rs"]
+mod linux_image_memory_case;
 #[path = "support/linux_installed_case.rs"]
 mod linux_installed_case;
 #[path = "support/persisted_case.rs"]
@@ -485,6 +487,17 @@ fn loader_preparation(
     case.json(&policy_path, &policy);
     let contract_path = path("mixed.contract.json");
     case.json(&contract_path, &contract);
+    let memory_receipt = linux_image_memory_case::image_fixture_budget(
+        owner,
+        &evidence.key,
+        definition,
+        &input,
+        &contract,
+    );
+    let memory_bytes = memory_receipt["budget"]["limit_bytes"].as_u64().unwrap();
+    let memory_token = format!("+{memory_bytes}B");
+    let memory_budget = path("fixture-memory-budget.json");
+    case.json(&memory_budget, &memory_receipt);
     let typed_contract: memcordon_core::workload_contract_v3::WorkloadContractV3 =
         serde_json::from_value(contract.clone()).unwrap();
     typed_contract.validate().unwrap();
@@ -507,12 +520,11 @@ fn loader_preparation(
     }
     native.extend(0u32.to_be_bytes());
     native.push(1);
-    native.extend((512u64 * 1024 * 1024).to_be_bytes());
+    native.extend(memory_bytes.to_be_bytes());
     native.extend([2, 0, 1, 1]);
     native.extend([9u8; 32]);
     native.extend(0u32.to_be_bytes());
     native.push(0);
-    native.extend(digest.bytes());
     let request=serde_json::to_vec(&json!({"format":"memcordon.mixed-runtime-request","revision":2,"contract":contract,"native_launch":native,"attempt_deadline_millis":100})).unwrap();
     let attempt = "12".repeat(16);
     let provider_request = path(&format!("observations/{attempt}.provider-request.bin"));
@@ -527,7 +539,7 @@ fn loader_preparation(
         "--clear-groups".into(),
         "--".into(),
         "/usr/libexec/memcordon".into(),
-        "+512M".into(),
+        memory_token.clone(),
         "+60000ms".into(),
         "--sealed".into(),
         "--workload-contract".into(),
@@ -540,6 +552,8 @@ fn loader_preparation(
         format!("{directory}/observations"),
         "--image-entrypoint".into(),
         "owned-readiness".into(),
+        "--wait-for".into(),
+        "command".into(),
         "--".into(),
         "bytes-argv-status".into(),
         "0".into(),
@@ -553,7 +567,7 @@ fn loader_preparation(
         "loader-closure-probe",
     ]
     .map(|value| json!({"display":value,"raw":null}));
-    let public = json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":"+512M"},{"kind":"time","token":"+60000ms"}],"memory_token":"+512M","deadline_token":"+60000ms","argv":public_argv});
+    let public = json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":memory_token},{"kind":"time","token":"+60000ms"}],"memory_token":memory_token,"deadline_token":"+60000ms","argv":public_argv});
     let detail = if scenario == "loader-config" {
         "ELF loader configuration is outside the approved immutable library catalogue"
     } else {
@@ -574,8 +588,12 @@ fn loader_preparation(
     case.mutate(&evidence.observation, |raw| {
         raw["preparation_probe"] = json!(format!("{directory}/preparation-probe.json"))
     });
+    case.mutate(&receipt, |raw| {
+        raw["memory_budget"] = json!(format!("{directory}/fixture-memory-budget.json"))
+    });
     LinuxImagePreparationEvidence {
         receipt,
+        memory_budget,
         activation: activation_path,
         policy: policy_path,
         contract: contract_path,
@@ -635,6 +653,46 @@ fn persisted_import_rejections_require_original_acquisition_and_native_command_c
         assert!(
             case.validate().is_err(),
             "{scenario} accepted substituted original administrative inode"
+        );
+    }
+}
+
+#[test]
+fn loader_probe_memory_binds_modified_runtime_and_original_fixture_headroom() {
+    for scenario in ["loader-config", "rpath-injection"] {
+        let path = format!(
+            "installed/mixed-cases/image-cases/{scenario}/preparation-probe/fixture-memory-budget.json"
+        );
+        for field in [
+            "runtime_image",
+            "input_image",
+            "image_bytes",
+            "rounded_image_bytes",
+            "headroom_bytes",
+            "limit_bytes",
+            "page_bytes",
+        ] {
+            let mut case = persisted_import(scenario);
+            case.validate().unwrap();
+            case.mutate(&path, |receipt| receipt["budget"][field] = json!(0));
+            assert!(
+                case.validate().is_err(),
+                "{scenario} accepted changed fixture {field}"
+            );
+        }
+        let mut case = persisted_import(scenario);
+        let original = linux_installed_case::read(&case, "installed/owned-resources-acquired.json");
+        let original_reference = memcordon_readiness_verifier::linux_image_reference(
+            &original["images"]["runtime"],
+            &case.record.key.target,
+        )
+        .unwrap();
+        case.mutate(&path, |receipt| {
+            receipt["budget"]["runtime_image"] = original_reference
+        });
+        assert!(
+            case.validate().is_err(),
+            "{scenario} accepted unchanged context image for modified runtime"
         );
     }
 }

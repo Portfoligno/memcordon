@@ -2,7 +2,7 @@ schema_version = 5
 repository = "Portfoligno/memcordon"
 workflow = "release.yml"
 registry = "crates-io"
-publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
+publish_packages = ["memcordon-core", "memcordon-windows-launch-core", "memcordon-platform", "memcordon"]
 github_api_version = "2022-11-28"
 # Shared deadline for GitHub throttling across a release operation, including public verification.
 github_rate_limit_wait_seconds = 1200

@@ -24,6 +24,7 @@ pub enum Suite {
     Native,
     NativeCompile,
     NativeExecute,
+    WindowsFixtureNative,
     SupplyChain,
     SupplyAudit,
     SupplyDeny,
@@ -95,6 +96,7 @@ impl Suite {
             | WorkingWindowsPrepare
             | RehearsalToolBuild
             | Policy
+            | WindowsFixtureNative
             | Stress
             | StressPackages
             | StressLifecycle

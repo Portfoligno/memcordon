@@ -202,6 +202,30 @@ pub struct ResultV2 {
     pub invocation: crate::InvocationReport,
 }
 impl ResultV2 {
+    /// Select the last authenticated mixed carrier without inventing terminal facts.
+    pub fn from_legacy(
+        report: &crate::MemcordonReport,
+        tool: crate::result_v1::OperationalToolV1,
+        wrapper_status: i32,
+    ) -> Result<Self, String> {
+        let runtime = report.attempts.last().and_then(|attempt| match &attempt.boundary_detail {
+            crate::BoundaryMechanismEvidence::LinuxMixedPrivate(runtime) => Some(runtime.as_ref()),
+            _ => None,
+        }).ok_or("combined result lacks authenticated native mixed carrier; retained uncertainty cannot be replaced by a legacy report")?;
+        let value = Self {
+            format: "memcordon.result".into(),
+            revision: 2,
+            tool,
+            runtime: runtime.runtime.clone(),
+            frontend: runtime.frontend.clone(),
+            wrapper_status,
+            delivery: crate::DeliveryEvidence::Prepared,
+            invocation: report.invocation.clone(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "memcordon.result" || self.revision != 2 {
             return Err("combined result format/revision differs".into());

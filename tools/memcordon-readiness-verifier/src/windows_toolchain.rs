@@ -23,6 +23,7 @@ struct Created {
     held_from_process_creation: bool,
     held_live_before_wait: bool,
     native_parent_edge_observed: bool,
+    compiler_inputs: Option<CompilerInputs>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +40,19 @@ struct Retired {
     native_parent_edge_observed: bool,
     native_wait_completed: bool,
     native_status: Option<i32>,
+    compiler_inputs: Option<CompilerInputs>,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompilerInputs {
+    cwd_utf16: Vec<u16>,
+    selected_linker_utf16: Vec<u16>,
+    cwd_native_identity: (u32, u64),
+    selected_linker_native_identity: (u32, u64),
+    selected_linker_sha256: String,
+    linker_mode: String,
+    retained_ancestor_count: usize,
+    binding: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +92,11 @@ pub(crate) fn validate(
 ) -> VerificationResult<()> {
     let tc = &descriptor["toolchain"];
     let fields = [
+        "native_work_cutoff_ticks",
+        "native_work_frequency",
+        "linker_mode",
+        "input_root",
+        "selected_images",
         "rustc",
         "native_linker",
         "native_library_directories",
@@ -91,6 +110,13 @@ pub(crate) fn validate(
     if tc.as_object().is_none_or(|object| {
         object.len() != fields.len() || object.keys().any(|field| !fields.contains(&field.as_str()))
     }) || tc["target"] != native.target
+        || tc["linker_mode"] != "bundled-lld-link"
+        || tc["native_work_cutoff_ticks"]
+            .as_u64()
+            .is_none_or(|value| value == 0)
+        || tc["native_work_frequency"]
+            .as_u64()
+            .is_none_or(|value| value == 0)
     {
         return Err("original Windows selected toolchain schema/target differs".into());
     }
@@ -113,6 +139,43 @@ pub(crate) fn validate(
                 .ok_or("original measured toolchain artifact absent")?,
         )
     };
+    let input_root = text("input_root")?;
+    if input_root
+        .split(['\\', '/'])
+        .any(|component| matches!(component, "." | ".."))
+        || input_root.split(['\\', '/']).next_back() != Some("locked-inputs")
+    {
+        return Err("qualified compiler input root differs".into());
+    }
+    let join = |parts: &[&str]| {
+        let mut path = std::path::PathBuf::from(input_root.replace('\\', "/"));
+        for part in parts {
+            path.push(part);
+        }
+        path.to_string_lossy().replace('/', "\\")
+    };
+    let linker_argument = match native.target.as_str() {
+        "x86_64-pc-windows-msvc" => {
+            "linker=./toolchain/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+        }
+        "aarch64-pc-windows-msvc" => {
+            "linker=./toolchain/lib/rustlib/aarch64-pc-windows-msvc/bin/rust-lld.exe"
+        }
+        _ => return Err("qualified bundled linker target differs".into()),
+    };
+    if text("rustc")?.replace('/', "\\") != join(&["toolchain", "bin", "rustc.exe"])
+        || text("native_linker")?.replace('/', "\\")
+            != join(&[
+                "toolchain",
+                "lib",
+                "rustlib",
+                &native.target,
+                "bin",
+                "rust-lld.exe",
+            ])
+    {
+        return Err("selected bundled linker/compiler path differs from qualified cwd".into());
+    }
     let manifest = raw("toolchain-inputs")?;
     if input.toolchain_identity.as_deref() != Some(sha256(manifest).as_str()) {
         return Err("original immutable toolchain manifest digest differs".into());
@@ -130,6 +193,30 @@ pub(crate) fn validate(
         {
             return Err("original selected toolchain manifest malformed or duplicated".into());
         }
+    }
+    let images: Vec<Selected> = wire::decode(
+        &serde_json::to_vec(&tc["selected_images"]).map_err(|error| error.to_string())?,
+    )?;
+    let projected: Vec<_> = measured
+        .iter()
+        .filter(|(path, _)| {
+            path.rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("exe"))
+        })
+        .map(|(path, digest)| (path.as_str(), digest.as_str()))
+        .collect();
+    if images.is_empty()
+        || images.len() > 256
+        || images
+            .iter()
+            .map(|image| (image.path.as_str(), image.sha256.as_str()))
+            .collect::<Vec<_>>()
+            != projected
+    {
+        return Err(
+            "frozen compiler image projection differs from original measured executable inventory"
+                .into(),
+        );
     }
     for field in [
         "rustc",
@@ -164,6 +251,11 @@ pub(crate) fn validate(
     let libraries: Vec<String> = serde_json::from_value(tc["native_library_directories"].clone())
         .map_err(|error| error.to_string())?;
     if libraries.len() != 3
+        || libraries
+            .iter()
+            .map(|path| path.replace('/', "\\"))
+            .collect::<Vec<_>>()
+            != [join(&["msvc-lib"]), join(&["sdk-ucrt"]), join(&["sdk-um"])]
         || libraries.iter().any(|path| {
             path.len() < 3
                 || path.as_bytes()[1] != b':'
@@ -258,6 +350,7 @@ pub(crate) fn validate(
         return Err("actual independently held compiler and linker kernel images absent".into());
     }
     let mut children = BTreeSet::new();
+    let mut original_compiler_inputs: Option<CompilerInputs> = None;
     for (role, source, flags) in [
         ("readiness.rlib", "library.rs", vec!["--crate-type=rlib"]),
         ("child.exe", "child.rs", vec![]),
@@ -300,6 +393,30 @@ pub(crate) fn validate(
             );
         }
         let (program, args, image) = if !source.is_empty() {
+            let held = created
+                .compiler_inputs
+                .as_ref()
+                .ok_or("original compiler cwd/linker custody absent")?;
+            if retired.compiler_inputs.as_ref() != Some(held)
+                || held.cwd_utf16 != utf16(&input_root)
+                || held.selected_linker_utf16 != utf16(&text("native_linker")?)
+                || held.selected_linker_sha256 != linker_sha
+                || held.linker_mode != "bundled-lld-link"
+                || !(1..=64).contains(&held.retained_ancestor_count)
+                || held.binding
+                    != "original held directory passed as Command.current_dir; original selected linker held through debug settlement"
+                || original_compiler_inputs
+                    .as_ref()
+                    .is_some_and(|original| original != held)
+            {
+                return Err(
+                    "original compiler cwd/linker native identity or lifetime binding differs"
+                        .into(),
+                );
+            }
+            if original_compiler_inputs.is_none() {
+                original_compiler_inputs = retired.compiler_inputs;
+            }
             let mut args = vec![format!("{root}\\{source}")];
             args.extend(flags.into_iter().map(String::from));
             args.extend([
@@ -307,15 +424,20 @@ pub(crate) fn validate(
                 "--target".into(),
                 native.target.clone(),
                 "-C".into(),
-                format!("linker={}", text("native_linker")?),
+                linker_argument.into(),
+                "-C".into(),
+                "linker-flavor=lld-link".into(),
                 "-o".into(),
                 format!("{root}\\{role}"),
             ]);
-            for directory in &libraries {
-                args.extend(["-L".into(), format!("native={directory}")]);
+            for directory in ["native=./msvc-lib", "native=./sdk-ucrt", "native=./sdk-um"] {
+                args.extend(["-L".into(), directory.into()]);
             }
             (text("rustc")?, args, compiler_sha.clone())
         } else {
+            if created.compiler_inputs.is_some() || retired.compiler_inputs.is_some() {
+                return Err("generated workload child substitutes compiler input custody".into());
+            }
             let artifact = match role {
                 "run-tests" => "tests.exe",
                 "run-child" => "child.exe",

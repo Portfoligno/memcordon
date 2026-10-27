@@ -1,9 +1,20 @@
 //! MemCordon-owned workload behavior; provider evidence remains independently checked.
+mod controller_gate_access;
+mod controller_gate_control_publication;
+mod controller_gate_diagnostic;
+mod controller_gate_error;
+mod controller_gate_resolution;
+mod controller_gate_thread_control;
+mod controller_gate_token;
 pub mod descriptor;
+mod fixture_default_dacl;
 mod fixture_environment;
+mod namespace_primary_worker;
 mod native;
+mod native_fixture_default_dacl;
 mod toolchain;
 mod toolchain_debug;
+mod toolchain_diagnostics;
 
 use descriptor::{Case, Descriptor};
 use serde::{Deserialize, Serialize};
@@ -15,6 +26,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
+
+pub(super) fn namespace_primary_experiment() -> io::Result<i32> {
+    namespace_primary_worker::run()
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -119,30 +134,44 @@ fn read_http_header(stream: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn tcp_peer(port: u16, challenge: &[u8], output_root: &std::path::Path) -> io::Result<()> {
-    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))?;
+    let context = |stage, error| toolchain_diagnostics::socket_error(stage, port, error);
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|error| context("connect", error))?;
     // The retained peer awaits server half-close through compiler/churn work;
     // the independently owned public deadline bounds that whole operation.
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    stream.write_all(b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
-    let header = read_http_header(&mut stream)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(600)))
+        .map_err(|error| context("set-read-timeout", error))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| context("set-write-timeout", error))?;
+    stream
+        .write_all(b"GET /readiness HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .map_err(|error| context("send-request", error))?;
+    let header = read_http_header(&mut stream).map_err(|error| context("receive-header", error))?;
     if header != b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" {
         return Err(io::Error::other("HTTP response differs"));
     }
     let mut received = Vec::new();
     frame_write(&mut received, &header)?;
     for payload in [Vec::new(), vec![0, 255, 128, 10], challenge.to_vec()] {
-        frame_write(&mut stream, &payload)?;
-        let actual = frame_read(&mut stream)?;
+        frame_write(&mut stream, &payload).map_err(|error| context("framed-send", error))?;
+        let actual = frame_read(&mut stream).map_err(|error| context("framed-receive", error))?;
         if actual != payload {
             return Err(io::Error::other("TCP binary frame differs"));
         }
         frame_write(&mut received, &actual)?;
     }
     fs::write(output_root.join("tcp-peer-received.bin"), &received)?;
-    stream.shutdown(Shutdown::Write)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| context("shutdown-write", error))?;
     let mut byte = [0];
-    if stream.read(&mut byte)? != 0 {
+    if stream
+        .read(&mut byte)
+        .map_err(|error| context("wait-server-eof", error))?
+        != 0
+    {
         return Err(io::Error::other("TCP half-close did not reach EOF"));
     }
     Ok(())
@@ -775,8 +804,20 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<i32> {
     let envelope = native::token_observation()?;
     transcript.event("token-envelope", None, &envelope)?;
     if let Some(gate) = &descriptor.start_gate {
-        native::wait_controller_gate(std::ffi::OsStr::new(gate), || Ok(()))?;
-        transcript.event("controller-released", None, &descriptor.challenge)?;
+        native::wait_controller_gate_for_fixture(
+            std::ffi::OsStr::new(gate),
+            &descriptor,
+            transcript.sequence,
+        )?;
+        transcript
+            .event("controller-released", None, &descriptor.challenge)
+            .map_err(|error| {
+                controller_gate_error::context(
+                    controller_gate_error::Stage::PublishRelease,
+                    None,
+                    error,
+                )
+            })?;
     }
     match descriptor.case {
         Case::Joint | Case::EndpointMismatch => joint(&descriptor, &mut transcript, false)?,

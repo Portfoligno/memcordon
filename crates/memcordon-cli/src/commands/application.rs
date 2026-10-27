@@ -1450,7 +1450,6 @@ fn selected_result(
 ) -> Result<memcordon_core::ResultReport, String> {
     match args.output.report_format {
         memcordon_core::ReportFormat::ResultV2 => {
-            let runtime=report.attempts.last().and_then(|attempt|match &attempt.boundary_detail{memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(runtime)=>Some((**runtime).clone()),_=>None}).ok_or("combined result lacks authenticated native mixed carrier; retained uncertainty cannot be replaced by a legacy report")?;
             let features = [
                 ("sealed-runtime", cfg!(feature = "sealed-runtime")),
                 ("private-tcp", cfg!(feature = "private-tcp")),
@@ -1459,23 +1458,17 @@ fn selected_result(
             .filter(|(_, enabled)| *enabled)
             .map(|(name, _)| name.to_owned())
             .collect();
-            let value = memcordon_core::result_v2::ResultV2 {
-                format: "memcordon.result".into(),
-                revision: 2,
-                tool: memcordon_core::result_v1::OperationalToolV1 {
+            let value = memcordon_core::result_v2::ResultV2::from_legacy(
+                &report,
+                memcordon_core::result_v1::OperationalToolV1 {
                     name: report.tool.name.clone(),
                     version: report.tool.version.clone(),
                     os: std::env::consts::OS.into(),
                     architecture: std::env::consts::ARCH.into(),
                     runtime_features: features,
                 },
-                runtime: runtime.runtime,
-                frontend: runtime.frontend,
-                wrapper_status: exit_code,
-                delivery: memcordon_core::DeliveryEvidence::Prepared,
-                invocation: report.invocation.clone(),
-            };
-            value.validate()?;
+                exit_code,
+            )?;
             Ok(memcordon_core::ResultReport::Mixed(Box::new(value)))
         }
         memcordon_core::ReportFormat::Legacy => {

@@ -106,10 +106,10 @@ fn finite_mapping_rejects_missing_extra_recursive_and_archive_aliases() {
     };
     assert!(
         StoragePlan::packed(
-            &[archive.clone()],
+            std::slice::from_ref(&archive),
             &[object],
             &[archive_alias],
-            &BTreeSet::from([archive.path])
+            &BTreeSet::from([archive.path.clone()])
         )
         .is_err()
     );
@@ -136,7 +136,7 @@ fn physical_budget_counts_original_archive_objects_and_metadata_at_boundary() {
     };
     let plan = StoragePlan::packed(
         &[raw.clone(), archive.clone()],
-        &[object.clone()],
+        std::slice::from_ref(&object),
         &[ArtifactBinding {
             logical_path: raw.path.clone(),
             object_path: object.path.clone(),
@@ -147,10 +147,10 @@ fn physical_budget_counts_original_archive_objects_and_metadata_at_boundary() {
     assert_eq!(plan.check_budget(metadata).unwrap(), MAX_PRODUCER_BYTES);
     assert!(plan.check_budget(metadata + 1).is_err());
     let local = StoragePlan::packed(
-        &[raw.clone()],
-        &[object.clone()],
+        std::slice::from_ref(&raw),
+        std::slice::from_ref(&object),
         &[ArtifactBinding {
-            logical_path: raw.path,
+            logical_path: raw.path.clone(),
             object_path: object.path.clone(),
         }],
         &BTreeSet::new(),

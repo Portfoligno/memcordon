@@ -6,6 +6,98 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PROBE_ELIGIBILITY_BYTES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DefaultDaclProbeKindV1 {
+    #[serde(rename = "qualified-w-envelope-restricted-fixture")]
+    QualifiedRestrictedEnvelopeFixture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DefaultDaclProbeTargetV1 {
+    #[serde(rename = "x86_64-pc-windows-msvc")]
+    X86_64WindowsMsvc,
+    #[serde(rename = "aarch64-pc-windows-msvc")]
+    Aarch64WindowsMsvc,
+}
+
+impl TryFrom<&str> for DefaultDaclProbeTargetV1 {
+    type Error = String;
+    fn try_from(target: &str) -> Result<Self, String> {
+        match target {
+            "x86_64-pc-windows-msvc" => Ok(Self::X86_64WindowsMsvc),
+            "aarch64-pc-windows-msvc" => Ok(Self::Aarch64WindowsMsvc),
+            _ => Err("unsupported controlled diagnostic target".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultDaclProbeEligibilityV1 {
+    pub revision: u32,
+    pub kind: DefaultDaclProbeKindV1,
+    pub source_commit: String,
+    pub target: DefaultDaclProbeTargetV1,
+    pub fixture_sha256: String,
+    pub original_result_sha256: String,
+    pub original_terminal_sha256: String,
+    pub original_descriptor_sha256: String,
+}
+
+fn deserialize_probe_eligibility<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<DefaultDaclProbeEligibilityV1>, D::Error> {
+    DefaultDaclProbeEligibilityV1::deserialize(decoder).map(Some)
+}
+
+impl DefaultDaclProbeEligibilityV1 {
+    pub fn validate_native(&self, machine: u16) -> Result<(), String> {
+        let expected = match self.target {
+            DefaultDaclProbeTargetV1::X86_64WindowsMsvc if cfg!(target_arch = "x86_64") => 0x8664,
+            DefaultDaclProbeTargetV1::Aarch64WindowsMsvc if cfg!(target_arch = "aarch64") => 0xaa64,
+            _ => {
+                return Err("controlled diagnostic target differs from helper architecture".into());
+            }
+        };
+        if !cfg!(windows) || machine != expected {
+            return Err("controlled diagnostic pinned image PE target differs".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, request: &WorkloadDiagnosticRequestV1) -> Result<(), String> {
+        if self.revision != 1
+            || !matches!(self.source_commit.len(), 40 | 64)
+            || !self
+                .source_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.source_commit
+                != request
+                    .original_request
+                    .expected_provider_binding
+                    .source_commit
+                    .as_str()
+            || self.fixture_sha256 != request.image_sha256
+            || self.original_result_sha256 != request.original_result_sha256
+            || self.original_terminal_sha256 != request.original_terminal_sha256
+            || self.original_descriptor_sha256 != request.original_descriptor_sha256
+            || serde_json::to_vec(self)
+                .map_err(|error| error.to_string())?
+                .len()
+                > MAX_PROBE_ELIGIBILITY_BYTES
+        {
+            return Err(
+                "controlled diagnostic eligibility differs from qualified original evidence".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Read-only mirror of the frontend-local custody envelope. No live scope or
 /// native authority can be reconstructed from this diagnostic serialization.
 #[derive(Deserialize)]
@@ -23,6 +115,12 @@ struct OriginalTerminalContext {
 #[serde(deny_unknown_fields)]
 pub struct WorkloadDiagnosticRequestV1 {
     pub schema_version: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_probe_eligibility"
+    )]
+    pub default_dacl_probe: Option<DefaultDaclProbeEligibilityV1>,
     pub original_result_sha256: String,
     pub original_terminal_sha256: String,
     pub original_result_bytes: Vec<u8>,
@@ -49,6 +147,17 @@ pub struct WorkloadDiagnosticRequestV1 {
 }
 
 impl WorkloadDiagnosticRequestV1 {
+    pub fn parse_transport(bytes: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if bytes.len() > MAX_REQUEST_BYTES || hex::encode(Sha256::digest(bytes)) != expected_sha256
+        {
+            return Err("workload diagnostic raw request digest or bound differs".into());
+        }
+        memcordon_core::canonical_json::reject_duplicate_json_keys(bytes)?;
+        let request: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let digest = |value: &str| {
             value.len() == 64
@@ -327,6 +436,9 @@ impl WorkloadDiagnosticRequestV1 {
         {
             return Err("workload diagnostic descriptor policy or canonical hash differs".into());
         }
+        if let Some(eligibility) = &self.default_dacl_probe {
+            eligibility.validate_for(self)?;
+        }
         Ok(())
     }
 }
@@ -343,4 +455,118 @@ fn windows_absolute(path: &str) -> bool {
             .as_str()
             .split('\\')
             .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(':'))
+}
+
+#[cfg(windows)]
+pub struct HeldWorkloadRequest {
+    pub input: WorkloadDiagnosticRequestV1,
+    file: std::fs::File,
+    identity: RequestFileIdentity,
+    raw_sha256: String,
+}
+
+#[cfg(windows)]
+#[derive(Eq, PartialEq)]
+struct RequestFileIdentity {
+    volume: u64,
+    id: [u8; 16],
+    length: u64,
+    written: u64,
+}
+
+#[cfg(windows)]
+impl HeldWorkloadRequest {
+    fn identity(file: &std::fs::File) -> Result<RequestFileIdentity, String> {
+        use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.len() > MAX_REQUEST_BYTES as u64
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err("workload request is not a bounded ordinary nonreparse file".into());
+        }
+        let mut native: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: live held file and correctly sized native output buffer.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut native as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(RequestFileIdentity {
+            volume: native.VolumeSerialNumber,
+            id: native.FileId.Identifier,
+            length: metadata.len(),
+            written: metadata.last_write_time(),
+        })
+    }
+
+    fn open_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn bytes(file: &std::fs::File) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = file;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_REQUEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_REQUEST_BYTES {
+            return Err("workload request grew beyond bound".into());
+        }
+        Ok(bytes)
+    }
+
+    pub fn open(path: &std::path::Path, expected_sha256: Option<&str>) -> Result<Self, String> {
+        let file = Self::open_file(path)?;
+        let identity = Self::identity(&file)?;
+        let bytes = Self::bytes(&file)?;
+        let raw_sha256 = hex::encode(Sha256::digest(&bytes));
+        let input = WorkloadDiagnosticRequestV1::parse_transport(
+            &bytes,
+            expected_sha256.unwrap_or(&raw_sha256),
+        )?;
+        let held = Self {
+            input,
+            file,
+            identity,
+            raw_sha256,
+        };
+        held.recheck(path)?;
+        Ok(held)
+    }
+
+    pub fn recheck(&self, path: &std::path::Path) -> Result<(), String> {
+        let named = Self::open_file(path)?;
+        if Self::identity(&self.file)? != self.identity
+            || Self::identity(&named)? != self.identity
+            || hex::encode(Sha256::digest(Self::bytes(&self.file)?)) != self.raw_sha256
+            || hex::encode(Sha256::digest(Self::bytes(&named)?)) != self.raw_sha256
+        {
+            return Err("held workload request bytes or native file identity changed".into());
+        }
+        Ok(())
+    }
 }

@@ -580,9 +580,12 @@ pub(super) fn recover_installation(
         .try_clone()?
         .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut owner_bytes)?;
-    memcordon_core::canonical_json::reject_duplicate_json_keys(&owner_bytes)
-        .map_err(CiError::Message)?;
-    let owner: PersistedLeaseOwner = serde_json::from_slice(&owner_bytes)?;
+    let owner: PersistedLeaseOwner =
+        serde_json::from_value(super::linux_mixed_installed::decode_owned_resource_json_at(
+            "interrupted-lease-owner",
+            &owner_path,
+            &owner_bytes,
+        )?)?;
     let named = fs::symlink_metadata(&owner_path)?;
     let after = owner_file.metadata()?;
     if named.file_type().is_symlink()
@@ -675,10 +678,12 @@ pub(super) fn recover_installation(
     let recovery_owner_path = expected_admin.join("recovery-harness-owner.json");
     let recovery_owner_bytes =
         super::linux_mixed_installed::read_owned_resource(&recovery_owner_path, 1024 * 1024)?;
-    memcordon_core::canonical_json::reject_duplicate_json_keys(&recovery_owner_bytes)
-        .map_err(CiError::Message)?;
     let recovery_owner: super::linux_recovery_harness::RecoveryHarnessOwner =
-        serde_json::from_slice(&recovery_owner_bytes)?;
+        serde_json::from_value(super::linux_mixed_installed::decode_owned_resource_json_at(
+            "interrupted-recovery-harness-owner",
+            &recovery_owner_path,
+            &recovery_owner_bytes,
+        )?)?;
     if recovery_owner.owner_path != recovery_owner_path
         || recovery_owner.executable
             != expected_admin.join("recovery-harness/operational/native-test-harness")

@@ -40,13 +40,7 @@ impl MixedObservationScope {
                 "gid":metadata.gid(),"mode":metadata.mode(),"is_directory":metadata.is_dir()},
             "frontend_pid":std::process::id()});
         let bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
-        let mut file = member(&directory, "report-delivery-failure.json", true)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| directory.sync_all())
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        publish_observation(&directory, "report-delivery-failure.json", &bytes)
     }
 
     pub fn install(directory: &Path) -> Result<Self, String> {
@@ -76,8 +70,9 @@ pub(super) fn member(root: &File, name: &str, write: bool) -> Result<File, std::
     let name = std::ffi::CString::new(name).expect("fixed validated attempt filename");
     let flags = libc::O_CLOEXEC
         | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
         | if write {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL
         } else {
             libc::O_RDONLY
         };
@@ -88,6 +83,176 @@ pub(super) fn member(root: &File, name: &str, write: bool) -> Result<File, std::
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
+
+/// A pending member is private evidence, never an observation-ready flag. Any
+/// failure retains its exclusive inode/name (or the atomically published final
+/// name); recovery must not guess that a partially completed publish is absent.
+struct PendingObservation {
+    file: File,
+    staging: String,
+    final_name: String,
+    complete: std::fs::Metadata,
+}
+
+fn observation_directory(root: &File) -> std::io::Result<()> {
+    let metadata = root.metadata()?;
+    // SAFETY: geteuid has no arguments and only observes this process's identity.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() == 0
+    {
+        return Err(std::io::Error::other(
+            "held observation directory custody differs",
+        ));
+    }
+    Ok(())
+}
+
+fn observation_stamp(
+    metadata: &std::fs::Metadata,
+) -> (u64, u64, u64, u64, u32, u32, u32, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.nlink(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn verify_observation(
+    root: &File,
+    name: &str,
+    held: &File,
+    expected: &std::fs::Metadata,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    observation_directory(root)?;
+    let named = member(root, name, false)?;
+    let before = held.metadata()?;
+    // SAFETY: geteuid only observes the current process's effective identity.
+    if !before.is_file()
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.nlink() != 1
+        || before.mode() & 0o7777 != 0o600
+        || before.len() != bytes.len() as u64
+        || observation_stamp(&before) != observation_stamp(expected)
+        || observation_stamp(&named.metadata()?) != observation_stamp(expected)
+    {
+        return Err(std::io::Error::other(
+            "observation held/named inode, size or custody differs",
+        ));
+    }
+    let mut held_chunk = [0; 65536];
+    let mut named_chunk = [0; 65536];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = held_chunk.len().min(bytes.len() - offset);
+        held.read_exact_at(&mut held_chunk[..count], offset as u64)?;
+        named.read_exact_at(&mut named_chunk[..count], offset as u64)?;
+        let expected_bytes = &bytes[offset..offset + count];
+        if &held_chunk[..count] != expected_bytes || &named_chunk[..count] != expected_bytes {
+            return Err(std::io::Error::other(
+                "observation complete held/named byte readback differs",
+            ));
+        }
+        offset += count;
+    }
+    if observation_stamp(&held.metadata()?) != observation_stamp(expected)
+        || observation_stamp(&named.metadata()?) != observation_stamp(expected)
+    {
+        return Err(std::io::Error::other(
+            "observation custody changed during complete readback",
+        ));
+    }
+    observation_directory(root)
+}
+
+impl PendingObservation {
+    fn prepare(root: &File, name: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(std::io::Error::other("observation final basename differs"));
+        }
+        observation_directory(root)?;
+        let staging = format!(".memcordon-observation-{name}.pending");
+        let mut file = member(root, &staging, true)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let complete = file.metadata()?;
+        verify_observation(root, &staging, &file, &complete, bytes)?;
+        Ok(Self {
+            file,
+            staging,
+            final_name: name.to_owned(),
+            complete,
+        })
+    }
+
+    fn publish(self, root: &File, bytes: &[u8]) -> std::io::Result<()> {
+        verify_observation(root, &self.staging, &self.file, &self.complete, bytes)?;
+        let staging =
+            std::ffi::CString::new(self.staging.as_str()).expect("validated private basename");
+        let final_name =
+            std::ffi::CString::new(self.final_name.as_str()).expect("validated final basename");
+        // SAFETY: both NUL-terminated basenames belong to the same retained
+        // directory descriptor. RENAME_NOREPLACE atomically preserves existing
+        // evidence, without exposing the link-count transition of link/unlink.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                root.as_raw_fd(),
+                staging.as_ptr(),
+                root.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        root.sync_all()?;
+        let published = self.file.metadata()?;
+        // Rename may change ctime. Every other held native fact and all bytes
+        // must remain unchanged, and final readback pins the new ctime too.
+        let stable = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.nlink(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+        if stable(&published) != stable(&self.complete) {
+            return Err(std::io::Error::other(
+                "observation native owner changed across atomic publication",
+            ));
+        }
+        verify_observation(root, &self.final_name, &self.file, &published, bytes)
+    }
+}
+
+fn publish_observation(root: &File, name: &str, bytes: &[u8]) -> Result<(), String> {
+    PendingObservation::prepare(root, name, bytes)
+        .and_then(|pending| pending.publish(root, bytes))
+        .map_err(|error| format!("observation publication failed; final={name}; private staging/final evidence retained: {error}"))
+}
+
+#[cfg(test)]
+#[path = "../../tests/support/mixed_observation_publication.rs"]
+mod publication_tests;
 
 /// State for the optional original-owner retirement exchange. Local observer
 /// failure is retained separately while the frontend continues reading the
@@ -370,15 +535,14 @@ fn record_retirement(
     suffix: &str,
     bytes: &[u8],
 ) -> Result<(), String> {
+    if bytes.len() > memcordon_core::mixed_observation::RETIREMENT_OBSERVATION_BYTES {
+        return Err("retirement observer member exceeds existing bound before publication".into());
+    }
     let directory = OBSERVER
         .with(|scope| scope.borrow().clone())
         .ok_or("retirement observer scope lost")?;
     let name = format!("{}.{suffix}", binding.attempt_id.as_str());
-    let mut file = member(&directory, &name, true).map_err(|e| e.to_string())?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| directory.sync_all())
-        .map_err(|e| e.to_string())?;
+    publish_observation(&directory, &name, bytes)?;
     if read_retirement_member(&directory, &name).map_err(|e| e.to_string())? != bytes {
         return Err("retirement observer persisted bytes differ".into());
     }
@@ -421,30 +585,7 @@ fn record_member(attempt: [u8; 16], suffix: &str, bytes: &[u8]) -> Result<(), St
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut file = member(&directory, &format!("{identity}.{suffix}"), true)
-        .map_err(|error| error.to_string())?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| directory.sync_all())
-        .map_err(|error| error.to_string())?;
-    let mut readback = member(&directory, &format!("{identity}.{suffix}"), false)
-        .map_err(|error| error.to_string())?;
-    let metadata = readback.metadata().map_err(|error| error.to_string())?;
-    if metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o7777 != 0o600
-        || metadata.len() != bytes.len() as u64
-    {
-        return Err("mixed provider request receipt custody differs".into());
-    }
-    let mut persisted = Vec::new();
-    readback
-        .read_to_end(&mut persisted)
-        .map_err(|error| error.to_string())?;
-    if persisted != bytes {
-        return Err("mixed provider request receipt readback differs".into());
-    }
-    Ok(())
+    publish_observation(&directory, &format!("{identity}.{suffix}"), bytes)
 }
 
 pub(super) fn observe(
@@ -537,13 +678,7 @@ fn observe_phase(
     {
         return Err("mixed observation attempt filename differs".into());
     }
-    let mut output = member(&directory, &format!("{attempt}.{observation_name}"), true)
-        .map_err(|error| error.to_string())?;
-    output
-        .write_all(bytes)
-        .and_then(|()| output.sync_all())
-        .and_then(|()| directory.sync_all())
-        .map_err(|error| error.to_string())?;
+    publish_observation(&directory, &format!("{attempt}.{observation_name}"), bytes)?;
     loop {
         if Instant::now() >= deadline {
             return Err("mixed native observer barrier deadline expired".into());

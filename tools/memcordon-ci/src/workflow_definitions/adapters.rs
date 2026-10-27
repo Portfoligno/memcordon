@@ -116,6 +116,7 @@ fn acquires_sources(recipe: &str) -> bool {
     matches!(
         recipe,
         "workspace-fetch"
+            | "windows-fixture-native"
             | "fuzz-fetch"
             | "prepare-fuzz"
             | "prepare-tools"
@@ -630,8 +631,8 @@ fn bootstrap_steps(windows: bool, source_build: Option<&str>) -> Result<Vec<Valu
     if source_build.is_none() {
         let cache = id("bootstrap-cache");
         steps.push(action(&cache,true,host.clone(),object(&[("path",text("target/ci-bootstrap-in")),
-            ("key",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
-            ("restore-keys",text("mc-ci-bootstrap-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
+            ("key",text("mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-lookup")),
+            ("restore-keys",text("mc-ci-bootstrap-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/driver-bootstrap.toml', 'ci/toolchains.toml') }}-"))]),2));
         steps.push(driver_step(&probe,DriverOperation::Probe,windows,format!("{host} && steps.{cache}.outcome == 'success' && steps.{cache}.outputs.cache-matched-key != ''"),2,true));
         steps.push(driver_step(
             &context,
@@ -1444,6 +1445,13 @@ pub(super) fn operation_recipe(command: &str) -> Option<&str> {
 /// supplied here. Unknown commands fail generation instead of inheriting an
 /// unrelated whole-job planning envelope.
 fn reviewed_step_minutes(step: &Value) -> Option<u64> {
+    if matches!(
+        field(step, "run"),
+        "./target/ci-runtime/current/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json"
+            | "./target/ci-runtime/current/memcordon-ci.exe release prepare-readiness-tools --build-source .release/build-source.json"
+    ) {
+        return Some(60); // same original public support-producer cutoff
+    }
     if let Some(minutes) = step["timeout-minutes"]
         .as_u64()
         .filter(|minutes| *minutes > 0)

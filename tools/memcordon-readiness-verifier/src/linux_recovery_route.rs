@@ -1016,6 +1016,7 @@ pub(crate) fn decode_journal(bytes: &[u8], attempt: &str) -> VerificationResult<
         "mixed_worker",
     ];
     let optional = [
+        "mixed_control",
         "mixed_export_intent",
         "mixed_root_staging_intent",
         "mixed_cgroup_identity",
@@ -1032,6 +1033,28 @@ pub(crate) fn decode_journal(bytes: &[u8], attempt: &str) -> VerificationResult<
         return Err("native recovery journal original attempt/schema differs".into());
     }
     digest(text(&record, "caller_envelope_digest")?)?;
+    if let Some(control) = record.get("mixed_control") {
+        closed(control, &["pid", "start_time"])?;
+        if control["pid"]
+            .as_u64()
+            .is_none_or(|pid| pid == 0 || pid > i32::MAX as u64)
+            || control["start_time"]
+                .as_u64()
+                .is_none_or(|birth| birth == 0)
+            || [
+                "frontend",
+                "mixed_worker",
+                "guardian",
+                "target",
+                "namespace_init",
+            ]
+            .iter()
+            .any(|actor| control["pid"] == record[*actor]["pid"])
+            || record["mixed_admission_metadata"].is_null()
+        {
+            return Err("native journal authenticated control identity differs".into());
+        }
+    }
     Ok(record)
 }
 

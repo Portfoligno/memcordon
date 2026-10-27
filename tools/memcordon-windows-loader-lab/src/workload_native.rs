@@ -46,6 +46,12 @@ use windows_sys::Win32::{
 const LIMIT: usize = 256 * 1024;
 const EVENT_LIMIT: usize = 2048;
 const FAILURE: u32 = 0x4d43_0d01;
+#[path = "default_dacl_counterfactual_native.rs"]
+mod default_dacl_counterfactual_native;
+#[path = "startup_access_probes.rs"]
+mod startup_access_probes;
+#[path = "workload_target_attempt.rs"]
+mod workload_target_attempt;
 static STOP: AtomicBool = AtomicBool::new(false);
 
 fn error(api: &str) -> String {
@@ -114,11 +120,11 @@ fn read(path: &Path, bound: usize) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
-fn request(path: &Path) -> Result<Request, String> {
-    let bytes = read(path, 16 * 1024 * 1024)?;
-    let request: Request = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    request.validate()?;
-    Ok(request)
+fn request(
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<memcordon_windows_loader_lab::workload::HeldWorkloadRequest, String> {
+    memcordon_windows_loader_lab::workload::HeldWorkloadRequest::open(path, expected_sha256)
 }
 fn publish(path: &Path, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
@@ -401,13 +407,13 @@ struct Process {
 #[derive(Clone, Copy)]
 enum DebugCreation<'a> {
     None,
-    OnlyThisProcess(&'a Path),
+    OnlyThisProcess(&'a Path, usize, usize),
 }
 impl DebugCreation<'_> {
     fn flags(self) -> u32 {
         match self {
             Self::None => 0,
-            Self::OnlyThisProcess(_) => DEBUG_ONLY_THIS_PROCESS,
+            Self::OnlyThisProcess(..) => DEBUG_ONLY_THIS_PROCESS,
         }
     }
 }
@@ -528,8 +534,11 @@ fn spawn_checked(
     // Adopt it before any fallible readback or checkpoint, including birth.
     let mut debugger = match debug {
         DebugCreation::None => None,
-        DebugCreation::OnlyThisProcess(output) => {
-            Some(DebugOwner::created(information.dwProcessId, output))
+        DebugCreation::OnlyThisProcess(output, event_limit, byte_limit) => {
+            let mut owner = DebugOwner::created(information.dwProcessId, output);
+            owner.event_limit = event_limit;
+            owner.byte_limit = byte_limit;
+            Some(owner)
         }
     };
     // CreateProcessAsUserW success guarantees both returned handles are valid.
@@ -583,7 +592,7 @@ fn spawn_checked(
             };
             let settled = wait(process.0, cleanup);
             let retained = match (debug, debugger.as_ref()) {
-                (DebugCreation::OnlyThisProcess(output), Some(owner)) => publish(
+                (DebugCreation::OnlyThisProcess(output, ..), Some(owner)) => publish(
                     &output.join("post-create-rollback.json"),
                     &json!({"format":"memcordon.workload-post-create-rollback","revision":1,"diagnostic_only":true,"certification_authority":false,"original_failure_unchanged":true,"pid":information.dwProcessId,"birth":created_birth,"tid":information.dwThreadId,"creator_thread":owner.creator,"debug_creation":"only-this-process","creation_flags":flags,"primary":primary,"termination_request":{"phase":"cleanup","code":FAILURE,"succeeded":terminated},"events":owner.events,"omitted_events":owner.omitted,"module_coverage":owner.module_coverage(),"exit":owner.exit,"exit_phase":owner.exit_phase,"debug_settlement":format!("{debug_settled:?}"),"held_process_settlement":format!("{settled:?}")}),
                 ),
@@ -745,6 +754,7 @@ pub fn run_desktop_holder(
     ready: u64,
     stop: u64,
     target_token: u64,
+    target_probe_token: u64,
 ) -> Result<(), String> {
     let ready =
         Handle::new(usize::try_from(ready).map_err(|_| "ready handle overflow")? as HANDLE)?;
@@ -760,8 +770,14 @@ pub fn run_desktop_holder(
         cleanup: Vec::new(),
         readiness_started: false,
     };
-    let result =
-        desktop_holder_operation(path, &ready, stop, target_token, &identity, &mut context);
+    let result = desktop_holder_operation(
+        path,
+        &ready,
+        stop,
+        (target_token, target_probe_token),
+        &identity,
+        &mut context,
+    );
     if let Err(primary) = &result
         && !context.readiness_started
     {
@@ -809,7 +825,7 @@ fn desktop_holder_operation(
     path: &Path,
     ready: &Handle,
     stop: u64,
-    target_token: u64,
+    target_tokens: (u64, u64),
     identity: &memcordon_core::WindowsProcessIdentityV1,
     context: &mut HolderContext,
 ) -> Result<(), String> {
@@ -817,12 +833,18 @@ fn desktop_holder_operation(
     clear(ready.0)?;
     clear(stop.0)?;
     let target_token = Handle::new(
-        usize::try_from(target_token).map_err(|_| "target query handle overflow")? as HANDLE,
+        usize::try_from(target_tokens.0).map_err(|_| "target query handle overflow")? as HANDLE,
     )?;
     clear(target_token.0)?;
     query_only_token(target_token.0)?;
+    let target_probe_token = Handle::new(
+        usize::try_from(target_tokens.1).map_err(|_| "target probe handle overflow")? as HANDLE,
+    )?;
+    clear(target_probe_token.0)?;
+    startup_access_probes::validate_probe_capability(target_probe_token.0, target_token.0)?;
     context.enter(Stage::Request, "read and validate holder request");
-    let request = request(path)?;
+    let held_request = request(path, None)?;
+    let request = &held_request.input;
     context.binding = Some(Binding {
         diagnostic_id: request.diagnostic_id.clone(),
         request_sha256: hex::encode(Sha256::digest(
@@ -830,7 +852,7 @@ fn desktop_holder_operation(
         )),
     });
     context.enter(Stage::Deadlines, "validate original holder deadlines");
-    let (_, cleanup) = deadlines(&request)?;
+    let (work, cleanup) = deadlines(request)?;
     context.enter(Stage::HolderToken, "query holder token and session");
     let mut raw = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
@@ -867,7 +889,7 @@ fn desktop_holder_operation(
     let desktop_creation =
         memcordon_windows_loader_lab::holder_creation::CreationSecurity::new(&desktop_sd)?;
     let desktop_sa = desktop_creation.attributes();
-    let name = desktop_name(&request);
+    let name = desktop_name(request);
     let (station_name, desktop_name) = name.split_once('\\').ok_or("invalid diagnostic desktop")?;
     context.enter(Stage::WindowStation, "create and select holder station");
     let original = unsafe { GetProcessWindowStation() };
@@ -981,6 +1003,34 @@ fn desktop_holder_operation(
         }
         let station_policy = station_policy?;
         let desktop_policy = desktop_policy?;
+        let probes = startup_access_probes::collect(
+            target_token.0,
+            target_probe_token,
+            (station, desktop),
+            (station_name, desktop_name),
+            (&station_expected, &station_observed),
+            (&desktop_expected, &desktop_observed),
+            (work, cleanup),
+        )?;
+        live(work)?;
+        let probe_record = json!({"format":"memcordon.workload-startup-access-probes","revision":1,
+            "diagnostic_only":true,"certification_authority":false,"inconclusive":true,
+            "binding":context.binding,"holder":identity,"holder_session":envelope.session_id,
+            "target_envelope_sha256":memcordon_windows_launch_core::token_envelope_sha256(&target_envelope)?,"probes":probes});
+        if serde_json::to_vec(&probe_record)
+            .map_err(|error| error.to_string())?
+            .len()
+            > LIMIT
+        {
+            return Err(
+                "startup access probes exceed existing finite observation bound; inconclusive"
+                    .into(),
+            );
+        }
+        publish(
+            &path.with_extension("startup-access-probes.json"),
+            &probe_record,
+        )?;
         context.enter(Stage::GateSecurity, "parse original gate security");
         let gate_name = request.descriptor["start_gate"]
             .as_str()
@@ -1030,7 +1080,7 @@ fn desktop_holder_operation(
             outcome: Outcome::Ready {
                 policy: Box::new(ReadyPolicy {
                     session_id: envelope.session_id,
-                    desktop: name,
+                    desktop: name.clone(),
                     station_sha256: station_observed.raw_sha256,
                     desktop_sha256: desktop_observed.raw_sha256,
                     station_policy,
@@ -1168,6 +1218,8 @@ struct DebugOwner {
     exit_phase: Option<DebugPhase>,
     events: Vec<Value>,
     event_bytes: usize,
+    event_limit: usize,
+    byte_limit: usize,
     omitted: u64,
     creator: u32,
     verified_birth: Option<u64>,
@@ -1195,6 +1247,8 @@ impl DebugOwner {
             exit_phase: None,
             events: Vec::new(),
             event_bytes: 0,
+            event_limit: EVENT_LIMIT,
+            byte_limit: LIMIT,
             omitted: 0,
             creator: unsafe { GetCurrentThreadId() },
             verified_birth: None,
@@ -1214,7 +1268,9 @@ impl DebugOwner {
     }
     fn record(&mut self, value: Value) {
         let length = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
-        if self.events.len() < EVENT_LIMIT && length <= LIMIT.saturating_sub(self.event_bytes) {
+        if self.events.len() < self.event_limit
+            && length <= self.byte_limit.saturating_sub(self.event_bytes)
+        {
             self.event_bytes += length;
             self.events.push(value);
         } else {
@@ -1671,20 +1727,27 @@ fn wait(process: HANDLE, cutoff: Instant) -> Result<(), String> {
     }
 }
 
+fn diagnostic_names(directory: &Path) -> Result<std::collections::BTreeSet<OsString>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+        if names.len() >= EVENT_LIMIT {
+            return Err("diagnostic directory inventory exceeds existing finite bound".into());
+        }
+        names.insert(entry.map_err(|error| error.to_string())?.file_name());
+    }
+    Ok(names)
+}
+
 fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Instant) -> Value {
     let mut image_pin: Option<File> = None;
-    let mut target: Option<Process> = None;
     let mut holder: Option<Process> = None;
-    let mut debugger: Option<DebugOwner> = None;
-    let mut target_job: Option<Job> = None;
     let mut holder_job: Option<Job> = None;
     let mut holder_stop: Option<Handle> = None;
     let mut measured = json!({});
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut stdout_omitted = 0;
-    let mut stderr_omitted = 0;
-    let mut streams: Option<(Handle, Handle, Handle)> = None;
+    let mut aggregate = workload_target_attempt::Aggregate::default();
+    let mut baseline_debug = Value::Null;
+    let mut baseline_work_exit = None;
+    let mut target_cleanup_errors = Vec::new();
     let primary = (|| -> Result<(), String> {
         live(work)?;
         input.validate()?;
@@ -1732,6 +1795,12 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             return Err("actual fixture image hash differs".into());
         }
         let imports = memcordon_core::parse_windows_pe_imports(&image)?;
+        if let Some(eligibility) = &input.default_dacl_probe {
+            eligibility.validate_native(imports.machine)?;
+            if eligibility.fixture_sha256 != input.image_sha256 {
+                return Err("counterfactual eligibility differs from native pinned fixture".into());
+            }
+        }
         let imports = json!({"machine":imports.machine,"normal_imports":imports.normal,"delayed_imports":imports.delayed});
         let import_bytes = serde_json::to_vec(&imports).map_err(|e| e.to_string())?;
         if import_bytes.len() > LIMIT {
@@ -1742,19 +1811,40 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
         }
         measured["actual_image"] = json!({"path":image_path,"sha256":input.image_sha256,"identity":file_identity(pin.as_raw_handle()),"imports":imports});
         image_pin = Some(pin);
-        let descriptor = read(&input.descriptor_path, 1024 * 1024)?;
-        let descriptor: Value = serde_json::from_slice(&descriptor).map_err(|e| e.to_string())?;
-        if descriptor != input.descriptor {
+        let mut descriptor_pin = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&input.descriptor_path)
+            .map_err(|error| error.to_string())?;
+        let descriptor_metadata = descriptor_pin
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        if !descriptor_metadata.is_file()
+            || descriptor_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || descriptor_metadata.len() > 1024 * 1024
+        {
+            return Err("diagnostic descriptor is not an immutable bounded regular file".into());
+        }
+        let mut descriptor = Vec::new();
+        Read::by_ref(&mut descriptor_pin)
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut descriptor)
+            .map_err(|error| error.to_string())?;
+        if descriptor != serde_json::to_vec(&input.descriptor).map_err(|error| error.to_string())?
+            || hex::encode(Sha256::digest(&descriptor)) != input.descriptor_sha256
+        {
             return Err("fresh diagnostic descriptor bytes differ".into());
         }
+        let descriptor_identity = file_identity(descriptor_pin.as_raw_handle());
+        if descriptor_identity["native_identity_measured"] != true {
+            return Err("diagnostic descriptor native file identity unavailable".into());
+        }
+        measured["descriptor_pin"] = json!({"identity":descriptor_identity,"sha256":input.descriptor_sha256,"held_through_both_targets":true});
         live(work)?;
         holder_job = Some(
             Job::create(input.reference_plan.job_security_descriptor_sddl())
                 .map_err(|e| format!("holder Job: {e:?}"))?,
-        );
-        target_job = Some(
-            Job::create(input.reference_plan.job_security_descriptor_sddl())
-                .map_err(|e| format!("target Job: {e:?}"))?,
         );
         let system = system_for_session(envelope.session_id)?;
         let (ready_read, ready_write) = pipe()?;
@@ -1781,6 +1871,23 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             return Err(error("duplicate inherited target query-only capability"));
         }
         let target_query = Handle::new(raw_query)?;
+        let mut raw_probe = ptr::null_mut();
+        if unsafe {
+            DuplicateTokenEx(
+                token.0,
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                &attributes,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut raw_probe,
+            )
+        } == 0
+        {
+            return Err(error(
+                "duplicate exact target impersonation diagnostic capability",
+            ));
+        }
+        let target_probe = Handle::new(raw_probe)?;
         let helper_image = std::env::current_exe().map_err(|e| e.to_string())?;
         let helper = memcordon_core::NativeWindowsCommandV1 {
             program: helper_image.as_os_str().encode_wide().collect(),
@@ -1803,6 +1910,11 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
                     .to_string()
                     .encode_utf16()
                     .collect(),
+                "--target-probe-token".encode_utf16().collect(),
+                (target_probe.0 as usize as u64)
+                    .to_string()
+                    .encode_utf16()
+                    .collect(),
             ],
         };
         holder = Some(spawn(SpawnSpec {
@@ -1812,13 +1924,14 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             cwd: &input.original_request.current_directory,
             desktop: None,
             job: holder_job.as_ref().expect("stored holder Job"),
-            handles: &[ready_write.0, stop.0, target_query.0],
+            handles: &[ready_write.0, stop.0, target_query.0, target_probe.0],
             standard: false,
             descriptors: None,
             cleanup,
             debug: DebugCreation::None,
         })?);
         drop(target_query);
+        drop(target_probe);
         clear(stop.0)?;
         holder_stop = Some(stop);
         drop(ready_write);
@@ -1943,137 +2056,150 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
         }
         measured["holder"] = readiness;
         live(work)?;
-        let (stdin_read, stdin_write) = pipe()?;
-        clear(stdin_write.0)?;
-        let (stdout_read, stdout_write) = pipe()?;
-        clear(stdout_read.0)?;
-        let (stderr_read, stderr_write) = pipe()?;
-        clear(stderr_read.0)?;
-        streams = Some((stdin_write, stdout_read, stderr_read));
-        live(work)?;
         measured["target_creation_mode"] = json!({"debug_creation":"only-this-process","debugger_perturbation":true,"creator_thread":unsafe{GetCurrentThreadId()},"intended_creation_flags":DEBUG_ONLY_THIS_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUPINFO_PRESENT|CREATE_UNICODE_ENVIRONMENT|CREATE_NEW_PROCESS_GROUP});
-        let spawned = spawn(SpawnSpec {
-            token: token.0,
-            command: &input.command,
-            environment: &input.original_request.environment,
-            cwd: &input.original_request.current_directory,
-            desktop: Some(&desktop_name(input)),
-            job: target_job.as_ref().expect("stored target Job"),
-            handles: &[stdin_read.0, stdout_write.0, stderr_write.0],
-            standard: true,
-            descriptors: Some((
-                input.reference_plan.process_security_descriptor_sddl(),
-                input.reference_plan.thread_security_descriptor_sddl(),
-            )),
-            cleanup,
-            debug: DebugCreation::OnlyThisProcess(&input.output_directory),
-        });
-        target = Some(match spawned {
-            Ok(process) => process,
-            Err(primary) => {
-                let retained = read(
-                    &input.output_directory.join("post-create-rollback.json"),
-                    LIMIT * 2,
-                )
-                .and_then(|bytes| {
-                    serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
-                });
-                measured["target_post_create_rollback"] = match retained {
-                    Ok(value) => value,
-                    Err(error) => {
-                        json!({"retention_error":error,"meaning":"no rollback authority inferred"})
+        let probe_bytes = read(&path.with_extension("startup-access-probes.json"), LIMIT)?;
+        memcordon_core::canonical_json::reject_duplicate_json_keys(&probe_bytes)?;
+        let probes: Value =
+            serde_json::from_slice(&probe_bytes).map_err(|error| error.to_string())?;
+        if probes["format"] != "memcordon.workload-startup-access-probes"
+            || probes["revision"] != 1
+            || probes["diagnostic_only"] != true
+            || probes["certification_authority"] != false
+            || probes["inconclusive"] != true
+            || probes["binding"]
+                != serde_json::to_value(&expected_request).map_err(|error| error.to_string())?
+            || probes["holder"]
+                != serde_json::to_value(&expected_holder).map_err(|error| error.to_string())?
+            || probes["holder_session"] != envelope.session_id
+            || probes["target_envelope_sha256"] != digest
+        {
+            return Err("startup probe binding differs from held request/holder/actual target token; inconclusive".into());
+        }
+        let source_default_dacl = &probes["probes"]["token_facts"]["default_dacl"];
+        let names_before = diagnostic_names(&input.output_directory)?;
+        let baseline = workload_target_attempt::observe(
+            workload_target_attempt::Spec {
+                input,
+                source: token.0,
+                token: token.0,
+                digest: &digest,
+                image_path: &image_path,
+                image_pin: image_pin.as_ref().expect("retained image pin"),
+                source_default_dacl,
+                changed: None,
+                work,
+                cleanup,
+            },
+            &mut aggregate,
+        );
+        baseline_debug = baseline.debug;
+        baseline_work_exit = baseline.work_exit;
+        target_cleanup_errors.extend(baseline.cleanup_errors.clone());
+        measured
+            .as_object_mut()
+            .expect("observation object")
+            .extend(
+                baseline
+                    .observation
+                    .as_object()
+                    .expect("attempt object")
+                    .clone(),
+            );
+        let actual_envelope_observed = measured["target"]["actual_envelope"].is_object();
+        measured["startup_access_probes"] = json!({"record":probes,"record_sha256":hex::encode(Sha256::digest(&probe_bytes)),
+            "actual_target":{"pid":measured["target"]["pid"],"birth":measured["target"]["birth"]},
+            "actual_target_token_envelope_sha256":actual_envelope_observed.then_some(&digest),"same_exact_primary_envelope_observed":actual_envelope_observed.then_some(true),"diagnostic_only":true,
+            "default_dacl_comparison":measured["default_dacl_comparison"]});
+        baseline.operation?;
+        if input.default_dacl_probe.is_some() {
+            use memcordon_windows_loader_lab::default_dacl_counterfactual::{
+                self as contract, BaselineEvidence,
+            };
+            let eligible = contract::eligible_baseline(BaselineEvidence {
+                work_exit: baseline.work_exit,
+                natural_exit: !baseline.forced,
+                fixture_entry: baseline.fixture_entry,
+                native_retirement_complete: baseline.settled,
+                pending_debug_event: baseline_debug["pending"] != false,
+                event_omissions: baseline.omissions,
+                stream_omissions: aggregate
+                    .stdout_omitted
+                    .saturating_add(aggregate.stderr_omitted),
+                source_default_acl_equal: baseline.default_acl_equal,
+                original_work_deadline_live: Instant::now() < work,
+            });
+            if !eligible {
+                measured["default_dacl_counterfactual"] = json!({"ran":false,"inconclusive":true,"reason":"fresh natural baseline, exact token equivalence, complete retirement or original work cutoff prerequisite absent"});
+            } else {
+                let changed = (|| -> Result<Value, String> {
+                    live(work)?;
+                    if diagnostic_names(&input.output_directory)? != names_before {
+                        return Err(
+                            "baseline left transcript or other output; counterfactual not run"
+                                .into(),
+                        );
                     }
+                    let held_holder = holder.as_ref().ok_or("original holder absent")?;
+                    if unsafe { WaitForSingleObject(held_holder.process.0, 0) } != WAIT_TIMEOUT
+                        || birth(held_holder.process.0)? != held_holder.birth
+                    {
+                        return Err("original target-session holder retired or changed before counterfactual".into());
+                    }
+                    let duplicate = default_dacl_counterfactual_native::Duplicate::create(
+                        token.0,
+                        work,
+                        &mut measured["duplicate_preintervention_refusal"],
+                    )?;
+                    let arm = workload_target_attempt::observe(
+                        workload_target_attempt::Spec {
+                            input,
+                            source: token.0,
+                            token: duplicate.token.0,
+                            digest: &digest,
+                            image_path: &image_path,
+                            image_pin: image_pin.as_ref().expect("retained image pin"),
+                            source_default_dacl: &duplicate.changed["default_dacl"],
+                            changed: Some(&duplicate),
+                            work,
+                            cleanup,
+                        },
+                        &mut aggregate,
+                    );
+                    target_cleanup_errors.extend(arm.cleanup_errors.clone());
+                    let token_unchanged = duplicate.verify_retired(token.0, cleanup);
+                    let interpretation = contract::interpret_changed(
+                        arm.fixture_entry,
+                        arm.work_exit,
+                        arm.forced,
+                        arm.settled && token_unchanged.is_ok() && arm.operation.is_ok(),
+                        arm.omissions != 0
+                            || aggregate.stdout_omitted != 0
+                            || aggregate.stderr_omitted != 0,
+                        Instant::now() >= work && !arm.fixture_entry && arm.work_exit.is_none(),
+                    );
+                    Ok(
+                        json!({"ran":true,"exactly_one_changed_arm":true,"default_dacl_counterfactual":true,
+                        "reference_plan_default_dacl_equivalence":false,"original_failure_unchanged":true,"gate_released":false,
+                        "observation":arm.observation,"debug":arm.debug,"operation":arm.operation,"cleanup":{"complete":arm.settled,"errors":arm.cleanup_errors},
+                        "token_immutability":token_unchanged,"interpretation":format!("{interpretation:?}"),"diagnostic_only":true,"inconclusive":true}),
+                    )
+                })();
+                measured["default_dacl_counterfactual"] = match changed {
+                    Ok(value) => value,
+                    Err(error) => json!({"ran":false,"inconclusive":true,"error":error}),
                 };
-                return Err(primary);
             }
-        });
-        debugger = target.as_mut().expect("stored target").debugger.take();
-        let created = target.as_ref().expect("stored target");
-        measured["target"] = json!({"pid":created.pid,"birth":created.birth,"creation_flags":created.creation_flags,"debug_creation":"only-this-process","debugger_perturbation":true,"post_create_image_and_token_checks":"not yet complete"});
-        drop((stdin_read, stdout_write, stderr_write));
-        let target = target.as_mut().expect("stored target");
-        let mut observed_path = vec![0_u16; 32768];
-        let mut length = observed_path.len() as u32;
-        if unsafe {
-            QueryFullProcessImageNameW(target.process.0, 0, observed_path.as_mut_ptr(), &mut length)
-        } == 0
-            || length as usize > observed_path.len()
-        {
-            return Err(error("QueryFullProcessImageNameW actual target"));
         }
-        let observed_path = PathBuf::from(OsString::from_wide(&observed_path[..length as usize]));
-        if observed_path.canonicalize().map_err(|e| e.to_string())?
-            != image_path.canonicalize().map_err(|e| e.to_string())?
-        {
-            return Err("executing actual target path differs from measured image".into());
-        }
-        let actual_token = process_token(target.process.0)?;
-        let actual_envelope = memcordon_windows_launch_core::query_token_envelope(actual_token.0)?;
-        if memcordon_windows_launch_core::token_envelope_sha256(&actual_envelope)? != digest {
-            return Err("actual process primary token envelope differs".into());
-        }
-        measured["target"] = json!({"pid":target.pid,"birth":target.birth,"new_identity":true,"creation_flags":target.creation_flags,"debug_creation":"only-this-process","stdio_roles":["stdin","stdout","stderr"],"stdin":"empty-live-pipe","actual_envelope":actual_envelope,"desktop":desktop_name(input),"debugger_perturbation":true});
-        let resumed = resume(
-            target,
-            "actual-workload-target",
-            "debug-at-creation-before-single-resume",
-            true,
-        )?;
-        measured["target_resume"] = serde_json::to_value(&resumed).map_err(|e| e.to_string())?;
-        resumed.result.require_exact_one()?;
-        loop {
-            live(work)?;
-            let (_, output, errors) = streams.as_ref().expect("retained stream owners");
-            drain(output.0, &mut stdout, &mut stdout_omitted)?;
-            drain(errors.0, &mut stderr, &mut stderr_omitted)?;
-            let owner = debugger.as_mut().expect("retained debug owner");
-            owner.poll(target.process.0, work, DebugPhase::Work)?;
-            if owner.omitted > 0 {
-                return Err(
-                    "finite debug event count or encoded-byte bound exhausted; inconclusive".into(),
-                );
-            }
-            if owner.exit.is_some() {
-                break;
-            }
-            let transcript = input.descriptor["transcript"]
-                .as_str()
-                .ok_or("fresh transcript absent")?;
-            if Path::new(transcript)
-                .try_exists()
-                .map_err(|e| e.to_string())?
-            {
-                let bytes = read(Path::new(transcript), LIMIT)?;
-                if !bytes.is_empty() {
-                    measured["fixture_entry"] = json!({"observed":true,"bytes":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes)),"meaning":"initialization progressed; original failure not reproduced"});
-                    break;
-                }
-            }
+        measured["aggregate_bounds"] = json!({"events":aggregate.events,"encoded_event_bytes":aggregate.event_bytes,
+            "event_count_limit":EVENT_LIMIT,"encoded_event_limit":LIMIT,"stdout_limit":LIMIT,"stderr_limit":LIMIT});
+        if file_identity(descriptor_pin.as_raw_handle()) != descriptor_identity {
+            return Err("held diagnostic descriptor identity changed through pair".into());
         }
         // Keep immutable image custody until the process/Job cleanup below.
         measured["image_pin_held_during_observation"] = json!(true);
         Ok(())
     })();
-    let mut cleanup_errors = Vec::new();
-    if let Some(job) = &target_job {
-        measured["target_termination_request"] = json!({"requested":true,"phase":"cleanup","reason":"diagnostic cleanup","code":FAILURE,"target":target.as_ref().map(|process|json!({"pid":process.pid,"birth":process.birth})),"meaning":"request provenance, not proof of a natural startup exit"});
-        if let Err(e) = job.terminate(FAILURE) {
-            measured["target_termination_request"]["native_result"] = json!(format!("{e:?}"));
-            cleanup_errors.push(format!("target Job termination: {e:?}"));
-        } else {
-            measured["target_termination_request"]["native_result"] = json!("success");
-        }
-    }
-    if let (Some(owner), Some(process)) = (debugger.as_mut(), target.as_ref()) {
-        if let Err(e) = owner.settle(process.process.0, cleanup) {
-            cleanup_errors.push(e);
-        }
-    }
-    if let Some(process) = &target {
-        if let Err(e) = wait(process.process.0, cleanup) {
-            cleanup_errors.push(e);
-        }
-    }
+    let mut cleanup_errors = target_cleanup_errors;
     let mut holder_forced = false;
     if let Some(stop) = &holder_stop {
         if unsafe { SetEvent(stop.0) } == 0 {
@@ -2113,7 +2239,7 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             cleanup_errors.push(format!("partial holder Job termination: {e:?}"));
         }
     }
-    for (name, job) in [("target", &target_job), ("holder", &holder_job)] {
+    for (name, job) in [("holder", &holder_job)] {
         if let Some(job) = job {
             match job.wait_empty(cleanup) {
                 Ok(true) => {}
@@ -2121,32 +2247,19 @@ fn run(path: &Path, input: &Request, source: HANDLE, work: Instant, cleanup: Ins
             }
         }
     }
-    if let Some((_, output, errors)) = &streams {
-        if let Err(e) = drain(output.0, &mut stdout, &mut stdout_omitted) {
-            cleanup_errors.push(e);
-        }
-        if let Err(e) = drain(errors.0, &mut stderr, &mut stderr_omitted) {
-            cleanup_errors.push(e);
-        }
-    }
-    let debug = debugger.as_ref().map(|owner| json!({"events":owner.events,"encoded_event_bytes":owner.event_bytes,"encoded_event_limit":LIMIT,"event_count_limit":EVENT_LIMIT,"omitted":owner.omitted,"module_coverage":owner.module_coverage(),"native_exit":owner.exit,"exit_observation_phase":owner.exit_phase,"exit_provenance_limit":"cleanup-phase events may follow diagnostic termination; observation phase does not establish when or why native exit occurred","creator_thread":owner.creator,"attached":owner.attached,"pending":owner.pending.is_some()}));
-    let work_exit = debugger.as_ref().and_then(|owner| {
-        if matches!(owner.exit_phase, Some(DebugPhase::Work)) {
-            owner.exit
-        } else {
-            None
-        }
-    });
+    let debug = baseline_debug;
+    let work_exit = baseline_work_exit;
     measured["startup_evidence"] = json!({"fixture_entry_observed":measured["fixture_entry"]["observed"]==true,"work_exit":work_exit,
         "interpretation":if measured["fixture_entry"]["observed"]==true {"fixture-entry-observed"}else if work_exit.is_some(){"work-exit-without-observed-fixture-entry"}else{"startup-not-established"},
         "authority":"diagnostic-only; successful collection is not successful target startup"});
     drop(image_pin);
-    json!({"format":"memcordon.workload-startup-diagnostic","revision":1,"diagnostic_only":true,"certification_authority":false,"inconclusive":true,"original_failure_unchanged":true,"original_result_sha256":input.original_result_sha256,"original_pid":input.original_pid,"original_birth":input.original_birth,"diagnostic_id":input.diagnostic_id,"observation":measured,"operation":primary,"cleanup":{"complete":cleanup_errors.is_empty(),"holder_forced":holder_forced,"errors":cleanup_errors},"debug":debug,"stdout":stdout,"stderr":stderr,"stdout_omitted":stdout_omitted,"stderr_omitted":stderr_omitted})
+    json!({"format":"memcordon.workload-startup-diagnostic","revision":1,"diagnostic_only":true,"certification_authority":false,"inconclusive":true,"original_failure_unchanged":true,"original_result_sha256":input.original_result_sha256,"original_pid":input.original_pid,"original_birth":input.original_birth,"diagnostic_id":input.diagnostic_id,"observation":measured,"operation":primary,"cleanup":{"complete":cleanup_errors.is_empty(),"holder_forced":holder_forced,"errors":cleanup_errors},"debug":debug,"stdout":aggregate.stdout,"stderr":aggregate.stderr,"stdout_omitted":aggregate.stdout_omitted,"stderr_omitted":aggregate.stderr_omitted})
 }
 
 struct ServiceArguments {
     name: Vec<u16>,
     request: PathBuf,
+    request_sha256: String,
     result: PathBuf,
     source: usize,
 }
@@ -2175,16 +2288,22 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
         return;
     }
     let outcome = (|| -> Result<(), String> {
-        let input = request(&arguments.request)?;
-        let (work, cleanup) = deadlines(&input)?;
-        let observation = run(
+        let held = request(&arguments.request, Some(&arguments.request_sha256))?;
+        let input = &held.input;
+        let (work, cleanup) = deadlines(input)?;
+        let mut observation = run(
             &arguments.request,
-            &input,
+            input,
             arguments.source as HANDLE,
             work,
             cleanup,
         );
-        publish(&arguments.result, &observation)
+        let binding = held.recheck(&arguments.request);
+        if let Err(error) = &binding {
+            observation["request_transport_error"] = json!(error);
+        }
+        publish(&arguments.result, &observation)?;
+        binding
     })();
     if let Err(error) = &outcome {
         let _ = publish(
@@ -2207,6 +2326,7 @@ pub fn run_as_service(
     name: &str,
     request: &Path,
     result: &Path,
+    request_sha256: &str,
     source_pid: u32,
     source_birth: u64,
     source_token: u64,
@@ -2249,6 +2369,7 @@ pub fn run_as_service(
         .set(ServiceArguments {
             name: wide(name),
             request: request.to_owned(),
+            request_sha256: request_sha256.to_owned(),
             result: result.to_owned(),
             source: token.0 as usize,
         })

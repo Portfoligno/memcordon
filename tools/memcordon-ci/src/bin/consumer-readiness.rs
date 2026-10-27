@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use memcordon_ci::command::CommandSpec;
 use memcordon_ci::consumer_readiness_ledger::{self as ledger, CellEvidence, SourceIdentity};
+use memcordon_ci::producer_failure_forwarding;
 use memcordon_readiness_verifier::{JobOutcome, ProducerOrigin};
 use std::{fs, path::PathBuf, process::ExitCode};
 
@@ -765,6 +766,19 @@ fn run(operation: Operation) -> Result<(), String> {
                     .arg("--operation-deadline-unix-millis")
                     .arg(absolute.to_string())
                     .output();
+            let acquisition_failed = !acquisition
+                .as_ref()
+                .is_ok_and(|observed| observed.status.success());
+            if acquisition_failed {
+                // Separate from the generic excerpt/error string: preserve a complete
+                // selected original record even when it exceeds the excerpt budget.
+                let stderr = acquisition
+                    .as_ref()
+                    .ok()
+                    .map(|output| output.stderr.as_slice());
+                let _ = producer_failure_forwarding::inspect(stderr)
+                    .write_to(&mut std::io::stderr().lock());
+            }
             let cleanup = CommandSpec::new(&driver, &cwd, std::time::Duration::from_secs(15 * 60))
                 .bounded_until(cutoff)
                 .arg("consumer-readiness-cleanup")
@@ -783,10 +797,7 @@ fn run(operation: Operation) -> Result<(), String> {
                 &memcordon_ci::release::consumer_readiness_cell::cell_record_path(&destination),
             );
             let mut failures = Vec::new();
-            if !acquisition
-                .as_ref()
-                .is_ok_and(|observed| observed.status.success())
-            {
+            if acquisition_failed {
                 failures.push(format!(
                     "actual acquisition/installed runner failed: {}",
                     command_failure(&acquisition)

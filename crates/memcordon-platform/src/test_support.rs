@@ -4,6 +4,16 @@ mod ci_interrupt;
 pub use ci_interrupt::{CiInterrupt, CiInterruptRegistration, CiInterruptToken};
 
 #[cfg(target_os = "linux")]
+mod linux_image_custody_transport;
+#[cfg(target_os = "linux")]
+pub use linux_image_custody_transport::{
+    IMAGE_CUSTODY_PACKET_BOUND, ImageCustodyFdBudget, ImageCustodyPacket, ImageCustodyPeer,
+    ImageCustodySocket, image_custody_current_peer, image_custody_cutoff_nanos,
+    image_custody_deadline, image_custody_fd_budget, image_custody_monotonic_nanos,
+    image_custody_parent_pid,
+};
+
+#[cfg(target_os = "linux")]
 #[path = "private_network_source.rs"]
 mod private_network_source;
 
@@ -630,9 +640,12 @@ pub fn backend_selection_matches(
     crate::supervisor::test_backend_selection_matches(selected, observed, metric)
 }
 
+pub use crate::mixed_indeterminate::test_project as project_mixed_indeterminate;
 pub use crate::supervisor::test_authorization_evidence_failure as authorization_evidence_failure;
+pub use crate::supervisor::test_supervise_backend_execution as supervise_backend_execution;
 pub use crate::supervisor::test_supervise_counted_failed_attempt as supervise_counted_failed_attempt;
 pub use crate::supervisor::test_supervise_failed_attempt as supervise_failed_attempt;
+pub use crate::supervisor::test_validate_backend_execution as validate_backend_execution;
 
 #[allow(clippy::result_large_err)]
 pub fn backend_selection_drift_execution(
@@ -951,6 +964,22 @@ pub struct WindowsImageProcess {
 }
 
 #[cfg(windows)]
+#[path = "windows_thread_activity.rs"]
+mod windows_thread_activity;
+#[cfg(windows)]
+pub use windows_thread_activity::WindowsThreadActivitySample;
+
+#[cfg(windows)]
+#[path = "windows_wait_observer.rs"]
+mod windows_wait_observer;
+#[cfg(windows)]
+pub use windows_wait_observer::{
+    WINDOWS_WAIT_OBSERVER_BOUND, WindowsWaitInherited, WindowsWaitObserver,
+    WindowsWaitObserverRetirement, WindowsWaitObserverSnapshot, WindowsWaitThreadHandle,
+    windows_observe_transferred_wait_cleanup, windows_unresolved_wait_owner_count,
+};
+
+#[cfg(windows)]
 fn windows_process_observation_error(
     operation: &str,
     pid: Option<u32>,
@@ -967,6 +996,97 @@ fn windows_process_observation_error(
 
 #[cfg(windows)]
 impl WindowsImageProcess {
+    /// Diagnostic-only token facts from this original retained process. A
+    /// retired process or changed binding is unavailable, never a PID lookup.
+    pub fn original_token_envelope(
+        &self,
+        deadline: std::time::Instant,
+    ) -> io::Result<memcordon_core::WindowsCallerTokenEnvelopeV1> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            Security::TOKEN_QUERY,
+            System::Threading::{
+                GetProcessId, GetProcessTimes, OpenProcessToken, WaitForSingleObject,
+            },
+        };
+        let live = || -> io::Result<()> {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original retained token observation cutoff exhausted",
+                ));
+            }
+            // SAFETY: query only the same retained process, never reopen its PID.
+            match unsafe { WaitForSingleObject(self._handle.as_raw_handle(), 0) } {
+                WAIT_TIMEOUT => {}
+                WAIT_OBJECT_0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "original retained process retired before token observation completed",
+                    ));
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+            let mut birth = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            // SAFETY: complete fixed native outputs and the original query-only handle.
+            let pid = unsafe { GetProcessId(self._handle.as_raw_handle()) };
+            if pid == 0
+                || unsafe {
+                    GetProcessTimes(
+                        self._handle.as_raw_handle(),
+                        &mut birth,
+                        &mut exit,
+                        &mut kernel,
+                        &mut user,
+                    )
+                } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let observed_birth =
+                (u128::from(birth.dwHighDateTime) << 32) | u128::from(birth.dwLowDateTime);
+            if pid != self.identity.pid || observed_birth != self.identity.birth {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "original retained process token binding differs",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original retained token observation cutoff exhausted",
+                ));
+            }
+            Ok(())
+        };
+        live()?;
+        let mut token = std::ptr::null_mut();
+        // SAFETY: TOKEN_QUERY only on the original retained hProcess; no privilege adjustment.
+        if unsafe { OpenProcessToken(self._handle.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful OpenProcessToken transfers exactly one native owner.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        live()?;
+        let envelope = memcordon_windows_launch_core::query_token_envelope(token.as_raw_handle())
+            .map_err(io::Error::other)?;
+        live()?;
+        Ok(envelope)
+    }
+
+    /// Read-only diagnostic sampling of this original process object. This
+    /// cannot add a process to the admitted family or prove compiler completion.
+    pub fn begin_thread_activity_sample(
+        &self,
+        deadline: std::time::Instant,
+    ) -> io::Result<WindowsThreadActivitySample> {
+        windows_thread_activity::begin(&self._handle, self.identity, deadline)
+    }
+
     /// Diagnostic-only census of direct children absent from the caller's held
     /// identities. These observations do not establish Job membership or add
     /// any process to the independently accepted family.
@@ -1326,6 +1446,26 @@ pub struct WindowsHeldFileIdentity {
 
 #[cfg(windows)]
 pub fn windows_held_file_identity(file: &std::fs::File) -> io::Result<WindowsHeldFileIdentity> {
+    let metadata = windows_held_file_metadata(file)?;
+    Ok(WindowsHeldFileIdentity {
+        volume_serial: metadata.volume_serial,
+        file_index: metadata.file_index,
+        length: metadata.length,
+    })
+}
+
+#[cfg(windows)]
+pub struct WindowsHeldFileMetadata {
+    pub volume_serial: u32,
+    pub file_index: u64,
+    pub length: u64,
+    pub attributes: u32,
+    pub links: u32,
+}
+
+/// Query the same retained File without exporting a native handle or changing access.
+#[cfg(windows)]
+pub fn windows_held_file_metadata(file: &std::fs::File) -> io::Result<WindowsHeldFileMetadata> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -1336,12 +1476,613 @@ pub fn windows_held_file_identity(file: &std::fs::File) -> io::Result<WindowsHel
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(WindowsHeldFileIdentity {
+    Ok(WindowsHeldFileMetadata {
         volume_serial: information.dwVolumeSerialNumber,
         file_index: (u64::from(information.nFileIndexHigh) << 32)
             | u64::from(information.nFileIndexLow),
         length: (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow),
+        attributes: information.dwFileAttributes,
+        links: information.nNumberOfLinks,
     })
+}
+
+#[cfg(windows)]
+struct WindowsFileOperationError {
+    operation: &'static str,
+    parameters: String,
+    cause_text: String,
+    cause: io::Error,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for WindowsFileOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "native-operation={}; kind={:?}; original-raw-os-error={:?}; {}; cause={}",
+            self.operation,
+            self.cause.kind(),
+            self.cause.raw_os_error(),
+            self.parameters,
+            self.cause_text
+        )
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsFileOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for WindowsFileOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_operation_error(
+    operation: &'static str,
+    parameters: String,
+    cause: io::Error,
+) -> io::Error {
+    fn bounded(value: &str, limit: usize) -> String {
+        if value.len() <= limit {
+            return value.to_owned();
+        }
+        let mut end = limit;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{} [omitted-bytes={}]", &value[..end], value.len() - end)
+    }
+    let kind = cause.kind();
+    struct Prefix(String);
+    const CAUSE_BOUND: usize = 512;
+    impl std::fmt::Write for Prefix {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut end = (CAUSE_BOUND - self.0.len()).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&text[..end]);
+            if end != text.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut prefix = Prefix(String::with_capacity(CAUSE_BOUND));
+    if std::fmt::write(&mut prefix, format_args!("{cause}")).is_err() {
+        prefix
+            .0
+            .push_str(" [cause-format-incomplete; omitted-bytes=unknown]");
+    }
+    let cause_text = prefix.0;
+    io::Error::new(
+        kind,
+        WindowsFileOperationError {
+            operation,
+            parameters: bounded(&parameters, 1024),
+            cause_text,
+            cause,
+        },
+    )
+}
+
+/// Prepare only an exclusively created writable diagnostic stage before its
+/// persistent metadata snapshot; the destination is never modified here.
+#[cfg(windows)]
+pub fn windows_prepare_persistent_stage(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsHeldFileMetadata> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_BASIC_INFO, FileBasicInfo, SetFileInformationByHandle,
+    };
+    let live = || {
+        if std::time::Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original persistent-stage cutoff exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    live()?;
+    let before = windows_held_file_metadata(file).map_err(|cause| {
+        windows_file_operation_error(
+            "prepare-source-metadata",
+            "held-source=true; metadata=unavailable".into(),
+            cause,
+        )
+    })?;
+    if before.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || before.links != 1
+    {
+        return Err(io::Error::other(
+            "persistent stage is not an ordinary single-link held file",
+        ));
+    }
+    let basic = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: FILE_ATTRIBUTE_NORMAL,
+    };
+    live()?;
+    // SAFETY: same held writable file and full native structure; zero time
+    // fields preserve times while explicitly preparing persistent attributes.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&basic as *const FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        let cause = io::Error::last_os_error();
+        return Err(windows_file_operation_error(
+            "prepare-FileBasicInfo",
+            format!(
+                "class={FileBasicInfo}; native-bytes={}; selected-attributes={FILE_ATTRIBUTE_NORMAL}; source-volume={}; source-file={}; source-length={}; source-attributes={}; source-links={}; expected-caller-access=0x00110180(READ_ATTRIBUTES|WRITE_ATTRIBUTES|DELETE|SYNCHRONIZE); expected-caller-share=0x5(READ|DELETE)",
+                std::mem::size_of::<FILE_BASIC_INFO>(),
+                before.volume_serial,
+                before.file_index,
+                before.length,
+                before.attributes,
+                before.links
+            ),
+            cause,
+        ));
+    }
+    live()?;
+    let after = windows_held_file_metadata(file).map_err(|cause|windows_file_operation_error(
+        "prepare-post-metadata",format!("class={FileBasicInfo}; selected-attributes={FILE_ATTRIBUTE_NORMAL}; source-volume={}; source-file={}; source-length={}; source-attributes-before={}; source-links={}",before.volume_serial,before.file_index,before.length,before.attributes,before.links),cause))?;
+    if (
+        before.volume_serial,
+        before.file_index,
+        before.links,
+        before.length,
+    ) != (
+        after.volume_serial,
+        after.file_index,
+        after.links,
+        after.length,
+    ) || after.attributes != FILE_ATTRIBUTE_NORMAL
+    {
+        return Err(io::Error::other(
+            "held persistent stage identity or prepared attributes differ",
+        ));
+    }
+    live()?;
+    Ok(after)
+}
+
+#[cfg(windows)]
+#[path = "windows_rename_status.rs"]
+mod windows_rename_status;
+
+#[cfg(windows)]
+use windows_rename_status::{
+    Completion as WindowsSynchronousStatus, classify as windows_synchronous_status,
+};
+
+#[cfg(windows)]
+fn windows_rename_live(deadline: std::time::Instant) -> io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original held rename cutoff exhausted",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_rename_component(name: &std::ffi::OsStr) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    const NATIVE_PATH_UNITS: usize = 32768;
+    let units: Vec<u16> = name.encode_wide().take(NATIVE_PATH_UNITS).collect();
+    if units.is_empty()
+        || units.len() >= NATIVE_PATH_UNITS
+        || name == std::ffi::OsStr::new(".")
+        || name == std::ffi::OsStr::new("..")
+        || units.iter().any(|unit| {
+            matches!(*unit, 0)
+                || *unit == u16::from(b'/')
+                || *unit == u16::from(b'\\')
+                || *unit == u16::from(b':')
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "held rename requires one bounded native filename component",
+        ));
+    }
+    Ok(units)
+}
+
+#[cfg(windows)]
+fn windows_rename_nt_error(operation: &'static str, parameters: String, status: i32) -> io::Error {
+    // SAFETY: NTSTATUS translation has no pointers or ownership effects.
+    let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+    windows_file_operation_error(
+        operation,
+        format!("native-status={status:#010x}; {parameters}"),
+        io::Error::from_raw_os_error(code as i32),
+    )
+}
+
+/// A metadata/DELETE owner opened synchronously relative to its original held
+/// parent. Arbitrary (possibly asynchronous) File handles cannot construct it.
+#[cfg(windows)]
+pub struct WindowsSynchronousRenameSource {
+    source: std::fs::File,
+    parent: std::fs::File,
+    deadline: std::time::Instant,
+}
+
+/// Knowledge that the native rename committed. Verify only AFTER disarming
+/// cleanup of the old name; a failed proof cannot undo the committed mutation.
+#[cfg(windows)]
+pub struct WindowsRenameCommitted {
+    status: i32,
+    information: usize,
+    deadline: std::time::Instant,
+}
+
+#[cfg(windows)]
+impl WindowsRenameCommitted {
+    pub fn verify(self, deadline: std::time::Instant) -> io::Result<()> {
+        if self.status != windows_sys::Win32::Foundation::STATUS_SUCCESS {
+            return Err(windows_rename_nt_error(
+                "rename-completed-IOSB",
+                format!("committed=true; iosb-information={}", self.information),
+                self.status,
+            ));
+        }
+        windows_rename_live(self.deadline.min(deadline))
+    }
+}
+
+/// Open ONLY an existing original stage, never create or follow a reparse.
+/// The independent reader remains the caller's continuous byte-custody owner.
+#[cfg(windows)]
+pub fn windows_open_synchronous_rename_source(
+    parent: &std::fs::File,
+    stage_name: &std::ffi::OsStr,
+    expected_readback: &std::fs::File,
+    deadline: std::time::Instant,
+) -> io::Result<WindowsSynchronousRenameSource> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    windows_rename_live(deadline)?;
+    let mut units = windows_rename_component(stage_name)?;
+    let length = units
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stage name exceeds native UNICODE_STRING length",
+            )
+        })?;
+    units.push(0);
+    let maximum_length = units
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stage name exceeds native UNICODE_STRING backing extent",
+            )
+        })?;
+    let parent = parent.try_clone()?;
+    let expected = windows_held_file_metadata(expected_readback)?;
+    let parent_metadata = windows_held_file_metadata(&parent)?;
+    if expected.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || expected.links != 1
+        || parent_metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || parent_metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || expected.volume_serial != parent_metadata.volume_serial
+    {
+        return Err(io::Error::other(
+            "original stage/parent type, link or volume differs",
+        ));
+    }
+    let mut name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: maximum_length,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+            .expect("native object attributes size"),
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &raw mut name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut iosb = IO_STATUS_BLOCK::default();
+    windows_rename_live(deadline)?;
+    // SAFETY: bounded native structures remain live throughout the synchronous
+    // existing-file open. Root authority is the original held parent, with no
+    // inheritance, creation, data-write access or reparse-following capability.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            &attributes,
+            &raw mut iosb,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    match windows_synchronous_status(status) {
+        WindowsSynchronousStatus::InvariantViolation => std::process::abort(),
+        WindowsSynchronousStatus::Failure => {
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                // SAFETY: immediately adopt any returned owned handle, including on error.
+                drop(unsafe { std::fs::File::from_raw_handle(handle) });
+            }
+            return Err(windows_rename_nt_error(
+                "rename-source-NtCreateFile",
+                format!(
+                    "parent-volume={}; parent-file={}; name-units={}; access=0x00110180; share=0x5; disposition={FILE_OPEN}; synchronous=true",
+                    parent_metadata.volume_serial,
+                    parent_metadata.file_index,
+                    units.len() - 1
+                ),
+                status,
+            ));
+        }
+        WindowsSynchronousStatus::Success => {}
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::other(
+            "synchronous stage open returned an invalid handle",
+        ));
+    }
+    // SAFETY: exact native success transfers its sole returned handle into RAII
+    // before any fallible status, cutoff or identity verification.
+    let source = unsafe { std::fs::File::from_raw_handle(handle) };
+    // SAFETY: a completed synchronous open supplies the status arm of IOSB.
+    let completed = unsafe { iosb.Anonymous.Status };
+    if completed != windows_sys::Win32::Foundation::STATUS_SUCCESS {
+        return Err(windows_rename_nt_error(
+            "rename-source-completed-IOSB",
+            format!("iosb-information={}", iosb.Information),
+            completed,
+        ));
+    }
+    windows_rename_live(deadline)?;
+    let actual = windows_held_file_metadata(&source)?;
+    let retained = windows_held_file_metadata(expected_readback)?;
+    let stamp = |value: &WindowsHeldFileMetadata| {
+        (
+            value.volume_serial,
+            value.file_index,
+            value.length,
+            value.attributes,
+            value.links,
+        )
+    };
+    if stamp(&actual) != stamp(&expected) || stamp(&retained) != stamp(&expected) {
+        return Err(io::Error::other(
+            "synchronous stage differs from original held readback",
+        ));
+    }
+    windows_rename_live(deadline)?;
+    Ok(WindowsSynchronousRenameSource {
+        source,
+        parent,
+        deadline,
+    })
+}
+
+#[cfg(windows)]
+impl WindowsSynchronousRenameSource {
+    pub fn as_file(&self) -> &std::fs::File {
+        &self.source
+    }
+
+    /// Atomically rename relative to the original parent through the closed
+    /// synchronous owner. Caller must disarm old-name cleanup immediately on Ok.
+    #[cfg(windows)]
+    pub fn rename(
+        &self,
+        target_name: &std::ffi::OsStr,
+        deadline: std::time::Instant,
+    ) -> io::Result<WindowsRenameCommitted> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS,
+            FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformationEx, NtSetInformationFile,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let deadline = self.deadline.min(deadline);
+        let source = &self.source;
+        let parent = &self.parent;
+        let live = || {
+            if std::time::Instant::now() >= deadline {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original held rename cutoff exhausted",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        live()?;
+        let name = windows_rename_component(target_name)?;
+        let source_metadata = windows_held_file_metadata(source).map_err(|cause| {
+            windows_file_operation_error(
+                "rename-source-metadata",
+                "held-source=true; metadata=unavailable".into(),
+                cause,
+            )
+        })?;
+        let parent_metadata = windows_held_file_metadata(parent).map_err(|cause|windows_file_operation_error(
+        "rename-parent-metadata",format!("held-parent=true; parent-metadata=unavailable; source-volume={}; source-file={}; source-length={}; source-attributes={}; source-links={}",source_metadata.volume_serial,source_metadata.file_index,source_metadata.length,source_metadata.attributes,source_metadata.links),cause))?;
+        if source_metadata.attributes != FILE_ATTRIBUTE_NORMAL
+            || source_metadata.links != 1
+            || parent_metadata.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || parent_metadata.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || source_metadata.volume_serial != parent_metadata.volume_serial
+        {
+            return Err(io::Error::other(
+                "held rename prepared source/parent type, link or volume differs",
+            ));
+        }
+        let invalid_extent = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "held rename native filename extent overflows",
+            )
+        };
+        let name_bytes = name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(invalid_extent)?;
+        let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let bytes = offset
+            .checked_add(name_bytes)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+            .ok_or_else(invalid_extent)?
+            .max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
+        let native_bytes = u32::try_from(bytes).map_err(|_| invalid_extent())?;
+        // Typed allocation guarantees the native SDK structure's alignment on each
+        // architecture. Checked offset/byte lengths include room for a zero terminator.
+        let mut buffer = vec![
+            FILE_RENAME_INFORMATION::default();
+            bytes.div_ceil(std::mem::size_of::<FILE_RENAME_INFORMATION>())
+        ];
+        // SAFETY: initialize every allocation byte, including native ABI padding,
+        // before writing union/handle/integer fields (all-zero is valid for them).
+        unsafe {
+            std::ptr::write_bytes(
+                buffer.as_mut_ptr().cast::<u8>(),
+                0,
+                buffer.len() * std::mem::size_of::<FILE_RENAME_INFORMATION>(),
+            )
+        };
+        buffer[0].Anonymous = FILE_RENAME_INFORMATION_0 {
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+        };
+        buffer[0].RootDirectory = parent.as_raw_handle();
+        buffer[0].FileNameLength = u32::try_from(name_bytes).map_err(|_| invalid_extent())?;
+        // SAFETY: native-aligned allocation covers the checked offset, all filename
+        // units and an explicit terminator; source and destination do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+                name.len(),
+            );
+            buffer
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<u16>()
+                .add(name.len())
+                .write(0);
+        }
+        let mut iosb = IO_STATUS_BLOCK::default();
+        live()?;
+        // SAFETY: this source's private constructor guarantees synchronous native
+        // I/O; the original parent, aligned native request and IOSB remain live
+        // throughout completion. No asynchronous/overlapped owner can enter here.
+        let status = unsafe {
+            NtSetInformationFile(
+                source.as_raw_handle(),
+                &raw mut iosb,
+                buffer.as_ptr().cast(),
+                native_bytes,
+                FileRenameInformationEx,
+            )
+        };
+        match windows_synchronous_status(status) {
+            WindowsSynchronousStatus::Success => {
+                // SAFETY: exact synchronous success completed IOSB. Merely copy it;
+                // NO fallible work or cutoff check before caller cleanup disarm.
+                return Ok(WindowsRenameCommitted {
+                    status: unsafe { iosb.Anonymous.Status },
+                    information: iosb.Information,
+                    deadline,
+                });
+            }
+            // A nonzero nonnegative status violates the closed synchrony/commit
+            // contract. Do not unwind/free buffers or run old-name cleanup while
+            // an outstanding or ambiguously committed operation may still exist.
+            WindowsSynchronousStatus::InvariantViolation => std::process::abort(),
+            WindowsSynchronousStatus::Failure => {}
+        }
+        const NAME_CONTEXT_BYTES: usize = 64;
+        let prefix: Vec<_> = name
+            .iter()
+            .take(NAME_CONTEXT_BYTES / std::mem::size_of::<u16>())
+            .copied()
+            .collect();
+        Err(windows_rename_nt_error(
+            "rename-NtSetInformationFile",
+            format!(
+                "class={FileRenameInformationEx}; flags={}; native-bytes={native_bytes}; allocation-bytes={}; native-size={}; native-align={}; filename-offset={offset}; name-units={}; name-bytes={name_bytes}; root-present={}; source-volume={}; source-file={}; source-length={}; source-attributes={}; source-links={}; parent-volume={}; parent-file={}; parent-length={}; parent-attributes={}; parent-links={}; expected-caller-access=0x00110180(READ_ATTRIBUTES|WRITE_ATTRIBUTES|DELETE|SYNCHRONIZE); expected-caller-share=0x5(READ|DELETE); name-omitted-units={}; name-prefix-utf16={prefix:?}",
+                FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+                buffer.len() * std::mem::size_of::<FILE_RENAME_INFORMATION>(),
+                std::mem::size_of::<FILE_RENAME_INFORMATION>(),
+                std::mem::align_of::<FILE_RENAME_INFORMATION>(),
+                name.len(),
+                !buffer[0].RootDirectory.is_null(),
+                source_metadata.volume_serial,
+                source_metadata.file_index,
+                source_metadata.length,
+                source_metadata.attributes,
+                source_metadata.links,
+                parent_metadata.volume_serial,
+                parent_metadata.file_index,
+                parent_metadata.length,
+                parent_metadata.attributes,
+                parent_metadata.links,
+                name.len() - prefix.len()
+            ),
+            status,
+        ))
+    }
 }
 
 /// Observe image candidates under the original caller cutoff. A query-failed

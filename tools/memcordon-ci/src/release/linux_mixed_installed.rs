@@ -27,6 +27,15 @@ mod admin_link_inventory;
 #[path = "owned_resource_open_error.rs"]
 mod owned_resource_open_error;
 
+#[path = "linux_prepared_observation.rs"]
+mod prepared_observation;
+
+#[path = "linux_capture_record.rs"]
+mod capture_record;
+
+#[path = "linux_frontend_output.rs"]
+mod frontend_output;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixtureBarrierDecision {
     Continue,
@@ -39,6 +48,7 @@ pub enum FixtureBarrierDecision {
 pub struct InstalledMixedLaunch {
     pub frontend: std::process::Child,
     stdout_worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    first_stdout_record: Option<std::sync::mpsc::Receiver<std::io::Result<capture_record::Record>>>,
     stderr_worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
@@ -60,6 +70,7 @@ pub struct InstalledMixedLaunch {
 }
 
 pub struct InstalledMixedLaunchInput<'a> {
+    pub lifetime: memcordon_core::Lifetime,
     pub directory: &'a Path,
     pub contract: &'a Path,
     pub caller_uid: u32,
@@ -388,8 +399,11 @@ impl InstalledMixedDriver {
             if !present {
                 continue;
             }
-            let intent =
-                decode_owned_resource_json(&read_owned_resource(&path, 16 * 1024 * 1024)?)?;
+            let intent = decode_owned_resource_json_at(
+                "interrupted-image-import-intent",
+                &path,
+                &read_owned_resource(&path, 16 * 1024 * 1024)?,
+            )?;
             let fields = [
                 "format",
                 "revision",
@@ -429,12 +443,17 @@ impl InstalledMixedDriver {
                 ));
             }
             let bytes = read_owned_resource(&definition, 16 * 1024 * 1024)?;
-            let image: RuntimeImageDefinitionV1 =
-                serde_json::from_value(decode_owned_resource_json(&bytes)?)?;
+            let image: RuntimeImageDefinitionV1 = serde_json::from_value(
+                decode_owned_resource_json_at("interrupted-image-definition", &definition, &bytes)?,
+            )?;
             let cleanup_path = root.join("cleanup-definition.json");
             let cleanup_bytes = read_owned_resource(&cleanup_path, 16 * 1024 * 1024)?;
             let cleanup: RuntimeImageDefinitionV1 =
-                serde_json::from_value(decode_owned_resource_json(&cleanup_bytes)?)?;
+                serde_json::from_value(decode_owned_resource_json_at(
+                    "interrupted-image-cleanup-definition",
+                    &cleanup_path,
+                    &cleanup_bytes,
+                )?)?;
             let valid = image.reference().is_ok();
             if intent["source_root"] != serde_json::to_value(root.join("source"))?
                 || intent["definition_sha256"] != hex::encode(Sha256::digest(&bytes))
@@ -1283,9 +1302,22 @@ impl InstalledMixedDriver {
                     &serde_json::json!({"stdout":reply.stdout,"stderr":reply.stderr,"status":reply.status.code()}),
                 )?,
             )?;
-            let value = decode_owned_resource_json(&reply.stdout)?;
-            if !reply.status.success()
-                || value["format"] != "memcordon.runtime-image-retirement"
+            if !reply.status.success() {
+                return Err(CiError::Message(format!(
+                    "recovered-case-image native retirement command failed; definition={path:?}; original intent retained; native-status={:?}; native-code={:?}; stdout-bytes={}; stderr-bytes={}; stderr-prefix-hex={}",
+                    reply.status,
+                    reply.status.code(),
+                    reply.stdout.len(),
+                    reply.stderr.len(),
+                    hex::encode(&reply.stderr[..reply.stderr.len().min(1024)])
+                )));
+            }
+            let value = decode_owned_resource_json_at(
+                "recovered-case-image-retirement-success-output",
+                path,
+                &reply.stdout,
+            )?;
+            if value["format"] != "memcordon.runtime-image-retirement"
                 || value["revision"] != 1
                 || value["storage_absent"] != true
                 || value["reference"] != serde_json::to_value(&reference)?
@@ -1503,6 +1535,16 @@ impl InstalledMixedDriver {
         artifacts: &mut Vec<memcordon_readiness_verifier::Artifact>,
     ) -> Result<()> {
         use memcordon_readiness_verifier::Artifact;
+        for report in &self.image_reports {
+            if report.failure_diagnostic.is_some() || report.failure_retention_error.is_some() {
+                let publication = self.publication.as_deref().ok_or_else(|| {
+                    CiError::Message(
+                        "original cell publication capability absent for image failure".into(),
+                    )
+                })?;
+                report.register_failure_diagnostic(publication, artifact_root, artifacts)?;
+            }
+        }
         for report in &self.lifecycle_reports {
             for artifact in &report.artifacts {
                 if artifact.length > 512 * 1024 * 1024 {
@@ -1577,6 +1619,34 @@ impl InstalledMixedDriver {
         Ok(())
     }
 
+    pub fn begin_image_normalization(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for report in &self.image_reports {
+            if let Err(error) = report.begin_normalization() {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CiError::Message(failures.join("; ")))
+        }
+    }
+
+    pub fn finish_image_custody(&mut self, deadline: std::time::Instant) -> Result<()> {
+        let mut failures = Vec::new();
+        for (ordinal, report) in self.image_reports.iter_mut().enumerate() {
+            if let Err(error) = report.finish_custody(deadline) {
+                failures.push(format!("image custody report {ordinal}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CiError::Message(failures.join("; ")))
+        }
+    }
+
     pub fn collect_case_records(
         &self,
         identity: &SourceIdentity,
@@ -1588,6 +1658,15 @@ impl InstalledMixedDriver {
         Vec<memcordon_readiness_verifier::Artifact>,
     )> {
         use memcordon_readiness_verifier::{Artifact, CaseEvidence, CaseRecord, CaseState};
+        if self
+            .image_reports
+            .iter()
+            .any(|report| !report.normalization_is_live())
+        {
+            return Err(CiError::Message(
+                "image normalization attempted outside original live custody phase".into(),
+            ));
+        }
         let mut records = Vec::new();
         let mut artifacts = BTreeMap::<String, Artifact>::new();
         let mut keys = BTreeSet::new();
@@ -2817,6 +2896,14 @@ impl InstalledMixedDriver {
                     None
                 };
                 let launch_input = InstalledMixedLaunchInput {
+                    lifetime: if (key.family == "L-LIFE-01"
+                        && key.scenario == "root-first-resource-descendant")
+                        || (key.family == "C-LIFETIME" && key.scenario == "root-first")
+                    {
+                        memcordon_core::Lifetime::Workload
+                    } else {
+                        memcordon_core::Lifetime::Command
+                    },
                     directory: &directory.join("frontend"),
                     contract: &directory.join("mixed.contract.json"),
                     caller_uid: 65534,
@@ -3113,6 +3200,7 @@ impl InstalledMixedDriver {
             Path::new("/usr/libexec/memcordon-sealed-agent"),
             512 * 1024 * 1024,
         )?));
+        let export_recovery = super::linux_export_recovery::RecoveryContext::from_input(&input)?;
         let image_report = super::linux_readiness_image_cases::run_import_cases(
             super::linux_readiness_image_cases::ImageCaseContext {
                 identity: &input.identity,
@@ -3131,20 +3219,21 @@ impl InstalledMixedDriver {
                 work_deadline_unix_millis: input.work_deadline_unix_millis,
                 cleanup_deadline_unix_millis: input.cleanup_deadline_unix_millis,
             },
+            &export_recovery,
         )?;
-        let image_failed = !image_report.failures.is_empty();
+        let image_failure = image_report.primary_failure();
         self.image_reports.push(image_report);
         self.image_attempts_settled = false;
-        if image_failed {
-            return Err(CiError::Message(
-                "installed image/export cases retained failures and native owners".into(),
-            ));
+        if let Some(original) = image_failure {
+            return Err(CiError::Message(format!(
+                "installed image/export cases retained failures and native owners; {original}"
+            )));
         }
         for report in &mut self.image_reports {
             super::linux_readiness_image_cases::finalize_attempts(report, input.cleanup_deadline)?;
             super::linux_export_recovery::recover_report(
                 report,
-                &input,
+                &export_recovery,
                 self.account.as_ref().expect("retained original account"),
             )?;
         }
@@ -3798,9 +3887,21 @@ fn normalize_policy_refusal(
 }
 
 pub(super) fn read_policy_observation_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_policy_observation_file_with_flags(path, limit, 0)
+}
+
+pub(super) fn read_policy_observation_file_nonblocking(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_policy_observation_file_with_flags(path, limit, libc::O_NONBLOCK)
+}
+
+fn read_policy_observation_file_with_flags(
+    path: &Path,
+    limit: u64,
+    extra_flags: i32,
+) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | extra_flags)
         .open(path)?;
     let before = file.metadata()?;
     if !before.is_file()
@@ -3822,7 +3923,7 @@ pub(super) fn read_policy_observation_file(path: &Path, limit: u64) -> Result<Ve
     file.read_exact_at(&mut bytes, 0)?;
     let named = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | extra_flags)
         .open(path)?;
     let stamp = |m: &std::fs::Metadata| {
         (
@@ -6278,46 +6379,87 @@ pub fn owned_fixture_recipes(cell: &ProductKey) -> Result<Vec<InstalledMixedReci
 fn capture_native_stream(
     mut stream: impl Read,
     destination: PathBuf,
+    mut publication: Option<capture_record::Publisher>,
     gate: Option<(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::time::Instant,
     )>,
 ) -> std::io::Result<()> {
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
-    let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        if let Some((held, deadline)) = &gate {
-            while held.load(std::sync::atomic::Ordering::Acquire) {
-                if std::time::Instant::now() >= *deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "original output capture hold deadline elapsed",
-                    ));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&destination)?;
+        let mut total = 0u64;
+        let mut publication_error = None;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            if let Some((held, deadline)) = &gate {
+                while held.load(std::sync::atomic::Ordering::Acquire) {
+                    if std::time::Instant::now() >= *deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "original output capture hold deadline elapsed",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
+            }
+            let count = stream.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            total = total
+                .checked_add(count as u64)
+                .ok_or_else(|| std::io::Error::other("native capture overflow"))?;
+            if total > 512 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "native capture exceeds finite bound; partial bytes retained",
+                ));
+            }
+            output.write_all(&buffer[..count])?;
+            output.flush()?;
+            if let Some(publisher) = &mut publication
+                && let Err(error) = publisher.flushed(&output, &destination, &buffer[..count])
+            {
+                publisher.fail(
+                    error
+                        .raw_os_error()
+                        .map(std::io::Error::from_raw_os_error)
+                        .unwrap_or_else(|| {
+                            std::io::Error::new(
+                                error.kind(),
+                                "capture first-record publication failed",
+                            )
+                        }),
+                );
+                publication_error = Some(error);
+                publication = None;
             }
         }
-        let count = stream.read(&mut buffer)?;
-        if count == 0 {
-            break;
+        if let Some(publisher) = &mut publication {
+            publisher.eof();
         }
-        total = total
-            .checked_add(count as u64)
-            .ok_or_else(|| std::io::Error::other("native capture overflow"))?;
-        if total > 512 * 1024 * 1024 {
-            return Err(std::io::Error::other(
-                "native capture exceeds finite bound; partial bytes retained",
-            ));
+        output.sync_all()?;
+        match publication_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        output.write_all(&buffer[..count])?;
-        output.flush()?;
+    })();
+    if let Err(error) = &result
+        && let Some(publisher) = &mut publication
+    {
+        publisher.fail(
+            error
+                .raw_os_error()
+                .map(std::io::Error::from_raw_os_error)
+                .unwrap_or_else(|| {
+                    std::io::Error::new(error.kind(), "capture first-record producer failed")
+                }),
+        );
     }
-    output.sync_all()
+    result
 }
 
 struct FrontendFileAccess {
@@ -6333,11 +6475,29 @@ struct FrontendFileAccess {
     frontend_contract_path: PathBuf,
     frontend_contract_bytes: Vec<u8>,
     frontend_directory_owner: File,
+    observation_directory_owner: File,
     frontend_directory_path: PathBuf,
     caller_uid: u32,
     caller_gid: u32,
     contract_stamp: (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64),
     directory_stamp: (u64, u64, u32, u32, u32),
+    observation_directory_stamp: (u64, u64, u32, u32, u32),
+}
+
+/// A view of the original package endpoint, available only after rechecking
+/// its retained socket inode and both retained/named directory ancestors.
+#[derive(Clone)]
+pub struct RetainedControlEndpoint {
+    group: std::num::NonZeroU32,
+    observation: serde_json::Value,
+}
+impl RetainedControlEndpoint {
+    pub fn group(&self) -> u32 {
+        self.group.get()
+    }
+    pub fn observation(&self) -> &serde_json::Value {
+        &self.observation
+    }
 }
 impl FrontendFileAccess {
     fn observe_endpoint(&self) -> Result<serde_json::Value> {
@@ -6476,6 +6636,32 @@ impl FrontendFileAccess {
                 "original frontend output directory descriptor custody differs".into(),
             ));
         }
+        let observations = self.observation_directory_owner.metadata()?;
+        let named_observations = File::from(
+            rustix::fs::openat(
+                &self.frontend_directory_owner,
+                "observations",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        )
+        .metadata()?;
+        if !observations.is_dir()
+            || observations.uid() != self.caller_uid
+            || observations.gid() != self.caller_gid
+            || observations.mode() & 0o777 != 0o700
+            || directory_stamp(&observations) != self.observation_directory_stamp
+            || directory_stamp(&named_observations) != self.observation_directory_stamp
+        {
+            return Err(CiError::Message(
+                "original frontend observations directory custody differs".into(),
+            ));
+        }
         Ok(
             serde_json::json!({"format":"memcordon.linux-frontend-file-access","revision":1,
             "contract":{"descriptor":129,"path":self.frontend_contract_path.as_os_str().as_bytes(),
@@ -6490,14 +6676,156 @@ impl FrontendFileAccess {
     }
 }
 impl InstalledMixedLaunch {
+    /// Read only this original frontend's fixed result or attempt request.
+    /// Caller ownership comes from pre-spawn retained access, never file data.
+    pub(super) fn read_original_export_output(
+        &self,
+        path: &Path,
+        attempt: &str,
+        request: bool,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>> {
+        let live = || -> Result<()> {
+            if std::time::Instant::now() >= deadline {
+                return Err(CiError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "original frontend output cutoff elapsed",
+                )));
+            }
+            Ok(())
+        };
+        live()?;
+        if !self.capture_owners_settled() {
+            return Err(CiError::Message(
+                "original frontend output remains unsettled".into(),
+            ));
+        }
+        self.retained_frontend_invocation()?;
+        live()?;
+        self.verify_original_output_directory()?;
+        live()?;
+        self.verify_original_observation_directory()?;
+        live()?;
+        if attempt.len() != size_of::<[u8; 16]>() * 2
+            || !attempt
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(CiError::Message(
+                "original frontend output attempt binding differs".into(),
+            ));
+        }
+        let expected_request = self
+            .observation_directory
+            .join(Path::new(attempt).with_extension("provider-request.bin"));
+        if (request && path != expected_request)
+            || (!request
+                && (path != self.result
+                    || path.file_name() != Some(std::ffi::OsStr::new("result.json"))))
+        {
+            return Err(CiError::Message(
+                "original frontend output attempt/path binding differs".into(),
+            ));
+        }
+        let directory = if request {
+            &self.file_access.observation_directory_owner
+        } else {
+            &self.file_access.frontend_directory_owner
+        };
+        let bytes = frontend_output::read(
+            directory,
+            path.file_name()
+                .ok_or_else(|| CiError::Message("original frontend leaf absent".into()))?,
+            self.file_access.caller_uid,
+            self.file_access.caller_gid,
+            if request {
+                4 * 1024 * 1024
+            } else {
+                16 * 1024 * 1024
+            },
+            deadline,
+        )?;
+        live()?;
+        self.retained_frontend_invocation()?;
+        live()?;
+        self.verify_original_output_directory()?;
+        live()?;
+        self.verify_original_observation_directory()?;
+        live()?;
+        Ok(bytes)
+    }
+
+    fn verify_original_observation_directory(&self) -> Result<()> {
+        let access = &self.file_access;
+        let held = access.observation_directory_owner.metadata()?;
+        let named = File::from(
+            rustix::fs::openat(
+                &access.frontend_directory_owner,
+                "observations",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        )
+        .metadata()?;
+        let stamp = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode());
+        if !held.is_dir()
+            || !named.is_dir()
+            || stamp(&held) != access.observation_directory_stamp
+            || stamp(&named) != access.observation_directory_stamp
+        {
+            return Err(CiError::Message(
+                "original frontend observations directory binding differs".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_original_output_directory(&self) -> Result<()> {
+        let access = &self.file_access;
+        let held = access.frontend_directory_owner.metadata()?;
+        let named = std::fs::symlink_metadata(&access.frontend_directory_path)?;
+        let stamp = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+            )
+        };
+        if !held.is_dir()
+            || !named.is_dir()
+            || named.file_type().is_symlink()
+            || stamp(&held) != access.directory_stamp
+            || stamp(&named) != access.directory_stamp
+            || self.result.parent() != Some(access.frontend_directory_path.as_path())
+            || self.observation_directory != access.frontend_directory_path.join("observations")
+        {
+            return Err(CiError::Message(
+                "original frontend output directory binding differs".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn retained_control_endpoint(&self) -> Result<RetainedControlEndpoint> {
+        let observation = self.file_access.observe_endpoint()?;
+        let group = std::num::NonZeroU32::new(self.file_access.endpoint_stamp.3)
+            .ok_or_else(|| CiError::Message("original installed control group is zero".into()))?;
+        Ok(RetainedControlEndpoint { group, observation })
+    }
     pub fn retained_frontend_wait(&self) -> Result<serde_json::Value> {
         use std::os::unix::process::ExitStatusExt;
         let status = self.frontend_status.ok_or_else(|| {
             CiError::Message("actual frontend Child wait remains unsettled".into())
         })?;
         let command = self.retained_frontend_invocation()?;
-        let stdout = read_policy_observation_file(&self.stdout, 16 * 1024 * 1024)?;
-        let stderr = read_policy_observation_file(&self.stderr, 16 * 1024 * 1024)?;
+        let stdout = read_policy_observation_file_nonblocking(&self.stdout, 16 * 1024 * 1024)?;
+        let stderr = read_policy_observation_file_nonblocking(&self.stderr, 16 * 1024 * 1024)?;
         Ok(
             serde_json::json!({"format":"memcordon.linux-policy-frontend-exit","revision":1,"process_id":self.frontend.id(),
             "process_birth":self.frontend_birth.ok_or_else(||CiError::Message("actual frontend birth observation absent".into()))?,
@@ -6541,19 +6869,49 @@ impl InstalledMixedLaunch {
         report_directory: bool,
         capture_hold_until: Option<std::time::Instant>,
     ) -> Result<Self> {
-        Self::start_controls(input, report_directory, capture_hold_until, None, None)
+        Self::start_controls(
+            input,
+            report_directory,
+            capture_hold_until,
+            None,
+            None,
+            false,
+        )
+    }
+    pub fn start_with_first_record(
+        input: InstalledMixedLaunchInput<'_>,
+        report_directory: bool,
+        first_record: bool,
+    ) -> Result<Self> {
+        Self::start_controls(input, report_directory, None, None, None, first_record)
+    }
+    pub fn first_stdout_record(&mut self, deadline: std::time::Instant) -> Result<Option<Vec<u8>>> {
+        let receiver = self.first_stdout_record.as_ref().ok_or_else(|| {
+            CiError::Message("capture first-record observation not enrolled".into())
+        })?;
+        match receiver.try_recv() {
+            Ok(record) => {
+                let bytes = record?.read(deadline, 0)?;
+                self.first_stdout_record = None;
+                Ok(Some(bytes))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(CiError::Message(
+                "capture ended before committed first record".into(),
+            )),
+        }
     }
     pub fn start_with_inherited_descriptor(
         input: InstalledMixedLaunchInput<'_>,
         descriptor: Option<(std::os::fd::OwnedFd, i32)>,
     ) -> Result<Self> {
-        Self::start_controls(input, false, None, descriptor, None)
+        Self::start_controls(input, false, None, descriptor, None, false)
     }
     pub fn start_with_host_stdin(
         input: InstalledMixedLaunchInput<'_>,
         stdin: std::os::fd::OwnedFd,
     ) -> Result<Self> {
-        Self::start_controls(input, false, None, None, Some(stdin))
+        Self::start_controls(input, false, None, None, Some(stdin), false)
     }
     fn start_controls(
         input: InstalledMixedLaunchInput<'_>,
@@ -6561,6 +6919,7 @@ impl InstalledMixedLaunch {
         capture_hold_until: Option<std::time::Instant>,
         inherited: Option<(std::os::fd::OwnedFd, i32)>,
         host_stdin: Option<std::os::fd::OwnedFd>,
+        first_record: bool,
     ) -> Result<Self> {
         if !input.directory.is_absolute()
             || !input.contract.is_absolute()
@@ -6657,6 +7016,11 @@ impl InstalledMixedLaunch {
             .arg("/proc/self/fd/130/observations")
             .arg("--image-entrypoint")
             .arg("owned-readiness")
+            .arg("--wait-for")
+            .arg(match input.lifetime {
+                memcordon_core::Lifetime::Command => "command",
+                memcordon_core::Lifetime::Workload => "workload",
+            })
             .arg("--")
             .args(input.target_arguments)
             .env_clear()
@@ -6696,6 +7060,20 @@ impl InstalledMixedLaunch {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
             .open(input.directory)?;
+        let observation_directory_owner = File::from(
+            rustix::fs::openat(
+                &frontend_directory_owner,
+                "observations",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        );
+        let observation_metadata = observation_directory_owner.metadata()?;
         // Occupy vacant fixed destinations before std creates its spawn pipes.
         // F_DUPFD_CLOEXEC never replaces another parent's owned descriptor.
         use std::os::fd::AsRawFd;
@@ -6787,6 +7165,7 @@ impl InstalledMixedLaunch {
             frontend_contract_path: input.contract.to_owned(),
             frontend_contract_bytes,
             frontend_directory_owner,
+            observation_directory_owner,
             frontend_directory_path: input.directory.to_owned(),
             caller_uid: input.caller_uid,
             caller_gid: input.caller_gid,
@@ -6809,6 +7188,13 @@ impl InstalledMixedLaunch {
                 directory_metadata.uid(),
                 directory_metadata.gid(),
                 directory_metadata.mode(),
+            ),
+            observation_directory_stamp: (
+                observation_metadata.dev(),
+                observation_metadata.ino(),
+                observation_metadata.uid(),
+                observation_metadata.gid(),
+                observation_metadata.mode(),
             ),
         };
         let access = file_access.observe()?;
@@ -6876,15 +7262,22 @@ impl InstalledMixedLaunch {
         let stderr_gate = stdout_gate.clone();
         let stdout_path = stdout.clone();
         let stderr_path = stderr.clone();
+        let (publication, first_stdout_record) = if first_record {
+            let (p, r) = capture_record::channel();
+            (Some(p), Some(r))
+        } else {
+            (None, None)
+        };
         let stdout_worker = std::thread::spawn(move || {
-            capture_native_stream(stdout_pipe, stdout_path, stdout_gate)
+            capture_native_stream(stdout_pipe, stdout_path, publication, stdout_gate)
         });
         let stderr_worker = std::thread::spawn(move || {
-            capture_native_stream(stderr_pipe, stderr_path, stderr_gate)
+            capture_native_stream(stderr_pipe, stderr_path, None, stderr_gate)
         });
         Ok(Self {
             frontend,
             stdout_worker: Some(stdout_worker),
+            first_stdout_record,
             stderr_worker: Some(stderr_worker),
             stdout,
             stderr,
@@ -7089,9 +7482,10 @@ impl InstalledMixedLaunch {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| CiError::Message("prepared observation timeout overflow".into()))?;
-        loop {
+        let observation_directory = &self.observation_directory;
+        let scan = || -> Result<Option<crate::linux_consumer_readiness::PreparedLinuxObserver>> {
             let mut named = Vec::new();
-            for entry in std::fs::read_dir(&self.observation_directory)? {
+            for entry in std::fs::read_dir(observation_directory)? {
                 let entry = entry?;
                 if entry
                     .file_name()
@@ -7113,41 +7507,44 @@ impl InstalledMixedLaunch {
                 let observation: memcordon_core::mixed_observation::MixedPreparedObservationV2 =
                     serde_json::from_slice(&bytes)?;
                 return crate::linux_consumer_readiness::PreparedLinuxObserver::acquire_named(
-                    &self.observation_directory,
+                    observation_directory,
                     provider,
                     request,
                     observation.admission.attempt_id.as_str(),
                     destination,
                     relative,
                 )
+                .map(Some)
                 .map_err(CiError::Message);
             }
-            if std::time::Instant::now() >= deadline {
-                let status = match self.frontend.try_wait() {
-                    Ok(status) => {
-                        if status.is_some() {
-                            self.frontend_status = status;
-                        }
-                        match status {
-                            Some(status) => format!("exited({status:?})"),
-                            None => "running-at-observation".into(),
-                        }
-                    }
-                    Err(error) => format!(
-                        "unavailable(kind={:?},raw-os-error={:?})",
-                        error.kind(),
-                        error.raw_os_error()
-                    ),
-                };
-                return Err(CiError::Message(format!(
-                    "no authenticated prepared observation before native timeout; launch owner retained; frontend-pid={}; observed-status={status}; stdout=[{}]; stderr=[{}]",
-                    self.frontend.id(),
-                    Self::capture_snapshot(&self.stdout),
-                    Self::capture_snapshot(&self.stderr),
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            Ok(None)
+        };
+        let outcome = prepared_observation::wait(
+            &mut self.frontend,
+            &mut self.frontend_status,
+            deadline,
+            scan,
+        )?;
+        let (reason, status) = match outcome {
+            prepared_observation::Outcome::Prepared(observer) => return Ok(observer),
+            prepared_observation::Outcome::Retired(status) => (
+                "original frontend retired before authenticated prepared observation",
+                format!("exited({status:?})"),
+            ),
+            prepared_observation::Outcome::Expired => (
+                "no authenticated prepared observation before native timeout",
+                self.frontend_status.map_or_else(
+                    || "not-observed-at-last-sweep".into(),
+                    |status| format!("exited({status:?})"),
+                ),
+            ),
+        };
+        Err(CiError::Message(format!(
+            "{reason}; launch owner retained; frontend-pid={}; observed-status={status}; stdout=[{}]; stderr=[{}]",
+            self.frontend.id(),
+            Self::capture_snapshot(&self.stdout),
+            Self::capture_snapshot(&self.stderr),
+        )))
     }
 
     /// Holds every declared member in the already authenticated target PID
@@ -7690,6 +8087,18 @@ impl InstalledMixedLaunch {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| CiError::Message("native capture deadline overflow".into()))?;
+        self.wait_and_capture_until(deadline)
+    }
+
+    pub(super) fn wait_and_capture_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<std::process::ExitStatus> {
+        if std::time::Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "original native capture cutoff exhausted; owners retained".into(),
+            ));
+        }
         loop {
             if let Some(status) = self.frontend.try_wait()? {
                 self.frontend_status = Some(status);
@@ -7755,6 +8164,11 @@ impl InstalledMixedLaunch {
         }
         if !self.capture_failures.is_empty() {
             return Err(CiError::Message(self.capture_failures.join("; ")));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "original native capture cutoff exhausted after settlement".into(),
+            ));
         }
         Ok(self.frontend_status.expect("observed native frontend exit"))
     }
@@ -8867,6 +9281,9 @@ fn provision_account_for_original_lifetime(
     })
 }
 
+#[path = "linux_refusal_census.rs"]
+mod refusal_census;
+
 /// Captures native credentials and the provider's actual attempt namespace.
 /// This is read-only evidence; it never removes a process or cgroup by name.
 #[expect(
@@ -8886,7 +9303,9 @@ pub fn persist_policy_refusal_census(
     destination: &Path,
     deadline: std::time::Instant,
 ) -> Result<()> {
+    use super::linux_recovery_harness::recovery_io::context;
     use std::os::unix::fs::MetadataExt;
+    let io_context = |operation, path: &Path, error| CiError::Io(context(operation, path, error));
     if attempt.len() != 32
         || !attempt
             .bytes()
@@ -8896,8 +9315,13 @@ pub fn persist_policy_refusal_census(
             "native refusal census attempt basename differs".into(),
         ));
     }
-    let mut cgroup_ancestors = vec![File::open("/")?];
+    let mut cgroup_ancestors = vec![
+        File::open("/")
+            .map_err(|error| io_context("census-cgroup-root-open", Path::new("/"), error))?,
+    ];
+    let mut cgroup_path = PathBuf::from("/");
     for component in ["sys", "fs", "cgroup", "memcordon-sealed"] {
+        cgroup_path.push(component);
         let file = File::from(
             rustix::fs::openat(
                 cgroup_ancestors.last().expect("held cgroup ancestor"),
@@ -8908,9 +9332,13 @@ pub fn persist_policy_refusal_census(
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(|error| CiError::Message(error.to_string()))?,
+            .map_err(|error| {
+                io_context("census-cgroup-ancestor-open", &cgroup_path, error.into())
+            })?,
         );
-        let metadata = file.metadata()?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_context("census-cgroup-ancestor-metadata", &cgroup_path, error))?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return Err(CiError::Message(
                 "native cgroup census ancestor custody differs".into(),
@@ -8921,10 +9349,13 @@ pub fn persist_policy_refusal_census(
     let root = cgroup_ancestors
         .last()
         .expect("held native cgroup root")
-        .try_clone()?;
-    let before = root.metadata()?;
+        .try_clone()
+        .map_err(|error| io_context("census-cgroup-root-clone", &cgroup_path, error))?;
+    let before = root
+        .metadata()
+        .map_err(|error| io_context("census-cgroup-root-metadata-before", &cgroup_path, error))?;
     let filesystem_type = rustix::fs::fstatfs(&root)
-        .map_err(|error| CiError::Message(error.to_string()))?
+        .map_err(|error| io_context("census-cgroup-root-filesystem", &cgroup_path, error.into()))?
         .f_type as u64;
     if filesystem_type != 0x63677270 {
         return Err(CiError::Message(
@@ -8939,8 +9370,17 @@ pub fn persist_policy_refusal_census(
     let mut tasks = Vec::new();
     let mut retained_status_bytes = 0usize;
     let mut credential_entries = 0usize;
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
+    for (process_ordinal, entry) in std::fs::read_dir("/proc")
+        .map_err(|error| io_context("census-proc-open", Path::new("/proc"), error))?
+        .enumerate()
+    {
+        if process_ordinal >= 65536 || std::time::Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "native process census exceeds original cutoff/count bound".into(),
+            ));
+        }
+        let entry =
+            entry.map_err(|error| io_context("census-proc-next", Path::new("/proc"), error))?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -8948,10 +9388,111 @@ pub fn persist_policy_refusal_census(
         else {
             continue;
         };
-        let entries = match std::fs::read_dir(entry.path().join("task")) {
-            Ok(entries) => entries,
+        let process_path = entry.path();
+        let process_birth = || -> std::io::Result<u64> {
+            let mut text = String::new();
+            File::open(process_path.join("stat"))?
+                .take(65537)
+                .read_to_string(&mut text)?;
+            if text.len() > 65536 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "census process stat exceeds bound",
+                ));
+            }
+            text.rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "census process birth absent",
+                    )
+                })?
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        };
+        let original_birth = match process_birth() {
+            Ok(birth) => birth,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(io_context(
+                    "census-process-birth-before",
+                    &process_path.join("stat"),
+                    error,
+                ));
+            }
+        };
+        let native_pid = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| CiError::Message("native census PID differs".into()))?;
+        let pidfd =
+            match rustix::process::pidfd_open(native_pid, rustix::process::PidfdFlags::empty()) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::SRCH) => continue,
+                Err(error) => {
+                    return Err(io_context(
+                        "census-process-pidfd",
+                        &process_path,
+                        error.into(),
+                    ));
+                }
+            };
+        let retired = || -> std::io::Result<bool> {
+            use rustix::event::{PollFd, PollFlags, Timespec};
+            let mut descriptors = [PollFd::new(&pidfd, PollFlags::IN)];
+            rustix::event::poll(
+                &mut descriptors,
+                Some(&Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            )?;
+            let events = descriptors[0].revents();
+            if events.intersects(PollFlags::ERR | PollFlags::NVAL) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "census original pidfd poll differs",
+                ));
+            }
+            Ok(events.contains(PollFlags::IN))
+        };
+        match process_birth() {
+            Ok(birth) => {
+                refusal_census::require_same_birth(original_birth, birth).map_err(|error| {
+                    io_context(
+                        "census-process-birth-binding-after-pidfd",
+                        &process_path,
+                        error,
+                    )
+                })?
+            }
+            Err(error) => {
+                refusal_census::disappeared(error, deadline, retired).map_err(|error| {
+                    error.contextualize(
+                        "census-process-birth-after",
+                        &process_path.join("stat"),
+                        &process_path,
+                        context,
+                    )
+                })?;
+                continue;
+            }
+        }
+        let task_path = process_path.join("task");
+        let entries = match std::fs::read_dir(&task_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                refusal_census::disappeared(error, deadline, retired).map_err(|error| {
+                    error.contextualize(
+                        "census-task-directory-open",
+                        &task_path,
+                        &process_path,
+                        context,
+                    )
+                })?;
+                continue;
+            }
         };
         for task in entries {
             if tasks.len() >= 65536 || std::time::Instant::now() >= deadline {
@@ -8959,7 +9500,20 @@ pub fn persist_policy_refusal_census(
                     "native policy census exceeds original cutoff/task bound".into(),
                 ));
             }
-            let task = task?;
+            let task = match task {
+                Ok(task) => task,
+                Err(error) => {
+                    refusal_census::disappeared(error, deadline, retired).map_err(|error| {
+                        error.contextualize(
+                            "census-task-directory-next",
+                            &task_path,
+                            &process_path,
+                            context,
+                        )
+                    })?;
+                    break;
+                }
+            };
             let tid = task
                 .file_name()
                 .to_str()
@@ -8997,7 +9551,13 @@ pub fn persist_policy_refusal_census(
             let birth = match task_birth() {
                 Ok(birth) => birth,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(io_context(
+                        "census-task-birth-before",
+                        &task.path().join("stat"),
+                        error,
+                    ));
+                }
             };
             let status = match (|| -> std::io::Result<String> {
                 let mut status = String::new();
@@ -9013,7 +9573,13 @@ pub fn persist_policy_refusal_census(
                     ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(io_context(
+                        "census-task-status",
+                        &task.path().join("status"),
+                        error,
+                    ));
+                }
             };
             let credentials = |prefix: &str, required: Option<usize>| -> Result<Vec<u32>> {
                 let line = status
@@ -9064,7 +9630,13 @@ pub fn persist_policy_refusal_census(
             let after_birth = match task_birth() {
                 Ok(birth) => birth,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(io_context(
+                        "census-task-birth-after",
+                        &task.path().join("stat"),
+                        error,
+                    ));
+                }
             };
             if after_birth != birth {
                 return Err(CiError::Message(
@@ -9073,29 +9645,80 @@ pub fn persist_policy_refusal_census(
             }
             tasks.push(serde_json::json!({"pid":pid,"tid":tid,"birth":birth,"uids":uid,"gids":gid,"groups":groups}));
         }
+        match process_birth() {
+            Ok(birth) => {
+                refusal_census::require_same_birth(original_birth, birth).map_err(|error| {
+                    io_context("census-process-birth-binding-final", &process_path, error)
+                })?
+            }
+            Err(error) => {
+                refusal_census::disappeared(error, deadline, retired).map_err(|error| {
+                    error.contextualize(
+                        "census-process-birth-final",
+                        &process_path.join("stat"),
+                        &process_path,
+                        context,
+                    )
+                })?
+            }
+        }
     }
     let mut cgroups = Vec::new();
-    for (ordinal, entry) in std::fs::read_dir(format!(
+    let cgroup_scan_path = PathBuf::from(format!(
         "/proc/self/fd/{}",
         std::os::fd::AsRawFd::as_raw_fd(&root)
-    ))?
-    .enumerate()
-    {
-        if ordinal >= 4096 {
-            return Err(CiError::Message(
-                "native cgroup parent entry bound exceeded".into(),
-            ));
+    ));
+    let mut cgroup_scan_count = 0usize;
+    loop {
+        let mut disappeared = false;
+        cgroups.clear();
+        for entry in std::fs::read_dir(&cgroup_scan_path)
+            .map_err(|error| io_context("census-cgroup-directory-open", &cgroup_scan_path, error))?
+        {
+            let ordinal = cgroup_scan_count;
+            cgroup_scan_count += 1;
+            if ordinal >= 4096 {
+                return Err(CiError::Message(
+                    "native cgroup parent entry bound exceeded".into(),
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(CiError::Message(
+                    "native cgroup census crossed original cutoff".into(),
+                ));
+            }
+            let entry = entry.map_err(|error| {
+                io_context("census-cgroup-directory-next", &cgroup_scan_path, error)
+            })?;
+            let name = entry.file_name();
+            let metadata =
+                match rustix::fs::statat(&root, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => metadata,
+                    Err(rustix::io::Errno::NOENT) => {
+                        disappeared = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(io_context(
+                            "census-cgroup-child-stat",
+                            &entry.path(),
+                            error.into(),
+                        ));
+                    }
+                };
+            if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                == rustix::fs::FileType::Directory
+            {
+                cgroups.push(name.as_encoded_bytes().to_vec());
+            }
+        }
+        if !disappeared {
+            break;
         }
         if std::time::Instant::now() >= deadline {
             return Err(CiError::Message(
-                "native cgroup census crossed original cutoff".into(),
+                "native cgroup census crossed original cutoff during disappearance rescan".into(),
             ));
-        }
-        let entry = entry?;
-        let name = entry.file_name();
-        let metadata = std::fs::symlink_metadata(entry.path())?;
-        if metadata.is_dir() {
-            cgroups.push(name.as_encoded_bytes().to_vec());
         }
     }
     if !cgroups.is_empty() {
@@ -9113,9 +9736,11 @@ pub fn persist_policy_refusal_census(
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )
-        .map_err(|error| CiError::Message(error.to_string()))?,
+        .map_err(|error| io_context("census-cgroup-root-reopen", &cgroup_path, error.into()))?,
     );
-    let after = named.metadata()?;
+    let after = named
+        .metadata()
+        .map_err(|error| io_context("census-cgroup-root-metadata-after", &cgroup_path, error))?;
     if (before.dev(), before.ino(), before.uid(), before.mode())
         != (after.dev(), after.ino(), after.uid(), after.mode())
     {
@@ -9126,15 +9751,28 @@ pub fn persist_policy_refusal_census(
     let absent = |parent: &File| -> Result<i32> {
         match rustix::fs::statat(parent, attempt, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
             Err(rustix::io::Errno::NOENT) => Ok(libc::ENOENT),
-            Err(error) => Err(CiError::Message(error.to_string())),
+            Err(error) => Err(io_context(
+                "census-attempt-absence-stat",
+                &PathBuf::from(format!(
+                    "/proc/self/fd/{}",
+                    std::os::fd::AsRawFd::as_raw_fd(parent)
+                ))
+                .join(attempt),
+                error.into(),
+            )),
             Ok(_) => Err(CiError::Message(
                 "native attempt path remains after no-target refusal".into(),
             )),
         }
     };
     let cgroup_absence_errno = absent(&root)?;
-    let mut state_ancestors = vec![File::open("/")?];
+    let mut state_ancestors = vec![
+        File::open("/")
+            .map_err(|error| io_context("census-state-root-open", Path::new("/"), error))?,
+    ];
+    let mut state_path = PathBuf::from("/");
     for component in ["var", "lib", "memcordon", "sealed"] {
+        state_path.push(component);
         let file = File::from(
             rustix::fs::openat(
                 state_ancestors.last().expect("held state ancestor"),
@@ -9145,9 +9783,11 @@ pub fn persist_policy_refusal_census(
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(|error| CiError::Message(error.to_string()))?,
+            .map_err(|error| io_context("census-state-ancestor-open", &state_path, error.into()))?,
         );
-        let metadata = file.metadata()?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_context("census-state-ancestor-metadata", &state_path, error))?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return Err(CiError::Message(
                 "native refusal journal ancestor custody differs".into(),
@@ -9156,9 +9796,13 @@ pub fn persist_policy_refusal_census(
         state_ancestors.push(file);
     }
     let state = state_ancestors.last().expect("held native state root");
-    let state_metadata = state.metadata()?;
+    let state_metadata = state
+        .metadata()
+        .map_err(|error| io_context("census-state-root-metadata", &state_path, error))?;
     let journal_absence_errno = absent(state)?;
+    let mut named_state_path = PathBuf::from("/");
     for (ordinal, component) in ["var", "lib", "memcordon", "sealed"].iter().enumerate() {
+        named_state_path.push(component);
         let named = File::from(
             rustix::fs::openat(
                 &state_ancestors[ordinal],
@@ -9169,10 +9813,20 @@ pub fn persist_policy_refusal_census(
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(|error| CiError::Message(error.to_string()))?,
+            .map_err(|error| {
+                io_context(
+                    "census-state-ancestor-reopen",
+                    &named_state_path,
+                    error.into(),
+                )
+            })?,
         );
-        let actual = named.metadata()?;
-        let held = state_ancestors[ordinal + 1].metadata()?;
+        let actual = named
+            .metadata()
+            .map_err(|error| io_context("census-state-named-metadata", &named_state_path, error))?;
+        let held = state_ancestors[ordinal + 1]
+            .metadata()
+            .map_err(|error| io_context("census-state-held-metadata", &named_state_path, error))?;
         if (actual.dev(), actual.ino(), actual.uid(), actual.mode())
             != (held.dev(), held.ino(), held.uid(), held.mode())
         {
@@ -9181,10 +9835,12 @@ pub fn persist_policy_refusal_census(
             ));
         }
     }
+    let mut named_cgroup_path = PathBuf::from("/");
     for (ordinal, component) in ["sys", "fs", "cgroup", "memcordon-sealed"]
         .iter()
         .enumerate()
     {
+        named_cgroup_path.push(component);
         let named = File::from(
             rustix::fs::openat(
                 &cgroup_ancestors[ordinal],
@@ -9195,10 +9851,20 @@ pub fn persist_policy_refusal_census(
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(|error| CiError::Message(error.to_string()))?,
+            .map_err(|error| {
+                io_context(
+                    "census-cgroup-ancestor-reopen",
+                    &named_cgroup_path,
+                    error.into(),
+                )
+            })?,
         );
-        let actual = named.metadata()?;
-        let held = cgroup_ancestors[ordinal + 1].metadata()?;
+        let actual = named.metadata().map_err(|error| {
+            io_context("census-cgroup-named-metadata", &named_cgroup_path, error)
+        })?;
+        let held = cgroup_ancestors[ordinal + 1].metadata().map_err(|error| {
+            io_context("census-cgroup-held-metadata", &named_cgroup_path, error)
+        })?;
         if (actual.dev(), actual.ino(), actual.uid(), actual.mode())
             != (held.dev(), held.ino(), held.uid(), held.mode())
         {
@@ -10026,6 +10692,17 @@ pub(super) fn decode_owned_resource_json(bytes: &[u8]) -> Result<serde_json::Val
     Ok(serde_json::from_slice(bytes)?)
 }
 
+pub(super) fn decode_owned_resource_json_at(
+    role: &'static str,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<serde_json::Value> {
+    decode_owned_resource_json(bytes).map_err(|error| {
+        let native = path.as_os_str().as_encoded_bytes();
+        CiError::Message(format!("owned JSON decode stage={role}; path-prefix-hex={}; path-omitted-bytes={}; bytes={}; sha256={}: {error}", hex::encode(&native[..native.len().min(512)]), native.len().saturating_sub(512), bytes.len(), super::artifacts::checksum(bytes)))
+    })
+}
+
 pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
@@ -10059,9 +10736,27 @@ pub(super) fn read_owned_resource(path: &Path, bound: u64) -> Result<Vec<u8>> {
         || (after.len(), after.mtime(), after.mtime_nsec())
             != (before.len(), before.mtime(), before.mtime_nsec())
     {
-        return Err(CiError::Message(
-            "owned resource readback named/native identity changed".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "owned resource readback named/native identity changed: path={path:?}; read_bytes={}; before=(dev:{},ino:{},len:{},mtime:{},ns:{}); after=(dev:{},ino:{},len:{},mtime:{},ns:{}); named=(dev:{},ino:{},symlink:{}); length_matches={}; named_matches={}; content_stamp_matches={}",
+            bytes.len(),
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            named.dev(),
+            named.ino(),
+            named.file_type().is_symlink(),
+            bytes.len() as u64 == before.len(),
+            (named.dev(), named.ino()) == (before.dev(), before.ino()),
+            (after.len(), after.mtime(), after.mtime_nsec())
+                == (before.len(), before.mtime(), before.mtime_nsec()),
+        )));
     }
     Ok(bytes)
 }

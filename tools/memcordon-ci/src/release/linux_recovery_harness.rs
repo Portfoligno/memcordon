@@ -1,4 +1,6 @@
 //! Original measured recovery image custody; reconstruction never builds.
+#[path = "linux_recovery_io.rs"]
+pub(super) mod recovery_io;
 use super::{artifacts, native_component_harness::MeasuredHarness};
 use crate::{CiError, Result, consumer_readiness_ledger::SourceIdentity};
 use memcordon_readiness_verifier::ProductKey;
@@ -102,8 +104,11 @@ pub fn protected_directory(path: &Path) -> Result<Vec<File>> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&current)?;
-        let metadata = file.metadata()?;
+            .open(&current)
+            .map_err(|error| recovery_io::context("harness-ancestry-open", &current, error))?;
+        let metadata = file.metadata().map_err(|error| {
+            recovery_io::context("harness-ancestry-held-metadata", &current, error)
+        })?;
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return Err(CiError::Message(
                 "native component controller ancestry is not protected administrator custody"
@@ -123,8 +128,11 @@ fn held_source_bytes(path: &Path, limit: u64, require_root: bool) -> Result<(Fil
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let before = file.metadata()?;
+        .open(path)
+        .map_err(|error| recovery_io::context("held-source-open", path, error))?;
+    let before = file
+        .metadata()
+        .map_err(|error| recovery_io::context("held-source-initial-metadata", path, error))?;
     if !before.is_file()
         || (require_root && before.uid() != 0)
         || before.nlink() != 1
@@ -136,9 +144,16 @@ fn held_source_bytes(path: &Path, limit: u64, require_root: bool) -> Result<(Fil
         ));
     }
     let mut bytes = Vec::new();
-    file.try_clone()?.take(limit + 1).read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
-    let named = fs::symlink_metadata(path)?;
+    file.try_clone()
+        .map_err(|error| recovery_io::context("held-source-duplicate", path, error))?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| recovery_io::context("held-source-read", path, error))?;
+    let after = file
+        .metadata()
+        .map_err(|error| recovery_io::context("held-source-final-metadata", path, error))?;
+    let named = fs::symlink_metadata(path)
+        .map_err(|error| recovery_io::context("held-source-named-metadata", path, error))?;
     let stamp = |m: &fs::Metadata| {
         (
             m.dev(),
@@ -171,14 +186,19 @@ fn create_record(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    File::open(
-        path.parent()
-            .ok_or_else(|| CiError::Message("recovery artifact parent absent".into()))?,
-    )?
-    .sync_all()?;
+        .open(path)
+        .map_err(|error| recovery_io::context("harness-record-create", path, error))?;
+    file.write_all(bytes)
+        .map_err(|error| recovery_io::context("harness-record-write", path, error))?;
+    file.sync_all()
+        .map_err(|error| recovery_io::context("harness-record-sync", path, error))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CiError::Message("recovery artifact parent absent".into()))?;
+    File::open(parent)
+        .map_err(|error| recovery_io::context("harness-record-parent-open", parent, error))?
+        .sync_all()
+        .map_err(|error| recovery_io::context("harness-record-parent-sync", parent, error))?;
     Ok(())
 }
 
@@ -202,7 +222,13 @@ impl HeldRecoveryHarness {
             .ok_or_else(|| CiError::Message("recovery image parent absent".into()))?;
         let _image_ancestry = protected_directory(image_parent)?;
         let (image, bytes) = held_bytes(&existing.executable, 512 * 1024 * 1024)?;
-        let metadata = image.metadata()?;
+        let metadata = image.metadata().map_err(|error| {
+            recovery_io::context(
+                "harness-acquired-image-metadata",
+                &existing.executable,
+                error,
+            )
+        })?;
         if artifacts::checksum(&bytes) != existing.sha256 || metadata.mode() & 0o7777 != 0o555 {
             return Err(CiError::Message(
                 "recovery image differs from original measured role".into(),
@@ -416,9 +442,21 @@ impl HeldRecoveryHarness {
                 "held recovery owner record changed".into(),
             ));
         }
-        let metadata = self.image.metadata()?;
+        let metadata = self.image.metadata().map_err(|error| {
+            recovery_io::context(
+                "harness-original-image-metadata",
+                &self.owner.executable,
+                error,
+            )
+        })?;
         let (named_image, bytes) = held_bytes(&self.owner.executable, 512 * 1024 * 1024)?;
-        let named = named_image.metadata()?;
+        let named = named_image.metadata().map_err(|error| {
+            recovery_io::context(
+                "harness-reopened-image-metadata",
+                &self.owner.executable,
+                error,
+            )
+        })?;
         if (
             metadata.dev(),
             metadata.ino(),

@@ -39,6 +39,7 @@ pub fn validate(document: &Value) -> Result<()> {
     }
     super::source_seed::validate(document)?;
     super::concurrency::validate(document)?;
+    super::windows_fixture_native::validate(document)?;
     if document["name"].as_str() == Some("Release") {
         super::release_fuzz::validate(document)?;
         super::host_preparation::validate(document)?;

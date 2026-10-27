@@ -14,6 +14,8 @@ pub struct CanonicalCatalog {
 }
 // Same portable public-member path bound enforced by the readiness verifier.
 const MAX_PATH_BYTES: usize = 4096;
+const DIAGNOSTIC_CONTRIBUTORS: usize = 8;
+const DIAGNOSTIC_PATH_PREFIX_BYTES: usize = 128;
 
 fn failure(message: &str) -> CiError {
     CiError::Message(message.into())
@@ -96,7 +98,49 @@ fn plan(
         selected.insert(record.path.clone(), record.clone());
     }
     if total > MAX_PRODUCER_BYTES {
-        return Err(failure("artifact unique byte plan exceeds producer bound"));
+        // Accounting only: identical declared bytes do not waive any path custody.
+        let mut content = BTreeMap::<(u64, &str), usize>::new();
+        for record in selected.values() {
+            live(deadline)?;
+            *content
+                .entry((record.length, record.sha256.as_str()))
+                .or_default() += 1;
+        }
+        let mut content_bytes = overhead;
+        let mut redundant = Vec::new();
+        for ((length, sha256), count) in &content {
+            content_bytes = content_bytes
+                .checked_add(*length)
+                .ok_or_else(|| failure("artifact content byte total overflow"))?;
+            if *count > 1 {
+                let savings = length
+                    .checked_mul((*count - 1) as u64)
+                    .ok_or_else(|| failure("artifact duplicate byte total overflow"))?;
+                redundant.push((savings, *length, *sha256, *count));
+            }
+        }
+        redundant.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(right.2)));
+        let redundant_groups = redundant.len();
+        let duplicate_bytes = total
+            .checked_sub(content_bytes)
+            .ok_or_else(|| failure("artifact content accounting differs"))?;
+        let redundant: Vec<_> = redundant.into_iter().take(DIAGNOSTIC_CONTRIBUTORS)
+            .map(|(savings, length, sha256, count)| serde_json::json!({"length":length,"sha256":sha256,"count":count,"duplicate_bytes":savings})).collect();
+        let mut largest: Vec<_> = selected.values().collect();
+        largest.sort_by(|left, right| {
+            right
+                .length
+                .cmp(&left.length)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let contributors: Vec<_> = largest.into_iter().take(DIAGNOSTIC_CONTRIBUTORS).map(|record| {
+            let prefix: Vec<_> = record.path.as_bytes().iter().copied().take(DIAGNOSTIC_PATH_PREFIX_BYTES).collect();
+            serde_json::json!({"path_prefix_bytes":prefix,"omitted_path_bytes":record.path.len().saturating_sub(prefix.len()),"length":record.length,"sha256":record.sha256})
+        }).collect();
+        return Err(failure(&format!(
+            "artifact unique byte plan exceeds producer bound: {}",
+            serde_json::json!({"total":total,"limit":MAX_PRODUCER_BYTES,"overhead":overhead,"unique_count":selected.len(),"largest":contributors,"declared_content_bytes":content_bytes,"declared_content_groups":content.len(),"declared_duplicate_bytes":duplicate_bytes,"declared_redundant_groups":redundant_groups,"largest_declared_redundant_groups":redundant,"content_custody_verified":false})
+        )));
     }
     if selected
         .keys()

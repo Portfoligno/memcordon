@@ -1177,7 +1177,16 @@ fn positive_toolchain(
     String,
 ) {
     use memcordon_readiness_verifier::*;
-    let tc = json!({"rustc":"C:\\owned\\toolchain\\rustc.exe","native_linker":"C:\\owned\\toolchain\\link.exe","native_library_directories":["C:\\owned\\toolchain\\vcrt","C:\\owned\\toolchain\\ucrt","C:\\owned\\toolchain\\um"],"library_source":"C:\\owned\\sources\\library.rs","test_source":"C:\\owned\\sources\\tests.rs","child_source":"C:\\owned\\sources\\child.rs","dll_source":"C:\\owned\\sources\\dll.rs","loader_source":"C:\\owned\\sources\\loader.rs","target":native.target});
+    let linker = match native.target.as_str() {
+        "x86_64-pc-windows-msvc" => {
+            "C:\\owned\\locked-inputs\\toolchain\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe"
+        }
+        "aarch64-pc-windows-msvc" => {
+            "C:\\owned\\locked-inputs\\toolchain\\lib\\rustlib\\aarch64-pc-windows-msvc\\bin\\rust-lld.exe"
+        }
+        _ => panic!("fixture native target unsupported"),
+    };
+    let mut tc = json!({"native_work_cutoff_ticks":900,"native_work_frequency":10,"linker_mode":"bundled-lld-link","input_root":"C:\\owned\\locked-inputs","selected_images":[],"rustc":"C:\\owned\\locked-inputs\\toolchain\\bin\\rustc.exe","native_linker":linker,"native_library_directories":["C:\\owned\\locked-inputs\\msvc-lib","C:\\owned\\locked-inputs\\sdk-ucrt","C:\\owned\\locked-inputs\\sdk-um"],"library_source":"C:\\owned\\locked-inputs\\sources\\library.rs","test_source":"C:\\owned\\locked-inputs\\sources\\tests.rs","child_source":"C:\\owned\\locked-inputs\\sources\\child.rs","dll_source":"C:\\owned\\locked-inputs\\sources\\dll.rs","loader_source":"C:\\owned\\locked-inputs\\sources\\loader.rs","target":native.target});
     let mut peers = Vec::new();
     let mut selected = Vec::new();
     for field in [
@@ -1233,9 +1242,9 @@ fn positive_toolchain(
         });
     }
     let mut libraries = Vec::new();
-    for (ordinal, directory) in ["vcrt", "ucrt", "um"].into_iter().enumerate() {
+    for (ordinal, directory) in ["msvc-lib", "sdk-ucrt", "sdk-um"].into_iter().enumerate() {
         let path = format!("selected-native-library-{ordinal}.bin");
-        let original = format!("C:\\owned\\toolchain\\{directory}\\native.lib");
+        let original = format!("C:\\owned\\locked-inputs\\{directory}\\native.lib");
         let bytes = format!("original native {directory} library");
         case.write(&path, bytes.as_bytes());
         selected.push(json!({"path":original,"sha256":sha256(bytes.as_bytes())}));
@@ -1246,6 +1255,13 @@ fn positive_toolchain(
         role: "selected-native-library-inputs".into(),
         path: "positive-native-library-inputs.json".into(),
     });
+    let mut selected_images = selected
+        .iter()
+        .filter(|image| image["path"].as_str().unwrap().ends_with(".exe"))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected_images.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    tc["selected_images"] = json!(selected_images);
     case.json("positive-toolchain-inputs.json", &json!(selected));
     let manifest_sha =
         sha256(&std::fs::read(case.root.path().join("positive-toolchain-inputs.json")).unwrap());
@@ -1289,18 +1305,26 @@ fn positive_toolchain(
                 "--target".into(),
                 native.target.clone(),
                 "-C".into(),
-                "linker=C:\\owned\\toolchain\\link.exe".into(),
+                match native.target.as_str() {
+                    "x86_64-pc-windows-msvc" => {
+                        "linker=./toolchain/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+                    }
+                    "aarch64-pc-windows-msvc" => {
+                        "linker=./toolchain/lib/rustlib/aarch64-pc-windows-msvc/bin/rust-lld.exe"
+                    }
+                    _ => panic!("fixture native target unsupported"),
+                }
+                .into(),
+                "-C".into(),
+                "linker-flavor=lld-link".into(),
                 "-o".into(),
                 format!("{root}\\{role}"),
             ]);
-            for directory in ["vcrt", "ucrt", "um"] {
-                args.extend([
-                    "-L".into(),
-                    format!("native=C:\\owned\\toolchain\\{directory}"),
-                ]);
+            for directory in ["native=./msvc-lib", "native=./sdk-ucrt", "native=./sdk-um"] {
+                args.extend(["-L".into(), directory.into()]);
             }
             (
-                "C:\\owned\\toolchain\\rustc.exe".into(),
+                "C:\\owned\\locked-inputs\\toolchain\\bin\\rustc.exe".into(),
                 args,
                 sha256(b"original immutable selected rustc"),
             )
@@ -1324,8 +1348,13 @@ fn positive_toolchain(
                 images[artifact].clone(),
             )
         };
-        let created = json!({"format":"memcordon.windows-fixture-owned-child-created","revision":1,"role":role,"challenge":challenge,"parent":parent,"child":child,"program_utf16":utf16(&program),"argv_utf16":args.iter().map(|arg|utf16(arg)).collect::<Vec<_>>(),"image_sha256":image,"held_from_process_creation":true,"held_live_before_wait":true,"native_parent_edge_observed":true});
-        let retired = json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,"role":role,"challenge":challenge,"parent":parent,"child":child,"image_sha256":image,"held_from_process_creation":true,"held_live_before_wait":true,"native_parent_edge_observed":true,"native_wait_completed":true,"native_status":0});
+        let mut created = json!({"format":"memcordon.windows-fixture-owned-child-created","revision":1,"role":role,"challenge":challenge,"parent":parent,"child":child,"program_utf16":utf16(&program),"argv_utf16":args.iter().map(|arg|utf16(arg)).collect::<Vec<_>>(),"image_sha256":image,"held_from_process_creation":true,"held_live_before_wait":true,"native_parent_edge_observed":true});
+        let mut retired = json!({"format":"memcordon.windows-fixture-owned-child-retired","revision":1,"role":role,"challenge":challenge,"parent":parent,"child":child,"image_sha256":image,"held_from_process_creation":true,"held_live_before_wait":true,"native_parent_edge_observed":true,"native_wait_completed":true,"native_status":0});
+        if !source.is_empty() {
+            let compiler_inputs = json!({"cwd_utf16":utf16("C:\\owned\\locked-inputs"),"selected_linker_utf16":utf16(linker),"cwd_native_identity":[1,2],"selected_linker_native_identity":[1,3],"selected_linker_sha256":sha256(b"original immutable selected native_linker"),"linker_mode":"bundled-lld-link","retained_ancestor_count":8,"binding":"original held directory passed as Command.current_dir; original selected linker held through debug settlement"});
+            created["compiler_inputs"] = compiler_inputs.clone();
+            retired["compiler_inputs"] = compiler_inputs;
+        }
         for (phase, value) in [("created", created), ("retired", retired)] {
             let path = format!("positive-native-child-{role}-{phase}.json");
             case.json(&path, &value);
@@ -1660,6 +1689,47 @@ fn persisted_windows_joint_and_toolchain_original_native_positive_graphs() {
             case.validate().is_err(),
             "{family}/{scenario} changed original measured source supplied to compiler"
         );
+        for mutation in ["mode", "cwd", "identity", "flavor", "missing-custody"] {
+            let mut case = factory();
+            if mutation == "mode" {
+                case.mutate("positive-descriptor.json", |raw| {
+                    raw["toolchain"]["linker_mode"] = json!("ambient-linker")
+                });
+            } else {
+                case.mutate(
+                    "positive-native-child-child.exe-created.json",
+                    |raw| match mutation {
+                        "cwd" => {
+                            raw["compiler_inputs"]["cwd_utf16"] =
+                                json!("C:\\other".encode_utf16().collect::<Vec<_>>())
+                        }
+                        "identity" => {
+                            raw["compiler_inputs"]["selected_linker_native_identity"] =
+                                json!([1, 99])
+                        }
+                        "missing-custody" => {
+                            raw.as_object_mut().unwrap().remove("compiler_inputs");
+                        }
+                        "flavor" => {
+                            let arguments = raw["argv_utf16"].as_array_mut().unwrap();
+                            let flavor =
+                                json!("linker-flavor=lld-link".encode_utf16().collect::<Vec<_>>());
+                            let at = arguments
+                                .iter()
+                                .position(|argument| argument == &flavor)
+                                .unwrap();
+                            arguments[at] =
+                                json!("linker-flavor=msvc".encode_utf16().collect::<Vec<_>>());
+                        }
+                        _ => unreachable!(),
+                    },
+                );
+            }
+            assert!(
+                case.validate().is_err(),
+                "{family}/{scenario} accepted changed qualified linker {mutation}"
+            );
+        }
     }
 }
 

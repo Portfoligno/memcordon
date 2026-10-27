@@ -22,6 +22,7 @@ pub struct LinuxImageExportEvidence {
     pub activation: String,
     pub policy: String,
     pub contract: String,
+    pub memory_budget: String,
     pub provider_request: String,
     pub result: String,
     pub prepared: String,
@@ -49,6 +50,7 @@ impl LinuxImageExportEvidence {
             &self.activation,
             &self.policy,
             &self.contract,
+            &self.memory_budget,
             &self.provider_request,
             &self.result,
             &self.prepared,
@@ -131,6 +133,22 @@ pub(crate) fn verify_export(
         .ok_or("export original selected installed product absent")?;
     let (owner, checkpoint) = validate_original_export_owner(index, record, e, product, custody)?;
     let row = crate::wire::json(custody.bytes(&e.observation)?)?;
+    if e.memory_budget
+        != crate::linux_path::join(
+            &crate::linux_path::parent(&e.observation).ok_or("export observation parent absent")?,
+            "fixture-memory-budget.json",
+        )
+        || row["memory_budget"]
+            != crate::linux_path::join(
+                &crate::linux_path::parent(
+                    row["contract"].as_str().ok_or("export contract absent")?,
+                )
+                .ok_or("export contract parent absent")?,
+                "fixture-memory-budget.json",
+            )
+    {
+        return Err("export fixture budget crosses original case scope".into());
+    }
     closed(
         &row,
         &[
@@ -139,6 +157,7 @@ pub(crate) fn verify_export(
             "fixture_mode",
             "challenge",
             "contract",
+            "memory_budget",
             "activation",
             "prepared",
             "prepared_native",
@@ -241,6 +260,8 @@ pub(crate) fn verify_export(
         .collect()
     } else if scenario == "device" {
         ["device-admin-handles-retired.json"].into_iter().collect()
+    } else if scenario == "fifo" {
+        ["fifo-admin-handles-retired.json"].into_iter().collect()
     } else {
         std::collections::BTreeSet::new()
     };
@@ -257,6 +278,7 @@ pub(crate) fn verify_export(
     }
     let controller_leaf = match scenario {
         "device" => Some("device-created.json"),
+        "fifo" => Some("fifo-created.json"),
         "concurrent-writer" => Some("writer-held.json"),
         _ => None,
     };
@@ -306,6 +328,7 @@ pub(crate) fn verify_export(
     validate_export_held_family(e, &owner, &prepared, &attempt, product, custody)?;
     match scenario {
         "device" => validate_export_device(e, &prepared, custody)?,
+        "fifo" => validate_export_special_object(e, &prepared, custody, true)?,
         "concurrent-writer" => {
             validate_export_preempty_writer(e, &prepared, custody)?;
             validate_export_external_helper(e, &owner, &checkpoint, &prepared, custody)?;
@@ -903,7 +926,7 @@ pub(crate) fn validate_export_execution_graph(
         || command["caller_uid"] != 65534
         || command["caller_gid"] != 65534
         || command["selected_cli_sha256"] != cli.installed_sha256
-        || args.len() != 24
+        || args.len() != 26
         || wait["format"] != "memcordon.linux-policy-frontend-exit"
         || wait["revision"] != 1
         || wait["process_id"] != prepared["caller"]["pid"]
@@ -923,7 +946,6 @@ pub(crate) fn validate_export_execution_graph(
         (3, "65534"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
-        (7, "+512M"),
         (9, "--sealed"),
         (10, "--workload-contract"),
         (12, "--report-format"),
@@ -932,8 +954,10 @@ pub(crate) fn validate_export_execution_graph(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "export-object"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "export-object"),
     ] {
         if args[index] != text.as_bytes() {
             return Err("export frontend invoked unrelated authority/work".into());
@@ -954,8 +978,8 @@ pub(crate) fn validate_export_execution_graph(
         crate::linux_path::parent(row["result"].as_str().ok_or("export result path absent")?)
             .ok_or("export result parent absent")?;
     if args[17] != crate::linux_path::join(&result_parent, "observations").as_bytes()
-        || args[22] != challenge_hex.as_bytes()
-        || args[23] != scenario.as_bytes()
+        || args[24] != challenge_hex.as_bytes()
+        || args[25] != scenario.as_bytes()
     {
         return Err("export public argv/observation scope differs".into());
     }
@@ -973,7 +997,17 @@ pub(crate) fn validate_export_execution_graph(
         .iter()
         .map(|text| serde_json::json!({"display":text,"raw":null}))
         .collect::<Vec<_>>();
-    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":"+512M"},{"kind":"time","token":deadline}],"memory_token":"+512M","deadline_token":deadline,"argv":public_args});
+    let memory = std::str::from_utf8(&args[7]).map_err(|_| "export memory not UTF8")?;
+    crate::linux_images::validate_image_fixture_memory(
+        &decode(&e.memory_budget)?,
+        owner,
+        &checkpoint["images"]["runtime"],
+        &checkpoint["images"]["input"],
+        &contract,
+        &e.key,
+        memory,
+    )?;
+    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":memory},{"kind":"time","token":deadline}],"memory_token":memory,"deadline_token":deadline,"argv":public_args});
     let result = decode(&e.result)?;
     crate::wire::validate_linux_public_result_envelope(
         &result,
@@ -1023,7 +1057,11 @@ pub(crate) fn validate_export_execution_graph(
             scenario.as_bytes().to_vec(),
         ],
         &[],
-        Some(512 * 1024 * 1024),
+        Some(
+            decode(&e.memory_budget)?["budget"]["limit_bytes"]
+                .as_u64()
+                .ok_or("export frozen native memory limit absent")?,
+        ),
         None,
     )?;
     validate_linux_export_outcome(scenario, &result, &attempt, &request_digest, status)?;
@@ -1210,6 +1248,14 @@ pub(crate) fn validate_export_device(
     prepared: &Value,
     custody: &crate::custody::Custody,
 ) -> VerificationResult<()> {
+    validate_export_special_object(e, prepared, custody, false)
+}
+fn validate_export_special_object(
+    e: &LinuxImageExportEvidence,
+    prepared: &Value,
+    custody: &crate::custody::Custody,
+    fifo: bool,
+) -> VerificationResult<()> {
     let setup = crate::wire::json(
         custody.bytes(
             e.controller_setup
@@ -1218,27 +1264,34 @@ pub(crate) fn validate_export_device(
         )?,
     )?;
     let source = crate::wire::json(custody.bytes(&e.native_source)?)?;
-    closed(
-        &setup,
-        &[
-            "format",
-            "revision",
-            "target_pid",
-            "target_birth",
-            "root_device",
-            "root_inode",
-            "work_device",
-            "work_inode",
-            "path",
-            "device",
-            "inode",
-            "rdev",
-            "mode",
-            "links",
-            "held_live_before_and_after",
-        ],
-    )?;
-    if setup["format"] != "memcordon.linux-native-export-device"
+    let mut fields = vec![
+        "format",
+        "revision",
+        "target_pid",
+        "target_birth",
+        "root_device",
+        "root_inode",
+        "work_device",
+        "work_inode",
+        "path",
+        "device",
+        "inode",
+        "rdev",
+        "mode",
+        "links",
+        "held_live_before_and_after",
+    ];
+    if fifo {
+        fields.extend(["attempt_id", "uid", "gid"]);
+    }
+    closed(&setup, &fields)?;
+    let expected_format = if fifo {
+        "memcordon.linux-native-export-fifo"
+    } else {
+        "memcordon.linux-native-export-device"
+    };
+    let expected_rdev = if fifo { 0 } else { 259 };
+    if setup["format"] != expected_format
         || setup["revision"] != 1
         || setup["target_pid"] != prepared["target"]["pid"]
         || setup["target_birth"] != prepared["target"]["birth"]
@@ -1249,7 +1302,7 @@ pub(crate) fn validate_export_device(
         || setup["inode"] != source["inode"]
         || setup["mode"] != source["mode"]
         || setup["links"] != 1
-        || setup["rdev"] != 259
+        || setup["rdev"] != expected_rdev
         || setup["held_live_before_and_after"] != true
         || ["work_device", "work_inode"]
             .iter()
@@ -1257,9 +1310,22 @@ pub(crate) fn validate_export_device(
     {
         return Err("export unsafe device did not reach actual held prepared root".into());
     }
+    if fifo
+        && (setup["attempt_id"] != prepared["admission"]["attempt_id"]
+            || setup["uid"] != source["uid"]
+            || setup["gid"] != source["gid"]
+            || setup["uid"] != source["exclusive_uid"]
+            || setup["gid"] != source["exclusive_gid"])
+    {
+        return Err("export FIFO administrative setup crosses original attempt/account".into());
+    }
     let closure_path = e
         .external
-        .get("device-admin-handles-retired.json")
+        .get(if fifo {
+            "fifo-admin-handles-retired.json"
+        } else {
+            "device-admin-handles-retired.json"
+        })
         .ok_or("device original controller handles closure absent")?;
     let closure = crate::wire::json(custody.bytes(closure_path)?)?;
     closed(
@@ -1285,9 +1351,18 @@ pub(crate) fn validate_export_device(
     if owners.len() != 3 {
         return Err("device native root/work/member owner closure incomplete".into());
     }
-    for owner in owners {
-        closed(owner, &["completed", "errno"])?;
-        if owner["completed"] != true || !owner["errno"].is_null() {
+    for (owner, role) in owners
+        .iter()
+        .zip(["root", "work", if fifo { "fifo" } else { "device" }])
+    {
+        closed(
+            owner,
+            &["role", "native_close_succeeded", "native_close_errno"],
+        )?;
+        if owner["role"] != role
+            || owner["native_close_succeeded"] != true
+            || !owner["native_close_errno"].is_null()
+        {
             return Err("device controller observation handle remains open".into());
         }
     }
@@ -1587,7 +1662,7 @@ pub(crate) fn validate_export_ready(
         .ok_or("export scenario prefix absent")?;
     let kind = match scenario {
         "symlink" => "symlink",
-        "fifo" => "fifo",
+        "fifo" => "admin-fifo-required",
         "socket" => "socket",
         "device" => "admin-device-required",
         "traversal" => "parent-symlink",
@@ -2620,13 +2695,44 @@ pub fn validate_linux_export_outcome(
         .as_str()
         .filter(|value| !value.is_empty() && value.len() <= 256)
         .ok_or("export native original cause invalid")?;
+    // These are the complete fixed messages emitted by the selected native
+    // exporter and its three retained-owner retirement wrappers. Never strip
+    // arbitrary context or accept a bare errno as the selected operation.
+    macro_rules! native_export_cause {
+        ($cause:literal) => {
+            concat!(
+                "retire mixed native execution: ",
+                "export mixed private root: ",
+                "export selected private root outputs: ",
+                $cause
+            )
+        };
+    }
     let accepted = match scenario {
-        "symlink" | "traversal" => detail == "Too many levels of symbolic links (os error 40)",
-        "fifo" | "device" => detail == "selected output lacks exclusive regular-file custody",
-        "socket" => detail == "No such device or address (os error 6)",
+        "symlink" => {
+            detail
+                == native_export_cause!(
+                    "openat2 selected output work/exported.bin from writable mount work: Too many levels of symbolic links (os error 40)"
+                )
+        }
+        "traversal" => {
+            detail
+                == native_export_cause!(
+                    "openat2 selected output work/parent/exported.bin from writable mount work: Too many levels of symbolic links (os error 40)"
+                )
+        }
+        "fifo" | "device" => {
+            detail == native_export_cause!("selected output lacks exclusive regular-file custody")
+        }
+        "socket" => {
+            detail
+                == native_export_cause!(
+                    "openat2 selected output work/exported.bin from writable mount work: No such device or address (os error 6)"
+                )
+        }
         "concurrent-writer" => [
-            "selected output changed during copy",
-            "selected output native identity/content changed",
+            native_export_cause!("selected output changed during copy"),
+            native_export_cause!("selected output native identity/content changed"),
         ]
         .contains(&detail),
         _ => false,

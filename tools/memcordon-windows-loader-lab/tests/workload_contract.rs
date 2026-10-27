@@ -28,6 +28,7 @@ fn original() -> WorkloadDiagnosticRequestV1 {
     command.arguments[1] = descriptor_path.to_str().unwrap().encode_utf16().collect();
     WorkloadDiagnosticRequestV1 {
         schema_version: 1,
+        default_dacl_probe: None,
         original_result_sha256: digest(&result),
         original_terminal_sha256: digest(&terminal),
         original_result_bytes: result,
@@ -57,6 +58,159 @@ fn original() -> WorkloadDiagnosticRequestV1 {
         work_deadline_tick_ms: 100,
         cleanup_deadline_tick_ms: 200,
     }
+}
+
+fn eligibility(
+    request: &WorkloadDiagnosticRequestV1,
+) -> memcordon_windows_loader_lab::workload::DefaultDaclProbeEligibilityV1 {
+    use memcordon_windows_loader_lab::workload::{
+        DefaultDaclProbeEligibilityV1, DefaultDaclProbeKindV1, DefaultDaclProbeTargetV1,
+    };
+    DefaultDaclProbeEligibilityV1 {
+        revision: 1,
+        kind: DefaultDaclProbeKindV1::QualifiedRestrictedEnvelopeFixture,
+        source_commit: request
+            .original_request
+            .expected_provider_binding
+            .source_commit
+            .as_str()
+            .to_owned(),
+        target: DefaultDaclProbeTargetV1::X86_64WindowsMsvc,
+        fixture_sha256: request.image_sha256.clone(),
+        original_result_sha256: request.original_result_sha256.clone(),
+        original_terminal_sha256: request.original_terminal_sha256.clone(),
+        original_descriptor_sha256: request.original_descriptor_sha256.clone(),
+    }
+}
+
+#[test]
+fn optional_eligibility_binds_original_source_role_and_all_evidence() {
+    let mut request = original();
+    request.validate().unwrap();
+    let baseline = serde_json::to_vec(&request).unwrap();
+    assert!(
+        serde_json::from_slice::<Value>(&baseline)
+            .unwrap()
+            .get("default_dacl_probe")
+            .is_none()
+    );
+    request.default_dacl_probe = Some(eligibility(&request));
+    request.validate().unwrap();
+    let qualified = serde_json::to_value(&request).unwrap();
+    assert_ne!(
+        digest(&baseline),
+        digest(&serde_json::to_vec(&request).unwrap())
+    );
+    for field in [
+        "source_commit",
+        "fixture_sha256",
+        "original_result_sha256",
+        "original_terminal_sha256",
+        "original_descriptor_sha256",
+    ] {
+        let mut changed = qualified.clone();
+        changed["default_dacl_probe"][field] = json!(digest(b"different selected evidence"));
+        let changed: WorkloadDiagnosticRequestV1 = serde_json::from_value(changed).unwrap();
+        assert!(changed.validate().is_err(), "accepted foreign {field}");
+    }
+    let mut wrong_revision = request.clone();
+    wrong_revision.default_dacl_probe.as_mut().unwrap().revision += 1;
+    assert!(wrong_revision.validate().is_err());
+    for (field, value) in [
+        ("kind", json!("arbitrary-workload")),
+        ("target", json!("x86_64-unknown-linux-gnu")),
+        ("unknown", json!(true)),
+    ] {
+        let mut changed = qualified.clone();
+        changed["default_dacl_probe"][field] = value;
+        assert!(serde_json::from_value::<WorkloadDiagnosticRequestV1>(changed).is_err());
+    }
+    let mut missing = qualified.clone();
+    missing["default_dacl_probe"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fixture_sha256");
+    assert!(serde_json::from_value::<WorkloadDiagnosticRequestV1>(missing).is_err());
+    let mut null = qualified.clone();
+    null["default_dacl_probe"] = Value::Null;
+    assert!(serde_json::from_value::<WorkloadDiagnosticRequestV1>(null).is_err());
+    let mut oversized = request.clone();
+    oversized.default_dacl_probe.as_mut().unwrap().source_commit = String::from_utf8(vec![
+        b'a';
+        memcordon_windows_loader_lab::workload::MAX_PROBE_ELIGIBILITY_BYTES
+            + 1
+    ])
+    .unwrap();
+    assert!(oversized.validate().is_err());
+    let mut different_case = request.clone();
+    different_case.descriptor["case"] = json!("unrelated");
+    different_case.descriptor_sha256 =
+        digest(&serde_json::to_vec(&different_case.descriptor).unwrap());
+    assert!(different_case.validate().is_err());
+    assert!(
+        request
+            .default_dacl_probe
+            .as_ref()
+            .unwrap()
+            .validate_native(0)
+            .is_err()
+    );
+}
+
+#[test]
+fn raw_transport_digest_is_distinct_from_canonical_holder_binding() {
+    let mut request = original();
+    request.default_dacl_probe = Some(eligibility(&request));
+    let canonical = serde_json::to_vec(&request).unwrap();
+    WorkloadDiagnosticRequestV1::parse_transport(&canonical, &digest(&canonical)).unwrap();
+    let mut spaced = canonical.clone();
+    spaced.push(b'\n');
+    assert!(WorkloadDiagnosticRequestV1::parse_transport(&spaced, &digest(&canonical)).is_err());
+    let parsed = WorkloadDiagnosticRequestV1::parse_transport(&spaced, &digest(&spaced)).unwrap();
+    assert_eq!(
+        digest(&serde_json::to_vec(&parsed).unwrap()),
+        digest(&canonical)
+    );
+    let duplicate = format!(
+        "{{\"schema_version\":1,{}",
+        std::str::from_utf8(&canonical)
+            .unwrap()
+            .strip_prefix('{')
+            .unwrap()
+    );
+    assert!(
+        WorkloadDiagnosticRequestV1::parse_transport(
+            duplicate.as_bytes(),
+            &digest(duplicate.as_bytes())
+        )
+        .is_err()
+    );
+    assert!(
+        WorkloadDiagnosticRequestV1::parse_transport(&canonical, &digest(b"foreign request bytes"))
+            .is_err()
+    );
+    let oversized = vec![b' '; memcordon_windows_loader_lab::workload::MAX_REQUEST_BYTES + 1];
+    assert!(WorkloadDiagnosticRequestV1::parse_transport(&oversized, &digest(&oversized)).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn native_request_pin_refuses_writers_replacement_and_foreign_digest() {
+    use memcordon_windows_loader_lab::workload::HeldWorkloadRequest;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("request.json");
+    let bytes = serde_json::to_vec(&original()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(HeldWorkloadRequest::open(&path, Some(&digest(b"other request"))).is_err());
+    let held = HeldWorkloadRequest::open(&path, Some(&digest(&bytes))).unwrap();
+    assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+    assert!(std::fs::rename(&path, root.path().join("replaced.json")).is_err());
+    assert!(std::fs::remove_file(&path).is_err());
+    held.recheck(&path).unwrap();
+    drop(held);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(HeldWorkloadRequest::open(&path, Some(&digest(&bytes))).is_err());
 }
 
 #[test]

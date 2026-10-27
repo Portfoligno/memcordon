@@ -349,6 +349,25 @@ fn validate(root: &Path, record: &Record, expected: &Inputs) -> Result<()> {
     Ok(())
 }
 
+fn private_relay_records(root: &Path) -> Result<Vec<FileRecord>> {
+    let upstream = Path::new(manifest(Kind::PrivateDriver));
+    let bytes = read(root, upstream, RECORD_LIMIT)?;
+    let record: Record = serde_json::from_slice(&bytes)?;
+    let expected = inputs(root, Kind::PrivateDriver)?;
+    validate(root, &record, &expected)?;
+    let files = records(root, &transported_files(root, &record)?)?;
+    if files != record.files {
+        return Err(invalid("private relay changed its admitted driver members"));
+    }
+    expected_source_recheck(root, Kind::PrivateDriver)?;
+    if read(root, upstream, RECORD_LIMIT)? != bytes {
+        return Err(invalid(
+            "private relay producer record changed during packaging",
+        ));
+    }
+    Ok(files)
+}
+
 /// Resolved in the original runner, never reconstructed from sudo's environment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,7 +525,11 @@ pub fn run(root: &Path, operation: Operation, kind: Kind) -> Result<()> {
                     }
                     let record = Record {
                         format: FORMAT,
-                        files: records(root, &files(root, kind)?)?,
+                        files: if kind == Kind::Private {
+                            private_relay_records(root)?
+                        } else {
+                            records(root, &files(root, kind)?)?
+                        },
                         inputs: expected,
                     };
                     validate(root, &record, &record.inputs)?;

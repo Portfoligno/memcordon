@@ -3,6 +3,8 @@
 use crate::{CiError, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
+#[path = "stress_artifact_inventory.rs"]
+mod artifact_inventory;
 
 pub const STRESS_PLATFORMS: &[(&str, &str)] = &[
     ("linux-x64", "ubuntu-24.04"),
@@ -402,10 +404,12 @@ pub fn aggregate_stress(root: &Path, input: &Path, destination: &Path) -> Result
                 .map_err(|_| CiError::Message("stress artifact name is not Unicode".into()))
         })
         .collect::<Result<_>>()?;
-    if actual_artifacts != expected_artifacts {
-        return Err(CiError::Message(
-            "stress artifact inventory differs from selected phases".into(),
-        ));
+    if let Some(difference) = artifact_inventory::difference(
+        &expected_artifacts,
+        &actual_artifacts,
+        STRESS_PLATFORMS.len(),
+    ) {
+        return Err(CiError::Message(difference));
     }
     let mut collected = Vec::new();
     for platform in &plan.stress {

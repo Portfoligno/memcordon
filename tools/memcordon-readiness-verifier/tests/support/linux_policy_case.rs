@@ -187,6 +187,8 @@ fn add_case(
         format!("/owned/policy/{scenario}/observations").into_bytes(),
         b"--image-entrypoint".to_vec(),
         b"owned-readiness".to_vec(),
+        b"--wait-for".to_vec(),
+        b"command".to_vec(),
         b"--".to_vec(),
         b"tcp-http".to_vec(),
         token.as_bytes().to_vec(),

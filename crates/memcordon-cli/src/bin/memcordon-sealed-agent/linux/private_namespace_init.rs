@@ -571,6 +571,10 @@ fn receive_startup_ancillary(
 }
 
 impl PrivateNamespaceStartupInit {
+    pub(super) fn progress(&self, phase: super::private_init_diagnostic::Phase) {
+        self.1.progress(phase);
+    }
+
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
@@ -730,12 +734,14 @@ fn run_namespace_init(
     provider_namespace: NamespaceIdentity,
     lifetime: crate::request::Lifetime,
 ) -> i32 {
+    use super::private_init_diagnostic::Phase;
     // SAFETY: clone gave this init local copies of provider-owned endpoints;
     // closing those copies ensures only the provider can hold its side open.
     unsafe {
         libc::close(provider_startup_fd.as_raw_fd());
         libc::close(provider_control_fd.as_raw_fd());
     }
+    startup.progress(Phase::NetworkPrepareBefore);
     let network =
         match prepare_private_namespace_before_target_fork(caller_namespace, provider_namespace) {
             Ok(network) => network,
@@ -750,6 +756,7 @@ fn run_namespace_init(
                 return 125;
             }
         };
+    startup.progress(Phase::NetworkPrepareAfter);
     // The caller's current-directory object was authenticated by the broker
     // and inherited through the caller mount-context bootstrap. Change cwd
     // before target fork, then close this extra capability so the gated target
@@ -758,12 +765,15 @@ fn run_namespace_init(
     let prepare_root = (|| -> Result<(), String> {
         match (caller_cwd, mixed) {
             (Some(caller_cwd), None) => {
+                startup.progress(Phase::WorkingDirectoryBefore);
                 if unsafe { libc::fchdir(caller_cwd.as_raw_fd()) } < 0 {
                     return Err(format!("caller cwd: {}", std::io::Error::last_os_error()));
                 }
                 drop(caller_cwd);
+                startup.progress(Phase::WorkingDirectoryAfter);
             }
             (None, Some(preparation)) => {
+                startup.progress(Phase::RootEnterBefore);
                 let root = super::private_root::MountedPrivateRoot::enter(
                     preparation.runtime,
                     preparation.input,
@@ -774,6 +784,8 @@ fn run_namespace_init(
                     preparation.attempt,
                     preparation.identity,
                 )?;
+                startup.progress(Phase::RootEnterAfter);
+                startup.progress(Phase::WorkingDirectoryBefore);
                 let directory = root.open_working_directory(&preparation.working_directory)?;
                 if unsafe { libc::fchdir(directory.as_raw_fd()) } < 0 {
                     return Err(format!(
@@ -782,7 +794,11 @@ fn run_namespace_init(
                     ));
                 }
                 drop(directory);
+                startup.progress(Phase::WorkingDirectoryAfter);
+                startup.progress(Phase::EntrypointBefore);
                 target.entrypoint = root.open_entrypoint(&preparation.entry)?;
+                startup.progress(Phase::EntrypointAfter);
+                startup.progress(Phase::FilterAndIdentityBefore);
                 target.mixed_root_filter = true;
                 let program = super::network_filter::select_mixed_filter(
                     target.native_abi,
@@ -801,6 +817,8 @@ fn run_namespace_init(
                 if unsafe { libc::geteuid() } == target.identity.uid() {
                     return Err("mixed namespace init identity aliases target".into());
                 }
+                startup.progress(Phase::FilterAndIdentityAfter);
+                startup.progress(Phase::RootPublishBefore);
                 root.publish_to_provider(
                     &preparation.root_channel,
                     &preparation.entry,
@@ -808,6 +826,7 @@ fn run_namespace_init(
                     preparation.nonce,
                     preparation.attempt,
                 )?;
+                startup.progress(Phase::RootPublishAfter);
                 drop(root);
                 drop(preparation.root_channel);
             }
@@ -857,6 +876,7 @@ fn run_namespace_init(
     };
     // SAFETY: fork has no borrowed pointers; only the target child runs the
     // single-threaded gated setup and never returns to this init.
+    startup.progress(Phase::TargetForkBefore);
     let child = unsafe { libc::fork() };
     if child == -1 {
         let _ = startup.report(
@@ -991,3 +1011,7 @@ fn run_namespace_init(
     }
     0
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/private/private_init_progress_authority.rs"]
+mod progress_authority_tests;

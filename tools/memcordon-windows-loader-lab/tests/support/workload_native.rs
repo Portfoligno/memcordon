@@ -107,6 +107,7 @@ fn invalid_source_identity_cannot_start_an_scm_diagnostic() {
             "invalid",
             std::path::Path::new("absent"),
             std::path::Path::new("absent-result"),
+            &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"absent request")),
             0,
             0,
             0
@@ -174,15 +175,11 @@ fn retained_spawn_resume_fixture(
         .as_os_str()
         .encode_wide()
         .collect();
-    let output = std::env::temp_dir().join(format!(
-        "memcordon-resume-{}-{debug}-{fault:?}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&output).unwrap();
+    let output = tempfile::Builder::new()
+        .prefix("memcordon-resume-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let mut process = None;
     let mut owner = None;
     let mut resume_observation = None;
@@ -205,7 +202,11 @@ fn retained_spawn_resume_fixture(
                 descriptors: None,
                 cleanup,
                 debug: if debug {
-                    native::DebugCreation::OnlyThisProcess(&output)
+                    native::DebugCreation::OnlyThisProcess(
+                        &output,
+                        native::EVENT_LIMIT,
+                        native::LIMIT,
+                    )
                 } else {
                     native::DebugCreation::None
                 },

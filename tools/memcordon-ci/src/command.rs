@@ -341,11 +341,26 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
+        self.run_observing_failure(|_| {})
+    }
+
+    pub fn run_with_producer_failure_forwarding(
+        &self,
+        destination: &mut impl std::io::Write,
+    ) -> Result<Vec<u8>> {
+        self.run_observing_failure(|output| {
+            let _ = crate::producer_failure_forwarding::inspect(Some(&output.stderr))
+                .write_to(destination);
+        })
+    }
+
+    fn run_observing_failure(&self, observe: impl FnOnce(&ObservedOutput)) -> Result<Vec<u8>> {
         let mut command = crate::work_outcome::WorkOutcome::before_start(self.materialize())?;
         let output = self.observe_with_progress(&mut command, true)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
+            observe(&output);
             Err(CiError::SettledCommandFailure(format!(
                 "subprocess failed with {}; stdout={:?}; stderr={:?}",
                 output.status,

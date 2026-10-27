@@ -52,6 +52,7 @@ pub struct LinuxImageMemberCapture {
 #[serde(deny_unknown_fields)]
 pub struct LinuxImagePreparationEvidence {
     pub receipt: String,
+    pub memory_budget: String,
     pub activation: String,
     pub policy: String,
     pub contract: String,
@@ -98,6 +99,7 @@ impl LinuxImageImportEvidence {
         if let Some(probe) = &self.preparation {
             paths.extend([
                 probe.receipt.as_str(),
+                &probe.memory_budget,
                 &probe.activation,
                 &probe.policy,
                 &probe.contract,
@@ -1665,6 +1667,31 @@ pub(crate) fn owned_exclusive_declaration_reference(
     )
 }
 
+pub(crate) fn validate_image_fixture_memory(
+    receipt: &Value,
+    owner: &Value,
+    runtime: &Value,
+    input: &Value,
+    contract: &Value,
+    key: &crate::CaseKey,
+    token: &str,
+) -> VerificationResult<()> {
+    let memory = receipt["budget"]["limit_bytes"]
+        .as_u64()
+        .ok_or("image fixture memory limit absent")?;
+    if token != format!("+{memory}B") {
+        return Err("image fixture invocation differs from frozen byte budget".into());
+    }
+    crate::linux_lifecycle::validate_fixture_memory_budget(
+        receipt,
+        owner,
+        &serde_json::json!({"images":{"runtime":runtime,"input":input}}),
+        contract,
+        key,
+        memory,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Compare selected image bytes with independent command, creation, exit and custody evidence"
@@ -1685,6 +1712,24 @@ fn verify_preparation(
         .ok_or("valid imported loader candidate lacks actual preparation attempt")?;
     let decode = |path: &str| crate::wire::json(custody.bytes(path)?);
     let receipt = decode(&probe.receipt)?;
+    if probe.memory_budget
+        != crate::linux_path::join(
+            &crate::linux_path::parent(&probe.receipt).ok_or("loader probe parent absent")?,
+            "fixture-memory-budget.json",
+        )
+        || receipt["memory_budget"]
+            != crate::linux_path::join(
+                &crate::linux_path::parent(
+                    receipt["contract"]
+                        .as_str()
+                        .ok_or("loader contract absent")?,
+                )
+                .ok_or("loader contract parent absent")?,
+                "fixture-memory-budget.json",
+            )
+    {
+        return Err("loader fixture budget crosses original probe scope".into());
+    }
     closed(
         &receipt,
         &[
@@ -1698,6 +1743,7 @@ fn verify_preparation(
             "contract",
             "protected_contract",
             "contract_sha256",
+            "memory_budget",
             "provider_request",
             "result",
             "native_census",
@@ -1836,7 +1882,7 @@ fn verify_preparation(
         || command["caller_uid"] != 65534
         || command["caller_gid"] != 65534
         || command["selected_cli_sha256"] != cli.installed_sha256
-        || arguments.len() != 24
+        || arguments.len() != 26
     {
         return Err("loader actual frontend native command differs".into());
     }
@@ -1847,7 +1893,6 @@ fn verify_preparation(
         (3, "65534"),
         (5, "--"),
         (6, "/usr/libexec/memcordon"),
-        (7, "+512M"),
         (9, "--sealed"),
         (10, "--workload-contract"),
         (12, "--report-format"),
@@ -1856,10 +1901,12 @@ fn verify_preparation(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "bytes-argv-status"),
-        (22, "0"),
-        (23, "loader-closure-probe"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "bytes-argv-status"),
+        (24, "0"),
+        (25, "loader-closure-probe"),
     ] {
         if arguments[index] != text.as_bytes() {
             return Err("loader preparation invoked unrelated work".into());
@@ -1903,8 +1950,18 @@ fn verify_preparation(
     .into_iter()
     .map(|text| serde_json::json!({"display":text,"raw":null}))
     .collect::<Vec<_>>();
-    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":"+512M"},{"kind":"time","token":deadline}],
-        "memory_token":"+512M","deadline_token":deadline,"argv":public_argv});
+    let memory = std::str::from_utf8(&arguments[7]).map_err(|_| "loader memory not UTF8")?;
+    validate_image_fixture_memory(
+        &decode(&probe.memory_budget)?,
+        owner,
+        definition,
+        &checkpoint["images"]["input"],
+        &contract,
+        &record.key,
+        memory,
+    )?;
+    let public = serde_json::json!({"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":memory},{"kind":"time","token":deadline}],
+        "memory_token":memory,"deadline_token":deadline,"argv":public_argv});
     let wait = &receipt["frontend_wait"];
     closed(
         wait,
@@ -1960,6 +2017,29 @@ fn verify_preparation(
         status,
         pid,
         "image-custody-mismatch",
+    )?;
+    let request = decode(&probe.provider_request)?;
+    let mut native: Vec<u8> = serde_json::from_value(request["native_launch"].clone())
+        .map_err(|error| error.to_string())?;
+    native.extend(
+        hex::decode(crate::wire::v3_request_digest(&contract)?)
+            .map_err(|error| error.to_string())?,
+    );
+    crate::wire::validate_mixed_public_arguments_and_deadline(
+        &native,
+        custody.bytes(&probe.contract)?,
+        &[
+            b"bytes-argv-status".to_vec(),
+            b"0".to_vec(),
+            b"loader-closure-probe".to_vec(),
+        ],
+        &[],
+        Some(
+            decode(&probe.memory_budget)?["budget"]["limit_bytes"]
+                .as_u64()
+                .ok_or("loader frozen native memory limit absent")?,
+        ),
+        None,
     )?;
     let detail = if record.key.scenario == "loader-config" {
         "ELF loader configuration is outside the approved immutable library catalogue"

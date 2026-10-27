@@ -110,8 +110,8 @@ fn canonical_fallback_configuration_derives_the_release_bound_dynamically() {
         release.publish_packages,
         [
             "memcordon-core",
-            "memcordon-platform",
             "memcordon-windows-launch-core",
+            "memcordon-platform",
             "memcordon"
         ]
     );

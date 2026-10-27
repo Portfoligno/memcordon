@@ -1,6 +1,9 @@
 //! Reviewed native command inventory. Runtime values never become shell source.
 #[derive(Clone, Copy)]
 pub(super) enum LiteralRun {
+    WindowsFixtureNative,
+    WindowsFixtureNativeRequest,
+    WindowsFixtureNativeCleanup,
     NativeCoveragePlan,
     NativeCoverageProduct,
     NativeCoverageShard0,
@@ -1737,10 +1740,21 @@ pub(super) enum LiteralRun {
     R1722,
     R1723,
     R1724,
+    R1725,
+    R1726,
 }
 impl LiteralRun {
     pub(super) fn command(self) -> &'static str {
         match self {
+            Self::WindowsFixtureNative => {
+                "./target/ci-runtime/current/memcordon-ci.exe ci segment windows-fixture-native"
+            }
+            Self::WindowsFixtureNativeRequest => {
+                "./target/ci-runtime/current/memcordon-ci.exe ci cache-requests windows-fixture-native"
+            }
+            Self::WindowsFixtureNativeCleanup => {
+                "./target/ci-runtime/current/memcordon-ci.exe ci cleanup-transfers windows-fixture-native"
+            }
             Self::NativeCoveragePlan => {
                 "./target/ci-runtime/current/memcordon-ci release native-coverage-plan --build-source .release/build-source.json"
             }
@@ -3318,7 +3332,7 @@ impl LiteralRun {
             Self::R545 => "./.release/tool/memcordon-ci release recovery-inputs",
             Self::R546 => "./.release/tool/memcordon-ci release publish",
             Self::R547 => {
-                "rustup run 1.97.1 cargo build --locked --release --target-dir target/ci/native -p memcordon --features test-fixtures --bin memcordon-test-fixture"
+                "./target/ci/release/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json"
             }
             Self::R548 => {
                 "./target/ci/release/memcordon-ci ci cache-context --purpose consumer-readiness --shard public"
@@ -6428,6 +6442,12 @@ impl LiteralRun {
             }
             Self::R1724 => {
                 "./target/ci/release/memcordon-ci release validate-package --build-source .release/build-source.json --consumer-readiness --failure-mode collect-all"
+            }
+            Self::R1725 => {
+                "./target/ci-runtime/current/memcordon-ci release prepare-readiness-tools --build-source .release/build-source.json"
+            }
+            Self::R1726 => {
+                "./target/ci-runtime/current/memcordon-ci.exe release prepare-readiness-tools --build-source .release/build-source.json"
             }
         }
     }

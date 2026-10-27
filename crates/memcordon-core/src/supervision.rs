@@ -1424,7 +1424,13 @@ impl SupervisionAggregates {
         let unknown = record
             .runtime
             .as_ref()
-            .is_some_and(|runtime| matches!(runtime.release, crate::ReleaseEvidence::Unknown));
+            .is_some_and(|runtime| matches!(runtime.release, crate::ReleaseEvidence::Unknown))
+            || matches!(&record.boundary_detail,
+                BoundaryMechanismEvidence::LinuxMixedPrivate(native)
+                if native.runtime.validate().is_ok()
+                    && matches!(&native.runtime.outcome,
+                        crate::result_v2::MixedRuntimeOutcomeV2::Indeterminate { retained_obligations, .. }
+                        if matches!(retained_obligations.authorization, crate::result_v2::MixedAuthorizationKnowledgeV2::Unknown)));
         for (counter, increment) in [
             (
                 &mut self.confirmed_authorizations,

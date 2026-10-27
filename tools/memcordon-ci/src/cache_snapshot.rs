@@ -680,9 +680,35 @@ fn selection(
             let Some(crate::cache::OptionalCache::Available { entry }) =
                 context.entries.get(entry_name)
             else {
-                return Err(CiError::Message(
-                    "compiled snapshot inputs unavailable".into(),
-                ));
+                let bounded = |value: &str| {
+                    let mut end = value.len().min(64);
+                    while !value.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    serde_json::json!({"prefix":&value[..end],"omitted_bytes":value.len()-end})
+                };
+                let (state, reason) = match context.entries.get(entry_name) {
+                    Some(crate::cache::OptionalCache::Unavailable { reason }) => {
+                        ("unavailable", Some(bounded(reason)))
+                    }
+                    None => ("missing", None),
+                    Some(crate::cache::OptionalCache::Available { .. }) => {
+                        unreachable!("available entry matched above")
+                    }
+                };
+                let codes: Vec<_> = context
+                    .diagnostics
+                    .unavailable_reasons
+                    .iter()
+                    .take(16)
+                    .map(|code| bounded(code))
+                    .collect();
+                return Err(CiError::Message(format!(
+                    "compiled snapshot inputs unavailable: {}",
+                    serde_json::json!({"purpose":bounded(purpose),"shard":bounded(shard),"partition":slot,
+                        "entry":entry_name,"entry_state":state,"reason":reason,"unavailable_reasons":codes,
+                        "omitted_reason_count":context.diagnostics.unavailable_reasons.len().saturating_sub(codes.len())})
+                )));
             };
             (
                 slot,

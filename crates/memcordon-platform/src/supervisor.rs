@@ -65,7 +65,7 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
                 crate::sealed::windows::run(&request.policy, &request.command, self, context)?;
             #[cfg(feature = "test-support")]
             crate::windows_stack_diagnostics::phase("sealed-run-return");
-            return attempt_execution(execution).map_err(Box::new);
+            return attempt_execution(execution, &request.policy).map_err(Box::new);
         }
         let execution = crate::windows_job::run_attempt(
             request.policy.clone(),
@@ -74,7 +74,7 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
             context,
         )
         .map_err(Box::new)?;
-        attempt_execution(execution).map_err(Box::new)
+        attempt_execution(execution, &request.policy).map_err(Box::new)
     }
 }
 
@@ -1036,28 +1036,33 @@ fn run_unix_attempt(
     #[cfg(target_os = "linux")]
     if request.policy.boundary() == BoundaryRequirement::Sealed {
         if let Some(contract) = request.policy.mixed_workload_contract() {
-            return attempt_execution(crate::sealed::client::mixed_backend_run(
+            return attempt_execution(
+                crate::sealed::client::mixed_backend_run(
+                    &request.policy,
+                    &request.command,
+                    contract,
+                    context,
+                    signal,
+                )?,
                 &request.policy,
-                &request.command,
-                contract,
-                context,
-                signal,
-            )?);
+            );
         }
         if let Some(contract) = request.policy.private_workload_contract() {
-            return attempt_execution(crate::sealed::client::private_backend_run(
+            return attempt_execution(
+                crate::sealed::client::private_backend_run(
+                    &request.policy,
+                    &request.command,
+                    contract,
+                    context,
+                    signal,
+                )?,
                 &request.policy,
-                &request.command,
-                contract,
-                context,
-                signal,
-            )?);
+            );
         }
-        return attempt_execution(crate::sealed::client::run(
+        return attempt_execution(
+            crate::sealed::client::run(&request.policy, &request.command, context)?,
             &request.policy,
-            &request.command,
-            context,
-        )?);
+        );
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let helper = request.memcordon_executable.as_deref();
@@ -1095,12 +1100,12 @@ fn run_unix_attempt(
     )?;
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     let execution = crate::unix_watchdog::run(request.policy.clone(), &request.command)?;
-    attempt_execution(execution)
+    attempt_execution(execution, &request.policy)
 }
 
 #[allow(clippy::result_large_err)]
-fn attempt_execution(execution: Execution) -> Result<AttemptExecution, Error> {
-    validate_backend_execution(&execution)?;
+fn attempt_execution(execution: Execution, policy: &Policy) -> Result<AttemptExecution, Error> {
+    validate_backend_execution(&execution, policy)?;
     Ok(AttemptExecution {
         launch: execution.launch.clone(),
         restart_safety: execution.restart_safety.clone(),
@@ -1109,18 +1114,24 @@ fn attempt_execution(execution: Execution) -> Result<AttemptExecution, Error> {
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_backend_execution(execution: &Execution) -> Result<(), Error> {
-    if execution.launch.target_released != execution.authorization_offset.is_some()
-        || (execution.launch.target_released && execution.child_pid.is_none())
-        || execution.runtime.as_ref().is_some_and(|runtime| {
-            !runtime.is_consistent()
-                || runtime.target_pid != execution.child_pid
-                || matches!(
-                    runtime.release,
-                    memcordon_core::ReleaseEvidence::Issued { .. }
-                ) != execution.launch.target_released
-        })
-    {
+fn validate_backend_execution(execution: &Execution, policy: &Policy) -> Result<(), Error> {
+    let mixed_indeterminate = matches!(&execution.boundary_detail,memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(native) if matches!(&native.runtime.outcome,memcordon_core::result_v2::MixedRuntimeOutcomeV2::Indeterminate{..}));
+    let invalid = if mixed_indeterminate {
+        policy.boundary() != BoundaryRequirement::Sealed
+            || !crate::mixed_indeterminate::consistent(execution, policy.mixed_workload_contract())
+    } else {
+        execution.launch.target_released != execution.authorization_offset.is_some()
+            || (execution.launch.target_released && execution.child_pid.is_none())
+            || execution.runtime.as_ref().is_some_and(|runtime| {
+                !runtime.is_consistent()
+                    || runtime.target_pid != execution.child_pid
+                    || matches!(
+                        runtime.release,
+                        memcordon_core::ReleaseEvidence::Issued { .. }
+                    ) != execution.launch.target_released
+            })
+    };
+    if invalid {
         return Err(authorization_evidence_failure(
             match &execution.boundary_detail {
                 memcordon_core::BoundaryMechanismEvidence::LinuxMixedPrivate(native) => {
@@ -1761,6 +1772,58 @@ pub fn test_supervise_counted_failed_attempt(
     supervise_with_origin(request, &adapter, backend, None)
         .map(|execution| (execution, adapter.calls.get()))
 }
+/// Exercise real backend validation and the normal history/restart loop without native launch.
+#[cfg(feature = "test-support")]
+pub fn test_supervise_backend_execution(
+    request: SupervisorRequest,
+    execution: Execution,
+) -> Result<(SupervisionExecution, usize), Box<Error>> {
+    assert!(
+        execution.duration.is_zero(),
+        "fixture supplies no fabricated elapsed target time"
+    );
+    struct CompletedAttempt {
+        execution: std::cell::RefCell<Option<Execution>>,
+        calls: std::cell::Cell<usize>,
+    }
+    impl InterruptionWait for CompletedAttempt {
+        fn wait(&self, _: Duration) -> std::io::Result<Option<i32>> {
+            panic!("non-limit fixture must never request restart wait")
+        }
+        fn execute_attempt(
+            &self,
+            request: &SupervisorRequest,
+            _: AttemptContext,
+        ) -> Result<AttemptExecution, Box<Error>> {
+            self.calls.set(self.calls.get() + 1);
+            attempt_execution(
+                self.execution
+                    .borrow_mut()
+                    .take()
+                    .expect("one original fixture attempt"),
+                &request.policy,
+            )
+            .map_err(Box::new)
+        }
+    }
+    let backend = request.resolved_backend.clone();
+    let adapter = CompletedAttempt {
+        execution: std::cell::RefCell::new(Some(execution)),
+        calls: std::cell::Cell::new(0),
+    };
+    supervise_with_origin(request, &adapter, backend, None)
+        .map(|execution| (execution, adapter.calls.get()))
+        .map_err(Box::new)
+}
+
+#[cfg(feature = "test-support")]
+pub fn test_validate_backend_execution(
+    execution: &Execution,
+    policy: &Policy,
+) -> Result<(), Box<Error>> {
+    validate_backend_execution(execution, policy).map_err(Box::new)
+}
+
 fn unsupported_capability() -> BackendCapabilityReport {
     BackendCapabilityReport {
         name: "unresolved".to_owned(),

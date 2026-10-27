@@ -147,6 +147,7 @@ fn select(
         ));
     }
     if key.channel.starts_with("public-") && !root.join(".release/target").exists() {
+        let diagnostic = root.join("target/ci/native/release/workload-diagnostic.json");
         super::installed_consumer::retain_original_public_inputs(
             &root.join(".release/prepared"),
             &key.target,
@@ -156,6 +157,9 @@ fn select(
                     "memcordon-test-fixture",
                     &key.target,
                 )),
+            key.target
+                .ends_with("-pc-windows-msvc")
+                .then_some(diagnostic.as_path()),
             &root.join(".release/target"),
             &root.join(".release/packages"),
         )?;
@@ -203,7 +207,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
             &std::env::current_exe()?,
             cleanup_deadline,
         )?
-        .run()
+        .run_with_producer_failure_forwarding(&mut std::io::stderr())
         .map(|_| ());
     }
     fs::create_dir_all(&arguments.destination)?;
@@ -345,6 +349,7 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                 &prefix.join("installed"),
                 &mut lease,
             );
+            let normalization_started = lease.driver.begin_image_normalization();
             let (diagnostics, normalized) =
                 super::linux_lifecycle_diagnostics::capture_before_normalize(
                     &mut cell.artifacts,
@@ -362,44 +367,50 @@ pub fn execute(root: &Path, arguments: &CellArguments) -> Result<()> {
                         )
                     },
                 );
-            let normalized = normalized.and_then(|(records, artifacts)| -> Result<()> {
-                for record in records {
-                    let selected = cell
-                        .records
-                        .iter_mut()
-                        .find(|selected| selected.key == record.key)
-                        .ok_or_else(|| {
-                            CiError::Message(
-                                "installed driver emitted an unknown finite row".into(),
-                            )
-                        })?;
-                    *selected = record;
-                }
-                for artifact in artifacts {
-                    if let Some(existing) = cell
-                        .artifacts
-                        .iter()
-                        .find(|existing| existing.path == artifact.path)
-                    {
-                        if existing.length != artifact.length || existing.sha256 != artifact.sha256
-                        {
-                            return Err(CiError::Message(
-                                "diagnostic and normalized artifact bytes conflict".into(),
-                            ));
-                        }
-                    } else {
-                        cell.artifacts.push(artifact);
+            let normalized = normalization_started.and(normalized).and_then(
+                |(records, artifacts)| -> Result<()> {
+                    for record in records {
+                        let selected = cell
+                            .records
+                            .iter_mut()
+                            .find(|selected| selected.key == record.key)
+                            .ok_or_else(|| {
+                                CiError::Message(
+                                    "installed driver emitted an unknown finite row".into(),
+                                )
+                            })?;
+                        *selected = record;
                     }
-                }
-                Ok(())
-            });
-            if let Err(primary) = observed {
-                return Err(CiError::Message(format!(
-                    "{primary}; diagnostic-retention={diagnostics:?}; case-normalization={normalized:?}"
-                )));
-            }
-            diagnostics?;
-            normalized?;
+                    for artifact in artifacts {
+                        if let Some(existing) = cell
+                            .artifacts
+                            .iter()
+                            .find(|existing| existing.path == artifact.path)
+                        {
+                            if existing.length != artifact.length
+                                || existing.sha256 != artifact.sha256
+                            {
+                                return Err(CiError::Message(
+                                    "diagnostic and normalized artifact bytes conflict".into(),
+                                ));
+                            }
+                        } else {
+                            cell.artifacts.push(artifact);
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            // Original source witnesses outlive diagnostic capture, both
+            // normalizers and row/artifact merge. Every outcome then crosses
+            // this explicit all-report native retirement boundary.
+            super::linux_image_custody_completion::finish(
+                observed,
+                diagnostics,
+                normalized,
+                || lease.driver.finish_image_custody(cleanup_deadline),
+            )
+            .map_err(CiError::Message)?;
             let (product, artifacts) = super::readiness_product::collect(
                 &identity,
                 &key,

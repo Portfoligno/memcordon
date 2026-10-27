@@ -251,6 +251,7 @@ pub struct PrivateAttemptOwner<J: PrivateNativeJournal = DurablePrivateAttempt> 
     record: Option<J>,
     cgroup: Option<AttemptCgroup>,
     namespace_init: Option<NamespaceInit>,
+    init_exit_diagnostic: InitExitDiagnostic,
     guardian: Option<PrivateGuardian>,
     target_pidfd: Option<OwnedFd>,
     target_pid_identity: Option<PrivateNamespaceTargetIdentity>,
@@ -288,6 +289,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             record: Some(record),
             cgroup: None,
             namespace_init: None,
+            init_exit_diagnostic: InitExitDiagnostic::default(),
             guardian: None,
             target_pidfd: None,
             target_pid_identity: None,
@@ -452,6 +454,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             caller_mount,
             NamespaceMode::PrivateTcp4,
             move || {
+                init_startup.progress(super::private_init_diagnostic::Phase::ChildClosureEntered);
                 // SAFETY: these are inherited provider-only copies in the
                 // clone child; the parent retains its owned descriptors.
                 unsafe {
@@ -551,6 +554,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             &cgroup,
             NamespaceMode::PrivateTcp4,
             move || {
+                init_startup.progress(super::private_init_diagnostic::Phase::ChildClosureEntered);
                 unsafe {
                     libc::close(status_read_fd);
                     libc::close(provider_root_fd);
@@ -596,6 +600,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             deadline,
         )
         .map_err(|root_error| {
+            let initial_exit = observe_init_exit(init);
+            self.init_exit_diagnostic.initial = Some(initial_exit.clone());
             let startup = self.startup.as_ref().ok_or_else(|| "mixed startup channel absent".to_owned())
                 .and_then(|startup| startup.receive(init.host_pid, deadline));
             match startup {
@@ -605,7 +611,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 ),
                 Err(startup_error) => format!(
                     "{root_error}; authenticated namespace startup unavailable: {startup_error}; original-init-exit={}",
-                    observe_init_exit(init),
+                    initial_exit,
                 ),
             }
         })?;
@@ -2113,7 +2119,12 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
 
     fn contain_native_resources(&mut self, deadline: Instant) -> Result<(), String> {
         let mut failures = Vec::new();
+        if self.init_exit_diagnostic.before_containment.is_none() {
+            self.init_exit_diagnostic.before_containment =
+                self.namespace_init.as_ref().map(observe_init_exit);
+        }
         if let Some(cgroup) = self.cgroup.as_ref() {
+            self.init_exit_diagnostic.containment_attempted = true;
             match cgroup.clone().kill_and_retire_observed(deadline) {
                 Ok(observed) => {
                     self.cgroup_retirement_raw = Some(observed);
@@ -2138,7 +2149,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         }
         if let Some(init) = self.namespace_init.as_ref() {
             match wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline) {
-                Ok(()) => {
+                Ok(status) => {
+                    self.init_exit_diagnostic.reaped = Some((init.host_pid, status));
                     self.namespace_init.take();
                 }
                 Err(error) => failures.push(format!(
@@ -2150,7 +2162,11 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         if !failures.is_empty() {
             // Keep failed owners and the armed guardian; no downstream proof
             // or authority release is available from partial containment.
-            return Err(failures.join("; "));
+            return Err(format!(
+                "{}; {}",
+                failures.join("; "),
+                self.init_exit_detail()
+            ));
         }
         self.startup.take();
         self.control.take();
@@ -2186,6 +2202,10 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn init_exit_detail(&self) -> String {
+        self.init_exit_diagnostic.detail()
     }
 }
 
@@ -2379,6 +2399,34 @@ fn receive_control_packet(
     }
 }
 
+#[derive(Default)]
+struct InitExitDiagnostic {
+    initial: Option<String>,
+    before_containment: Option<String>,
+    containment_attempted: bool,
+    reaped: Option<(libc::pid_t, i32)>,
+}
+
+impl InitExitDiagnostic {
+    fn detail(&self) -> String {
+        let reaped = match self.reaped {
+            None => "unavailable".to_owned(),
+            Some((pid, raw)) => format!(
+                "pid={pid},raw={raw},exit={:?},signal={:?},core={}",
+                libc::WIFEXITED(raw).then(|| libc::WEXITSTATUS(raw)),
+                libc::WIFSIGNALED(raw).then(|| libc::WTERMSIG(raw)),
+                libc::WIFSIGNALED(raw) && libc::WCOREDUMP(raw),
+            ),
+        };
+        format!(
+            "original-init-status: initial=[{}],pre-containment=[{}],containment-attempted={},reaped=[{reaped}]",
+            self.initial.as_deref().unwrap_or("not-sampled"),
+            self.before_containment.as_deref().unwrap_or("not-sampled"),
+            self.containment_attempted,
+        )
+    }
+}
+
 fn observe_init_exit(init: &NamespaceInit) -> String {
     // Observe only the original held child. WNOWAIT leaves its status and
     // ownership intact for the existing retirement path; WNOHANG never waits.
@@ -2395,7 +2443,12 @@ fn observe_init_exit(init: &NamespaceInit) -> String {
         )
     };
     if observed == -1 {
-        return format!("unavailable: {}", std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return format!(
+            "query-error: kind={:?},raw={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
     }
     // SAFETY: successful waitid initialized the child-status siginfo fields.
     let pid = unsafe { info.si_pid() };
@@ -2418,14 +2471,14 @@ fn wait_exact_child(
     pid: libc::pid_t,
     pidfd: BorrowedFd<'_>,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     wait_pidfd(pidfd, deadline)?;
     loop {
         let mut status = 0;
         // SAFETY: pid is the exact namespace init child retained by this owner.
         let reaped = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
         if reaped == pid {
-            return Ok(());
+            return Ok(status);
         }
         if reaped == -1 {
             return Err(format!(
@@ -2439,3 +2492,7 @@ fn wait_exact_child(
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/private/linux_init_exit.rs"]
+mod init_exit_tests;

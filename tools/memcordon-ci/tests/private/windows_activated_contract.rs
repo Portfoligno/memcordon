@@ -43,6 +43,7 @@ fn activated_contract_selection_is_absolute_exclusive_and_shared_by_both_fronten
         sentinel_handles: vec![],
         descendant_gate: None,
         start_gate: None,
+        gate_access_diagnostic: None,
         completion_gate: None,
         cohort_gate: None,
         generation_gate: None,

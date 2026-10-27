@@ -1,4 +1,4 @@
-use super::channel;
+use super::{Phase, channel};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -92,4 +92,127 @@ fn dropping_init_owner_closes_its_diagnostic_endpoint() {
         0
     );
     assert!(provider.context().contains("record-absent"));
+}
+
+fn raw_packet(init: &super::Init, sequence: u8, dropped: u8, kind: u8, phase: u8, detail: &[u8]) {
+    let mut bytes = super::HEADER.to_vec();
+    bytes.extend_from_slice(&[sequence, dropped, kind, phase, 0]);
+    bytes.extend_from_slice(detail);
+    // SAFETY: a finite hostile packet goes only to this owned diagnostic peer.
+    assert_eq!(
+        unsafe {
+            libc::send(
+                init.as_fd().as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        },
+        bytes.len() as isize
+    );
+}
+
+#[test]
+fn finite_progress_prefix_preserves_both_original_and_publication_failures() {
+    let (provider, init) = channel().unwrap();
+    for phase in [
+        Phase::ChildClosureEntered,
+        Phase::NetworkPrepareBefore,
+        Phase::NetworkPrepareAfter,
+        Phase::RootEnterBefore,
+    ] {
+        init.progress(phase);
+    }
+    init.record(1, 1, "controlled pre-root publication failure")
+        .unwrap();
+    init.record(2, 1, "authenticated publication unavailable")
+        .unwrap();
+    let context = provider.context();
+    assert!(context.contains("progress seq=3 phase=RootEnterBefore"));
+    assert!(!context.contains("phase=RootEnterAfter"));
+    assert!(context.contains("original-failure phase=1"));
+    assert!(context.contains("publication-failure phase=1"));
+    assert!(
+        context.find("original-failure").unwrap() < context.find("publication-failure").unwrap()
+    );
+}
+
+#[test]
+fn full_finite_phase_list_fits_without_displacing_failure_records() {
+    let (provider, init) = channel().unwrap();
+    for phase in [
+        Phase::ChildClosureEntered,
+        Phase::NetworkPrepareBefore,
+        Phase::NetworkPrepareAfter,
+        Phase::RootEnterBefore,
+        Phase::RootEnterAfter,
+        Phase::WorkingDirectoryBefore,
+        Phase::WorkingDirectoryAfter,
+        Phase::EntrypointBefore,
+        Phase::EntrypointAfter,
+        Phase::FilterAndIdentityBefore,
+        Phase::FilterAndIdentityAfter,
+        Phase::RootPublishBefore,
+        Phase::RootPublishAfter,
+        Phase::TargetForkBefore,
+    ] {
+        init.progress(phase);
+    }
+    init.record(1, 2, "target fork refusal").unwrap();
+    init.record(2, 2, "publication refusal").unwrap();
+    let context = provider.context();
+    assert!(context.contains("phase=TargetForkBefore"));
+    assert!(context.contains("original-failure phase=2"));
+    assert!(context.contains("publication-failure phase=2"));
+    assert!(!context.contains("malformed"));
+    assert!(!context.contains("exceeded"));
+}
+
+#[test]
+fn decoder_rejects_unknown_duplicate_backward_and_extra_packets() {
+    for (phase, sequence, message) in [
+        (u8::MAX, 1, "unknown-progress-phase"),
+        (
+            Phase::ChildClosureEntered as u8,
+            1,
+            "inconsistent-progress-record",
+        ),
+        (
+            Phase::NetworkPrepareBefore as u8,
+            0,
+            "duplicate-backward-or-inconsistent-sequence",
+        ),
+    ] {
+        let (provider, init) = channel().unwrap();
+        init.progress(Phase::ChildClosureEntered);
+        raw_packet(&init, sequence, 0, 3, phase, &[]);
+        assert!(provider.context().contains(message));
+    }
+    let (provider, init) = channel().unwrap();
+    for phase in 1..=Phase::TargetForkBefore as u8 {
+        raw_packet(&init, phase - 1, 0, 3, phase, &[]);
+    }
+    raw_packet(&init, Phase::TargetForkBefore as u8, 0, 1, 1, b"original");
+    raw_packet(
+        &init,
+        Phase::TargetForkBefore as u8 + 1,
+        0,
+        2,
+        1,
+        b"publication",
+    );
+    raw_packet(&init, super::MAX_RECORDS, 0, 2, 1, b"extra");
+    assert!(provider.context().contains("extra-record-cap-exceeded"));
+}
+
+#[test]
+fn missing_marker_and_reported_send_loss_remain_explicitly_incomplete() {
+    let (provider, init) = channel().unwrap();
+    raw_packet(&init, 1, 1, 3, Phase::NetworkPrepareBefore as u8, &[]);
+    let context = provider.context();
+    assert!(context.contains("missing-records=1,reported-send-failures=1"));
+    assert!(context.contains("entered-marker-missing"));
+    let (provider, init) = channel().unwrap();
+    raw_packet(&init, 1, 0, 3, Phase::NetworkPrepareBefore as u8, &[]);
+    assert!(provider.context().contains("inconsistent-sequence"));
 }

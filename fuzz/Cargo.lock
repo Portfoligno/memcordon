@@ -854,6 +854,7 @@ version = "0.5.8-dev"
 dependencies = [
  "libc",
  "memcordon-core",
+ "memcordon-windows-launch-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",

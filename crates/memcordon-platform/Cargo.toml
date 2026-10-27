@@ -12,7 +12,7 @@ categories = ["os", "development-tools"]
 publish = ["crates-io"]
 
 [features]
-test-support = ["dep:tempfile"]
+test-support = ["dep:tempfile", "dep:memcordon-windows-launch-core"]
 
 [dependencies]
 libc.workspace = true
@@ -26,6 +26,7 @@ tempfile = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", version = "=0.5.8-dev", optional = true }
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -45,6 +46,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Performance",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [[test]]

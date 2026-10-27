@@ -27,6 +27,59 @@ pub struct TargetBundle {
     pub archive: FileRecord,
     pub members: Vec<FileRecord>,
     pub fixture: FileRecord,
+    #[serde(default)]
+    pub workload_diagnostic: Option<FileRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadDiagnosticBundle {
+    pub source: BuildSourceIdentity,
+    pub target: String,
+    pub executable: FileRecord,
+}
+
+fn validate_workload_diagnostic_record(record: &FileRecord, target: &str) -> Result<()> {
+    if !target.ends_with("-pc-windows-msvc")
+        || record.kind != "workload-diagnostic"
+        || record.name != "memcordon-windows-loader-lab.exe"
+        || record.target.as_deref() != Some(target)
+        || record.package.as_deref() != Some("memcordon-windows-loader-lab")
+        || record.byte_len == 0
+        || record.byte_len > 128 * 1024 * 1024
+    {
+        return Err(CiError::Message(
+            "qualified workload diagnostic record role/target/bound differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl WorkloadDiagnosticBundle {
+    pub fn load(path: &Path, expected: &BuildSourceIdentity, target: &str) -> Result<Self> {
+        let record: Self = source::read_json(path)?;
+        record.source.validate()?;
+        validate_workload_diagnostic_record(&record.executable, target)?;
+        if &record.source != expected || record.target != target {
+            return Err(CiError::Message(
+                "qualified diagnostic companion source/target/role differs".into(),
+            ));
+        }
+        let directory = path
+            .parent()
+            .ok_or_else(|| CiError::Message("diagnostic companion parent absent".into()))?;
+        crate::windows_installed_cases::WorkloadDiagnosticInput {
+            source: record.source.clone(),
+            target: record.target.clone(),
+            executable: crate::windows_installed_cases::SelectedArtifact {
+                path: std::path::absolute(directory)?.join(&record.executable.name),
+                sha256: record.executable.sha256.clone(),
+            },
+            byte_len: record.executable.byte_len,
+        }
+        .validate_for(expected, target)?;
+        Ok(record)
+    }
 }
 
 pub fn binary_name(binary: &str, target: &str) -> String {
@@ -239,6 +292,29 @@ pub fn decode_archive(bytes: &[u8], target: &str) -> Result<BTreeMap<String, Vec
 }
 
 impl TargetBundle {
+    pub fn workload_diagnostic_input(
+        &self,
+        directory: &Path,
+    ) -> Result<Option<crate::windows_installed_cases::WorkloadDiagnosticInput>> {
+        self.workload_diagnostic
+            .as_ref()
+            .map(|record| {
+                validate_workload_diagnostic_record(record, &self.distribution.target)?;
+                let input = crate::windows_installed_cases::WorkloadDiagnosticInput {
+                    source: self.source.clone(),
+                    target: self.distribution.target.clone(),
+                    executable: crate::windows_installed_cases::SelectedArtifact {
+                        path: std::path::absolute(directory)?.join(&record.name),
+                        sha256: record.sha256.clone(),
+                    },
+                    byte_len: record.byte_len,
+                };
+                input.validate_for(&self.source, &self.distribution.target)?;
+                Ok(input)
+            })
+            .transpose()
+    }
+
     pub fn load(directory: &Path) -> Result<(Self, Vec<u8>)> {
         let bundle: Self = source::read_json(&directory.join("target.json"))?;
         bundle.source.validate()?;
@@ -254,6 +330,23 @@ impl TargetBundle {
         let fixture = artifacts::read_file(&directory.join(&bundle.fixture.name))?;
         artifacts::check_bytes(&bundle.fixture, &fixture)?;
         validate_executable(&fixture, &bundle.distribution.target)?;
+        if let Some(diagnostic) = &bundle.workload_diagnostic {
+            validate_workload_diagnostic_record(diagnostic, &bundle.distribution.target)?;
+            if diagnostic.name == bundle.fixture.name
+                || diagnostic.name == bundle.archive.name
+                || bundle
+                    .members
+                    .iter()
+                    .any(|member| member.name == diagnostic.name)
+            {
+                return Err(CiError::Message(
+                    "native workload diagnostic association differs".into(),
+                ));
+            }
+            let bytes = artifacts::read_file(&directory.join(&diagnostic.name))?;
+            artifacts::check_bytes(diagnostic, &bytes)?;
+            validate_executable(&bytes, &bundle.distribution.target)?;
+        }
         if bundle.format != "memcordon.target"
             || bundle.revision != 1
             || bundle.archive.kind != "archive"
@@ -858,6 +951,246 @@ pub fn validate_covered_selected(
     })
 }
 
+struct BuiltWorkloadDiagnostic {
+    record: FileRecord,
+    bytes: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn build_workload_diagnostic(
+    root: &Path,
+    selected: &BuildSourceIdentity,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<BuiltWorkloadDiagnostic>> {
+    if !target.ends_with("-pc-windows-msvc") {
+        return Ok(None);
+    }
+    selected.recheck(root)?;
+    let toolchain = crate::config::toolchains(root)?.stable;
+    let metadata = rustup_cargo(
+        root,
+        &toolchain,
+        [
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ],
+        Duration::from_secs(120),
+    )
+    .bounded_until(deadline)
+    .selection(selected, Some(target))
+    .output_owned()
+    .map_validated(|output| {
+        if !output.status.success() {
+            return Err(CiError::Message(
+                "diagnostic producer metadata failed".into(),
+            ));
+        }
+        Ok(serde_json::from_slice::<cargo_metadata::Metadata>(
+            &output.stdout,
+        )?)
+    })
+    .into_result()?;
+    let packages: Vec<_> = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name.as_str() == "memcordon-windows-loader-lab")
+        .collect();
+    if packages.len() != 1 {
+        return Err(CiError::Message(
+            "diagnostic producer package association differs".into(),
+        ));
+    }
+    let package = packages[0];
+    let targets: Vec<_> = package
+        .targets
+        .iter()
+        .filter(|entry| {
+            entry.name == "memcordon-windows-loader-lab"
+                && entry.kind.contains(&cargo_metadata::TargetKind::Bin)
+        })
+        .collect();
+    if targets.len() != 1 {
+        return Err(CiError::Message(
+            "diagnostic producer ordinary binary target differs".into(),
+        ));
+    }
+    let build_root = std::path::absolute(root.join("target/ci/native"))?;
+    let compile_budget = crate::native_test_plan::commands_with_failure(
+        true,
+        crate::failure_mode::FailureMode::StopAfterFailure,
+    )[0]
+    .deadline;
+    rustup_cargo(
+        root,
+        &toolchain,
+        [
+            "build",
+            "--release",
+            "--locked",
+            "--offline",
+            "--all-features",
+            "-p",
+            "memcordon-windows-loader-lab",
+            "--bin",
+            "memcordon-windows-loader-lab",
+            "--message-format=json-render-diagnostics",
+            "--target-dir",
+        ],
+        compile_budget,
+    )
+    .arg(&build_root)
+    .bounded_until(deadline)
+    .phase(crate::command::CiPhase::NativeCompile)
+    .selection(selected, Some(target))
+    .output_owned()
+    .map_validated(|output| {
+        if !output.status.success() {
+            return Err(CiError::Message(format!(
+                "ordinary diagnostic producer failed: {}",
+                crate::command::bounded_excerpt(&output.stderr)
+            )));
+        }
+        let mut executable = None;
+        let mut finished = false;
+        for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
+            match message.map_err(|error| CiError::Message(error.to_string()))? {
+                cargo_metadata::Message::CompilerArtifact(artifact)
+                    if artifact.package_id == package.id
+                        && artifact.target == *targets[0]
+                        && !artifact.profile.test =>
+                {
+                    if let Some(path) = artifact.executable
+                        && executable.replace(path.into_std_path_buf()).is_some()
+                    {
+                        return Err(CiError::Message(
+                            "diagnostic Cargo output repeats the selected ordinary executable"
+                                .into(),
+                        ));
+                    }
+                }
+                cargo_metadata::Message::BuildFinished(status) => {
+                    if finished || !status.success {
+                        return Err(CiError::Message(
+                            "diagnostic Cargo completion differs".into(),
+                        ));
+                    }
+                    finished = true;
+                }
+                _ => {}
+            }
+        }
+        let executable = executable.ok_or_else(|| {
+            CiError::Message(
+                "diagnostic Cargo output lacks the selected ordinary executable".into(),
+            )
+        })?;
+        let name = binary_name("memcordon-windows-loader-lab", target);
+        if !finished || executable != build_root.join("release").join(&name) {
+            return Err(CiError::Message(
+                "diagnostic ordinary executable escapes its native producer".into(),
+            ));
+        }
+        let bytes = artifacts::read_file(&executable)?;
+        if bytes.is_empty() || bytes.len() > 128 * 1024 * 1024 {
+            return Err(CiError::Message(
+                "diagnostic executable exceeds existing bound".into(),
+            ));
+        }
+        validate_executable(&bytes, target)?;
+        selected.recheck(root)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(CiError::Message(
+                "original native deadline expired producing diagnostic".into(),
+            ));
+        }
+        Ok(Some(BuiltWorkloadDiagnostic {
+            record: FileRecord {
+                name,
+                kind: "workload-diagnostic".into(),
+                target: Some(target.into()),
+                package: Some("memcordon-windows-loader-lab".into()),
+                byte_len: bytes.len() as u64,
+                sha256: artifacts::checksum(&bytes),
+            },
+            bytes,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }))
+    })
+    .into_result()
+}
+
+/// Replace the existing public fixture-preparation step under its same one-hour
+/// producer allowance. No compiler is started from an installed failure callback.
+pub fn prepare_readiness_tools(root: &Path, source_path: &Path) -> Result<()> {
+    let selected: BuildSourceIdentity = source::read_json(source_path)?;
+    let target = super::distribution::native_target()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
+    crate::preparation::with_operation(
+        crate::failure_mode::FailureMode::StopAfterFailure,
+        deadline,
+        || {
+            selected.recheck(root)?;
+            let toolchain = crate::config::toolchains(root)?.stable;
+            rustup_cargo(
+                root,
+                &toolchain,
+                [
+                    "build",
+                    "--locked",
+                    "--release",
+                    "--target-dir",
+                    "target/ci/native",
+                    "-p",
+                    "memcordon",
+                    "--features",
+                    "test-fixtures",
+                    "--bin",
+                    "memcordon-test-fixture",
+                ],
+                Duration::from_secs(60 * 60),
+            )
+            .bounded_until(deadline)
+            .phase(crate::command::CiPhase::NativeCompile)
+            .selection(&selected, Some(target))
+            .run()?;
+            if let Some(diagnostic) = build_workload_diagnostic(root, &selected, target, deadline)?
+            {
+                let directory = root.join("target/ci/native/release");
+                source::write_json(
+                    &directory.join("workload-diagnostic.json"),
+                    &WorkloadDiagnosticBundle {
+                        source: selected.clone(),
+                        target: target.to_owned(),
+                        executable: diagnostic.record,
+                    },
+                )?;
+                fs::write(
+                    directory.join("workload-diagnostic-cargo.jsonl"),
+                    diagnostic.stdout,
+                )?;
+                fs::write(
+                    directory.join("workload-diagnostic-cargo.stderr.bin"),
+                    diagnostic.stderr,
+                )?;
+            }
+            selected.recheck(root)?;
+            if std::time::Instant::now() >= deadline {
+                return Err(CiError::Message(
+                    "original readiness-tool producer deadline expired".into(),
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
 pub fn validate_selected(
     root: &Path,
     selected: &BuildSourceIdentity,
@@ -910,6 +1243,8 @@ fn validate_and_package_native(
     };
     let product = root.join("target/ci-build/product");
     let toolchain = crate::config::toolchains(root)?.stable;
+    let workload_diagnostic =
+        build_workload_diagnostic(root, selected, &distribution.target, operation_deadline)?;
     for phase in crate::native_test_plan::commands_with_failure(true, failure_mode)
         .into_iter()
         .skip(1)
@@ -1089,6 +1424,17 @@ fn validate_and_package_native(
             artifacts::read_file(&root.join("target/ci/native/release").join(&fixture_name))?;
         validate_executable(&fixture_bytes, &distribution.target)?;
         fs::write(destination.join(&fixture_name), &fixture_bytes)?;
+        if let Some(diagnostic) = &workload_diagnostic {
+            fs::write(destination.join(&diagnostic.record.name), &diagnostic.bytes)?;
+            fs::write(
+                destination.join("workload-diagnostic-cargo.jsonl"),
+                &diagnostic.stdout,
+            )?;
+            fs::write(
+                destination.join("workload-diagnostic-cargo.stderr.bin"),
+                &diagnostic.stderr,
+            )?;
+        }
         let fixture = FileRecord {
             name: fixture_name,
             kind: "fixture".into(),
@@ -1107,6 +1453,9 @@ fn validate_and_package_native(
                 archive,
                 members: records,
                 fixture,
+                workload_diagnostic: workload_diagnostic
+                    .as_ref()
+                    .map(|diagnostic| diagnostic.record.clone()),
             },
         )?;
         TargetBundle::load(destination)?;

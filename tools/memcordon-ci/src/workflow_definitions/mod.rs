@@ -22,6 +22,7 @@ mod release_fuzz;
 mod semantics;
 mod source_seed;
 mod translations;
+mod windows_fixture_native;
 
 use crate::{CiError, Result};
 use literal::LiteralRun;
@@ -67,6 +68,7 @@ pub fn definition(name: &str) -> Result<Value> {
     let mut value =
         original(name).ok_or_else(|| CiError::Message("unknown workflow definition".into()))?;
     adapters::apply(&mut value, name)?;
+    windows_fixture_native::apply(&mut value, name)?;
     native_coverage::apply(&mut value, name)?;
     cancellation::apply(&mut value);
     validate_references(&value)?;

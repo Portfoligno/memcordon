@@ -1,7 +1,12 @@
 //! Persist owned native image observations without accepting their semantics.
 #![cfg(target_os = "linux")]
+
+#[cfg(test)]
+#[path = "../../tests/private/linux_image_normalize.rs"]
+mod tests;
 use super::linux_readiness_image_cases::ImageCaseReport;
 use crate::{CiError, Result, consumer_readiness_ledger::SourceIdentity};
+use memcordon_core::workload_registry_v3::{ImageEntryV1, RuntimeImageDefinitionV1};
 use memcordon_readiness_verifier::{
     Artifact, CaseKey, CaseRecord, CaseState, EvidenceClass, LinuxImageExportEvidence,
     LinuxImageImportEvidence, LinuxImageMemberCapture, LinuxImagePreparationEvidence, ProductKey,
@@ -85,12 +90,129 @@ fn capture_bounded(
     artifacts: &mut BTreeMap<String, Artifact>,
     limit: u64,
 ) -> Result<String> {
+    capture_qualified(root, path, artifacts, limit, None, None, None)
+}
+
+fn capture_image(
+    root: &Path,
+    path: &Path,
+    artifacts: &mut BTreeMap<String, Artifact>,
+    expected: (u64, &str),
+    custody: &[std::fs::File],
+    deadline: std::time::Instant,
+) -> Result<String> {
+    capture_qualified(
+        root,
+        path,
+        artifacts,
+        memcordon_readiness_verifier::MAX_ARTIFACT_BYTES,
+        Some(expected),
+        Some(custody),
+        Some(deadline),
+    )
+}
+
+fn capture_live(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(CiError::Message(
+            "original image normalization cleanup cutoff exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn capture_qualified(
+    root: &Path,
+    path: &Path,
+    artifacts: &mut BTreeMap<String, Artifact>,
+    limit: u64,
+    expected: Option<(u64, &str)>,
+    custody: Option<&[std::fs::File]>,
+    deadline: Option<std::time::Instant>,
+) -> Result<String> {
+    use std::io::Read;
+    capture_live(deadline)?;
     let path_string = relative(root, path)?;
-    let bytes = read(path, limit)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || ![0, 65534].contains(&before.uid())
+        || before.mode() & 0o022 != 0
+        || before.len() > limit
+        || expected.is_some_and(|(length, _)| length > limit || length != before.len())
+    {
+        return Err(CiError::Message(format!(
+            "native image normalized artifact custody/size differs; observed={}; expected={:?}; bound={limit}",
+            before.len(),
+            expected.map(|(length, _)| length)
+        )));
+    }
+    if let Some(custody) = custody {
+        let mut original = false;
+        for held in custody {
+            if stamp(&held.metadata()?) == stamp(&before) {
+                original = true;
+                break;
+            }
+        }
+        if !original {
+            return Err(CiError::Message(
+                "native image normalized artifact lacks original retained inode custody".into(),
+            ));
+        }
+    }
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        capture_live(deadline)?;
+        let length = file.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        count = count
+            .checked_add(length as u64)
+            .ok_or_else(|| CiError::Message("normalized image byte count overflow".into()))?;
+        if count > before.len() || count > limit {
+            return Err(CiError::Message(
+                "native image normalized artifact grew during streaming capture".into(),
+            ));
+        }
+        hash.update(&buffer[..length]);
+    }
+    let digest = hex::encode(hash.finalize());
+    let named = std::fs::symlink_metadata(path)?;
+    if count != before.len()
+        || stamp(&before) != stamp(&file.metadata()?)
+        || stamp(&before) != stamp(&named)
+        || expected.is_some_and(|(_, sha256)| sha256 != digest)
+    {
+        return Err(CiError::Message("native image normalized artifact identity/bytes changed or differ from exact image record".into()));
+    }
     let artifact = Artifact {
         path: path_string.clone(),
-        length: bytes.len() as u64,
-        sha256: hex::encode(Sha256::digest(&bytes)),
+        length: count,
+        sha256: digest,
     };
     if artifacts
         .get(&path_string)
@@ -100,8 +222,31 @@ fn capture_bounded(
             "image artifact path has conflicting owned bytes".into(),
         ));
     }
+    capture_live(deadline)?;
     artifacts.insert(path_string.clone(), artifact);
     Ok(path_string)
+}
+
+fn baseline_regular(definition: &RuntimeImageDefinitionV1, path: &str) -> Result<(u64, String)> {
+    let path = super::linux_readiness_image_cases::resolve_member(definition, path)?;
+    definition
+        .entries
+        .as_slice()
+        .iter()
+        .find_map(|entry| match entry {
+            ImageEntryV1::Regular {
+                path: member,
+                size,
+                sha256,
+                ..
+            } if member.as_str() == path => Some((*size, String::from(sha256.clone()))),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            CiError::Message(
+                "normalized baseline image member lacks exact regular definition".into(),
+            )
+        })
 }
 fn value_path(value: &serde_json::Value, field: &str) -> Result<PathBuf> {
     value[field]
@@ -158,6 +303,18 @@ pub fn collect_import_records(
                 return Err(CiError::Message(error.clone()));
             }
             let inventory = json(&row.source_inventory)?;
+            let baseline: RuntimeImageDefinitionV1 =
+                serde_json::from_value(inventory["baseline_definition"].clone())?;
+            let baseline_entry = baseline
+                .entrypoints
+                .as_slice()
+                .iter()
+                .find(|entry| entry.id.as_str() == "owned-readiness")
+                .ok_or_else(|| {
+                    CiError::Message("normalized baseline owned entrypoint absent".into())
+                })?;
+            let baseline_entry_expected =
+                baseline_regular(&baseline, baseline_entry.path.as_str())?;
             let mut source_members = Vec::new();
             for member in inventory["members"]
                 .as_array()
@@ -166,19 +323,36 @@ pub fn collect_import_records(
                 if member["bytes"].is_null() {
                     continue;
                 }
+                let member_path = member["path"]
+                    .as_str()
+                    .ok_or_else(|| CiError::Message("native image member path absent".into()))?;
+                let size = member["size"].as_u64().ok_or_else(|| {
+                    CiError::Message("native image member exact size absent".into())
+                })?;
+                let sha256 = member["sha256"].as_str().ok_or_else(|| {
+                    CiError::Message("native image member actual digest absent".into())
+                })?;
                 source_members.push(LinuxImageMemberCapture {
-                    path: member["path"]
-                        .as_str()
-                        .ok_or_else(|| CiError::Message("native image member path absent".into()))?
-                        .into(),
-                    bytes: capture(root, &value_path(member, "bytes")?, artifacts)?,
+                    path: member_path.into(),
+                    bytes: capture_image(
+                        root,
+                        &value_path(member, "bytes")?,
+                        artifacts,
+                        (size, sha256),
+                        &report.file_custody,
+                        report.cleanup_deadline,
+                    )?,
                     baseline_bytes: if member["baseline_bytes"].is_null() {
                         None
                     } else {
-                        Some(capture(
+                        let expected = baseline_regular(&baseline, member_path)?;
+                        Some(capture_image(
                             root,
                             &value_path(member, "baseline_bytes")?,
                             artifacts,
+                            (expected.0, &expected.1),
+                            &report.file_custody,
+                            report.cleanup_deadline,
                         )?)
                     },
                 });
@@ -191,6 +365,11 @@ pub fn collect_import_records(
                 })?;
                 Some(LinuxImagePreparationEvidence {
                     receipt: capture(root, path, artifacts)?,
+                    memory_budget: capture(
+                        root,
+                        &value_path(&receipt, "memory_budget")?,
+                        artifacts,
+                    )?,
                     activation: capture(root, &value_path(&receipt, "activation")?, artifacts)?,
                     policy: capture(
                         root,
@@ -270,7 +449,14 @@ pub fn collect_import_records(
                 stderr: capture(root, &row.stderr, artifacts)?,
                 exit: capture(root, &row.exit, artifacts)?,
                 source_inventory: capture(root, &row.source_inventory, artifacts)?,
-                baseline_entrypoint: capture(root, &row.baseline_entrypoint, artifacts)?,
+                baseline_entrypoint: capture_image(
+                    root,
+                    &row.baseline_entrypoint,
+                    artifacts,
+                    (baseline_entry_expected.0, &baseline_entry_expected.1),
+                    &report.file_custody,
+                    report.cleanup_deadline,
+                )?,
                 neighbor_definition: capture(root, &neighbor.definition_capture, artifacts)?,
                 neighbor_stdout: capture(root, &neighbor.stdout, artifacts)?,
                 neighbor_invocation: capture(root, &neighbor.invocation, artifacts)?,
@@ -364,6 +550,8 @@ pub fn collect_export_records(
                 ]
             } else if row.fixture_mode == "device" {
                 vec!["device-admin-handles-retired.json"]
+            } else if row.fixture_mode == "fifo" {
+                vec!["fifo-admin-handles-retired.json"]
             } else {
                 Vec::new()
             };
@@ -457,6 +645,7 @@ pub fn collect_export_records(
                 activation: capture(root, required(&row.activation)?, artifacts)?,
                 policy: capture(root, &directory.join("mixed.policy.json"), artifacts)?,
                 contract: capture(root, &row.contract, artifacts)?,
+                memory_budget: capture(root, required(&row.memory_budget)?, artifacts)?,
                 provider_request: capture(root, required(&row.provider_request)?, artifacts)?,
                 result: capture(root, required(&row.result)?, artifacts)?,
                 prepared: capture(root, required(&row.prepared)?, artifacts)?,

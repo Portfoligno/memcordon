@@ -170,6 +170,7 @@ fn same_association(old: &Value, new: &Value) -> Result<(), String> {
         "mixed_admission_metadata",
         "binding",
         "mixed_worker",
+        "mixed_control",
     ] {
         if old[name] != new[name] {
             return Err(format!(

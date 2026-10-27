@@ -1,9 +1,9 @@
 use memcordon_ci::windows_consumer_readiness::descriptor::{
-    CHURN_CREATIONS, CHURN_LIVE, Case, Descriptor, Toolchain,
+    self, CHURN_CREATIONS, CHURN_LIVE, Case, Descriptor, Toolchain,
 };
 use memcordon_ci::windows_consumer_readiness::{
     CaseAssessment, SuiteInput, accepted, check_positive_barrier_result, positive_keys,
-    validate_suite,
+    validate_suite, validate_toolchain_inventory,
 };
 
 #[test]
@@ -96,6 +96,15 @@ fn released_loader_event_context_requires_exact_failure_and_retirement() {
 
 fn descriptor() -> Descriptor {
     let root = std::env::temp_dir().join("memcordon-readiness-input-oracle");
+    let inputs = root.join("locked-inputs");
+    let rustc = inputs.join("toolchain").join("bin").join("rustc.exe");
+    let linker = inputs
+        .join("toolchain")
+        .join("lib")
+        .join("rustlib")
+        .join("x86_64-pc-windows-msvc")
+        .join("bin")
+        .join("rust-lld.exe");
     Descriptor {
         format: "memcordon.fixture-workload".into(),
         revision: 1,
@@ -113,17 +122,29 @@ fn descriptor() -> Descriptor {
         sentinel_handles: Vec::new(),
         descendant_gate: None,
         start_gate: Some("Local\\memcordon-readiness-test-start".into()),
+        gate_access_diagnostic: None,
         completion_gate: None,
         cohort_gate: Some("Local\\memcordon-readiness-test-cohort".into()),
         generation_gate: Some("Local\\memcordon-readiness-test-generation".into()),
         toolchain: Some(Toolchain {
             native_work_cutoff_ticks: 1,
             native_work_frequency: 1,
-            rustc: root.join("rustc.exe"),
-            native_linker: root.join("link.exe"),
-            native_library_directories: ["vc", "ucrt", "um"]
+            linker_mode: descriptor::LinkerMode::BundledLldLink,
+            input_root: inputs.clone(),
+            rustc: rustc.clone(),
+            native_linker: linker.clone(),
+            selected_images: descriptor::project_toolchain_images([rustc, linker].into_iter().map(
+                |path| {
+                    (
+                        path,
+                        String::from(memcordon_core::DiagnosticSha256::from_bytes([7; 32])),
+                    )
+                },
+            ))
+            .unwrap(),
+            native_library_directories: ["msvc-lib", "sdk-ucrt", "sdk-um"]
                 .into_iter()
-                .map(|name| root.join(name))
+                .map(|name| inputs.join(name))
                 .collect(),
             library_source: root.join("library.rs"),
             test_source: root.join("tests.rs"),
@@ -133,6 +154,75 @@ fn descriptor() -> Descriptor {
             target: "x86_64-pc-windows-msvc".into(),
         }),
     }
+}
+
+#[test]
+fn compiler_creation_uses_the_exact_frozen_measured_executable_inventory() {
+    let mut input = descriptor();
+    input.validate().unwrap();
+    let toolchain = input.toolchain.as_mut().unwrap();
+    let root = toolchain.rustc.parent().unwrap().to_owned();
+    let helper = root.join("compiler-helper.exe");
+    let helper_digest = String::from(memcordon_core::DiagnosticSha256::from_bytes([9; 32]));
+    let mut measured: Vec<_> = toolchain
+        .selected_images
+        .iter()
+        .map(|image| (image.path.clone(), image.sha256.clone()))
+        .collect();
+    measured.push((helper.clone(), helper_digest.clone()));
+    measured.push((root.join("library.rs"), helper_digest.clone()));
+    let frozen = descriptor::project_toolchain_images(measured).unwrap();
+    toolchain.selected_images = frozen.clone();
+    validate_toolchain_inventory(toolchain, &frozen).unwrap();
+    assert!(toolchain.admits_created_image(&helper, &helper_digest));
+    let changed_digest = String::from(memcordon_core::DiagnosticSha256::from_bytes([10; 32]));
+    assert!(!toolchain.admits_created_image(&helper, &changed_digest));
+    assert!(!toolchain.admits_created_image(&root.join("foreign.exe"), &helper_digest));
+    let mut omitted = frozen.clone();
+    omitted.retain(|image| image.path != helper);
+    assert!(validate_toolchain_inventory(toolchain, &omitted).is_err());
+    let mut rehashed = frozen.clone();
+    rehashed
+        .iter_mut()
+        .find(|image| image.path == helper)
+        .unwrap()
+        .sha256 = changed_digest;
+    assert!(validate_toolchain_inventory(toolchain, &rehashed).is_err());
+    let valid = toolchain.clone();
+    for malformed in [
+        Vec::new(),
+        vec![frozen[0].clone(), frozen[0].clone()],
+        frozen
+            .iter()
+            .filter(|image| image.path != valid.rustc)
+            .cloned()
+            .collect(),
+        frozen
+            .iter()
+            .filter(|image| image.path != valid.native_linker)
+            .cloned()
+            .collect(),
+    ] {
+        toolchain.selected_images = malformed;
+        assert!(toolchain.validate_selected_images().is_err());
+    }
+    toolchain.selected_images = frozen;
+    toolchain.selected_images[0].sha256 = "invalid".into();
+    assert!(toolchain.validate_selected_images().is_err());
+    let overflow = (0..=descriptor::MAX_TOOLCHAIN_IMAGES).map(|index| {
+        (
+            root.join(index.to_string()).with_extension("exe"),
+            helper_digest.clone(),
+        )
+    });
+    assert!(descriptor::project_toolchain_images(overflow).is_err());
+    assert!(
+        descriptor::project_toolchain_images([(
+            root.join("..").join("foreign.exe"),
+            helper_digest.clone()
+        ),])
+        .is_err()
+    );
 }
 
 #[test]

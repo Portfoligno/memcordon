@@ -3,6 +3,37 @@ use memcordon_readiness_verifier::{
     validate_linux_export_source,
 };
 use serde_json::{Value, json};
+
+#[test]
+fn export_memory_receipt_cannot_replace_image_charge_headroom_or_source() {
+    for field in [
+        "image_bytes",
+        "rounded_image_bytes",
+        "headroom_bytes",
+        "limit_bytes",
+        "page_bytes",
+        "runtime_image",
+    ] {
+        let mut case = linux_export_case::finish(linux_export_case::original_graph("symlink"));
+        case.validate().unwrap();
+        case.mutate(
+            "installed/mixed-cases/image-cases/export-symlink/fixture-memory-budget.json",
+            |receipt| receipt["budget"][field] = json!(1),
+        );
+        assert!(case.validate().is_err(), "accepted changed fixture {field}");
+    }
+    for field in ["source", "cell", "lease_id", "key"] {
+        let mut case = linux_export_case::finish(linux_export_case::original_graph("symlink"));
+        case.mutate(
+            "installed/mixed-cases/image-cases/export-symlink/fixture-memory-budget.json",
+            |receipt| receipt[field] = json!("unrelated"),
+        );
+        assert!(
+            case.validate().is_err(),
+            "accepted unrelated fixture {field}"
+        );
+    }
+}
 #[path = "support/linux_export_case.rs"]
 mod linux_export_case;
 #[path = "support/linux_installed_case.rs"]
@@ -11,6 +42,113 @@ mod linux_installed_case;
 mod linux_prepared_case;
 #[path = "support/persisted_case.rs"]
 mod persisted_case;
+
+#[test]
+fn fifo_administrative_setup_must_join_original_attempt_target_source_and_account() {
+    let factory = || linux_export_case::finish(linux_export_case::fifo_graph());
+    factory().validate().unwrap();
+    let prefix = "installed/mixed-cases/image-cases/export-fifo";
+    for (field, value) in [
+        ("format", json!("memcordon.linux-native-export-device")),
+        ("attempt_id", json!("f".repeat(32))),
+        ("target_pid", json!(999)),
+        ("target_birth", json!(999)),
+        ("root_device", json!(999)),
+        ("root_inode", json!(999)),
+        ("work_device", json!(0)),
+        ("work_inode", json!(0)),
+        ("device", json!(999)),
+        ("inode", json!(999)),
+        ("mode", json!(0o100600)),
+        ("links", json!(2)),
+        ("rdev", json!(259)),
+        ("uid", json!(0)),
+        ("gid", json!(0)),
+        ("path", json!("/work/unrelated")),
+        ("held_live_before_and_after", json!(false)),
+    ] {
+        let mut case = factory();
+        case.mutate(&format!("{prefix}/fifo-created.json"), |setup| {
+            setup[field] = value
+        });
+        assert!(
+            case.validate().is_err(),
+            "accepted FIFO setup substitution {field}"
+        );
+    }
+    for (field, value) in [
+        ("mode", json!(0o100600)),
+        ("uid", json!(0)),
+        ("gid", json!(0)),
+        ("nlink", json!(2)),
+        ("inode", json!(999)),
+    ] {
+        let mut case = factory();
+        case.mutate(&format!("{prefix}/native-export-source.json"), |source| {
+            source[field] = value
+        });
+        assert!(
+            case.validate().is_err(),
+            "accepted FIFO source substitution {field}"
+        );
+    }
+    let case = linux_export_case::finish(linux_export_case::original_graph("fifo"));
+    assert!(
+        case.validate().is_err(),
+        "readiness without actual administrative setup is not creation proof"
+    );
+    let mut case = factory();
+    case.mutate(&format!("{prefix}/ready.json"), |ready| {
+        ready["observation"]["kind"] = json!("fifo")
+    });
+    assert!(
+        case.validate().is_err(),
+        "fixture readiness must explicitly request administrative FIFO setup"
+    );
+}
+
+#[test]
+fn special_object_closure_requires_three_distinct_ordered_successful_native_closes() {
+    for scenario in ["fifo", "device"] {
+        let factory = || {
+            linux_export_case::finish(if scenario == "fifo" {
+                linux_export_case::fifo_graph()
+            } else {
+                linux_export_case::device_graph()
+            })
+        };
+        factory().validate().unwrap();
+        let path = format!(
+            "installed/mixed-cases/image-cases/export-{scenario}/{scenario}-admin-handles-retired.json"
+        );
+        let mut missing = if scenario == "fifo" {
+            linux_export_case::fifo_graph()
+        } else {
+            linux_export_case::device_graph()
+        };
+        missing
+            .evidence
+            .external
+            .remove(&format!("{scenario}-admin-handles-retired.json"));
+        assert!(linux_export_case::finish(missing).validate().is_err());
+        for mutation in 0..7 {
+            let mut case = factory();
+            case.mutate(&path, |closure| match mutation {
+                0 => { closure["closures"].as_array_mut().unwrap().pop(); },
+                1 => closure["closures"][2] = closure["closures"][0].clone(),
+                2 => closure["closures"][1]["native_close_succeeded"] = json!(false),
+                3 => closure["closures"][1]["native_close_errno"] = json!(5),
+                4 => closure["attempt_id"] = json!("f".repeat(32)),
+                5 => closure["before_root_release"] = json!(false),
+                _ => closure["closures"] = json!([{"completed":true,"errno":null},{"completed":true,"errno":null},{"completed":true,"errno":null}]),
+            });
+            assert!(
+                case.validate().is_err(),
+                "accepted {scenario} closure mutation {mutation}"
+            );
+        }
+    }
+}
 
 #[test]
 fn complete_export_records_require_original_native_retirement_and_recovery() {
@@ -24,6 +162,7 @@ fn complete_export_records_require_original_native_retirement_and_recovery() {
     ] {
         let factory = || match scenario {
             "device" => linux_export_case::device_graph(),
+            "fifo" => linux_export_case::fifo_graph(),
             "concurrent-writer" => linux_export_case::concurrent_graph(),
             _ => linux_export_case::original_graph(scenario),
         };
@@ -127,34 +266,15 @@ fn complete_export_records_require_original_native_retirement_and_recovery() {
 // Independent codec vectors. Native execution evidence is acquired by the producer.
 #[test]
 fn all_six_export_effects_require_native_object_and_original_authorized_cause() {
-    for (scenario, kind, cause) in [
-        (
-            "symlink",
-            0o120000,
-            "Too many levels of symbolic links (os error 40)",
-        ),
-        (
-            "traversal",
-            0o120000,
-            "Too many levels of symbolic links (os error 40)",
-        ),
-        (
-            "fifo",
-            0o010000,
-            "selected output lacks exclusive regular-file custody",
-        ),
-        (
-            "device",
-            0o020000,
-            "selected output lacks exclusive regular-file custody",
-        ),
-        ("socket", 0o140000, "No such device or address (os error 6)"),
-        (
-            "concurrent-writer",
-            0o100000,
-            "selected output native identity/content changed",
-        ),
+    for (scenario, kind) in [
+        ("symlink", 0o120000),
+        ("traversal", 0o120000),
+        ("fifo", 0o010000),
+        ("device", 0o020000),
+        ("socket", 0o140000),
+        ("concurrent-writer", 0o100000),
     ] {
+        let cause = linux_export_case::native_cause(scenario);
         let prepared = json!({"attempt_id":"attempt","target":{"process_id":101,"birth":123},"root_device":7,"root_inode":8});
         let account = json!({"uid":61001,"gid":61001});
         let source = json!({"format":"memcordon.linux-export-native-source","revision":1,"scenario":scenario,"attempt_id":"attempt","target":prepared["target"],"root_device":7,"root_inode":8,
@@ -184,6 +304,10 @@ fn all_six_export_effects_require_native_object_and_original_authorized_cause() 
         for (pointer, value) in [
             ("/runtime/outcome/kind", json!("executed")),
             ("/runtime/outcome/attempt_id", json!("other")),
+            ("/runtime/outcome/request_sha256", json!("other-request")),
+            ("/runtime/carrier_revision", json!(0)),
+            ("/frontend/relay_drained", json!(false)),
+            ("/frontend/relay_error", json!("unsettled original relay")),
             (
                 "/runtime/outcome/retained_obligations/authorization",
                 json!("never-authorized"),
@@ -202,6 +326,90 @@ fn all_six_export_effects_require_native_object_and_original_authorized_cause() 
                 "{scenario} accepted {pointer}"
             );
         }
+        let prefix = concat!(
+            "retire mixed native execution: ",
+            "export mixed private root: ",
+            "export selected private root outputs: "
+        );
+        let mut changed_causes = vec![
+            cause.replacen(
+                "retire mixed native execution: ",
+                "retire unrelated native execution: ",
+                1,
+            ),
+            cause.replacen(
+                "export mixed private root: ",
+                "export unrelated private root: ",
+                1,
+            ),
+            cause.replacen(
+                "export selected private root outputs: ",
+                "export unselected private root outputs: ",
+                1,
+            ),
+            cause
+                .strip_prefix("retire mixed native execution: ")
+                .unwrap()
+                .to_owned(),
+            cause.strip_prefix(prefix).unwrap().to_owned(),
+            format!("retire mixed native execution: {cause}"),
+            format!("unexpected {cause}"),
+            format!("{cause}\n"),
+        ];
+        if matches!(scenario, "symlink" | "traversal" | "socket") {
+            changed_causes.push(cause.replacen(
+                "from writable mount work:",
+                "from writable mount other:",
+                1,
+            ));
+            changed_causes.push(cause.replacen(
+                "selected output work/",
+                "selected output other/",
+                1,
+            ));
+            changed_causes.push(cause.replacen(
+                if scenario == "socket" {
+                    "(os error 6)"
+                } else {
+                    "(os error 40)"
+                },
+                "(os error 1)",
+                1,
+            ));
+            changed_causes.push(
+                if scenario == "socket" {
+                    "No such device or address (os error 6)"
+                } else {
+                    "Too many levels of symbolic links (os error 40)"
+                }
+                .to_owned(),
+            );
+        }
+        if matches!(scenario, "symlink" | "traversal") {
+            changed_causes.push(
+                linux_export_case::native_cause(if scenario == "symlink" {
+                    "traversal"
+                } else {
+                    "symlink"
+                })
+                .to_owned(),
+            );
+        }
+        for changed in changed_causes {
+            let mut hostile = result.clone();
+            hostile["runtime"]["outcome"]["retained_obligations"]["obligations"] = json!([changed]);
+            assert!(
+                validate_linux_export_outcome(scenario, &hostile, "attempt", "digest", 125)
+                    .is_err(),
+                "{scenario} accepted altered full native cause"
+            );
+        }
+        let mut additional = result.clone();
+        additional["runtime"]["outcome"]["retained_obligations"]["obligations"] =
+            json!([cause, "unrelated retained obligation"]);
+        assert!(
+            validate_linux_export_outcome(scenario, &additional, "attempt", "digest", 125).is_err()
+        );
         let mut hostile = result;
         hostile["runtime"]["outcome"]["forged_retirement"] = json!(true);
         assert!(

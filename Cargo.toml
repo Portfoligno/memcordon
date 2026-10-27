@@ -60,6 +60,13 @@ all = "warn"
 [profile.release.package.memcordon-ci]
 opt-level = 1
 
+# Keep fresh content verification practical in ordinary dev/test builds while
+# retaining the runtime checks used by the optimized controller profile.
+[profile.dev.package.sha2]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
 # Use an optimized driver/bootstrap profile with its runtime checks retained.
 # Optimize the controller and its runtime dependencies without removing checks.
 [profile.ci-bootstrap]

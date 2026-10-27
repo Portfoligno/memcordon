@@ -160,10 +160,19 @@ pub fn validate_linux_lifecycle_intervention(
                 "revision",
                 "worker",
                 "caller",
+                "control",
+                "control_status_bytes",
+                "control_endpoint",
+                "caller_image",
+                "worker_image_check",
+                "control_image_check",
+                "caller_image_check",
+                "current_image_check",
                 "source_descriptor",
                 "device",
                 "inode",
                 "peer_uid",
+                "peer_pid",
                 "peer_gid",
                 "socket_type",
                 "socket_domain",
@@ -175,9 +184,11 @@ pub fn validate_linux_lifecycle_intervention(
         )?;
         closed(&action["worker"], &["pid", "birth"])?;
         closed(&action["caller"], &["pid", "birth"])?;
+        let control_gid =
+            crate::linux_frontend_access::endpoint_group(&action["control_endpoint"])?;
         if intent["native_operation"] != "socket-shutdown"
             || action["format"] != "memcordon.linux-lifecycle-control-shutdown"
-            || action["revision"] != 1
+            || action["revision"] != 3
             || action["worker"]["pid"] != selected.pid
             || action["worker"]["birth"] != selected.birth
             || action["caller"]["pid"] != prepared["caller"]["pid"]
@@ -185,8 +196,8 @@ pub fn validate_linux_lifecycle_intervention(
             || action["source_descriptor"]
                 .as_u64()
                 .is_none_or(|number| number > i32::MAX as u64)
-            || action["peer_uid"] != 65534
-            || action["peer_gid"] != 65534
+            || action["peer_uid"] != 0
+            || action["peer_gid"] != control_gid
             || prepared["admission"]["caller_uid"] != 65534
             || ["device", "inode"]
                 .iter()
@@ -206,11 +217,8 @@ pub fn validate_linux_lifecycle_intervention(
             return Err("lifecycle native caller credential source bound differs".into());
         }
         let status = std::str::from_utf8(&status).map_err(|error| error.to_string())?;
-        for (field, selected) in [("Uid:", &action["peer_uid"]), ("Gid:", &action["peer_gid"])] {
-            let uid = selected
-                .as_u64()
-                .filter(|value| *value > 0 && *value <= u32::MAX as u64)
-                .ok_or("lifecycle control native unprivileged caller absent")?;
+        for field in ["Uid:", "Gid:"] {
+            let uid = 65534;
             let values = status
                 .lines()
                 .find_map(|line| line.strip_prefix(field))
@@ -226,6 +234,78 @@ pub fn validate_linux_lifecycle_intervention(
                 );
             }
         }
+        let control = &action["control"];
+        closed(control, &["pid", "birth", "native_image", "journal_sha256"])?;
+        closed(
+            &control["native_image"],
+            &["device", "inode", "length", "sha256"],
+        )?;
+        closed(
+            &action["caller_image"],
+            &["device", "inode", "length", "sha256"],
+        )?;
+        let control_pid = control["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 0 && *pid <= i32::MAX as u64)
+            .ok_or("original authenticated control PID absent")?;
+        if control["birth"].as_u64().is_none_or(|birth| birth == 0)
+            || action["peer_pid"] != control_pid
+            || journal["mixed_control"]["pid"] != control_pid
+            || journal["mixed_control"]["start_time"] != control["birth"]
+            || ["caller", "target", "namespace_init", "guardian"]
+                .iter()
+                .any(|role| prepared[*role]["pid"] == control_pid)
+            || worker["pid"] == control_pid
+            || control["native_image"]["sha256"] != agent_sha256
+            || action["caller_image"]["sha256"] != cli_sha256
+        {
+            return Err(
+                "lifecycle control does not retain the original authenticated two-hop chain".into(),
+            );
+        }
+        crate::digest(
+            control["journal_sha256"]
+                .as_str()
+                .ok_or("original control journal digest absent")?,
+        )?;
+        let control_status: Vec<u8> =
+            serde_json::from_value(action["control_status_bytes"].clone())
+                .map_err(|error| error.to_string())?;
+        if control_status.is_empty() || control_status.len() > 65536 {
+            return Err("lifecycle native control credential source bound differs".into());
+        }
+        let control_status =
+            std::str::from_utf8(&control_status).map_err(|error| error.to_string())?;
+        for (field, expected) in [("Uid:", 0), ("Gid:", control_gid)] {
+            let values = control_status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .ok_or("native authenticated control credentials absent")?
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            if values != vec![expected; 4] {
+                return Err(
+                    "native socket peer is not the authenticated root control worker".into(),
+                );
+            }
+        }
+        validate_image_readback(
+            &action["control_image_check"],
+            control,
+            &control["native_image"],
+        )?;
+        validate_image_readback(
+            &action["worker_image_check"],
+            worker,
+            &intent["native_image"],
+        )?;
+        validate_image_readback(
+            &action["caller_image_check"],
+            &prepared["caller"],
+            &action["caller_image"],
+        )?;
     } else {
         closed(
             action,
@@ -236,6 +316,7 @@ pub fn validate_linux_lifecycle_intervention(
                 "signal",
                 "native_status",
                 "native_errno",
+                "current_image_check",
             ],
         )?;
         if intent["native_operation"] != "pidfd-sigkill"
@@ -247,6 +328,11 @@ pub fn validate_linux_lifecycle_intervention(
             return Err("lifecycle loss lacks original held native PIDFD SIGKILL".into());
         }
     }
+    validate_image_readback(
+        &action["current_image_check"],
+        &intent["actor"],
+        &intent["native_image"],
+    )?;
     if action["native_status"] != 0 || !action["native_errno"].is_null() {
         return Err("lifecycle native intervention did not succeed".into());
     }
@@ -336,6 +422,36 @@ pub fn validate_linux_lifecycle_intervention(
         }
     } else if !intent["retirement_barrier"].is_null() {
         return Err("non-drain phase adopts retirement witness".into());
+    }
+    Ok(())
+}
+
+fn validate_image_readback(check: &Value, actor: &Value, image: &Value) -> VerificationResult<()> {
+    closed(
+        check,
+        &[
+            "current_image_verified",
+            "pid",
+            "birth",
+            "device",
+            "inode",
+            "length",
+            "original_held_metadata_unchanged",
+            "rehash",
+        ],
+    )?;
+    if check["current_image_verified"] != true
+        || check["original_held_metadata_unchanged"] != true
+        || check["pid"] != actor["pid"]
+        || check["birth"] != actor["birth"]
+        || check["rehash"] != "not repeated; unchanged original measured executable remains held"
+        || ["device", "inode", "length"].iter().any(|field| {
+            image[*field].as_u64().is_none_or(|value| value == 0) || check[*field] != image[*field]
+        })
+    {
+        return Err(
+            "lifecycle immediate native executable readback differs from held original".into(),
+        );
     }
     Ok(())
 }
@@ -1040,7 +1156,22 @@ fn validate_frontend(
         NativeArguments::UnixBytes(values) => values,
         _ => return Err("lifecycle original argv is not native Unix bytes".into()),
     };
-    if arguments.len() != 21 + target.len()
+    let lifetime = if context.input.key.family == "L-LIFE-02"
+        && context.input.key.scenario.ends_with("-drain")
+    {
+        "workload"
+    } else {
+        "command"
+    };
+    let suffix = [
+        "--image-entrypoint",
+        "owned-readiness",
+        "--wait-for",
+        lifetime,
+        "--",
+    ];
+    let target_start = 18 + suffix.len();
+    if arguments.len() != target_start + target.len()
         || program != b"/usr/bin/setpriv"
         || command["format"] != "memcordon.linux-owned-frontend-invocation"
         || command["revision"] != 1
@@ -1070,15 +1201,16 @@ fn validate_frontend(
         (13, "result-v2"),
         (14, "--report"),
         (16, "--mixed-observation-directory"),
-        (18, "--image-entrypoint"),
-        (19, "owned-readiness"),
-        (20, "--"),
     ] {
         if arguments[index] != text.as_bytes() {
             return Err("lifecycle native frontend invokes unrelated authority/budgets".into());
         }
     }
-    if arguments[21..] != *target
+    if arguments[18..target_start]
+        .iter()
+        .zip(suffix)
+        .any(|(actual, expected)| actual != expected.as_bytes())
+        || arguments[target_start..] != *target
         || arguments[11].is_empty()
         || arguments[15].is_empty()
         || [11, 15, 17]
@@ -1320,6 +1452,43 @@ fn validate_boundary(
         )?;
         let intent: Value = crate::wire::json(custody.bytes(path("controller-intent.json")?)?)?;
         let action: Value = crate::wire::json(custody.bytes(path("controller-action.json")?)?)?;
+        if context.input.key.scenario.starts_with("control-") {
+            if action["control_endpoint"] != command["endpoint_access"] {
+                return Err(
+                    "control credentials replace original frontend endpoint custody".into(),
+                );
+            }
+            let original_bytes: Vec<u8> =
+                serde_json::from_value(allocation["worker_source"]["journal_bytes"].clone())
+                    .map_err(|error| error.to_string())?;
+            let original = crate::linux_recovery_route::decode_journal(&original_bytes, attempt)?;
+            let control = &action["control"];
+            if control["journal_sha256"] != sha256(&original_bytes)
+                || original["mixed_control"]
+                    != serde_json::json!({"pid":control["pid"],"start_time":control["birth"]})
+                || journal["mixed_control"] != original["mixed_control"]
+                || control["native_image"]["length"]
+                    != custody
+                        .bytes(
+                            context.owner["selected_agent"]
+                                .as_str()
+                                .ok_or("selected control agent absent")?,
+                        )?
+                        .len() as u64
+                || action["caller_image"]["length"]
+                    != custody
+                        .bytes(
+                            context.owner["selected_cli"]
+                                .as_str()
+                                .ok_or("selected frontend CLI absent")?,
+                        )?
+                        .len() as u64
+            {
+                return Err(
+                    "lifecycle control replaces original protected admission/native images".into(),
+                );
+            }
+        }
         if intervention[0]["revision"] != 1
             || intervention[0]["intent"] != intent
             || intervention[0]["action"] != action
@@ -2039,6 +2208,8 @@ fn validate_final_settlement(
                 lease_owner,
                 prepared,
                 allocation_journal,
+                frontend_invocation,
+                original_contract,
                 report_destination,
                 report_delivery_failure,
             } if context.input.key.family == "L-LIFE-05"
@@ -2049,6 +2220,8 @@ fn validate_final_settlement(
                     lease_owner,
                     allocation_journal,
                     vec![
+                        ("frontend-invocation.json", frontend_invocation),
+                        ("original-contract.json", original_contract),
                         ("report-destination.json", report_destination),
                         ("report-delivery-failure.json", report_delivery_failure),
                     ],
@@ -2790,7 +2963,7 @@ fn original_context(
 
 // Independent reconstruction from the source-bound acquisition inventory. The
 // receipt is evidence, never permission to choose different fixture headroom.
-fn validate_fixture_memory_budget(
+pub(crate) fn validate_fixture_memory_budget(
     receipt: &Value,
     owner: &Value,
     acquisition: &Value,

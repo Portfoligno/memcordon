@@ -2,6 +2,8 @@
 use super::{linux_installed_case, linux_prepared_case, persisted_case::PersistedCase};
 use memcordon_readiness_verifier::{LinuxImageExportEvidence, sha256};
 use serde_json::{Value, json};
+#[path = "linux_image_memory_case.rs"]
+mod linux_image_memory_case;
 
 pub struct ExportGraph {
     pub case: PersistedCase,
@@ -10,6 +12,33 @@ pub struct ExportGraph {
     pub prepared: linux_prepared_case::PreparedGraph,
     pub prefix: String,
     pub directory: String,
+}
+
+pub fn native_cause(scenario: &str) -> &'static str {
+    macro_rules! cause {
+        ($suffix:literal) => {
+            concat!(
+                "retire mixed native execution: ",
+                "export mixed private root: ",
+                "export selected private root outputs: ",
+                $suffix
+            )
+        };
+    }
+    match scenario {
+        "symlink" => cause!(
+            "openat2 selected output work/exported.bin from writable mount work: Too many levels of symbolic links (os error 40)"
+        ),
+        "traversal" => cause!(
+            "openat2 selected output work/parent/exported.bin from writable mount work: Too many levels of symbolic links (os error 40)"
+        ),
+        "fifo" | "device" => cause!("selected output lacks exclusive regular-file custody"),
+        "socket" => cause!(
+            "openat2 selected output work/exported.bin from writable mount work: No such device or address (os error 6)"
+        ),
+        "concurrent-writer" => cause!("selected output native identity/content changed"),
+        _ => panic!("unknown finite export vector"),
+    }
 }
 
 pub fn original_graph(scenario: &str) -> ExportGraph {
@@ -39,6 +68,17 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         }],
         requirements,
     );
+    let acquisition = linux_installed_case::read(&case, "installed/owned-resources-acquired.json");
+    let memory_receipt = linux_image_memory_case::image_fixture_budget(
+        &owner,
+        &case.record.key,
+        &acquisition["images"]["runtime"],
+        &acquisition["images"]["input"],
+        &contract,
+    );
+    let memory_bytes = memory_receipt["budget"]["limit_bytes"].as_u64().unwrap();
+    let memory_token = format!("+{memory_bytes}B");
+    case.json(&path("fixture-memory-budget.json"), &memory_receipt);
     let challenge = vec![7u8; 32];
     let challenge_hex = hex::encode(&challenge);
     let arguments = vec![
@@ -52,7 +92,7 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         &owner["provider"],
         "decoder-run",
         &arguments,
-        512 * 1024 * 1024,
+        memory_bytes,
         60000,
         b"original agent image",
     );
@@ -76,13 +116,7 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         "launch/observations/{attempt}.provider-request.bin"
     ));
     case.write(&request_path, &request_bytes);
-    let cause = match scenario {
-        "symlink" | "traversal" => "Too many levels of symbolic links (os error 40)",
-        "fifo" | "device" => "selected output lacks exclusive regular-file custody",
-        "socket" => "No such device or address (os error 6)",
-        "concurrent-writer" => "selected output native identity/content changed",
-        _ => panic!("unknown finite export vector"),
-    };
+    let cause = native_cause(scenario);
     let public_argv = [
         "owned-readiness",
         "export-object",
@@ -91,10 +125,10 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
     ]
     .map(|value| json!({"display":value,"raw":null}));
     let result = json!({"format":"memcordon.result","revision":2,"tool":{"name":"memcordon","version":case.index.version,"os":"linux","architecture":"x86_64","runtime_features":["sealed-runtime","private-tcp"]},
-        "invocation":{"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":"+512M"},{"kind":"time","token":"+60000ms"}],"memory_token":"+512M","deadline_token":"+60000ms","argv":public_argv},
+        "invocation":{"syntax":"plus-budgets-v1","budget_tokens":[{"kind":"memory","token":memory_token},{"kind":"time","token":"+60000ms"}],"memory_token":memory_token,"deadline_token":"+60000ms","argv":public_argv},
         "runtime":{"kind":"linux-mixed-private","carrier_revision":2,"provider_contract":4,"launch_wire":4,"outcome":{"kind":"indeterminate","attempt_id":attempt,"request_sha256":graph.prepared["admission"]["request_sha256"],"retained_obligations":{"authorization":"authorized","obligations":[cause]}}},"delivery":{"prepared-by":{"writer_pid":102}},"frontend":{"relay_drained":true,"interruption":null,"relay_error":null},"wrapper_status":125});
     let ready = json!({"format":"memcordon.linux-readiness-transcript","revision":1,"sequence":1,"challenge":challenge_hex,"root_pid":2,"root_birth":302,"operation":"export-object-ready",
-        "observation":{"scenario":scenario,"path":if scenario=="traversal"{"/work/parent/exported.bin"}else{"/work/exported.bin"},"kind":match scenario{"symlink"=>"symlink","fifo"=>"fifo","device"=>"admin-device-required","socket"=>"socket","traversal"=>"parent-symlink",_=>"regular-with-held-writer"},"source_path":if scenario=="traversal"{json!("/work/other/exported.bin")}else{Value::Null}}});
+        "observation":{"scenario":scenario,"path":if scenario=="traversal"{"/work/parent/exported.bin"}else{"/work/exported.bin"},"kind":match scenario{"symlink"=>"symlink","fifo"=>"admin-fifo-required","device"=>"admin-device-required","socket"=>"socket","traversal"=>"parent-symlink",_=>"regular-with-held-writer"},"source_path":if scenario=="traversal"{json!("/work/other/exported.bin")}else{Value::Null}}});
     let mut stdout = serde_json::to_vec(&ready).unwrap();
     stdout.push(b'\n');
     case.write(&path("launch/stdout.bin"), &stdout);
@@ -107,7 +141,7 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         "--clear-groups".into(),
         "--".into(),
         "/usr/libexec/memcordon".into(),
-        "+512M".into(),
+        memory_token.clone(),
         "+60000ms".into(),
         "--sealed".into(),
         "--workload-contract".into(),
@@ -120,6 +154,8 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         format!("{directory}/launch/observations"),
         "--image-entrypoint".into(),
         "owned-readiness".into(),
+        "--wait-for".into(),
+        "command".into(),
         "--".into(),
         "export-object".into(),
         challenge_hex.clone(),
@@ -176,6 +212,7 @@ pub fn original_graph(scenario: &str) -> ExportGraph {
         activation: path("mixed.activation.json"),
         policy: path("mixed.policy.json"),
         contract: path("request.json"),
+        memory_budget: path("fixture-memory-budget.json"),
         provider_request: request_path,
         result: path("launch/result.json"),
         prepared: path("prepared.json"),
@@ -287,11 +324,27 @@ pub fn device_graph() -> ExportGraph {
     graph.case.json(&path,&json!({"format":"memcordon.linux-native-export-device","revision":1,"target_pid":103,"target_birth":302,"root_device":1,"root_inode":900,"work_device":1,"work_inode":901,"path":"/work/exported.bin","device":1,"inode":700,"rdev":259,"mode":0o020600,"links":1,"held_live_before_and_after":true}));
     graph.evidence.controller_setup = Some(path);
     let path = format!("{}/device-admin-handles-retired.json", graph.prefix);
-    graph.case.json(&path,&json!({"format":"memcordon.linux-export-administrative-handle-retirement","revision":1,"attempt_id":graph.prepared.prepared["admission"]["attempt_id"],"before_root_release":true,"closures":[{"completed":true,"errno":null},{"completed":true,"errno":null},{"completed":true,"errno":null}]}));
+    graph.case.json(&path,&json!({"format":"memcordon.linux-export-administrative-handle-retirement","revision":1,"attempt_id":graph.prepared.prepared["admission"]["attempt_id"],"before_root_release":true,"closures":[{"role":"root","native_close_succeeded":true,"native_close_errno":null},{"role":"work","native_close_succeeded":true,"native_close_errno":null},{"role":"device","native_close_succeeded":true,"native_close_errno":null}]}));
     graph
         .evidence
         .external
         .insert("device-admin-handles-retired.json".into(), path);
+    graph
+}
+
+pub fn fifo_graph() -> ExportGraph {
+    let mut graph = original_graph("fifo");
+    let path = format!("{}/fifo-created.json", graph.prefix);
+    graph.case.json(&path, &json!({"format":"memcordon.linux-native-export-fifo","revision":1,"attempt_id":graph.prepared.prepared["admission"]["attempt_id"],"target_pid":103,"target_birth":302,"root_device":1,"root_inode":900,"work_device":1,"work_inode":901,"path":"/work/exported.bin","device":1,"inode":700,"rdev":0,"mode":0o010600,"links":1,"uid":61001,"gid":61001,"held_live_before_and_after":true}));
+    graph.evidence.controller_setup = Some(path);
+    let path = format!("{}/fifo-admin-handles-retired.json", graph.prefix);
+    let closures = ["root", "work", "fifo"]
+        .map(|role| json!({"role":role,"native_close_succeeded":true,"native_close_errno":null}));
+    graph.case.json(&path, &json!({"format":"memcordon.linux-export-administrative-handle-retirement","revision":1,"attempt_id":graph.prepared.prepared["admission"]["attempt_id"],"before_root_release":true,"closures":closures}));
+    graph
+        .evidence
+        .external
+        .insert("fifo-admin-handles-retired.json".into(), path);
     graph
 }
 
@@ -430,6 +483,7 @@ pub fn finish(mut graph: ExportGraph) -> PersistedCase {
     for (field, leaf) in [
         ("challenge", "challenge.bin"),
         ("contract", "request.json"),
+        ("memory_budget", "fixture-memory-budget.json"),
         ("activation", "mixed.activation.json"),
         ("prepared", "prepared.json"),
         ("prepared_native", "prepared-native.json"),

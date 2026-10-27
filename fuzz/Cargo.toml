@@ -7,11 +7,14 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+ci-targets = ["dep:memcordon-ci"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 memcordon-core = { path = "../crates/memcordon-core", features = ["test-support"] }
 memcordon = { path = "../crates/memcordon-cli" }
-memcordon-ci = { path = "../tools/memcordon-ci" }
+memcordon-ci = { path = "../tools/memcordon-ci", optional = true }
 memcordon-platform = { path = "../crates/memcordon-platform", features = ["test-support"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -70,6 +73,7 @@ bench = false
 
 [[bin]]
 name = "policy_parser"
+required-features = ["ci-targets"]
 path = "fuzz_targets/policy_parser.rs"
 test = false
 doc = false
@@ -77,6 +81,7 @@ bench = false
 
 [[bin]]
 name = "workflow_parser"
+required-features = ["ci-targets"]
 path = "fuzz_targets/workflow_parser.rs"
 test = false
 doc = false
@@ -196,6 +201,7 @@ bench = false
 
 [[bin]]
 name = "target-distribution"
+required-features = ["ci-targets"]
 path = "fuzz_targets/target_distribution.rs"
 test = false
 doc = false
@@ -210,6 +216,7 @@ bench = false
 
 [[bin]]
 name = "mount-context-manifest"
+required-features = ["ci-targets"]
 path = "fuzz_targets/mount_context_manifest.rs"
 test = false
 doc = false
@@ -217,6 +224,7 @@ bench = false
 
 [[bin]]
 name = "runtime-manifest"
+required-features = ["ci-targets"]
 path = "fuzz_targets/runtime_manifest.rs"
 test = false
 doc = false
@@ -224,6 +232,7 @@ bench = false
 
 [[bin]]
 name = "release-asset-components"
+required-features = ["ci-targets"]
 path = "fuzz_targets/release_asset_components.rs"
 test = false
 doc = false
@@ -384,3 +393,8 @@ doc = false
 bench = false
 
 [workspace]
+
+# Match the root workspace's cold-controller compilation policy. cargo-fuzz
+# retains its normal instrumentation and debug assertions for these targets.
+[profile.release.package.memcordon-ci]
+opt-level = 1

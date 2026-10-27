@@ -424,20 +424,119 @@ pub fn wait_controller_gate(
     name: &std::ffi::OsStr,
     ready: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    wait_controller_gate_bound(name, ready, None)
+}
+
+pub fn wait_controller_gate_for_fixture(
+    name: &std::ffi::OsStr,
+    descriptor: &super::Descriptor,
+    next_sequence: u32,
+) -> io::Result<()> {
+    wait_controller_gate_bound(name, || Ok(()), Some((descriptor, next_sequence)))
+}
+
+fn wait_controller_gate_bound(
+    name: &std::ffi::OsStr,
+    ready: impl FnOnce() -> io::Result<()>,
+    binding: Option<(&super::Descriptor, u32)>,
+) -> io::Result<()> {
     use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject};
     let name: Vec<u16> = name.encode_wide().chain(Some(0)).collect();
     // SAFETY: opens only the explicitly named controller event for wait access.
     let handle = unsafe { OpenEventW(0x0010_0000, 0, name.as_ptr()) };
     if handle.is_null() {
-        return Err(io::Error::last_os_error());
+        let original = io::Error::last_os_error();
+        let original_name = name
+            .strip_suffix(&[0])
+            .expect("appended event name terminator");
+        let access = binding.and_then(|(descriptor, _)| {
+            descriptor.gate_access_diagnostic.as_ref().map(|input| {
+                super::controller_gate_token::AccessRequest {
+                    input,
+                    name: original_name,
+                    challenge: &descriptor.challenge,
+                }
+            })
+        });
+        let resolution = match access.as_ref() {
+            Some(request) => super::controller_gate_resolution::query(&name, None, || {
+                request.input.validate(request.name, request.challenge)?;
+                super::controller_gate_access::check(request.input)
+            }),
+            None => super::controller_gate_resolution::Observation::unavailable(
+                super::controller_gate_resolution::Context::FailedFixture,
+                "bound-original-work-clock-unavailable",
+            ),
+        };
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for unit in name
+            .strip_suffix(&[0])
+            .expect("appended event name terminator")
+        {
+            digest.update(unit.to_le_bytes());
+        }
+        let name_sha256 = super::controller_gate_diagnostic::hex(&digest.finalize());
+        let challenge_sha256 = binding.map(|(descriptor, _)| {
+            super::controller_gate_diagnostic::hex(&Sha256::digest(&descriptor.challenge))
+        });
+        let publication = (|| -> io::Result<super::controller_gate_control_publication::Permit> {
+            let request = access
+                .as_ref()
+                .ok_or_else(|| io::Error::other("bound original gate input unavailable"))?;
+            super::controller_gate_access::check(request.input)?;
+            request.input.validate(request.name, request.challenge)?;
+            let binding = serde_json::json!({"case":binding.map(|(descriptor,_)|descriptor.case),"gate_name_utf16_sha256":name_sha256,"challenge_sha256":challenge_sha256,"next_transcript_sequence":binding.map(|(_,sequence)|sequence)});
+            let permit = super::controller_gate_control_publication::publish(
+                &original,
+                &binding,
+                &mut std::io::stderr().lock(),
+            )?;
+            super::controller_gate_access::check(request.input)?;
+            Ok(permit)
+        })();
+        let publication_observation = match &publication {
+            Ok(_) => {
+                serde_json::json!({"state":"offered-and-flushed","control":"pending","diagnostic_only":true})
+            }
+            Err(error) => {
+                serde_json::json!({"state":"unavailable","kind":format!("{:?}",error.kind()),"raw_os_error":error.raw_os_error(),"control":"not-authorized-by-publication","diagnostic_only":true})
+            }
+        };
+        let token = match publication {
+            Ok(permit) => super::controller_gate_token::capture_with_control(access, Some(permit)),
+            Err(_) => super::controller_gate_token::capture(access),
+        };
+        let context = serde_json::json!({
+            "format":"memcordon.controller-gate-open-context","revision":1,"diagnostic_only":true,
+            "access":0x0010_0000_u32,"gate_name_utf16_sha256":name_sha256,
+            "case":binding.map(|(descriptor,_)|descriptor.case),
+            "challenge_sha256":challenge_sha256,
+            "next_transcript_sequence":binding.map(|(_,sequence)|sequence),
+            "effective_token":token,
+            "failed_fixture_zero_access_resolution":resolution,
+            "original_failure_prepublication":publication_observation,
+        });
+        return Err(super::controller_gate_error::open_diagnostic(
+            original,
+            super::controller_gate_diagnostic::encode(&context),
+        ));
     }
     // SAFETY: fresh owned event reference is closed once.
     let _owned = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
     ready()?;
     // SAFETY: held event handle; bounded outer driver supervises this wait.
-    if unsafe { WaitForSingleObject(handle, 120_000) } != 0 {
-        return Err(io::Error::other(
-            "controller descendant gate did not release",
+    let status = unsafe { WaitForSingleObject(handle, 120_000) };
+    if status != 0 {
+        let original = if status == windows_sys::Win32::Foundation::WAIT_FAILED {
+            io::Error::last_os_error()
+        } else {
+            io::Error::other("controller descendant gate did not release")
+        };
+        return Err(super::controller_gate_error::context(
+            super::controller_gate_error::Stage::Wait,
+            Some(status),
+            original,
         ));
     }
     Ok(())
@@ -786,6 +885,11 @@ fn launch_frontend(
         return Err(io::Error::other(
             "native restricted token was not restricted",
         ));
+    }
+    if restrict {
+        // This launcher owns the newly derived fixture token. Its default
+        // objects must satisfy both ordinary and RestrictedCode access checks.
+        super::native_fixture_default_dacl::prepare(primary, restricted)?;
     }
     // SAFETY: read only this launcher's three standard handles.
     let standard_handles = unsafe {

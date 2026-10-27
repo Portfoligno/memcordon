@@ -92,6 +92,14 @@ fn query(root: &Path, program: impl Into<std::ffi::OsString>, args: &[&str]) -> 
 }
 
 fn native_recipe(purpose: &str) -> Option<Vec<Vec<&'static str>>> {
+    if purpose == "windows-fixture-native-v1" {
+        return Some(
+            crate::native_test_plan::windows_fixture_commands()
+                .into_iter()
+                .map(|command| command.arguments)
+                .collect(),
+        );
+    }
     let release = match purpose {
         "native-debug" => false,
         "native-release" | "native-readiness" | "windows-working" | "private" => true,
@@ -524,7 +532,7 @@ fn collect_context(
                 allocation.second.get().to_string(),
             );
         }
-    } else if purpose == "native-debug" {
+    } else if matches!(purpose, "native-debug" | "windows-fixture-native-v1") {
         inputs.insert(
             "native-compiler-jobs".into(),
             crate::preparation::compiler_budget().to_string(),
@@ -608,7 +616,7 @@ fn collect_context(
         );
         inputs.insert(
             "profile".into(),
-            if purpose == "native-debug" {
+            if matches!(purpose, "native-debug" | "windows-fixture-native-v1") {
                 "source-tests:dev"
             } else {
                 "source-tests:release;product:release"
@@ -761,7 +769,12 @@ fn collect_context(
                 inputs.insert("cargo-fuzz".into(), value);
             }
             Err(error) if crate::work_outcome::has_unresolved_owner(&error) => return Err(error),
-            Err(_) => usable = false,
+            Err(_) => {
+                usable = false;
+                diagnostics
+                    .unavailable_reasons
+                    .push("cargo-fuzz-version-query-unavailable".into());
+            }
         }
     }
     if purpose.starts_with("miri") {
@@ -1027,6 +1040,15 @@ fn collect_context(
             .display()
             .to_string(),
     );
+    if partition == Some(crate::cache_restore::CompiledPartition::FuzzTargets) {
+        compatibility.insert(
+            "fuzz-target-build-plans".into(),
+            serde_json::to_string(&crate::fuzz_targets::plans_sharded(
+                &std::fs::read_to_string(root.join("fuzz/Cargo.toml"))?,
+                None,
+            )?)?,
+        );
+    }
     if let Some(partition) = partition {
         compatibility = partition_compatibility(purpose, partition, compatibility)?;
     }

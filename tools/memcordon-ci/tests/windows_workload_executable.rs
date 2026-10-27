@@ -42,7 +42,12 @@ fn workload_preparation_materializes_cargo_alias_into_independent_held_executabl
     assert!(hold_artifact(&source, None, 128 * 1024 * 1024).is_err());
 
     let report = reports.join("result.json");
-    let (executable, held) = prepare_workload_executable(&build, &report).unwrap();
+    let expected = memcordon_ci::windows_causal_acceptance::sha256(bytes);
+    let wrong_report = reports.join("wrong-source.json");
+    let foreign_digest = memcordon_ci::windows_causal_acceptance::sha256(b"foreign bytes");
+    assert!(prepare_workload_executable(&source, &foreign_digest, &wrong_report).is_err());
+    assert!(!wrong_report.with_extension("workload-lab.exe").exists());
+    let (executable, held) = prepare_workload_executable(&source, &expected, &report).unwrap();
     assert_eq!(executable, report.with_extension("workload-lab.exe"));
     assert!(!executable.starts_with(&build));
     assert_eq!(executable.parent(), Some(reports.as_path()));
@@ -61,7 +66,7 @@ fn workload_preparation_materializes_cargo_alias_into_independent_held_executabl
     assert_eq!(fs::read(&alias).unwrap(), bytes);
     assert!(hold_artifact(&source, None, 128 * 1024 * 1024).is_err());
 
-    assert!(prepare_workload_executable(&build, &report).is_err());
+    assert!(prepare_workload_executable(&source, &expected, &report).is_err());
     verify_named_artifact(&held, &executable).unwrap();
     let wrong = reports.join("wrong-digest.exe");
     let foreign_digest = memcordon_ci::windows_causal_acceptance::sha256(b"foreign bytes");
@@ -87,7 +92,8 @@ fn oversized_compiler_output_is_rejected_before_publication() {
     assert_eq!(file.metadata().unwrap().len(), oversized);
     drop(file);
     let report = reports.join("result.json");
-    assert!(prepare_workload_executable(&build, &report).is_err());
+    let expected = memcordon_ci::windows_causal_acceptance::sha256(b"selected bounded source");
+    assert!(prepare_workload_executable(&source, &expected, &report).is_err());
     assert!(!report.with_extension("workload-lab.exe").exists());
     assert_eq!(fs::metadata(&source).unwrap().len(), oversized);
 }

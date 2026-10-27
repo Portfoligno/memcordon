@@ -859,7 +859,7 @@ pub fn validate_linux_policy_frontend(
     if command["format"] != "memcordon.linux-owned-frontend-invocation"
         || command["revision"] != 1
         || program != b"/usr/bin/setpriv"
-        || arguments.len() != 23
+        || arguments.len() != 25
         || command["environment_cleared"] != true
         || command["caller_uid"].as_u64() != Some(u64::from(caller))
         || command["caller_gid"].as_u64() != Some(u64::from(caller))
@@ -883,15 +883,17 @@ pub fn validate_linux_policy_frontend(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "tcp-http"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "tcp-http"),
     ];
     if required
         .into_iter()
         .any(|(index, value)| arguments[index] != value.as_bytes())
         || arguments[1] != caller.to_string().as_bytes()
         || arguments[3] != caller.to_string().as_bytes()
-        || arguments[22] != hex::encode(challenge).as_bytes()
+        || arguments[24] != hex::encode(challenge).as_bytes()
         || [11, 15, 17]
             .into_iter()
             .any(|index| !arguments[index].starts_with(b"/") || arguments[index].contains(&0))
@@ -911,8 +913,8 @@ pub fn validate_linux_policy_frontend(
     }
     let argv = vec![
         arguments[19].clone(),
-        arguments[21].clone(),
-        arguments[22].clone(),
+        arguments[23].clone(),
+        arguments[24].clone(),
     ];
     let actual_public = serde_json::json!({"syntax":"plus-budgets-v1",
         "budget_tokens":[{"kind":"memory","token":"+256M"},{"kind":"time","token":deadline}],

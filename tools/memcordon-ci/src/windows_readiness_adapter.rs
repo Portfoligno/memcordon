@@ -146,6 +146,15 @@ pub struct HeldWindowsArtifact {
     _ancestors: Vec<std::fs::File>,
 }
 
+#[cfg(windows)]
+impl HeldWindowsArtifact {
+    /// Lend the existing selected, writer-denying native file owner for
+    /// suspended diagnostic image attestation; never reopen it as authority.
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self._file
+    }
+}
+
 /// Compare the named leaf and every retained directory to the original native
 /// handles; equal bytes alone do not authorize replacement of a custody record.
 #[cfg(windows)]
@@ -278,28 +287,24 @@ pub fn copy_compiler_artifact(
 /// Select an independently published diagnostic executable, never a Cargo alias.
 #[cfg(windows)]
 pub fn prepare_workload_executable(
-    build_root: &Path,
+    source: &Path,
+    expected: &str,
     report: &Path,
 ) -> crate::Result<(PathBuf, HeldWindowsArtifact)> {
     const BOUND: usize = 128 * 1024 * 1024;
-    let source = build_root.join("release/memcordon-windows-loader-lab.exe");
+    let build_root = source.parent().ok_or_else(|| {
+        crate::CiError::Message("qualified diagnostic source parent absent".into())
+    })?;
     let destination = report.with_extension("workload-lab.exe");
     if !build_root.is_absolute() || !report.is_absolute() || destination.starts_with(build_root) {
         return Err(crate::CiError::Message(
             "diagnostic executable destination crosses protected report boundary".into(),
         ));
     }
-    // This preliminary measurement grants no custody. The copier independently
-    // pins native source/ancestors and must reproduce this exact bounded digest.
-    let bytes = crate::windows_consumer_readiness::native::read(&source, BOUND)?;
-    if bytes.is_empty() {
-        return Err(crate::CiError::Message(
-            "diagnostic compiler source is empty".into(),
-        ));
-    }
-    let expected = crate::windows_causal_acceptance::sha256(&bytes);
+    // The expected digest comes from the qualified producer input, never a
+    // fresh measurement of whatever named executable happens to be present.
     let held =
-        copy_compiler_artifact_bounded(&source, build_root, &destination, &expected, BOUND as u64)?;
+        copy_compiler_artifact_bounded(source, build_root, &destination, expected, BOUND as u64)?;
     Ok((destination, held))
 }
 
@@ -651,11 +656,21 @@ fn normalize_positive_cases(
         .into_iter()
         .find_map(|result| result.as_ref().err())
         {
+            let snapshot_retention = if case.descriptor.toolchain.is_some() {
+                retain_failed_toolchain_snapshots(&mut bundle, &row, context, case, assessment)
+                    .err()
+                    .map(|error| crate::command::bounded_excerpt(error.to_string().as_bytes()))
+            } else {
+                None
+            };
             records.push(CaseRecord {
                 key,
                 run_id: context.identity.run_id.clone(),
                 state: CaseState::Failed,
-                reason: Some(reason.clone()),
+                reason: Some(match snapshot_retention {
+                    Some(error) => format!("{reason}; diagnostic-snapshot-retention={error}"),
+                    None => reason.clone(),
+                }),
                 evidence: None,
             });
             continue;
@@ -1011,6 +1026,79 @@ fn normalize_positive_cases(
         records,
         artifacts: bundle.artifacts,
     })
+}
+
+/// Failed rows keep diagnostic snapshots without turning them into execution
+/// evidence. The original assessment and native retirement predicates stand.
+#[cfg(windows)]
+fn retain_failed_toolchain_snapshots(
+    bundle: &mut Bundle,
+    row: &Path,
+    context: &WindowsAdapterContext,
+    case: &crate::windows_consumer_readiness::CaseInput,
+    assessment: &crate::windows_consumer_readiness::CaseAssessment,
+) -> crate::Result<()> {
+    const SNAPSHOT_BOUND: u64 = 128 * 1024;
+    let descriptor = hold_artifact(
+        &case.descriptor_path,
+        Some(&assessment.descriptor_sha256),
+        1024 * 1024,
+    )?;
+    let parsed =
+        crate::windows_consumer_readiness::descriptor::Descriptor::parse(&descriptor.bytes)
+            .map_err(crate::CiError::Message)?;
+    if serde_json::to_vec(&parsed)? != serde_json::to_vec(&case.descriptor)? {
+        return Err(crate::CiError::Message(
+            "failed toolchain snapshot descriptor differs from original suite".into(),
+        ));
+    }
+    bundle.retain(&row.join("descriptor.json"), &descriptor.bytes)?;
+    bundle.held.extend(descriptor._ancestors);
+    bundle.held.push(descriptor._file);
+    let mut snapshots = Vec::new();
+    for name in [
+        "toolchain-current-phase.json",
+        "toolchain-current-debug.json",
+    ] {
+        let source = parsed.output_root.join("compiled").join(name);
+        let captured = (|| -> crate::Result<serde_json::Value> {
+            let held = hold_artifact(&source, None, SNAPSHOT_BOUND)?;
+            let parse = memcordon_core::canonical_json::reject_duplicate_json_keys(&held.bytes)
+                .and_then(|()| {
+                    serde_json::from_slice::<serde_json::Value>(&held.bytes)
+                        .map_err(|error| error.to_string())
+                });
+            let reference = bundle.retain(&row.join("diagnostics").join(name), &held.bytes)?;
+            let status = serde_json::json!({"name":name,"captured":true,"path":reference,
+                "bytes":held.bytes.len(),"sha256":held.sha256,"json_valid":parse.is_ok(),
+                "parse_error":parse.err().map(|error| crate::command::bounded_excerpt(error.as_bytes())),
+                "diagnostic_only":true,"content_binding_verified":false,"execution_or_retirement_proof":false});
+            bundle.held.extend(held._ancestors);
+            bundle.held.push(held._file);
+            Ok(status)
+        })();
+        snapshots.push(match captured {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({"name":name,"captured":false,"state":"unknown",
+                "error":crate::command::bounded_excerpt(error.to_string().as_bytes()),"diagnostic_only":true}),
+        });
+    }
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"format":"memcordon.windows-toolchain-snapshot-retention","revision":1,
+            "identity":context.identity,"product":context.product,"lease_id":context.lease_id,
+            "descriptor_sha256":assessment.descriptor_sha256,"case":case.key,"challenge":parsed.challenge,
+            "original_assessment_failed":true,"diagnostic_only":true,"snapshots":snapshots}),
+    )?;
+    if bytes.len() > 256 * 1024 {
+        return Err(crate::CiError::Message(
+            "toolchain diagnostic retention record exceeds finite bound".into(),
+        ));
+    }
+    bundle.retain(
+        &row.join("diagnostics/toolchain-snapshot-retention.json"),
+        &bytes,
+    )?;
+    Ok(())
 }
 
 /// Preserves every real capacity constituent and every convergence observation.

@@ -22,6 +22,7 @@ mod prepared;
 mod support_diagnostic;
 #[cfg(windows)]
 mod token;
+mod token_observation;
 mod token_snapshot;
 
 #[cfg(all(windows, feature = "test-support"))]
@@ -63,5 +64,12 @@ pub use prepared::{
     PreparedCurrentDirectoryV1, PreparedLoaderCommandV1, PreparedLoaderEnvironmentV1,
 };
 #[cfg(windows)]
-pub use token::query_token_envelope;
+pub use token::{
+    query_token_envelope, query_token_envelope_bounded, query_token_envelope_with_observation,
+};
+pub use token_observation::{
+    ObservationUnavailable, PrivilegeAttributesV1, SidAttributesV1, TOKEN_OBSERVATION_BYTE_BOUND,
+    TOKEN_OBSERVATION_ENTRY_BOUND, TokenObservationV1, TokenStatisticsObservationV1,
+    privilege_attributes_digest, sid_attributes_digest,
+};
 pub use token_snapshot::{TargetTokenIdentityV1, token_envelope_sha256};

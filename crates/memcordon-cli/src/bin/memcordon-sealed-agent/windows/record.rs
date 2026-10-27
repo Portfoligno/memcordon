@@ -15,7 +15,7 @@ use memcordon_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, FILETIME, WAIT_FAILED, WAIT_OBJECT_0,
+    ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO,
@@ -225,6 +225,10 @@ fn publication_io_error(error: io::Error) -> String {
 #[cfg(test)]
 #[path = "../../../../tests/sealed_agent/windows_record_faults.rs"]
 mod record_fault_tests;
+
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_guardian_liveness.rs"]
+mod guardian_liveness_tests;
 
 /// Native component tests use the real publication boundary at an owned path;
 /// this hook changes neither installed storage paths nor production authority.
@@ -567,7 +571,9 @@ impl WindowsAttemptRecordV1 {
             phase = next;
             Ok(())
         })
-        .map_err(|error| format!("publication phase={phase:?}: {error}"))
+        .map_err(|error| {
+            format!("publication phase={phase:?}; attempt={}; expected-revision={expected_revision}; candidate-revision={}: {error}", self.attempt_id, self.record_revision)
+        })
     }
 
     fn publish_at(
@@ -5201,9 +5207,7 @@ pub fn observe_live_guardian_details(
     let root = attempts_root();
     super::security::SecurityDescriptor::from_sddl(&super::security::launcher_state_sddl()?)?
         .verify_path(&root)?;
-    if !process_identity_is_live(expected.clone())? {
-        return Err("observed guardian is no longer the live held process".into());
-    }
+    require_live_guardian(expected, GuardianObservationPhase::BeforeInventory)?;
     let provider = package::installed_public_provider_binding()?;
     let boot = boot_identity()?;
     let mut selected = None;
@@ -5267,9 +5271,7 @@ pub fn observe_live_guardian_details(
                 .ok_or("live released target identity missing")?,
         ));
     }
-    if !process_identity_is_live(expected.clone())? {
-        return Err("guardian retired during live association readback".into());
-    }
+    require_live_guardian(expected, GuardianObservationPhase::AfterInventory)?;
     selected.ok_or_else(|| "held live guardian has no unique native attempt record".into())
 }
 
@@ -6038,7 +6040,81 @@ fn record_has_live_process(record: &WindowsAttemptRecordV1) -> Result<bool, Stri
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessLiveness {
+    Live,
+    PidAbsent {
+        raw_os_error: i32,
+    },
+    Signaled {
+        wait_status: u32,
+    },
+    IdentityMismatch {
+        observed: WindowsProcessIdentityV1,
+        wait_status: u32,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum GuardianObservationPhase {
+    BeforeInventory,
+    AfterInventory,
+}
+
+fn guardian_liveness_refusal(
+    expected: &WindowsProcessIdentityV1,
+    observation: &ProcessLiveness,
+    phase: GuardianObservationPhase,
+) -> Option<String> {
+    let (prefix, phase) = match phase {
+        GuardianObservationPhase::BeforeInventory => (
+            "observed guardian is no longer the live held process",
+            "before-record-inventory",
+        ),
+        GuardianObservationPhase::AfterInventory => (
+            "guardian retired during live association readback",
+            "after-record-inventory",
+        ),
+    };
+    let facts = match observation {
+        ProcessLiveness::Live => return None,
+        ProcessLiveness::PidAbsent { raw_os_error } => {
+            format!("reason=pid-absent; raw-os-error={raw_os_error}")
+        }
+        ProcessLiveness::Signaled { wait_status } => {
+            format!("reason=process-signaled; wait-status={wait_status}")
+        }
+        ProcessLiveness::IdentityMismatch {
+            observed,
+            wait_status,
+        } => format!(
+            "reason=identity-mismatch; wait-status={wait_status}; observed-pid={}; observed-birth={}",
+            observed.process_id, observed.creation_time_100ns
+        ),
+    };
+    // Only closed phase/reason text and fixed-width native scalars are rendered.
+    Some(format!(
+        "{prefix}; phase={phase}; expected-pid={}; expected-birth={}; {facts}",
+        expected.process_id, expected.creation_time_100ns
+    ))
+}
+
+fn require_live_guardian(
+    expected: &WindowsProcessIdentityV1,
+    phase: GuardianObservationPhase,
+) -> Result<(), String> {
+    let observation = observe_process_liveness(expected.clone())?;
+    match guardian_liveness_refusal(expected, &observation, phase) {
+        Some(detail) => Err(detail),
+        None => Ok(()),
+    }
+}
+
 fn process_identity_is_live(expected: WindowsProcessIdentityV1) -> Result<bool, String> {
+    observe_process_liveness(expected).map(|observation| observation == ProcessLiveness::Live)
+}
+
+fn observe_process_liveness(expected: WindowsProcessIdentityV1) -> Result<ProcessLiveness, String> {
     // SAFETY: PID comes from an authenticated record and rights are query-only.
     let raw = unsafe {
         OpenProcess(
@@ -6049,35 +6125,57 @@ fn process_identity_is_live(expected: WindowsProcessIdentityV1) -> Result<bool, 
     };
     if raw.is_null() {
         let error = std::io::Error::last_os_error();
-        let missing = error
-            .raw_os_error()
-            .and_then(|value| u32::try_from(value).ok())
-            == Some(ERROR_INVALID_PARAMETER);
-        return if missing {
-            Ok(false)
-        } else {
-            Err(error.to_string())
-        };
+        return process_open_failure(error);
     }
     let handle = OwnedHandle::new(raw)?;
+    observe_held_process_liveness(handle.raw(), expected)
+}
+
+fn process_open_failure(error: std::io::Error) -> Result<ProcessLiveness, String> {
+    match error
+        .raw_os_error()
+        .and_then(|value| u32::try_from(value).ok())
+    {
+        Some(ERROR_INVALID_PARAMETER) => Ok(ProcessLiveness::PidAbsent {
+            raw_os_error: error.raw_os_error().expect("matched native code"),
+        }),
+        _ => Err(error.to_string()),
+    }
+}
+
+fn observe_held_process_liveness(
+    handle: HANDLE,
+    expected: WindowsProcessIdentityV1,
+) -> Result<ProcessLiveness, String> {
     // SAFETY: handle is live and queried without blocking.
-    match unsafe { WaitForSingleObject(handle.raw(), 0) } {
-        WAIT_OBJECT_0 => return Ok(false),
+    let wait_status = unsafe { WaitForSingleObject(handle, 0) };
+    match wait_status {
+        WAIT_OBJECT_0 => return Ok(ProcessLiveness::Signaled { wait_status }),
         WAIT_FAILED => return Err(std::io::Error::last_os_error().to_string()),
         _ => {}
     }
-    Ok(super::process::process_identity(handle.raw())? == expected)
+    let observed = super::process::process_identity(handle)?;
+    Ok(if observed == expected {
+        ProcessLiveness::Live
+    } else {
+        ProcessLiveness::IdentityMismatch {
+            observed,
+            wait_status,
+        }
+    })
 }
 
 pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
-    let source = source
+    let source_path = source;
+    let destination_path = destination;
+    let source = source_path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let destination = destination
+    let destination = destination_path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -6092,9 +6190,110 @@ pub fn replace_atomically(source: &Path, destination: &Path) -> Result<(), Strin
         )
     } == 0
     {
-        Err(publication_io_error(std::io::Error::last_os_error()))
+        // Capture the original causal event before any diagnostic API can
+        // replace the thread's last-error value. Never retry this mutation.
+        let error = std::io::Error::last_os_error();
+        let native_error = error.raw_os_error();
+        let original = publication_io_error(error);
+        Err(replacement_failure_context(
+            &original,
+            native_error,
+            source_path,
+            destination_path,
+        ))
     } else {
         Ok(())
+    }
+}
+
+fn replacement_failure_context(
+    original: &str,
+    native_error: Option<i32>,
+    source: &Path,
+    destination: &Path,
+) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::ERROR_NO_TOKEN,
+        Security::TOKEN_QUERY,
+        Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
+        System::Threading::{
+            GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId,
+            OpenProcessToken, OpenThreadToken,
+        },
+    };
+
+    fn close_token(handle: windows_sys::Win32::Foundation::HANDLE) -> serde_json::Value {
+        match OwnedHandle::new(handle) {
+            Ok(mut owned) => match owned.close_checked() {
+                Ok(()) => serde_json::json!({"closed":true}),
+                Err(error) => serde_json::json!({"closed":false,"error":error}),
+            },
+            Err(error) => serde_json::json!({"owned":false,"error":error}),
+        }
+    }
+
+    fn path_facts(path: &Path) -> serde_json::Value {
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        // Allocate a finite fraction of the existing publisher-error carrier
+        // to each path, including worst-case JSON escaping/number encoding.
+        let prefix = units
+            .iter()
+            .take(MAX_TERMINALIZATION_DETAIL_BYTES / 32)
+            .copied()
+            .collect::<Vec<_>>();
+        let native = units
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: native is a live NUL-terminated path; this only queries attributes.
+        let attributes = unsafe { GetFileAttributesW(native.as_ptr()) };
+        let probe = if attributes == INVALID_FILE_ATTRIBUTES {
+            serde_json::json!({"error":io::Error::last_os_error().raw_os_error()})
+        } else {
+            serde_json::json!({"value":attributes})
+        };
+        serde_json::json!({"utf16":prefix,"units":units.len(),
+            "truncated":prefix.len()!=units.len(),"absolute":path.is_absolute(),
+            "attributes":probe})
+    }
+
+    let mut token = ptr::null_mut();
+    // SAFETY: current-thread pseudo handle and a live output pointer; query only.
+    let thread_ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    let token_context = if thread_ok != 0 {
+        serde_json::json!({"thread":"present","handle":close_token(token)})
+    } else {
+        let thread_error = io::Error::last_os_error().raw_os_error();
+        if thread_error == Some(ERROR_NO_TOKEN as i32) {
+            // Only an explicit NO_TOKEN result permits process-context observation.
+            let mut process_token = ptr::null_mut();
+            // SAFETY: query-only access to this process and a live output pointer.
+            let ok =
+                unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) };
+            if ok != 0 {
+                serde_json::json!({"thread":"absent","process":"present","handle":close_token(process_token)})
+            } else {
+                serde_json::json!({"thread":"absent","process_error":io::Error::last_os_error().raw_os_error()})
+            }
+        } else {
+            serde_json::json!({"thread":"unknown","error":thread_error})
+        }
+    };
+    let context = serde_json::json!({"format_revision":1,"api":"MoveFileExW","native_error":native_error,
+        "flags":MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH,
+        "source":path_facts(source),"destination":path_facts(destination),
+        "same_parent":source.parent()==destination.parent(),
+        "process":unsafe {GetCurrentProcessId()},"thread":unsafe {GetCurrentThreadId()},
+        "token":token_context,"security_identity":"not-collected"});
+    let message = format!("{original}; replacement-context={context}");
+    if message.len() <= MAX_TERMINALIZATION_DETAIL_BYTES * 3 / 4 {
+        message
+    } else {
+        format!(
+            "{original}; replacement-context={{\"revision\":1,\"api\":\"MoveFileExW\",\"omitted\":\"context exceeds existing carrier allocation\"}}"
+        )
     }
 }
 

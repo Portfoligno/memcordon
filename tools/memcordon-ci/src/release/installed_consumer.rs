@@ -36,6 +36,7 @@ pub struct MaterializedPayload {
     pub artifacts: Vec<SelectedArtifact>,
     selected_artifact_count: usize,
     pub fixture: SelectedArtifact,
+    pub workload_diagnostic: Option<crate::windows_installed_cases::WorkloadDiagnosticInput>,
     _owner: tempfile::TempDir,
 }
 
@@ -236,6 +237,24 @@ fn fixture(
     })
 }
 
+fn workload_diagnostic(
+    bundle: &TargetBundle,
+    target_directory: &Path,
+    directory: &Path,
+) -> Result<Option<crate::windows_installed_cases::WorkloadDiagnosticInput>> {
+    bundle
+        .workload_diagnostic_input(target_directory)?
+        .map(|mut input| {
+            let path = directory.join("memcordon-windows-loader-lab.exe");
+            fs::write(&path, artifacts::read_file(&input.executable.path)?)?;
+            executable(&path)?;
+            input.executable.path = path;
+            input.validate_for(&bundle.source, &bundle.distribution.target)?;
+            Ok(input)
+        })
+        .transpose()
+}
+
 pub fn materialize_native(
     target_directory: &Path,
     temporary_parent: &Path,
@@ -257,6 +276,7 @@ pub fn materialize_native(
         ))?;
     }
     let fixture = fixture(&bundle, target_directory, owner.path())?;
+    let workload_diagnostic = workload_diagnostic(&bundle, target_directory, owner.path())?;
     Ok(MaterializedPayload {
         channel: InstalledChannel::NativeBundle,
         source: bundle.source,
@@ -268,6 +288,7 @@ pub fn materialize_native(
         }],
         selected_artifact_count: 1,
         fixture,
+        workload_diagnostic,
         _owner: owner,
     })
 }
@@ -703,6 +724,7 @@ pub fn retain_original_public_inputs(
     prepared: &Path,
     target_name: &str,
     fixture_path: &Path,
+    diagnostic_path: Option<&Path>,
     target_directory: &Path,
     package_directory: &Path,
 ) -> Result<()> {
@@ -780,6 +802,25 @@ pub fn retain_original_public_inputs(
         &original.payloads[index],
     )?;
     retain(&target_directory.join(&fixture.name), &fixture_bytes)?;
+    let workload_diagnostic = if target_name.ends_with("-pc-windows-msvc") {
+        let path = diagnostic_path.ok_or_else(|| {
+            CiError::Message(
+                "current public Windows inputs require their qualified diagnostic companion".into(),
+            )
+        })?;
+        let record = super::target::WorkloadDiagnosticBundle::load(path, &selected, target_name)?;
+        let bytes = artifacts::read_file(
+            &path
+                .parent()
+                .ok_or_else(|| CiError::Message("diagnostic companion parent absent".into()))?
+                .join(&record.executable.name),
+        )?;
+        artifacts::check_bytes(&record.executable, &bytes)?;
+        retain(&target_directory.join(&record.executable.name), &bytes)?;
+        Some(record.executable)
+    } else {
+        None
+    };
     super::source::write_json(
         &target_directory.join("target.json"),
         &TargetBundle {
@@ -790,6 +831,7 @@ pub fn retain_original_public_inputs(
             archive: archive.clone(),
             members: records,
             fixture,
+            workload_diagnostic,
         },
     )?;
     let mut crate_records = Vec::new();
@@ -881,6 +923,11 @@ pub fn acquire_public_selected(
     let fixture = artifacts::read_file(&target_directory.join(&target.fixture.name))?;
     artifacts::check_bytes(&target.fixture, &fixture)?;
     fs::write(native.join(&target.fixture.name), fixture)?;
+    if let Some(diagnostic) = &target.workload_diagnostic {
+        let bytes = artifacts::read_file(&target_directory.join(&diagnostic.name))?;
+        artifacts::check_bytes(diagnostic, &bytes)?;
+        fs::write(native.join(&diagnostic.name), bytes)?;
+    }
     source::write_json(&native.join("target.json"), &target)?;
     for record in &packages.files {
         if !original.metadata.files.contains(record) {
@@ -1448,6 +1495,12 @@ fn materialize_cargo_install(
         }
     }
     let fixture = fixture(bundle, target_directory, owner.path())?;
+    // Historical packages never borrow a current helper and label it older.
+    let workload_diagnostic = if legacy_predecessor {
+        None
+    } else {
+        workload_diagnostic(bundle, target_directory, owner.path())?
+    };
     let artifacts: Vec<_> = packages
         .files
         .iter()
@@ -1465,6 +1518,7 @@ fn materialize_cargo_install(
         artifacts,
         selected_artifact_count,
         fixture,
+        workload_diagnostic,
         _owner: owner,
     })
 }
@@ -1633,6 +1687,7 @@ pub fn run_materialized_channel(
             )?,
             &payload.directory,
             payload.fixture.clone(),
+            payload.workload_diagnostic.clone(),
             &installed,
             output.join("windows-installed"),
         )?;
@@ -1652,6 +1707,7 @@ pub fn run_materialized_channel(
             )?,
             &predecessor.directory,
             predecessor.fixture.clone(),
+            predecessor.workload_diagnostic.clone(),
             &installed,
             output.join("windows-predecessor"),
         )?;

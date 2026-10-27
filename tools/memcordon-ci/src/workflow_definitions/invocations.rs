@@ -1,6 +1,9 @@
 use super::LiteralRun;
 pub(super) fn invocation(recipe: &str, path: u8, operation: u8) -> Option<LiteralRun> {
     match (recipe, path, operation) {
+        ("windows-fixture-native", 2, 0) => Some(LiteralRun::WindowsFixtureNative),
+        ("windows-fixture-native", 2, 1) => Some(LiteralRun::WindowsFixtureNativeRequest),
+        ("windows-fixture-native", 2, 2) => Some(LiteralRun::WindowsFixtureNativeCleanup),
         ("backend-linux-cgroup", 0, 0) => Some(LiteralRun::R1281),
         ("backend-linux-cgroup", 0, 1) => Some(LiteralRun::R1282),
         ("backend-linux-cgroup", 0, 2) => Some(LiteralRun::R1283),

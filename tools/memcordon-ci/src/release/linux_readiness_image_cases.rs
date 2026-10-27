@@ -20,6 +20,15 @@ use super::linux_mixed_installed::{
 use crate::command::CommandSpec;
 use crate::consumer_readiness_ledger::SourceIdentity;
 use crate::{CiError, Result};
+#[path = "linux_elf_patch.rs"]
+mod elf_patch;
+#[path = "linux_export_sequence.rs"]
+mod export_sequence;
+#[path = "linux_image_failure_diagnostics.rs"]
+mod failure_diagnostics;
+#[path = "linux_image_capture.rs"]
+mod image_capture;
+use super::linux_image_custody as image_custody;
 
 #[derive(Clone, Copy)]
 pub struct ImageCaseContext<'a> {
@@ -78,6 +87,7 @@ pub struct ExportCaseObservation {
     pub fixture_mode: String,
     pub challenge: PathBuf,
     pub contract: PathBuf,
+    pub memory_budget: Option<PathBuf>,
     pub activation: Option<PathBuf>,
     pub prepared: Option<PathBuf>,
     pub prepared_native: Option<PathBuf>,
@@ -107,12 +117,456 @@ pub struct ImageCaseReport {
     pub export_worker_owners: Vec<crate::linux_consumer_readiness::HeldLinuxProcess>,
     pub directory_custody: Vec<File>,
     pub file_custody: Vec<File>,
+    image_custody: super::linux_image_custodian::Custodians,
+    image_directory_witnesses: Vec<Vec<super::linux_image_custodian::Witness>>,
+    image_file_witnesses: Vec<super::linux_image_custodian::Witness>,
+    image_partial_files: Vec<Option<File>>,
     pub administrative_export_handles: Vec<File>,
     export_helpers: Vec<ExportPermissionOwner>,
     pub failures: Vec<String>,
+    pub failure_diagnostic: Option<(memcordon_readiness_verifier::Artifact, usize)>,
+    pub failure_retention_error: Option<String>,
+    first_failure_phase: Option<String>,
+    first_failure_scenario: Option<String>,
+    failure_journal: Option<(File, usize)>,
+    emergency_descriptors: Vec<File>,
+    custody_phase: std::cell::Cell<CustodyPhase>,
     pub output: PathBuf,
     pub cleanup_deadline: Instant,
     pub cleanup_attempts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustodyPhase {
+    Collecting,
+    Normalizing,
+    NormalizationFinished,
+    Settled,
+}
+
+impl ImageCaseReport {
+    fn ensure_cleanup_reserve(&mut self) -> Result<()> {
+        while self.emergency_descriptors.len()
+            < super::linux_image_custodian::capacity::CLEANUP_RESERVE_OWNERS
+        {
+            self.emergency_descriptors.push(File::open("/dev/null")?);
+        }
+        Ok(())
+    }
+    pub fn begin_normalization(&self) -> Result<()> {
+        if self.custody_phase.get() != CustodyPhase::Collecting {
+            return Err(CiError::Message(
+                "image normalization is a one-shot original custody phase".into(),
+            ));
+        }
+        self.custody_phase.set(CustodyPhase::Normalizing);
+        Ok(())
+    }
+
+    pub fn normalization_is_live(&self) -> bool {
+        self.custody_phase.get() == CustodyPhase::Normalizing
+    }
+
+    pub fn finish_custody(&mut self, deadline: Instant) -> Result<()> {
+        if self.custody_phase.get() == CustodyPhase::Settled {
+            return Ok(());
+        }
+        self.emergency_descriptors.clear();
+        self.custody_phase.set(CustodyPhase::NormalizationFinished);
+        self.image_custody
+            .finish(deadline.min(self.cleanup_deadline))?;
+        self.custody_phase.set(CustodyPhase::Settled);
+        self.failure_journal.take();
+        Ok(())
+    }
+    fn custody_io(&self, operation: &str, path: &Path, error: std::io::Error) -> CiError {
+        ancestry_rejection(
+            &format!(
+                "image custody operation={operation}; kind={:?}; raw-os-error={:?}; physical-owners={}; logical-file-witnesses={}; logical-directory-chains={}",
+                error.kind(),
+                error.raw_os_error(),
+                self.image_custody.owner_count(),
+                self.image_file_witnesses.len(),
+                self.image_directory_witnesses.len()
+            ),
+            "image-original-owner",
+            0,
+            path,
+            None,
+            None,
+        )
+    }
+
+    fn hold_image_ancestry(
+        &mut self,
+        path: &Path,
+        evidence: bool,
+        deadline: Instant,
+    ) -> Result<Vec<super::linux_image_custodian::Witness>> {
+        use super::linux_image_custodian::Role;
+        use std::path::Component;
+        remaining(deadline)?;
+        if path != Path::new("/") {
+            image_capture::normalized_descendant(Path::new("/"), path)?;
+        }
+        let role = if evidence {
+            Role::EvidenceDirectory
+        } else {
+            Role::AdministrativeDirectory
+        };
+        let mut named = PathBuf::from("/");
+        let mut chain = Vec::new();
+        let mut parent_owner: Option<File> = None;
+        self.image_custody.reserve()?;
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&named)
+            .map_err(|error| self.custody_io("open-root", &named, error))?;
+        let mut root = Some(root);
+        let components = std::iter::once(None).chain(path.components().filter_map(|part| {
+            if let Component::Normal(name) = part {
+                Some(Some(name))
+            } else {
+                None
+            }
+        }));
+        for (ordinal, part) in components.enumerate() {
+            remaining(deadline)?;
+            self.image_custody.reserve()?;
+            let candidate = if let Some(part) = part {
+                named.push(part);
+                let file: File = rustix::fs::openat(
+                    parent_owner.as_ref().expect("original parent directory"),
+                    part,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|error| self.custody_io("open-directory-edge", &named, error.into()))?
+                .into();
+                file
+            } else {
+                root.take().expect("single root admission")
+            };
+            let metadata = candidate.metadata()?;
+            let named_metadata = std::fs::symlink_metadata(&named)?;
+            let sticky = if evidence {
+                named == Path::new("/tmp")
+                    && named != path
+                    && metadata.uid() == 0
+                    && metadata.mode() & libc::S_ISVTX != 0
+            } else {
+                metadata.mode() & libc::S_ISVTX != 0
+            };
+            if !metadata.is_dir()
+                || !named_metadata.is_dir()
+                || (metadata.dev(), metadata.ino()) != (named_metadata.dev(), named_metadata.ino())
+                || (!evidence && metadata.uid() != 0)
+                || (metadata.mode() & 0o022 != 0 && !sticky)
+            {
+                return Err(ancestry_rejection(
+                    "image ancestry role custody differs",
+                    if evidence {
+                        "retained-evidence"
+                    } else {
+                        "administrative-source/staging"
+                    },
+                    ordinal,
+                    &named,
+                    Some(&metadata),
+                    Some(&named_metadata),
+                ));
+            }
+            let (witness, lease) = self.image_custody.admit(
+                role,
+                &named,
+                candidate,
+                deadline,
+                self.cleanup_deadline,
+            )?;
+            chain.push(witness);
+            parent_owner = Some(lease);
+        }
+        remaining(deadline)?;
+        self.image_directory_witnesses.push(chain.clone());
+        Ok(chain)
+    }
+
+    fn hold_image_file(&mut self, path: &Path, deadline: Instant) -> Result<File> {
+        self.image_custody.reserve()?;
+        let candidate = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| self.custody_io("open-readonly-image", path, error))?;
+        let (witness, lease) = self.image_custody.admit(
+            super::linux_image_custodian::Role::AdministrativeFile,
+            path,
+            candidate,
+            deadline,
+            self.cleanup_deadline,
+        )?;
+        self.image_file_witnesses.push(witness);
+        Ok(lease)
+    }
+
+    fn verify_image_evidence_ancestry(
+        &mut self,
+        path: &Path,
+        held: &[super::linux_image_custodian::Witness],
+        deadline: Instant,
+    ) -> Result<()> {
+        Self::verify_original_image_ancestry(
+            &mut self.image_custody,
+            path,
+            held,
+            super::linux_image_custodian::Role::EvidenceDirectory,
+            deadline,
+        )
+    }
+
+    fn verify_original_image_ancestry(
+        custody: &mut super::linux_image_custodian::Custodians,
+        path: &Path,
+        held: &[super::linux_image_custodian::Witness],
+        role: super::linux_image_custodian::Role,
+        deadline: Instant,
+    ) -> Result<()> {
+        use std::path::Component;
+        remaining(deadline)?;
+        if path.components().count() != held.len() || !path.is_absolute() {
+            return Err(CiError::Message(
+                "remote evidence original ancestry cardinality differs".into(),
+            ));
+        }
+        let mut named_path = PathBuf::from("/");
+        let mut previous: Option<File> = None;
+        let mut parts = path.components().filter_map(|part| match part {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        });
+        for (ordinal, witness) in held.iter().enumerate() {
+            remaining(deadline)?;
+            let original = custody.borrow(witness, deadline)?;
+            let fresh: File = if ordinal == 0 {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    )
+                    .open("/")?
+            } else {
+                let part = parts.next().ok_or_else(|| {
+                    CiError::Message("remote evidence ancestry component absent".into())
+                })?;
+                named_path.push(part);
+                rustix::fs::openat(
+                    previous.as_ref().expect("original parent lease"),
+                    part,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?
+                .into()
+            };
+            let old = original.metadata()?;
+            let named = fresh.metadata()?;
+            let evidence = role == super::linux_image_custodian::Role::EvidenceDirectory;
+            let sticky_root = if evidence {
+                named_path == Path::new("/tmp")
+                    && named_path != path
+                    && named.uid() == 0
+                    && named.mode() & libc::S_ISVTX != 0
+            } else {
+                named.mode() & libc::S_ISVTX != 0
+            };
+            if witness.role != role
+                || witness.path != named_path
+                || !named.is_dir()
+                || (!evidence && named.uid() != 0)
+                || (named.mode() & 0o022 != 0 && !sticky_root)
+                || (old.dev(), old.ino(), old.uid(), old.gid(), old.mode())
+                    != (
+                        named.dev(),
+                        named.ino(),
+                        named.uid(),
+                        named.gid(),
+                        named.mode(),
+                    )
+            {
+                return Err(ancestry_rejection(
+                    "remote evidence nofollow ancestry differs from original native owner",
+                    if evidence {
+                        "retained-evidence"
+                    } else {
+                        "administrative-source/staging"
+                    },
+                    ordinal,
+                    &named_path,
+                    Some(&old),
+                    Some(&named),
+                ));
+            }
+            previous = Some(original);
+        }
+        remaining(deadline)?;
+        Ok(())
+    }
+
+    pub fn primary_failure(&self) -> Option<String> {
+        failure_diagnostics::primary(
+            self.first_failure_phase
+                .as_deref()
+                .unwrap_or("image-or-export"),
+            self.first_failure_scenario.as_deref(),
+            &self.failures,
+            self.failure_retention_error.as_deref(),
+        )
+    }
+
+    pub fn register_failure_diagnostic(
+        &self,
+        publication: &super::linux_lifecycle_diagnostics::HeldCellPublication,
+        artifact_root: &Path,
+        artifacts: &mut Vec<memcordon_readiness_verifier::Artifact>,
+    ) -> Result<()> {
+        let Some((expected, index)) = &self.failure_diagnostic else {
+            return match &self.failure_retention_error {
+                Some(error) => Err(CiError::Message(format!(
+                    "image failure diagnostic retention failed: {error}"
+                ))),
+                None => Ok(()),
+            };
+        };
+        failure_diagnostics::validate_artifact(expected, expected).map_err(CiError::Message)?;
+        let held = self.file_custody.get(*index).ok_or_else(|| {
+            CiError::Message("original image failure file capability absent".into())
+        })?;
+        let before = held.metadata()?;
+        let path = artifact_root.join(&expected.path);
+        let mut registered = Vec::new();
+        let named = super::linux_lifecycle_diagnostics::register_existing(
+            publication,
+            &path,
+            &mut registered,
+        )?;
+        let [actual] = registered.as_slice() else {
+            return Err(CiError::Message(
+                "image failure diagnostic registration cardinality differs".into(),
+            ));
+        };
+        failure_diagnostics::validate_registration(
+            expected,
+            actual,
+            &before,
+            &held.metadata()?,
+            &named.metadata()?,
+        )
+        .map_err(CiError::Message)?;
+        artifacts.extend(registered);
+        Ok(())
+    }
+}
+
+fn note_failure(report: &mut ImageCaseReport, phase: &str, scenario: Option<&str>) {
+    if !report.failures.is_empty() {
+        report.emergency_descriptors.clear();
+    }
+    if report.first_failure_phase.is_none() && !report.failures.is_empty() {
+        report.first_failure_phase = Some(phase.into());
+        report.first_failure_scenario = scenario.map(str::to_owned);
+    }
+}
+
+fn retain_failures(context: &ImageCaseContext<'_>, report: &mut ImageCaseReport) {
+    if report.failures.is_empty() {
+        return;
+    }
+    let result = (|| -> Result<()> {
+        let binding = serde_json::json!({"identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,
+            "work_deadline_unix_millis":context.work_deadline_unix_millis,"cleanup_deadline_unix_millis":context.cleanup_deadline_unix_millis});
+        let bytes = failure_diagnostics::encode(
+            binding,
+            report
+                .first_failure_phase
+                .as_deref()
+                .unwrap_or("image-or-export"),
+            report.first_failure_scenario.as_deref(),
+            &report.failures,
+            report
+                .observations
+                .iter()
+                .any(|row| row.scenario == "neighbor-import"),
+        )
+        .map_err(CiError::Message)?;
+        let path = report.output.join("image-case-failures.json");
+        let relative = path
+            .strip_prefix(context.artifact_root)
+            .map_err(|error| CiError::Message(error.to_string()))?
+            .to_str()
+            .ok_or_else(|| CiError::Message("image failure diagnostic path is not UTF8".into()))?
+            .to_owned();
+        let artifact = memcordon_readiness_verifier::Artifact {
+            path: relative,
+            length: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        failure_diagnostics::validate_artifact(&artifact, &artifact).map_err(CiError::Message)?;
+        let (writer, index) = report.failure_journal.as_ref().ok_or_else(|| {
+            CiError::Message("preopened original image failure journal absent".into())
+        })?;
+        let held = report.file_custody.get(*index).ok_or_else(|| {
+            CiError::Message("original image failure journal read owner absent".into())
+        })?;
+        let before = held.metadata()?;
+        if (before.dev(), before.ino()) != (writer.metadata()?.dev(), writer.metadata()?.ino()) {
+            return Err(CiError::Message(
+                "image failure journal writer/read owner identity differs".into(),
+            ));
+        }
+        remaining(context.cleanup_deadline)?;
+        writer.write_all_at(&bytes, 0)?;
+        writer.set_len(bytes.len() as u64)?;
+        writer.sync_all()?;
+        let mut actual = vec![0; bytes.len()];
+        held.read_exact_at(&mut actual, 0)?;
+        let named = std::fs::symlink_metadata(&path)?;
+        let after = held.metadata()?;
+        if actual != bytes
+            || !named.is_file()
+            || named.nlink() != 1
+            || (named.dev(), named.ino(), named.len(), named.mode())
+                != (after.dev(), after.ino(), bytes.len() as u64, after.mode())
+            || (before.dev(), before.ino()) != (after.dev(), after.ino())
+        {
+            return Err(CiError::Message(
+                "original image failure journal named/readback differs".into(),
+            ));
+        }
+        remaining(context.cleanup_deadline)?;
+        let index = *index;
+        // Mirror only the already validated, same-owned journal readback. This
+        // diagnostic has no producer/publication authority and survives a later
+        // catalog refusal through the existing bounded stderr capture.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "image-first-failure-record {}",
+            String::from_utf8_lossy(&actual)
+        );
+        report.failure_diagnostic = Some((artifact, index));
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.failure_retention_error = Some(error.to_string());
+    }
 }
 
 struct ExportPermissionOwner {
@@ -136,7 +590,10 @@ struct ExportPermissionOwner {
 
 /// Exercise import integrity against fresh copies, retaining an actual neighboring
 /// successful import and every native mutation intent before calling the installer.
-pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport> {
+pub fn run_import_cases(
+    context: ImageCaseContext<'_>,
+    recovery: &super::linux_export_recovery::RecoveryContext<'_>,
+) -> Result<ImageCaseReport> {
     if !context.output.is_absolute()
         || !context.output.starts_with(context.artifact_root)
         || !context.admin_root.is_absolute()
@@ -151,6 +608,7 @@ pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport
     {
         return Err(CiError::Message("invalid owned image-case context".into()));
     }
+    image_capture::normalized_descendant(context.artifact_root, context.output)?;
     std::fs::create_dir(context.output)?;
     std::fs::set_permissions(context.output, std::fs::Permissions::from_mode(0o711))?;
     let admin = context
@@ -169,14 +627,67 @@ pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport
         importer_owners: Vec::new(),
         directory_custody: hold_ancestry(&admin)?,
         file_custody: Vec::new(),
+        image_custody: super::linux_image_custodian::Custodians::default(),
+        image_directory_witnesses: Vec::new(),
+        image_file_witnesses: Vec::new(),
+        image_partial_files: Vec::new(),
         administrative_export_handles: Vec::new(),
         export_helpers: Vec::new(),
         export_worker_owners: Vec::new(),
         failures: Vec::new(),
+        failure_diagnostic: None,
+        failure_retention_error: None,
+        first_failure_phase: None,
+        first_failure_scenario: None,
+        failure_journal: None,
+        emergency_descriptors: Vec::new(),
+        custody_phase: std::cell::Cell::new(CustodyPhase::Collecting),
         output: context.output.to_path_buf(),
         cleanup_deadline: context.cleanup_deadline,
         cleanup_attempts: 0,
     };
+    // Reserve both original journal capabilities before inventory growth.
+    // A later EMFILE cannot turn the first failure into a missing-record open.
+    let journal_path = context.output.join("image-case-failures.json");
+    let journal_ancestry = hold_evidence_ancestry(context.output, context.deadline)?;
+    verify_evidence_ancestry(context.output, &journal_ancestry, context.deadline)?;
+    let writer: File = rustix::fs::openat(
+        journal_ancestry.last().expect("held journal parent"),
+        journal_path.file_name().expect("journal filename"),
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::from_raw_mode(0o444),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    let readonly: File = rustix::fs::openat(
+        journal_ancestry.last().expect("held journal parent"),
+        journal_path.file_name().expect("journal filename"),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    if (writer.metadata()?.dev(), writer.metadata()?.ino())
+        != (readonly.metadata()?.dev(), readonly.metadata()?.ino())
+    {
+        return Err(CiError::Message(
+            "preopened image failure journal native identity differs".into(),
+        ));
+    }
+    let journal_index = report.file_custody.len();
+    report.file_custody.push(readonly);
+    report.failure_journal = Some((writer, journal_index));
+    verify_evidence_ancestry(context.output, &journal_ancestry, context.deadline)?;
+    report.directory_custody.extend(journal_ancestry);
+    report.ensure_cleanup_reserve()?;
     let admin_metadata = std::fs::symlink_metadata(context.admin_root)?;
     retain(
         &context.output.join("owner.json"),
@@ -193,9 +704,17 @@ pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport
         Ok(selected) => selected,
         Err(error) => {
             report.failures.push(error.to_string());
+            note_failure(&mut report, "select-startup-members", None);
+            retain_failures(&context, &mut report);
             return Ok(report);
         }
     };
+    if let Err(error) = plan_image_custody(&context, &admin, &mut report) {
+        report.failures.push(error.to_string());
+        note_failure(&mut report, "image-custody-preflight", None);
+        retain_failures(&context, &mut report);
+        return Ok(report);
+    }
     for (scenario, member) in [
         ("neighbor-import", None),
         ("first-image", Some(selected.0.as_str())),
@@ -205,8 +724,10 @@ pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport
     ] {
         if let Err(error) = import_case(&context, &admin, &mut report, scenario, member) {
             report.failures.push(format!("{scenario}: {error}"));
+            note_failure(&mut report, "import-case", Some(scenario));
             break;
         }
+        note_failure(&mut report, "import-case", Some(scenario));
     }
     if report.failures.is_empty() {
         for (scenario, member) in [
@@ -216,35 +737,151 @@ pub fn run_import_cases(context: ImageCaseContext<'_>) -> Result<ImageCaseReport
         ] {
             if let Err(error) = import_case(&context, &admin, &mut report, scenario, member) {
                 report.failures.push(format!("{scenario}: {error}"));
+                note_failure(&mut report, "import-case", Some(scenario));
                 break;
             }
+            note_failure(&mut report, "import-case", Some(scenario));
         }
     }
     if report.failures.is_empty() {
-        for scenario in [
-            "symlink",
-            "fifo",
-            "device",
-            "socket",
-            "traversal",
-            "concurrent-writer",
-        ] {
-            if let Err(error) = export_case(&context, &admin, &mut report, scenario) {
-                if let Some(observation) = report.export_observations.last_mut() {
-                    observation.error = Some(error.to_string());
-                }
-                report.failures.push(format!("export {scenario}: {error}"));
-                break;
+        let result = export_sequence::run(
+            &mut report,
+            &[
+                "symlink",
+                "fifo",
+                "device",
+                "socket",
+                "traversal",
+                "concurrent-writer",
+            ],
+            |report, scenario| export_case(&context, &admin, report, scenario),
+            |report| {
+                super::linux_export_recovery::recover_report(report, recovery, context.account)
+            },
+        );
+        if let Err(failure) = result {
+            let scenario = failure.scenario;
+            let error = failure.error;
+            if let Some(observation) = report.export_observations.last_mut() {
+                observation.error = Some(error.to_string());
             }
+            report.failures.push(format!("export {scenario}: {error}"));
+            note_failure(&mut report, failure.stage.phase(), Some(scenario));
         }
     }
+    retain_failures(&context, &mut report);
     Ok(report)
+}
+
+fn plan_image_custody(
+    context: &ImageCaseContext<'_>,
+    admin: &Path,
+    report: &mut ImageCaseReport,
+) -> Result<()> {
+    use super::linux_image_custodian::{Role, capacity};
+    let scenarios = [
+        "neighbor-import",
+        "first-image",
+        "interpreter",
+        "shared-library",
+        "writable-alias",
+        "ld-injection",
+        "loader-config",
+        "rpath-injection",
+    ];
+    let exports = [
+        "symlink",
+        "fifo",
+        "device",
+        "socket",
+        "traversal",
+        "concurrent-writer",
+    ];
+    let mut directories = std::collections::BTreeSet::new();
+    let mut add_chain = |role, path: &Path| {
+        for ancestor in path.ancestors() {
+            directories.insert((role, ancestor.to_path_buf()));
+        }
+    };
+    let mut regular = 0usize;
+    for entry in context.images.runtime.entries.as_slice() {
+        remaining(context.deadline)?;
+        let ImageEntryV1::Regular { path, .. } = entry else {
+            continue;
+        };
+        regular += 1;
+        let source = context.images.runtime_source.join(path.as_str());
+        add_chain(
+            Role::AdministrativeDirectory,
+            source.parent().expect("manifest member parent"),
+        );
+        for scenario in scenarios {
+            let destination = admin.join(scenario).join("source").join(path.as_str());
+            add_chain(
+                Role::AdministrativeDirectory,
+                destination.parent().expect("copied manifest member parent"),
+            );
+        }
+    }
+    for scenario in scenarios {
+        add_chain(Role::AdministrativeDirectory, &admin.join(scenario));
+        add_chain(Role::EvidenceDirectory, &context.output.join(scenario));
+    }
+    add_chain(
+        Role::AdministrativeDirectory,
+        &admin.join("loader-config/source/etc"),
+    );
+    let mut unpooled_directories = context
+        .images
+        .runtime_source
+        .join("bin")
+        .ancestors()
+        .count();
+    let mut activation_directories = 0;
+    for scenario in ["loader-config", "rpath-injection"] {
+        let protected = admin.join(scenario).join("preparation-probe");
+        let caller_chain = protected.ancestors().count();
+        unpooled_directories += caller_chain;
+        // Activation temporarily holds both its existing parent chain and its
+        // exclusively created child chain. Only one activation runs at a time;
+        // caller-owned chains remain retained across both preparation probes.
+        activation_directories = activation_directories
+            .max(caller_chain + protected.join("activation-policy").ancestors().count());
+    }
+    unpooled_directories += activation_directories;
+    for scenario in exports {
+        unpooled_directories += admin.join(format!("export-{scenario}")).ancestors().count();
+    }
+    // Each export worker pins its protected journal ancestry. Only the
+    // concurrent-writer helper additionally pins the cgroup ancestry.
+    unpooled_directories += exports.len()
+        * Path::new("/var/lib/memcordon/sealed").ancestors().count()
+        + Path::new("/sys/fs/cgroup/memcordon-sealed")
+            .ancestors()
+            .count();
+    let budget = memcordon_platform::test_support::image_custody_fd_budget()?;
+    let plan = capacity::Plan::new(
+        budget
+            .open_descriptors
+            .checked_sub(report.emergency_descriptors.len())
+            .ok_or_else(|| {
+                CiError::Message("image reserve exceeds observed native descriptor baseline".into())
+            })?,
+        regular,
+        directories.len(),
+        unpooled_directories,
+        budget.soft_limit,
+    )?;
+    report.image_custody.configure(plan)?;
+    remaining(context.deadline)?;
+    Ok(())
 }
 
 /// Settle every frontend/capture/native family independently. Image retirement
 /// is deliberately separate: the outer owner must first restore its registry.
 pub fn finalize_attempts(report: &mut ImageCaseReport, deadline: Instant) -> Result<()> {
     let deadline = deadline.min(report.cleanup_deadline);
+    report.emergency_descriptors.clear();
     // Partial device setup may retain controller mount references; close
     // those explicit obligations before asking the provider to retire roots.
     let mut failures = Vec::new();
@@ -500,7 +1137,7 @@ fn import_case(
     std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o711))?;
     std::fs::create_dir(&staged)?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))?;
-    report.directory_custody.extend(hold_ancestry(&staged)?);
+    report.hold_image_ancestry(&staged, false, context.deadline)?;
     let root = staged.join("source");
     std::fs::create_dir(&root)?;
     let mut definition = context.images.runtime.clone();
@@ -520,18 +1157,15 @@ fn import_case(
         .find(|entry| entry.id.as_str() == "owned-readiness")
         .ok_or_else(|| CiError::Message("actual baseline entrypoint absent".into()))?;
     let entrypoint_member = resolve_member(&definition, entrypoint.path.as_str())?;
-    let mut entrypoint_owner = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(context.images.runtime_source.join(&entrypoint_member))?;
-    let entrypoint_bytes =
-        read_image_bytes_until(&mut entrypoint_owner, 64 * 1024 * 1024, context.deadline)?;
-    retain(
-        &baseline_entrypoint,
-        &entrypoint_bytes,
-        &mut report.file_custody,
+    capture_manifest_member(
+        &context.images.runtime_source,
+        &valid_baseline_definition,
+        &entrypoint_member,
+        Some(&baseline_entrypoint),
+        true,
+        report,
+        context.deadline,
     )?;
-    report.file_custody.push(entrypoint_owner);
     copy_inventory(
         &context.images.runtime_source,
         &root,
@@ -553,9 +1187,7 @@ fn import_case(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        report
-            .directory_custody
-            .extend(hold_ancestry(&root.join("etc"))?);
+        report.hold_image_ancestry(&root.join("etc"), false, context.deadline)?;
         retain(
             &root.join("etc/ld.so.preload"),
             bytes,
@@ -572,23 +1204,24 @@ fn import_case(
             std::fs::hard_link(&path, staged.join("writable-startup-alias"))?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         } else if scenario == "rpath-injection" {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)?;
-            let mut bytes = Vec::new();
-            std::io::Read::by_ref(&mut file)
-                .take(64 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > 64 * 1024 * 1024 {
-                return Err(CiError::Message("owned ELF mutation exceeds bound".into()));
-            }
-            add_writable_rpath(&mut bytes)?;
-            file.write_all_at(&bytes, 0)?;
-            file.sync_all()?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555))?;
+            let (original_size, original_hash) = definition
+                .entries
+                .as_slice()
+                .iter()
+                .find_map(|entry| match entry {
+                    ImageEntryV1::Regular {
+                        path, size, sha256, ..
+                    } if path.as_str() == member => Some((*size, String::from(sha256.clone()))),
+                    _ => None,
+                })
+                .ok_or_else(|| CiError::Message("mutated ELF inventory member absent".into()))?;
+            let digest = mutate_owned_rpath(
+                report,
+                &path,
+                original_size,
+                &original_hash,
+                context.deadline,
+            )?;
             let mut raw = serde_json::to_value(&definition)?;
             let entry = raw["entries"]
                 .as_array_mut()
@@ -596,7 +1229,7 @@ fn import_case(
                 .iter_mut()
                 .find(|entry| entry["path"] == member)
                 .ok_or_else(|| CiError::Message("mutated ELF inventory member absent".into()))?;
-            entry["sha256"] = hex(&Sha256::digest(&bytes)).into();
+            entry["sha256"] = digest.into();
             definition = serde_json::from_value(raw)?;
         } else {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -622,44 +1255,41 @@ fn import_case(
             continue;
         };
         let source = root.join(path.as_str());
-        let mut held = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&source)?;
+        let held = report.hold_image_file(&source, context.deadline)?;
         let before = held.metadata()?;
-        let bytes = read_image_bytes_until(&mut held, 64 * 1024 * 1024, context.deadline)?;
-        if bytes.len() > 64 * 1024 * 1024 || !before.is_file() {
-            return Err(CiError::Message(
-                "native source inventory member exceeds bound/type".into(),
-            ));
-        }
         let selected = member == Some(path.as_str()) || path.as_str() == "etc/ld.so.preload";
         let retained_bytes = if selected {
             let destination = output.join(format!("source-member-{}.bin", native_members.len()));
-            retain(&destination, &bytes, &mut report.file_custody)?;
             Some(destination)
         } else {
             None
         };
+        let actual_hash = capture_manifest_member(
+            &root,
+            &definition,
+            path.as_str(),
+            retained_bytes.as_deref(),
+            member != Some(path.as_str()) || scenario == "rpath-injection",
+            report,
+            context.deadline,
+        )?;
         let baseline_bytes = if member == Some(path.as_str()) {
-            let original = context.images.runtime_source.join(path.as_str());
-            let mut held = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(original)?;
-            let bytes = read_image_bytes_until(&mut held, 64 * 1024 * 1024, context.deadline)?;
-            if bytes.len() > 64 * 1024 * 1024 {
-                return Err(CiError::Message(
-                    "baseline source member exceeds bound".into(),
-                ));
-            }
             let destination = output.join(format!("baseline-member-{}.bin", native_members.len()));
-            retain(&destination, &bytes, &mut report.file_custody)?;
+            capture_manifest_member(
+                &context.images.runtime_source,
+                &valid_baseline_definition,
+                path.as_str(),
+                Some(&destination),
+                true,
+                report,
+                context.deadline,
+            )?;
             Some(destination)
         } else {
             None
         };
         let after = held.metadata()?;
+        let named = std::fs::symlink_metadata(&source)?;
         if (
             before.dev(),
             before.ino(),
@@ -672,6 +1302,18 @@ fn import_case(
             after.len(),
             after.ctime(),
             after.ctime_nsec(),
+        ) || (
+            named.dev(),
+            named.ino(),
+            named.len(),
+            named.mode(),
+            named.nlink(),
+        ) != (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mode(),
+            before.nlink(),
         ) {
             return Err(CiError::Message(
                 "native source inventory member changed during capture".into(),
@@ -679,8 +1321,7 @@ fn import_case(
         }
         native_members.push(serde_json::json!({"path":path.as_str(),"device":before.dev(),"inode":before.ino(),"uid":before.uid(),"mode":before.mode(),
             "nlink":before.nlink(),"size":before.len(),"ctime_seconds":before.ctime(),"ctime_nanoseconds":before.ctime_nsec(),
-            "sha256":hex(&Sha256::digest(&bytes)),"bytes":retained_bytes,"baseline_bytes":baseline_bytes}));
-        report.file_custody.push(held);
+            "sha256":actual_hash,"bytes":retained_bytes,"baseline_bytes":baseline_bytes}));
     }
     let alias = if scenario == "writable-alias" {
         let path = staged.join("writable-startup-alias");
@@ -1038,6 +1679,172 @@ pub fn capture_import_command_for_identity(
     Ok(captured)
 }
 
+fn capture_manifest_member(
+    root: &Path,
+    definition: &RuntimeImageDefinitionV1,
+    member: &str,
+    destination: Option<&Path>,
+    require_manifest_hash: bool,
+    report: &mut ImageCaseReport,
+    deadline: Instant,
+) -> Result<String> {
+    remaining(deadline)?;
+    if let Some(path) = destination {
+        image_capture::normalized_descendant(&report.output, path)?;
+    }
+    let (size, expected_hash) = definition
+        .entries
+        .as_slice()
+        .iter()
+        .find_map(|entry| match entry {
+            ImageEntryV1::Regular {
+                path, size, sha256, ..
+            } if path.as_str() == member => Some((*size, String::from(sha256.clone()))),
+            _ => None,
+        })
+        .ok_or_else(|| CiError::Message("capture member absent from selected manifest".into()))?;
+    let bound = memcordon_readiness_verifier::MAX_ARTIFACT_BYTES;
+    if destination.is_some() && size > bound {
+        return Err(CiError::Message(format!(
+            "image evidence exceeds existing artifact bound: member={member:?} expected-bytes={size} bound={bound}"
+        )));
+    }
+    let source = root.join(member);
+    report.hold_image_ancestry(source.parent().expect("member parent"), false, deadline)?;
+    let input = report.hold_image_file(&source, deadline)?;
+    let before = input.metadata()?;
+    if !before.is_file() || before.len() != size || (require_manifest_hash && before.nlink() != 1) {
+        return Err(CiError::Message(format!(
+            "image capture type/manifest length differs: member={member:?} expected-bytes={size} observed-bytes={}",
+            before.len()
+        )));
+    }
+    let mut output_owner_index = None;
+    let mut output_ancestry = None;
+    let mut output = if let Some(path) = destination {
+        let parent = path.parent().expect("artifact parent");
+        let ancestry = report.hold_image_ancestry(parent, true, deadline)?;
+        report.verify_image_evidence_ancestry(parent, &ancestry, deadline)?;
+        remaining(deadline)?;
+        let parent_owner = report
+            .image_custody
+            .borrow(ancestry.last().expect("held evidence parent"), deadline)?;
+        let file: File = rustix::fs::openat(
+            &parent_owner,
+            path.file_name().expect("artifact filename"),
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::from_raw_mode(0o444),
+        )
+        .map_err(std::io::Error::from)?
+        .into();
+        output_owner_index = Some(report.file_custody.len());
+        report.file_custody.push(file);
+        let writer =
+            report.file_custody[output_owner_index.expect("created artifact owner")].try_clone()?;
+        output_ancestry = Some(ancestry);
+        Some(writer)
+    } else {
+        None
+    };
+    let mut reader = image_custody::PositionalReader::new(&input);
+    let digest = if let Some(file) = output.as_mut() {
+        image_capture::transfer(&mut reader, file, size, deadline)?
+    } else {
+        image_capture::transfer(&mut reader, &mut std::io::sink(), size, deadline)?
+    };
+    let digest = hex(&digest);
+    if require_manifest_hash && digest != expected_hash {
+        return Err(CiError::Message(format!(
+            "image capture selected digest differs: member={member:?} expected-bytes={size}"
+        )));
+    }
+    let stamp = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    if stamp(&before) != stamp(&input.metadata()?)
+        || stamp(&before) != stamp(&std::fs::symlink_metadata(&source)?)
+    {
+        return Err(CiError::Message(
+            "image capture held/named source changed".into(),
+        ));
+    }
+    if let (Some(output), Some(path)) = (output, destination) {
+        let ancestry = &output_ancestry.expect("created evidence ancestry");
+        let parent = path.parent().expect("artifact parent");
+        report.verify_image_evidence_ancestry(parent, ancestry, deadline)?;
+        remaining(deadline)?;
+        output.sync_all()?;
+        let written = output.metadata()?;
+        remaining(deadline)?;
+        let parent_owner = report
+            .image_custody
+            .borrow(ancestry.last().expect("held evidence parent"), deadline)?;
+        let mut readback_owner: File = rustix::fs::openat(
+            &parent_owner,
+            path.file_name().expect("artifact filename"),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?
+        .into();
+        if !written.is_file()
+            || written.nlink() != 1
+            || written.len() != size
+            || stamp(&written) != stamp(&readback_owner.metadata()?)
+        {
+            return Err(CiError::Message(
+                "image artifact reopened owner differs before readback".into(),
+            ));
+        }
+        let readback =
+            image_capture::transfer(&mut readback_owner, &mut std::io::sink(), size, deadline)?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !written.is_file()
+            || written.nlink() != 1
+            || written.len() != size
+            || hex(&readback) != digest
+            || stamp(&written) != stamp(&output.metadata()?)
+            || stamp(&written) != stamp(&named)
+        {
+            return Err(CiError::Message(
+                "image artifact held/named readback differs".into(),
+            ));
+        }
+        if stamp(&written) != stamp(&readback_owner.metadata()?) {
+            return Err(CiError::Message(
+                "image artifact reopened owner differs".into(),
+            ));
+        }
+        report.verify_image_evidence_ancestry(parent, ancestry, deadline)?;
+        remaining(deadline)?;
+        parent_owner.sync_all()?;
+        report.verify_image_evidence_ancestry(parent, ancestry, deadline)?;
+        report.file_custody[output_owner_index.expect("created artifact owner")] = readback_owner;
+    }
+    remaining(deadline)?;
+    Ok(digest)
+}
+
 fn read_image_bytes_until(file: &mut File, limit: usize, deadline: Instant) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
@@ -1055,6 +1862,46 @@ fn read_image_bytes_until(file: &mut File, limit: usize, deadline: Instant) -> R
         bytes.extend_from_slice(&chunk[..count]);
     }
     Ok(bytes)
+}
+
+fn retain_image_memory_budget(
+    context: &ImageCaseContext<'_>,
+    report: &mut ImageCaseReport,
+    images: &MixedImages,
+    contract: &memcordon_core::workload_contract_v3::WorkloadContractV3,
+    scenario: &str,
+    path: &Path,
+) -> Result<String> {
+    remaining(context.deadline)?;
+    let budget = super::linux_fixture_memory_budget::FrozenImageMemoryBudget::for_images(
+        &images.runtime,
+        &images.input,
+        &contract.runtime_image,
+        &contract.input_image,
+        super::linux_readiness_limits_cases::native_fixture_page_bytes()?,
+        512 * 1024 * 1024,
+    )
+    .map_err(CiError::Message)?;
+    let key = memcordon_readiness_verifier::CaseKey {
+        target: context.cell.target.clone(),
+        channel: Some(context.cell.channel.clone()),
+        evidence_class: memcordon_readiness_verifier::EvidenceClass::InstalledProduct,
+        family: if scenario.starts_with("export-") {
+            "L-IMG-04"
+        } else {
+            "L-IMG-02"
+        }
+        .into(),
+        scenario: scenario.into(),
+    };
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "format":"memcordon.linux-fixture-memory-budget", "revision":1,
+        "source":context.identity, "cell":context.cell, "lease_id":context.lease_id,
+        "key":key, "budget":budget,
+    }))?;
+    retain(path, &receipt, &mut report.file_custody)?;
+    remaining(context.deadline)?;
+    Ok(budget.token())
 }
 
 fn probe_loader_closure(
@@ -1097,7 +1944,7 @@ fn probe_loader_closure(
         Vec::new(),
         Vec::new(),
         &directory,
-        &protected,
+        &protected.join("activation-policy"),
         context.deadline,
     )?;
     let protected_contract = protected.join("contract.json");
@@ -1115,18 +1962,28 @@ fn probe_loader_closure(
         OsString::from("0"),
         OsString::from("loader-closure-probe"),
     ];
+    let memory_receipt = directory.join("fixture-memory-budget.json");
+    let memory = retain_image_memory_budget(
+        context,
+        report,
+        &images,
+        &activated.contract,
+        scenario,
+        &memory_receipt,
+    )?;
     let budget = format!(
         "+{}ms",
         remaining(context.deadline)?.as_millis().min(60_000)
     );
     let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+        lifetime: memcordon_core::Lifetime::Command,
         directory: &directory.join("launch"),
         contract: &contract,
         caller_uid: 65534,
         caller_gid: 65534,
         target_arguments: &arguments,
         deadline: std::ffi::OsStr::new(&budget),
-        memory: std::ffi::OsStr::new("+512MiB"),
+        memory: std::ffi::OsStr::new(&memory),
     })?;
     let index = report.launches.len();
     report.launches.push(launch);
@@ -1178,6 +2035,7 @@ fn probe_loader_closure(
                 "identity":context.identity,"cell":context.cell,"lease_id":context.lease_id,"scenario":scenario,
                 "activation":activated.activation_path,"contract":contract,"protected_contract":protected_contract,
                 "contract_sha256":hex(&Sha256::digest(&contract_bytes)),"provider_request":request_path,
+                "memory_budget":memory_receipt,
                 "result":report.launches[index].result,"native_census":census,
                 "frontend_invocation":serde_json::from_slice::<serde_json::Value>(&report.launches[index].retained_frontend_invocation()?)?,
                 "frontend_wait":report.launches[index].retained_frontend_wait()?,"raw_result":decoded
@@ -1196,115 +2054,221 @@ fn probe_loader_closure(
 /// Mutates a real owned ELF64 dynamic entry into an actual writable RPATH.
 /// The updated inventory hashes these exact bytes so loader validation, rather
 /// than a stale member checksum, must reject the native startup definition.
-fn add_writable_rpath(bytes: &mut [u8]) -> Result<()> {
-    let failure = || {
-        CiError::Message(
-            "owned ELF lacks a bounded dynamic string suitable for RPATH mutation".into(),
+fn mutate_owned_rpath(
+    report: &mut ImageCaseReport,
+    path: &Path,
+    size: u64,
+    original_hash: &str,
+    deadline: Instant,
+) -> Result<String> {
+    use super::linux_image_custodian::Role;
+    remaining(deadline)?;
+    if size > memcordon_readiness_verifier::MAX_ARTIFACT_BYTES {
+        return Err(CiError::Message(
+            "owned ELF exceeds image artifact role bound".into(),
+        ));
+    }
+    let witness = report
+        .image_file_witnesses
+        .iter()
+        .rev()
+        .find(|witness| witness.path == path && witness.role == Role::AdministrativeFile)
+        .cloned()
+        .ok_or_else(|| CiError::Message("owned ELF original copy witness absent".into()))?;
+    let original = report.image_custody.borrow(&witness, deadline)?;
+    let before = original.metadata()?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| CiError::Message("owned ELF parent absent".into()))?;
+    let chain = report.hold_image_ancestry(parent_path, false, deadline)?;
+    let parent = report
+        .image_custody
+        .borrow(chain.last().expect("absolute held parent"), deadline)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| CiError::Message("owned ELF basename absent".into()))?;
+    report.image_custody.reserve()?;
+    let writer: File = rustix::fs::openat(
+        &parent,
+        name,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    // Retain the actual mutation capability before any metadata or content mutation.
+    let index = report.image_partial_files.len();
+    report.image_partial_files.push(Some(writer));
+    let writer = report.image_partial_files[index]
+        .as_ref()
+        .expect("retained ELF writer");
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.nlink(),
+            metadata.len(),
         )
     };
-    let u16_at = |offset: usize| -> Result<u16> {
-        Ok(u16::from_le_bytes(
-            bytes
-                .get(offset..offset + 2)
-                .ok_or_else(failure)?
-                .try_into()
-                .map_err(|_| failure())?,
-        ))
+    let stamp = |metadata: &std::fs::Metadata| {
+        (
+            metadata.mode(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
     };
-    let u64_at = |offset: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            bytes
-                .get(offset..offset + 8)
-                .ok_or_else(failure)?
-                .try_into()
-                .map_err(|_| failure())?,
-        ))
+    let expected_identity = identity(&before);
+    let failure = || std::io::Error::other("owned ELF original native custody changed");
+    let mut verify = || -> std::io::Result<std::fs::Metadata> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "owned ELF original cutoff elapsed",
+            ));
+        }
+        ImageCaseReport::verify_original_image_ancestry(
+            &mut report.image_custody,
+            parent_path,
+            &chain,
+            Role::AdministrativeDirectory,
+            deadline,
+        )
+        .map_err(|error| match error {
+            CiError::Io(error) => error,
+            other => std::io::Error::other(other),
+        })?;
+        let held = writer.metadata()?;
+        let old = original.metadata()?;
+        let named: File = rustix::fs::openat(
+            &parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?
+        .into();
+        let named = named.metadata()?;
+        if !held.is_file()
+            || !old.is_file()
+            || !named.is_file()
+            || before.uid() != 0
+            || before.nlink() != 1
+            || before.len() != size
+            || before.mode() & 0o7777 != 0o555
+            || identity(&held) != expected_identity
+            || identity(&old) != expected_identity
+            || identity(&named) != expected_identity
+            || stamp(&held) != stamp(&old)
+            || stamp(&held) != stamp(&named)
+        {
+            return Err(failure());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "owned ELF original cutoff elapsed",
+            ));
+        }
+        ImageCaseReport::verify_original_image_ancestry(
+            &mut report.image_custody,
+            parent_path,
+            &chain,
+            Role::AdministrativeDirectory,
+            deadline,
+        )
+        .map_err(|error| match error {
+            CiError::Io(error) => error,
+            other => std::io::Error::other(other),
+        })?;
+        Ok(held)
     };
-    if bytes.get(..6) != Some(&b"\x7fELF\x02\x01"[..]) {
-        return Err(failure());
-    }
-    let headers = usize::try_from(u64_at(32)?).map_err(|_| failure())?;
-    let stride = usize::from(u16_at(54)?);
-    let count = usize::from(u16_at(56)?);
-    if stride < 56 || count == 0 || count > 256 {
-        return Err(failure());
-    }
-    let mut loads = Vec::new();
-    let mut dynamic = None;
-    for ordinal in 0..count {
-        let offset = headers
-            .checked_add(ordinal.checked_mul(stride).ok_or_else(failure)?)
-            .ok_or_else(failure)?;
-        let kind = u32::from_le_bytes(
-            bytes
-                .get(offset..offset + 4)
-                .ok_or_else(failure)?
-                .try_into()
-                .map_err(|_| failure())?,
-        );
-        let file = u64_at(offset + 8)?;
-        let address = u64_at(offset + 16)?;
-        let size = u64_at(offset + 32)?;
-        if kind == 1 {
-            loads.push((file, address, size));
+    verify()?;
+    writer.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let prepared = verify()?;
+    let final_stamp = std::cell::RefCell::new(None);
+    let result = elf_patch::mutate(
+        size,
+        original_hash,
+        deadline,
+        |offset, bytes| writer.read_at(bytes, offset),
+        |offset, bytes| writer.write_all_at(bytes, offset),
+        || writer.sync_all(),
+        |stage| {
+            let current = verify()?;
+            match stage {
+                elf_patch::Stage::BeforeOriginal
+                | elf_patch::Stage::AfterOriginal
+                | elf_patch::Stage::BeforeWrites => {
+                    if stamp(&current) != stamp(&prepared) {
+                        return Err(failure());
+                    }
+                }
+                elf_patch::Stage::AfterWrites => {
+                    *final_stamp.borrow_mut() = Some(stamp(&current));
+                }
+                elf_patch::Stage::AfterFinal => {
+                    if final_stamp.borrow().as_ref() != Some(&stamp(&current)) {
+                        return Err(failure());
+                    }
+                }
+            }
+            Ok(())
+        },
+    );
+    // Restore only this known owned inode's intended executable mode, even on a partial failure.
+    let restored = if Instant::now() >= report.cleanup_deadline {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "owned ELF restoration cleanup cutoff elapsed",
+        ))
+    } else {
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o555))
+            .and_then(|()| {
+                if Instant::now() >= report.cleanup_deadline {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "owned ELF restoration cleanup cutoff elapsed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+    };
+    let digest = match (result, restored) {
+        (Err(primary), Err(secondary)) => {
+            return Err(CiError::LaneFailures {
+                primary: Box::new(primary.into()),
+                secondary: Box::new(secondary.into()),
+            });
         }
-        if kind == 2 {
-            dynamic = Some((file, size));
-        }
-    }
-    let (start, size) = dynamic.ok_or_else(failure)?;
-    if size > 1024 * 1024 || size % 16 != 0 {
-        return Err(failure());
-    }
-    let start = usize::try_from(start).map_err(|_| failure())?;
-    let mut string_address = None;
-    let mut needed = None;
-    for ordinal in 0..usize::try_from(size / 16).map_err(|_| failure())? {
-        let offset = start
-            .checked_add(ordinal.checked_mul(16).ok_or_else(failure)?)
-            .ok_or_else(failure)?;
-        let tag = u64_at(offset)?;
-        let value = u64_at(offset + 8)?;
-        if tag == 0 {
-            break;
-        }
-        if tag == 5 {
-            string_address = Some(value);
-        }
-        if tag == 1 && needed.is_none() {
-            needed = Some((offset, value));
-        }
-    }
-    let address = string_address.ok_or_else(failure)?;
-    let string_base = loads
-        .iter()
-        .find_map(|(file, base, size)| {
-            address
-                .checked_sub(*base)
-                .filter(|delta| *delta < *size)
-                .and_then(|delta| file.checked_add(delta))
+        (Err(primary), _) => return Err(primary.into()),
+        (Ok(_), Err(secondary)) => return Err(secondary.into()),
+        (Ok(digest), Ok(())) => digest,
+    };
+    remaining(deadline)?;
+    let restored_metadata = verify()?;
+    let hashed_stamp = final_stamp.borrow();
+    if restored_metadata.mode() & 0o7777 != 0o555
+        || !hashed_stamp.as_ref().is_some_and(|hashed| {
+            (restored_metadata.mtime(), restored_metadata.mtime_nsec()) == (hashed.1, hashed.2)
         })
-        .ok_or_else(failure)?;
-    let (tag_offset, string_offset) = needed.ok_or_else(failure)?;
-    let position = usize::try_from(string_base.checked_add(string_offset).ok_or_else(failure)?)
-        .map_err(|_| failure())?;
-    let original = bytes.get(position..).ok_or_else(failure)?;
-    let length = original
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(failure)?;
-    if !(5..=4096).contains(&length) {
-        return Err(failure());
+    {
+        return Err(failure().into());
     }
-    bytes
-        .get_mut(tag_offset..tag_offset + 8)
-        .ok_or_else(failure)?
-        .copy_from_slice(&15u64.to_le_bytes());
-    bytes
-        .get_mut(position..position + 6)
-        .ok_or_else(failure)?
-        .copy_from_slice(b"/work\0");
-    Ok(())
+    // The original readonly custodian owner has remained live throughout the mutation.
+    report.image_partial_files[index].take();
+    Ok(digest)
 }
 
 fn export_case(
@@ -1343,6 +2307,7 @@ fn export_case(
         fixture_mode: scenario.into(),
         challenge: challenge_path,
         contract: contract_path.clone(),
+        memory_budget: None,
         activation: None,
         prepared: None,
         prepared_native: None,
@@ -1396,6 +2361,16 @@ fn export_case(
         &mut report.file_custody,
     )?;
     std::fs::set_permissions(&contract_path, std::fs::Permissions::from_mode(0o444))?;
+    let memory_receipt = directory.join("fixture-memory-budget.json");
+    let memory = retain_image_memory_budget(
+        context,
+        report,
+        context.images,
+        &activated.contract,
+        &format!("export-{scenario}"),
+        &memory_receipt,
+    )?;
+    report.export_observations[index].memory_budget = Some(memory_receipt);
     let arguments = vec![
         OsString::from("export-object"),
         OsString::from(hex(&challenge)),
@@ -1406,13 +2381,14 @@ fn export_case(
         remaining(context.deadline)?.as_millis().min(60_000)
     );
     let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+        lifetime: memcordon_core::Lifetime::Command,
         directory: &directory.join("launch"),
         contract: &contract_path,
         caller_uid: 65534,
         caller_gid: 65534,
         target_arguments: &arguments,
         deadline: std::ffi::OsStr::new(&product_budget),
-        memory: std::ffi::OsStr::new("+512MiB"),
+        memory: std::ffi::OsStr::new(&memory),
     })?;
     let launch_index = report.launches.len();
     report.launches.push(launch);
@@ -1456,13 +2432,76 @@ fn export_case(
     report.prepared_owners[observer_index]
         .acknowledge(&report.launches[launch_index].observation_directory)
         .map_err(CiError::Message)?;
-    let ready = wait_export_ready(
+    let ready_outcome = wait_export_ready(
         &report.launches[launch_index].stdout,
         &hex(&challenge),
         scenario,
         context.deadline,
         &report.prepared_owners[observer_index].target,
-    )?;
+    );
+    let ready = match ready_outcome {
+        Ok(ready) => ready,
+        Err(original) => {
+            use std::os::unix::process::ExitStatusExt;
+            let launch = &mut report.launches[launch_index];
+            let settlement = launch.wait_and_capture_until(context.cleanup_deadline);
+            let capture = |path: &Path| -> serde_json::Value {
+                if Instant::now() >= context.cleanup_deadline || !launch.capture_owners_settled() {
+                    return serde_json::json!({"state":"unavailable","reason":"original-capture-unsettled-or-cutoff"});
+                }
+                match super::linux_mixed_installed::read_policy_observation_file_nonblocking(
+                    path,
+                    16 * 1024 * 1024,
+                ) {
+                    Ok(bytes) => {
+                        serde_json::json!({"state":"observed","bytes":bytes.len(),"sha256":super::artifacts::checksum(&bytes),"prefix_hex":hex(&bytes[..bytes.len().min(1024)]),"omitted_bytes":bytes.len().saturating_sub(1024)})
+                    }
+                    Err(_) => {
+                        serde_json::json!({"state":"unavailable","reason":"original-capture-read-refused"})
+                    }
+                }
+            };
+            let target = &report.prepared_owners[observer_index];
+            let invocation_sha256 = if Instant::now() < context.cleanup_deadline {
+                launch
+                    .retained_frontend_invocation()
+                    .ok()
+                    .map(|bytes| super::artifacts::checksum(&bytes))
+            } else {
+                None
+            };
+            let mut diagnostic = serde_json::json!({"format":"memcordon.export-readiness-failure","revision":1,"diagnostic_only":true,
+                "scenario":scenario,"attempt_id":target.observation.admission.attempt_id,
+                "target_pid":target.target.process_id,"target_birth":target.target.birth,
+                "capture_settled":launch.capture_owners_settled(),"settlement_succeeded":settlement.is_ok(),
+                "original_frontend_native_exit":launch.frontend_status.as_ref().and_then(|status|status.code()),
+                "original_frontend_raw_wait_status":launch.frontend_status.as_ref().map(|status|(*status).into_raw()),
+                "original_frontend_signal":launch.frontend_status.as_ref().and_then(|status|status.signal()),
+                "original_invocation_sha256":invocation_sha256,
+                "stdout":capture(&launch.stdout),"stderr":capture(&launch.stderr)});
+            let publication = if Instant::now() < context.cleanup_deadline {
+                serde_json::to_vec(&diagnostic)
+                    .map_err(CiError::from)
+                    .and_then(|bytes| {
+                        retain(
+                            &directory.join("readiness-failure.json"),
+                            &bytes,
+                            &mut report.file_custody,
+                        )
+                    })
+            } else {
+                Err(CiError::Message(
+                    "original cleanup cutoff elapsed before failure evidence publication".into(),
+                ))
+            };
+            diagnostic["diagnostic_retention_succeeded"] = serde_json::json!(publication.is_ok());
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "export-readiness-failure {diagnostic}"
+            );
+            return Err(original);
+        }
+    };
     let ready_path = directory.join("ready.json");
     retain(
         &ready_path,
@@ -1568,14 +2607,22 @@ fn export_case(
             &directory,
             &challenge,
         )?);
-    } else if scenario == "device" {
+    } else if matches!(scenario, "device" | "fifo") {
+        let object = if scenario == "device" {
+            ExportSpecialObject::Device
+        } else {
+            ExportSpecialObject::Fifo
+        };
         let handles_start = report.administrative_export_handles.len();
-        let setup = create_owned_export_device(
+        let setup = create_owned_export_special(
             &report.prepared_owners[observer_index],
+            object,
+            context.account,
             &mut report.administrative_export_handles,
+            context.deadline,
         )?;
         let handles_end = report.administrative_export_handles.len();
-        let path = directory.join("device-created.json");
+        let path = directory.join(object.created_leaf());
         retain(
             &path,
             &serde_json::to_vec(&setup)?,
@@ -1603,6 +2650,8 @@ fn export_case(
             || setup["inode"] != device.ino()
             || setup["rdev"] != device.rdev()
             || setup["mode"] != device.mode()
+            || (object == ExportSpecialObject::Fifo
+                && (setup["uid"] != device.uid() || setup["gid"] != device.gid()))
             || (named_root.dev(), named_root.ino()) != (root.dev(), root.ino())
             || report.prepared_owners[observer_index]
                 .target
@@ -1617,7 +2666,7 @@ fn export_case(
         // PIDFD custody and must close before provider root retirement.
         let mut closures = Vec::new();
         let mut closure_errors = Vec::new();
-        for (role, file) in ["root", "work", "device"].into_iter().zip(
+        for (role, file) in ["root", "work", object.role()].into_iter().zip(
             report
                 .administrative_export_handles
                 .drain(handles_start..handles_end),
@@ -1636,7 +2685,7 @@ fn export_case(
         }
         report.failures.extend(closure_errors.iter().cloned());
         let publication = retain(
-            &directory.join("device-admin-handles-retired.json"),
+            &directory.join(object.closure_leaf()),
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.linux-export-administrative-handle-retirement","revision":1,
                 "attempt_id":report.prepared_owners[observer_index].observation.admission.attempt_id,
@@ -1654,6 +2703,7 @@ fn export_case(
         }
     }
     let source_path = directory.join("native-export-source.json");
+    remaining(context.deadline)?;
     if scenario != "concurrent-writer" {
         retain_export_worker(context, report, observer_index, &directory)?;
     }
@@ -1668,6 +2718,7 @@ fn export_case(
         &mut report.file_custody,
     )?;
     report.export_observations[index].native_source = Some(source_path);
+    remaining(context.deadline)?;
     report.launches[launch_index].release_fixture_barrier()?;
     if let Some(helper_index) = export_helper {
         finish_export_permission_helper(context, report, helper_index, observer_index)?;
@@ -1904,6 +2955,7 @@ pub fn retain_prepared_worker(
         ));
     }
     for (field, process) in [
+        ("frontend", &observer.caller),
         ("target", &observer.target),
         ("namespace_init", &observer.namespace_init),
         ("guardian", &observer.guardian),
@@ -2028,6 +3080,78 @@ pub fn retain_prepared_worker(
         "attempt_id":attempt,"provider":observer.observation.provider,"admission":observer.observation.admission,
         "journal_path":path,"journal_device":before.dev(),"journal_inode":before.ino(),"journal_sha256":hex(&Sha256::digest(&bytes)),
         "journal_bytes":bytes,"worker":{"pid":pid,"birth":birth,"image_sha256":expected_agent_sha256},"native_image":image}),
+    )
+}
+
+/// Pin the authenticated public control worker from the same protected journal
+/// already retained for this prepared execution worker. This is a separate
+/// native owner; it never substitutes for the unprivileged frontend.
+pub fn retain_prepared_control(
+    source: &serde_json::Value,
+    observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
+    expected_agent_sha256: &str,
+    deadline: Instant,
+    workers: &mut Vec<crate::linux_consumer_readiness::HeldLinuxProcess>,
+) -> Result<serde_json::Value> {
+    remaining(deadline)?;
+    let bytes: Vec<u8> = serde_json::from_value(source["journal_bytes"].clone())?;
+    if source["journal_sha256"] != hex(&Sha256::digest(&bytes)) {
+        return Err(CiError::Message(
+            "control source journal checksum differs".into(),
+        ));
+    }
+    let attempt = observer.observation.admission.attempt_id.as_str();
+    let record = super::linux_phase_journal::decode(&bytes, attempt).map_err(CiError::Message)?;
+    if record["mixed_admission_metadata"] != serde_json::to_value(&observer.observation.admission)?
+        || record["frontend"]
+            != serde_json::json!({"pid":observer.caller.process_id,"start_time":observer.caller.birth})
+    {
+        return Err(CiError::Message(
+            "control original caller/admission association differs".into(),
+        ));
+    }
+    let identity = &record["mixed_control"];
+    let pid = identity["pid"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
+        .ok_or_else(|| CiError::Message("authenticated control PID absent".into()))?;
+    let birth = identity["start_time"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CiError::Message("authenticated control birth absent".into()))?;
+    if identity.as_object().is_none_or(|object| object.len() != 2)
+        || [
+            observer.caller.process_id,
+            observer.target.process_id,
+            observer.namespace_init.process_id,
+            observer.guardian.process_id,
+        ]
+        .contains(&pid)
+        || workers.iter().any(|owner| owner.process_id == pid)
+    {
+        return Err(CiError::Message(
+            "authenticated control aliases original family".into(),
+        ));
+    }
+    workers.push(
+        crate::linux_consumer_readiness::HeldLinuxProcess::acquire(pid, birth)
+            .map_err(CiError::Message)?,
+    );
+    let owner = workers
+        .last_mut()
+        .expect("original authenticated control retained");
+    let image = owner
+        .hold_executable_image(deadline)
+        .map_err(CiError::Message)?;
+    if image["sha256"] != expected_agent_sha256 {
+        return Err(CiError::Message(
+            "authenticated control image differs from selected agent".into(),
+        ));
+    }
+    remaining(deadline)?;
+    Ok(
+        serde_json::json!({"pid":pid,"birth":birth,"native_image":image,"journal_sha256":source["journal_sha256"]}),
     )
 }
 
@@ -3114,6 +4238,44 @@ fn read_export_capture(file: &File, length: u64, deadline: Instant) -> Result<Ve
     }
 }
 
+fn ancestry_rejection(
+    reason: &str,
+    role: &str,
+    ordinal: usize,
+    component: &Path,
+    held: Option<&std::fs::Metadata>,
+    named: Option<&std::fs::Metadata>,
+) -> CiError {
+    use std::os::unix::ffi::OsStrExt;
+    const COMPONENT_CONTEXT_BYTES: usize = 128;
+    let component = component
+        .file_name()
+        .unwrap_or(component.as_os_str())
+        .as_bytes();
+    let prefix: Vec<_> = component
+        .iter()
+        .take(COMPONENT_CONTEXT_BYTES)
+        .copied()
+        .collect();
+    let stamp = |metadata: Option<&std::fs::Metadata>| {
+        metadata.map(|value| {
+            (
+                value.dev(),
+                value.ino(),
+                value.uid(),
+                value.gid(),
+                value.mode(),
+            )
+        })
+    };
+    CiError::Message(format!(
+        "{reason}; role={role}; component-index={ordinal}; component-prefix-bytes={prefix:?}; component-omitted-bytes={}; native-fields=(device,inode,uid,gid,mode); held={:?}; named={:?}",
+        component.len() - prefix.len(),
+        stamp(held),
+        stamp(named)
+    ))
+}
+
 fn hold_evidence_ancestry(path: &Path, deadline: Instant) -> Result<Vec<File>> {
     use std::path::Component;
     if !path.is_absolute()
@@ -3133,19 +4295,29 @@ fn hold_evidence_ancestry(path: &Path, deadline: Instant) -> Result<Vec<File>> {
     let mut named = PathBuf::from("/");
     let root = current.metadata()?;
     if !root.is_dir() || root.mode() & 0o022 != 0 {
-        return Err(CiError::Message(
-            "external capture root is not protected".into(),
+        return Err(ancestry_rejection(
+            "external capture root is not protected",
+            "retained-evidence",
+            0,
+            Path::new("/"),
+            Some(&root),
+            None,
         ));
     }
     held.push(current.try_clone()?);
-    for part in path.components().filter_map(|part| {
-        if let Component::Normal(name) = part {
-            Some(name)
-        } else {
-            None
-        }
-    }) {
+    for (ordinal, part) in path
+        .components()
+        .filter_map(|part| {
+            if let Component::Normal(name) = part {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .enumerate()
+    {
         remaining(deadline)?;
+        named.push(part);
         current = rustix::fs::openat(
             &current,
             part,
@@ -3155,17 +4327,35 @@ fn hold_evidence_ancestry(path: &Path, deadline: Instant) -> Result<Vec<File>> {
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )
-        .map_err(std::io::Error::from)?
+        .map_err(|error| {
+            let error = std::io::Error::from(error);
+            ancestry_rejection(
+                &format!(
+                    "external capture openat failed: kind={:?}; raw-os-error={:?}; cause={error}",
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+                "retained-evidence",
+                ordinal + 1,
+                &named,
+                None,
+                None,
+            )
+        })?
         .into();
-        named.push(part);
         let stamp = current.metadata()?;
         let expected_sticky_root = named == Path::new("/tmp")
             && stamp.uid() == 0
             && stamp.mode() & libc::S_ISVTX != 0
             && named != path;
         if !stamp.is_dir() || (stamp.mode() & 0o022 != 0 && !expected_sticky_root) {
-            return Err(CiError::Message(
-                "external capture ancestry is writable outside its original trusted owner".into(),
+            return Err(ancestry_rejection(
+                "external capture ancestry is writable outside its original trusted owner",
+                "retained-evidence",
+                ordinal + 1,
+                &named,
+                Some(&stamp),
+                None,
             ));
         }
         held.push(current.try_clone()?);
@@ -3173,36 +4363,100 @@ fn hold_evidence_ancestry(path: &Path, deadline: Instant) -> Result<Vec<File>> {
     Ok(held)
 }
 
-fn verify_evidence_ancestry(path: &Path, held: &[File], deadline: Instant) -> Result<()> {
+fn verify_evidence_ancestry<T: std::borrow::Borrow<File>>(
+    path: &Path,
+    held: &[T],
+    deadline: Instant,
+) -> Result<()> {
+    use std::path::Component;
     remaining(deadline)?;
-    let fresh = hold_evidence_ancestry(path, deadline)?;
-    if fresh.len() != held.len() {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(CiError::Message(
+            "external capture directory is not an absolute normalized path".into(),
+        ));
+    }
+    if path.components().count() != held.len() {
         return Err(CiError::Message(
             "external capture original ancestry cardinality changed".into(),
         ));
     }
-    for (original, named) in held.iter().zip(&fresh) {
+    let mut named_path = PathBuf::from("/");
+    let mut parts = path.components().filter_map(|part| {
+        if let Component::Normal(name) = part {
+            Some(name)
+        } else {
+            None
+        }
+    });
+    for (ordinal, original) in held.iter().enumerate() {
         remaining(deadline)?;
-        let original = original.metadata()?;
-        let named = named.metadata()?;
-        if (
-            original.dev(),
-            original.ino(),
-            original.uid(),
-            original.gid(),
-            original.mode(),
-        ) != (
-            named.dev(),
-            named.ino(),
-            named.uid(),
-            named.gid(),
-            named.mode(),
-        ) {
-            return Err(CiError::Message(
-                "external capture nofollow ancestry differs from original native owner".into(),
+        let fresh: File = if ordinal == 0 {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+                .open("/")?
+        } else {
+            let part = parts
+                .next()
+                .expect("validated original ancestry cardinality");
+            named_path.push(part);
+            rustix::fs::openat(
+                held[ordinal - 1].borrow(),
+                part,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?
+            .into()
+        };
+        let original = original.borrow().metadata()?;
+        let named = fresh.metadata()?;
+        let sticky_root = named_path == Path::new("/tmp")
+            && named_path != path
+            && named.uid() == 0
+            && named.mode() & libc::S_ISVTX != 0;
+        if !named.is_dir()
+            || (named.mode() & 0o022 != 0 && !sticky_root)
+            || (
+                original.dev(),
+                original.ino(),
+                original.uid(),
+                original.gid(),
+                original.mode(),
+            ) != (
+                named.dev(),
+                named.ino(),
+                named.uid(),
+                named.gid(),
+                named.mode(),
+            )
+        {
+            let component = path
+                .components()
+                .nth(ordinal)
+                .map(|part| Path::new(part.as_os_str()))
+                .unwrap_or(path);
+            return Err(ancestry_rejection(
+                "external capture nofollow ancestry differs from original native owner",
+                "retained-evidence",
+                ordinal,
+                component,
+                Some(&original),
+                Some(&named),
             ));
         }
     }
+    remaining(deadline)?;
     Ok(())
 }
 
@@ -3221,7 +4475,7 @@ fn wait_export_ready(
     };
     let kind = match scenario {
         "symlink" => "symlink",
-        "fifo" => "fifo",
+        "fifo" => "admin-fifo-required",
         "socket" => "socket",
         "device" => "admin-device-required",
         "traversal" => "parent-symlink",
@@ -3309,11 +4563,41 @@ fn wait_export_stage(
     }
 }
 
-fn create_owned_export_device(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportSpecialObject {
+    Device,
+    Fifo,
+}
+impl ExportSpecialObject {
+    fn role(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Fifo => "fifo",
+        }
+    }
+    fn created_leaf(self) -> &'static str {
+        match self {
+            Self::Device => "device-created.json",
+            Self::Fifo => "fifo-created.json",
+        }
+    }
+    fn closure_leaf(self) -> &'static str {
+        match self {
+            Self::Device => "device-admin-handles-retired.json",
+            Self::Fifo => "fifo-admin-handles-retired.json",
+        }
+    }
+}
+
+fn create_owned_export_special(
     observer: &crate::linux_consumer_readiness::PreparedLinuxObserver,
+    object: ExportSpecialObject,
+    account: &ExclusiveAccount,
     owners: &mut Vec<File>,
+    deadline: Instant,
 ) -> Result<serde_json::Value> {
     use rustix::fs::{FileType, Mode, OFlags, makedev, mknodat, openat};
+    remaining(deadline)?;
     if observer.target.exited().map_err(CiError::Message)? {
         return Err(CiError::Message(
             "native export device target is not held live".into(),
@@ -3351,12 +4635,21 @@ fn create_owned_export_device(
     let work_meta = work.metadata()?;
     let work_index = owners.len();
     owners.push(work);
+    remaining(deadline)?;
     mknodat(
         &owners[work_index],
         "exported.bin",
-        FileType::CharacterDevice,
+        if object == ExportSpecialObject::Device {
+            FileType::CharacterDevice
+        } else {
+            FileType::Fifo
+        },
         Mode::RUSR | Mode::WUSR,
-        makedev(1, 3),
+        if object == ExportSpecialObject::Device {
+            makedev(1, 3)
+        } else {
+            0
+        },
     )
     .map_err(std::io::Error::from)?;
     let device: File = openat(
@@ -3367,10 +4660,40 @@ fn create_owned_export_device(
     )
     .map_err(std::io::Error::from)?
     .into();
-    let actual = device.metadata()?;
+    let before = device.metadata()?;
     owners.push(device);
-    if actual.mode() & libc::S_IFMT != libc::S_IFCHR
-        || actual.rdev() != makedev(1, 3)
+    remaining(deadline)?;
+    let (kind, rdev, uid, gid) = if object == ExportSpecialObject::Device {
+        (libc::S_IFCHR, makedev(1, 3), 0, 0)
+    } else {
+        (libc::S_IFIFO, 0, account.uid, account.gid)
+    };
+    if before.mode() & libc::S_IFMT != kind || before.rdev() != rdev || before.nlink() != 1 {
+        return Err(CiError::Message(
+            "created export special object type/custody differs".into(),
+        ));
+    }
+    if object == ExportSpecialObject::Fifo {
+        // EMPTY_PATH applies ownership to the exact O_PATH inode already held,
+        // without a writable FIFO open or a mutable-name ownership operation.
+        remaining(deadline)?;
+        rustix::fs::chownat(
+            &owners[work_index + 1],
+            "",
+            Some(rustix::process::Uid::from_raw(uid)),
+            Some(rustix::process::Gid::from_raw(gid)),
+            rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(std::io::Error::from)?;
+    }
+    remaining(deadline)?;
+    let actual = owners[work_index + 1].metadata()?;
+    if actual.mode() & libc::S_IFMT != kind
+        || actual.rdev() != rdev
+        || actual.uid() != uid
+        || actual.gid() != gid
+        || actual.mode() & 0o7777 != 0o600
+        || (actual.dev(), actual.ino()) != (before.dev(), before.ino())
         || actual.nlink() != 1
         || observer.target.exited().map_err(CiError::Message)?
     {
@@ -3388,9 +4711,63 @@ fn create_owned_export_device(
             "native prepared root changed during private device setup".into(),
         ));
     }
-    Ok(
-        serde_json::json!({"format":"memcordon.linux-native-export-device","revision":1,"target_pid":observer.target.process_id,"target_birth":observer.target.birth,"root_device":metadata.dev(),"root_inode":metadata.ino(),"work_device":work_meta.dev(),"work_inode":work_meta.ino(),"path":"/work/exported.bin","device":actual.dev(),"inode":actual.ino(),"rdev":actual.rdev(),"mode":actual.mode(),"links":actual.nlink(),"held_live_before_and_after":true}),
+    let named_member: File = openat(
+        &owners[work_index],
+        "exported.bin",
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
     )
+    .map_err(std::io::Error::from)?
+    .into();
+    let named_work: File = openat(
+        &owners[root_index],
+        "work",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    let stamp = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.uid(),
+            m.gid(),
+            m.mode(),
+            m.nlink(),
+            m.rdev(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    let matched = stamp(&actual) == stamp(&named_member.metadata()?)
+        && stamp(&actual) == stamp(&owners[work_index + 1].metadata()?)
+        && (
+            owners[root_index].metadata()?.dev(),
+            owners[root_index].metadata()?.ino(),
+        ) == (metadata.dev(), metadata.ino())
+        && (
+            owners[work_index].metadata()?.dev(),
+            owners[work_index].metadata()?.ino(),
+        ) == (work_meta.dev(), work_meta.ino())
+        && (named_work.metadata()?.dev(), named_work.metadata()?.ino())
+            == (work_meta.dev(), work_meta.ino());
+    memcordon_platform::linux_checked_close(named_member.into())?;
+    memcordon_platform::linux_checked_close(named_work.into())?;
+    remaining(deadline)?;
+    if !matched || observer.target.exited().map_err(CiError::Message)? {
+        return Err(CiError::Message(
+            "export special object held/named identity or target liveness changed".into(),
+        ));
+    }
+    let mut receipt = serde_json::json!({"format":"memcordon.linux-native-export-device","revision":1,"target_pid":observer.target.process_id,"target_birth":observer.target.birth,"root_device":metadata.dev(),"root_inode":metadata.ino(),"work_device":work_meta.dev(),"work_inode":work_meta.ino(),"path":"/work/exported.bin","device":actual.dev(),"inode":actual.ino(),"rdev":actual.rdev(),"mode":actual.mode(),"links":actual.nlink(),"held_live_before_and_after":true});
+    if object == ExportSpecialObject::Fifo {
+        receipt["format"] = serde_json::json!("memcordon.linux-native-export-fifo");
+        receipt["attempt_id"] = serde_json::json!(observer.observation.admission.attempt_id);
+        receipt["uid"] = serde_json::json!(uid);
+        receipt["gid"] = serde_json::json!(gid);
+    }
+    Ok(receipt)
 }
 
 fn select_startup_members(images: &MixedImages) -> Result<(String, String, String)> {
@@ -3439,7 +4816,7 @@ fn select_startup_members(images: &MixedImages) -> Result<(String, String, Strin
     Ok((first, interpreter, library))
 }
 
-fn resolve_member(definition: &RuntimeImageDefinitionV1, path: &str) -> Result<String> {
+pub(super) fn resolve_member(definition: &RuntimeImageDefinitionV1, path: &str) -> Result<String> {
     let mut member = path.to_owned();
     for _ in 0..64 {
         match definition
@@ -3467,7 +4844,8 @@ fn copy_inventory(
     report: &mut ImageCaseReport,
     deadline: Instant,
 ) -> Result<()> {
-    report.directory_custody.extend(hold_ancestry(source)?);
+    report.ensure_cleanup_reserve()?;
+    report.hold_image_ancestry(source, false, deadline)?;
     for entry in definition.entries.as_slice() {
         remaining(deadline)?;
         let ImageEntryV1::Regular {
@@ -3485,32 +4863,36 @@ fn copy_inventory(
             .parent()
             .ok_or_else(|| CiError::Message("image member parent absent".into()))?;
         std::fs::create_dir_all(parent)?;
-        report
-            .directory_custody
-            .extend(hold_ancestry(input_path.parent().expect("member parent"))?);
-        report.directory_custody.extend(hold_ancestry(parent)?);
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&input_path)?;
+        report.hold_image_ancestry(input_path.parent().expect("member parent"), false, deadline)?;
+        report.hold_image_ancestry(parent, false, deadline)?;
+        let input = report.hold_image_file(&input_path, deadline)?;
+        let mut reader = image_custody::PositionalReader::new(&input);
         let before = input.metadata()?;
         if !before.is_file() || before.nlink() != 1 || before.len() != *size {
             return Err(CiError::Message(
                 "selected image source native type/size differs".into(),
             ));
         }
-        let mut output = OpenOptions::new()
+        remaining(deadline)?;
+        report.image_custody.reserve()?;
+        let output = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&output_path)?;
+            .open(&output_path)
+            .map_err(|error| report.custody_io("create-copy", &output_path, error))?;
+        let partial_index = report.image_partial_files.len();
+        report.image_partial_files.push(Some(output));
+        let mut output = report.image_partial_files[partial_index]
+            .as_ref()
+            .expect("retained copy writer");
         let mut hash = Sha256::new();
         let mut copied = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
             remaining(deadline)?;
-            let count = input.read(&mut buffer)?;
+            let count = reader.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
@@ -3553,15 +4935,26 @@ fn copy_inventory(
             ));
         }
         let written = output.metadata()?;
-        let mut copied_file = OpenOptions::new()
+        let copied_file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&output_path)?;
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&output_path)
+            .map_err(|error| report.custody_io("open-copy-readback", &output_path, error))?;
         let copied_metadata = copied_file.metadata()?;
+        if !copied_metadata.is_file()
+            || copied_metadata.nlink() != 1
+            || copied_metadata.len() != *size
+            || (written.dev(), written.ino()) != (copied_metadata.dev(), copied_metadata.ino())
+        {
+            return Err(CiError::Message(
+                "copied image reopened identity differs before readback".into(),
+            ));
+        }
+        let mut copied_reader = image_custody::PositionalReader::new(&copied_file);
         let mut copied_hash = Sha256::new();
         loop {
             remaining(deadline)?;
-            let count = copied_file.read(&mut buffer)?;
+            let count = copied_reader.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
@@ -3576,9 +4969,20 @@ fn copy_inventory(
                 "copied image named identity/readback differs from approved bytes".into(),
             ));
         }
-        report.file_custody.push(input);
-        report.file_custody.push(copied_file);
+        remaining(deadline)?;
+        let (copied_owner, _lease) = report.image_custody.admit(
+            super::linux_image_custodian::Role::AdministrativeFile,
+            &output_path,
+            copied_file,
+            deadline,
+            report.cleanup_deadline,
+        )?;
+        report.image_file_witnesses.push(copied_owner);
+        // Only the verified readonly owner replaces this object's writer.
+        // Failed copies keep the original writer in the report.
+        report.image_partial_files[partial_index].take();
     }
+    remaining(deadline)?;
     Ok(())
 }
 
@@ -3589,7 +4993,13 @@ fn hold_ancestry(path: &Path) -> Result<Vec<File>> {
         ));
     }
     let mut result = Vec::new();
-    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+    for (ordinal, ancestor) in path
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .enumerate()
+    {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
@@ -3602,8 +5012,13 @@ fn hold_ancestry(path: &Path) -> Result<Vec<File>> {
             || held.uid() != 0
             || (held.mode() & 0o022 != 0 && held.mode() & libc::S_ISVTX == 0)
         {
-            return Err(CiError::Message(
-                "image source/staging ancestry is not protected native root custody".into(),
+            return Err(ancestry_rejection(
+                "image source/staging ancestry is not protected native root custody",
+                "administrative-source/staging",
+                ordinal,
+                ancestor,
+                Some(&held),
+                Some(&named),
             ));
         }
         result.push(file);
@@ -3659,3 +5074,15 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[cfg(test)]
+#[path = "../../tests/private/linux_image_custody_fixture.rs"]
+mod custody_fixture;
+
+#[cfg(test)]
+#[path = "../../tests/private/linux_image_evidence_capture.rs"]
+mod evidence_capture_tests;
+
+#[cfg(test)]
+#[path = "../../tests/private/linux_image_fd_custody.rs"]
+mod fd_custody_tests;

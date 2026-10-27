@@ -89,6 +89,7 @@ pub(super) fn run(
     root: &memcordon_core::WindowsProcessIdentityV1,
     original_child: &std::process::Child,
     mut acknowledge: impl FnMut(&Created) -> io::Result<()>,
+    mut observe: impl FnMut(&str, serde_json::Value) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut held = BTreeMap::<u32, OwnedHandle>::new();
     let mut breakpoints = BTreeSet::new();
@@ -96,13 +97,35 @@ pub(super) fn run(
     let mut pending_process = None;
     let mut active = BTreeSet::new();
     let mut identities = BTreeMap::<u32, u64>::new();
+    let mut diagnostic_members =
+        BTreeMap::<u32, super::toolchain_diagnostics::CreationIdentity>::new();
+    let mut exits = super::toolchain_diagnostics::ExitState::new(original_child.id());
+    let mut last_event = serde_json::Value::Null;
+    let mut changed = true;
+    let mut ack_validated = false;
+    let mut continued = false;
     let outcome = (|| {
         for _ in 0..131_072 {
             let mut event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+            // Persist only meaningful state transitions, never DLL/poll iterations.
+            if changed {
+                observe(
+                    "before-debug-wait",
+                    serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(), held.len()),
+                    "last_event":last_event,"pending_event":pending,"ack_validated":ack_validated,"continued":continued,
+                    "original_child_pid":original_child.id(),"exit_observations":exits.snapshot()}),
+                )?;
+                changed = false;
+            }
             if unsafe { WaitForDebugEvent(&mut event, remaining(cutoff, frequency)?) } == 0 {
-                return Err(io::Error::last_os_error());
+                return Err(operation_error(
+                    "WaitForDebugEvent",
+                    Some(original_child.id()),
+                    io::Error::last_os_error(),
+                ));
             }
             pending = Some((event.dwProcessId, event.dwThreadId));
+            let mut observed_exit = None;
             let mut continuation = DBG_CONTINUE;
             match event.dwDebugEventCode {
                 CREATE_PROCESS_DEBUG_EVENT => {
@@ -242,7 +265,7 @@ pub(super) fn run(
                         return Err(io::Error::other("toolchain creation image exceeds bound"));
                     }
                     use sha2::Digest;
-                    acknowledge(&Created {
+                    let created = Created {
                         identity: memcordon_core::WindowsProcessIdentityV1 {
                             process_id: event.dwProcessId,
                             creation_time_100ns: child_birth,
@@ -253,8 +276,53 @@ pub(super) fn run(
                         image_sha256: String::from(memcordon_core::DiagnosticSha256::from_bytes(
                             sha2::Sha256::digest(&bytes).into(),
                         )),
-                    })?;
+                    };
+                    let member = super::toolchain_diagnostics::CreationIdentity {
+                        pid: created.identity.process_id,
+                        birth: created.identity.creation_time_100ns,
+                        parent_pid: created.parent_pid,
+                        parent_birth: created.parent_birth,
+                        image_sha256: created.image_sha256.clone(),
+                        held_process_owner: true,
+                        image_observation: "creation-event-owned-file",
+                    };
+                    exits.created(&member);
+                    diagnostic_members.insert(event.dwProcessId, member);
+                    last_event = serde_json::json!({"kind":"create-process","pid":event.dwProcessId,"tid":event.dwThreadId});
+                    ack_validated = false;
+                    continued = false;
+                    observe(
+                        "creation-held-before-ack",
+                        serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(),held.len()),"event":last_event,"pending_event":pending,"ack_validated":false,"continued":false,"exit_observations":exits.snapshot()}),
+                    )?;
+                    acknowledge(&created)?;
+                    ack_validated = true;
+                    observe(
+                        "creation-ack-validated-before-continue",
+                        serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(),held.len()),"event":last_event,"pending_event":pending,"ack_validated":true,"continued":false,"exit_observations":exits.snapshot()}),
+                    )?;
                     remaining(cutoff, frequency)?;
+                    changed = true;
+                }
+                EXIT_PROCESS_DEBUG_EVENT => {
+                    // The discriminant establishes this union member. Copy its
+                    // scalar while original creation owners are still retained.
+                    let native_exit_status = unsafe { event.u.ExitProcess.dwExitCode };
+                    let creation = diagnostic_members.get(&event.dwProcessId).filter(|member| {
+                        held.contains_key(&event.dwProcessId)
+                            && identities.get(&event.dwProcessId) == Some(&member.birth)
+                    });
+                    let observation = exits.observe_exit(
+                        event.dwProcessId,
+                        event.dwThreadId,
+                        native_exit_status,
+                        creation,
+                    );
+                    last_event = serde_json::to_value(&observation)
+                        .expect("finite scalar exit observation serializes");
+                    observed_exit = Some(observation);
+                    continued = false;
+                    ack_validated = false;
                 }
                 LOAD_DLL_DEBUG_EVENT => {
                     let file = unsafe { event.u.LoadDll.hFile };
@@ -277,16 +345,47 @@ pub(super) fn run(
             }
             if unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continuation) } == 0
             {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                if let Some(observation) = observed_exit.as_mut() {
+                    exits.continuation_result(observation, Err(error.raw_os_error()));
+                    last_event = serde_json::to_value(observation)
+                        .expect("finite scalar exit observation serializes");
+                }
+                return Err(operation_error(
+                    "ContinueDebugEvent",
+                    Some(event.dwProcessId),
+                    error,
+                ));
             }
             pending = None;
             pending_process = None;
+            if let Some(observation) = observed_exit.as_mut() {
+                exits.continuation_result(observation, Ok(()));
+                last_event = serde_json::to_value(observation)
+                    .expect("finite scalar exit observation serializes");
+                continued = true;
+            }
+            if event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+                continued = true;
+                observe(
+                    "creation-continued",
+                    serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(),held.len()),"event":last_event,"pending_event":pending,"ack_validated":ack_validated,"continued":true,"exit_observations":exits.snapshot()}),
+                )?;
+            }
             if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
                 held.remove(&event.dwProcessId).ok_or_else(|| {
                     io::Error::other("toolchain exit event lacks original creation owner")
                 })?;
                 active.remove(&event.dwProcessId);
                 identities.remove(&event.dwProcessId);
+                diagnostic_members.remove(&event.dwProcessId);
+                continued = true;
+                ack_validated = false;
+                changed = true;
+                observe(
+                    "exit-continued",
+                    serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(),held.len()),"event":last_event,"pending_event":pending,"continued":true,"exit_observations":exits.snapshot()}),
+                )?;
                 if held.is_empty() {
                     return Ok(());
                 }
@@ -297,6 +396,10 @@ pub(super) fn run(
         ))
     })();
     if let Err(original) = outcome {
+        let retained_state = serde_json::json!({"active":super::toolchain_diagnostics::inventory(diagnostic_members.values(),held.len()),
+            "last_event":last_event,"pending_event":pending,"ack_validated":ack_validated,
+            "continued":continued,"original_child_pid":original_child.id(),"exit_observations":exits.snapshot()});
+        let diagnostic_retention = observe("debug-error-before-cleanup", retained_state.clone());
         // Do not detach a live failed child and let it continue unobserved.
         let mut cleanup = Vec::new();
         // The original creation owner exists even if the cutoff expired before
@@ -396,7 +499,8 @@ pub(super) fn run(
             cleanup.push("original compiler retirement unproved".into());
         }
         return Err(io::Error::other(format!(
-            "{original}; debug cleanup={cleanup:?}"
+            "{original}; original-raw-os-error={:?}; held-debug-state={retained_state}; diagnostic-retention={diagnostic_retention:?}; debug cleanup={cleanup:?}",
+            original.raw_os_error()
         )));
     }
     Ok(())

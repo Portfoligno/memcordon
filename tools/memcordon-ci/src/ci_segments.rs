@@ -174,6 +174,7 @@ pub fn scopes(suite: Suite) -> Vec<CompiledScope<'static>> {
             Some(P::AuxiliaryProfiles),
             "compiled-recipe-complete",
         )],
+        Suite::WindowsFixtureNative => ordinary("windows-fixture-native-v1", "complete"),
         Suite::SupplyChain
         | Suite::PrepareTools
         | Suite::SupplyAudit
@@ -402,6 +403,7 @@ fn run_resolved(root: &Path, suite: Suite, mode: FailureMode) -> Result<()> {
     let sources = matches!(
         suite,
         Suite::WorkspaceFetch
+            | Suite::WindowsFixtureNative
             | Suite::FuzzFetch
             | Suite::PrepareTools
             | Suite::PrepareFuzz

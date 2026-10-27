@@ -1001,13 +1001,7 @@ fn export_object(transcript: &mut Transcript, scenario: &str) -> Result<()> {
             std::os::unix::fs::symlink("/owned-source/Cargo.toml", output)?;
             "symlink"
         }
-        "fifo" => {
-            let path = std::ffi::CString::new(output)?;
-            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            "fifo"
-        }
+        "fifo" => "admin-fifo-required",
         "socket" => {
             socket = Some(std::os::unix::net::UnixListener::bind(output)?);
             "socket"

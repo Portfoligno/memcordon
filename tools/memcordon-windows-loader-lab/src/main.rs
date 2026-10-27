@@ -19,6 +19,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Role {
+    #[cfg(windows)]
+    ObserveToolchainWait {
+        #[arg(long)]
+        request_mapping: u64,
+        #[arg(long)]
+        output: u64,
+        #[arg(long)]
+        protocol: u32,
+    },
     WorkloadDesktopHolder {
         #[arg(long)]
         request: PathBuf,
@@ -28,10 +37,14 @@ enum Role {
         stop: u64,
         #[arg(long)]
         target_token: u64,
+        #[arg(long)]
+        target_probe_token: u64,
     },
     RunWorkload {
         #[arg(long)]
         request: PathBuf,
+        #[arg(long)]
+        request_sha256: String,
         #[arg(long)]
         result: PathBuf,
     },
@@ -40,6 +53,8 @@ enum Role {
         service_name: String,
         #[arg(long)]
         request: PathBuf,
+        #[arg(long)]
+        request_sha256: String,
         #[arg(long)]
         result: PathBuf,
         #[arg(long)]
@@ -99,16 +114,37 @@ enum Role {
 
 fn main() {
     let result = match Cli::parse().role {
+        #[cfg(windows)]
+        Role::ObserveToolchainWait {
+            request_mapping,
+            output,
+            protocol,
+        } => {
+            memcordon_windows_loader_lab::helper_wait_worker::run(request_mapping, output, protocol)
+                .map_err(|error| {
+                    format!(
+                        "helper wait observer unavailable; kind={:?}; raw-os-error={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    )
+                })
+        }
         Role::WorkloadDesktopHolder {
             request,
             ready,
             stop,
             target_token,
-        } => run_workload_holder(&request, ready, stop, target_token),
-        Role::RunWorkload { request, result } => controller::run_workload(&request, &result),
+            target_probe_token,
+        } => run_workload_holder(&request, ready, stop, target_token, target_probe_token),
+        Role::RunWorkload {
+            request,
+            result,
+            request_sha256,
+        } => controller::run_workload(&request, &result, &request_sha256),
         Role::ServiceWorkload {
             service_name,
             request,
+            request_sha256,
             result,
             source_process_id,
             source_creation_time,
@@ -117,6 +153,7 @@ fn main() {
             &service_name,
             &request,
             &result,
+            &request_sha256,
             source_process_id,
             source_creation_time,
             source_token,
@@ -166,12 +203,13 @@ fn run_workload_holder(
     ready: u64,
     stop: u64,
     target_token: u64,
+    target_probe_token: u64,
 ) -> Result<(), String> {
-    workload_native::run_desktop_holder(request, ready, stop, target_token)
+    workload_native::run_desktop_holder(request, ready, stop, target_token, target_probe_token)
 }
 
 #[cfg(not(windows))]
-fn run_workload_holder(_: &std::path::Path, _: u64, _: u64, _: u64) -> Result<(), String> {
+fn run_workload_holder(_: &std::path::Path, _: u64, _: u64, _: u64, _: u64) -> Result<(), String> {
     Err("actual-workload desktop holder requires native Windows".into())
 }
 
@@ -180,6 +218,7 @@ fn run_workload_service(
     name: &str,
     request: &std::path::Path,
     result: &std::path::Path,
+    request_sha256: &str,
     source_pid: u32,
     source_birth: u64,
     source_token: u64,
@@ -188,6 +227,7 @@ fn run_workload_service(
         name,
         request,
         result,
+        request_sha256,
         source_pid,
         source_birth,
         source_token,
@@ -199,6 +239,7 @@ fn run_workload_service(
     _: &str,
     _: &std::path::Path,
     _: &std::path::Path,
+    _: &str,
     _: u32,
     _: u64,
     _: u64,

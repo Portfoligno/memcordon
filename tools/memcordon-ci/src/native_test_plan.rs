@@ -62,6 +62,18 @@ pub struct NativeTestCommand {
     pub deadline: Duration,
 }
 
+/// Independent Windows fixture contract, under the original native phase
+/// allocations. The calling suite's captured operation cutoff bounds both.
+pub fn windows_fixture_commands() -> Vec<NativeTestCommand> {
+    crate::windows_fixture_native::commands(BUILD_DEADLINE, DESKTOP_EXECUTION_DEADLINE)
+        .into_iter()
+        .map(|command| NativeTestCommand {
+            arguments: command.arguments,
+            deadline: command.deadline,
+        })
+        .collect()
+}
+
 pub fn commands(release_mode: bool) -> Vec<NativeTestCommand> {
     commands_with_failure(
         release_mode,

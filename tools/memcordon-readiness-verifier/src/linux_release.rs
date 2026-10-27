@@ -303,8 +303,34 @@ pub fn validate_linux_release_ownership(
         return Err("leased journal envelope has extra fields".into());
     }
     let record: Value = crate::wire::decode(payload.as_bytes())?;
+    let mut schema_record = record.clone();
+    if let Some(control) = schema_record
+        .as_object_mut()
+        .and_then(|object| object.remove("mixed_control"))
+    {
+        closed_fields(&control, &["pid", "start_time"])?;
+        if control["pid"]
+            .as_u64()
+            .is_none_or(|pid| pid == 0 || pid > i32::MAX as u64)
+            || control["start_time"]
+                .as_u64()
+                .is_none_or(|birth| birth == 0)
+            || [
+                "frontend",
+                "mixed_worker",
+                "guardian",
+                "target",
+                "namespace_init",
+            ]
+            .iter()
+            .any(|actor| control["pid"] == record[*actor]["pid"])
+            || record["mixed_admission_metadata"].is_null()
+        {
+            return Err("leased authenticated control identity differs".into());
+        }
+    }
     closed_fields(
-        &record,
+        &schema_record,
         &[
             "attempt_id",
             "boot_identity",

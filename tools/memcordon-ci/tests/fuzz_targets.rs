@@ -1,6 +1,127 @@
 use std::collections::BTreeSet;
 
-use memcordon_ci::fuzz_targets::{FuzzShard, targets};
+use memcordon_ci::fuzz_targets::{FuzzShard, RequiredFeature, plans_sharded, targets};
+
+#[test]
+fn typed_plans_preserve_all_targets_and_only_six_ci_dependency_requirements() {
+    let manifest = include_str!("../../../fuzz/Cargo.toml");
+    let plans = plans_sharded(manifest, None).unwrap();
+    assert_eq!(plans.len(), 52);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.name.clone())
+            .collect::<Vec<_>>(),
+        targets(manifest, None).unwrap()
+    );
+    let ci: Vec<_> = plans
+        .iter()
+        .filter(|plan| !plan.required_features.is_empty())
+        .map(|plan| plan.name.as_str())
+        .collect();
+    assert_eq!(
+        ci,
+        [
+            "mount-context-manifest",
+            "policy_parser",
+            "release-asset-components",
+            "runtime-manifest",
+            "target-distribution",
+            "workflow_parser"
+        ]
+    );
+    let mut covered = BTreeSet::new();
+    for index in 0..4 {
+        let shard = memcordon_ci::target_shard::ShardSpec::new(
+            index,
+            std::num::NonZeroUsize::new(4).unwrap(),
+        )
+        .unwrap();
+        for plan in plans_sharded(manifest, Some(shard)).unwrap() {
+            assert_eq!(
+                plans.iter().find(|original| original.name == plan.name),
+                Some(&plan)
+            );
+            assert!(covered.insert(plan.name));
+        }
+    }
+    assert_eq!(
+        covered.into_iter().collect::<Vec<_>>(),
+        targets(manifest, None).unwrap()
+    );
+    for plan in &plans {
+        let mut build: Vec<std::ffi::OsString> =
+            vec!["fuzz".into(), "build".into(), plan.name.clone().into()];
+        let mut run: Vec<std::ffi::OsString> =
+            vec!["fuzz".into(), "run".into(), plan.name.clone().into()];
+        if ci.contains(&plan.name.as_str()) {
+            assert_eq!(plan.required_features, [RequiredFeature::CiTargets]);
+            build.extend(["--features".into(), "ci-targets".into()]);
+            run.extend(["--features".into(), "ci-targets".into()]);
+        } else {
+            assert!(plan.required_features.is_empty());
+        }
+        run.extend([
+            "--".into(),
+            "-max_total_time=30".into(),
+            if plan.name.starts_with("workload-") {
+                "-max_len=1048576".into()
+            } else {
+                "-max_len=4096".into()
+            },
+        ]);
+        assert_eq!(plan.build_arguments(), build);
+        assert_eq!(plan.run_arguments(), run);
+        let serialized = serde_json::to_value(plan).unwrap();
+        assert_eq!(
+            serialized["required_features"],
+            if ci.contains(&plan.name.as_str()) {
+                serde_json::json!(["ci-targets"])
+            } else {
+                serde_json::json!([])
+            }
+        );
+    }
+}
+
+#[test]
+fn required_features_are_explicit_closed_and_never_silently_omitted() {
+    for requirements in [
+        "'ci-targets'",
+        "true",
+        "[1]",
+        "['unknown']",
+        "['ci-targets','ci-targets']",
+        "['ci-targets','future']",
+    ] {
+        let manifest = format!("[[bin]]\nname='selected'\nrequired-features={requirements}\n");
+        assert!(plans_sharded(&manifest, None).is_err(), "{manifest}");
+        assert!(
+            targets(&manifest, None).is_err(),
+            "legacy API must also reject {manifest}"
+        );
+    }
+    for requirement in ["", "required-features=[]"] {
+        let manifest = format!("[[bin]]\nname='future_ordinary'\n{requirement}\n");
+        let plan = plans_sharded(&manifest, None).unwrap().remove(0);
+        assert!(plan.required_features.is_empty());
+        assert_eq!(
+            plan.build_arguments(),
+            ["fuzz", "build", "future_ordinary"].map(std::ffi::OsString::from)
+        );
+    }
+    let plan = plans_sharded(
+        "[[bin]]\nname='future_ci'\nrequired-features=['ci-targets']",
+        None,
+    )
+    .unwrap()
+    .remove(0);
+    assert_eq!(plan.required_features, [RequiredFeature::CiTargets]);
+    assert_eq!(
+        plan.build_arguments(),
+        ["fuzz", "build", "future_ci", "--features", "ci-targets"].map(std::ffi::OsString::from)
+    );
+}
 
 #[test]
 fn retained_probe_and_distribution_seeds_reach_valid_models_and_reject_substitution() {

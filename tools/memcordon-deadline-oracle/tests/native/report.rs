@@ -14,15 +14,15 @@ fn report(authorized: bool) -> Value {
 }
 #[test]
 fn coherent_deadline_paths_classify() {
-    for (authorized, expected) in [
-        (false, ObservedLifecycle::PreAuthorizationExpired),
-        (true, ObservedLifecycle::AuthorizedExpired),
+    for (authorized, guardian_ready, expected) in [
+        (false, false, ObservedLifecycle::PreAuthorizationExpired),
+        (false, true, ObservedLifecycle::PreAuthorizationExpired),
+        (true, true, ObservedLifecycle::AuthorizedExpired),
     ] {
-        let proof = classify_report(
-            &serde_json::to_vec(&report(authorized)).unwrap(),
-            SCENARIOS[0],
-        )
-        .unwrap();
+        let mut value = report(authorized);
+        value["attempts"][0]["launch"]["guardian_started_before_authorization"] =
+            json!(guardian_ready);
+        let proof = classify_report(&serde_json::to_vec(&value).unwrap(), SCENARIOS[0]).unwrap();
         assert_eq!(proof.lifecycle, expected);
         assert_eq!(proof.target_pid, authorized.then_some(42));
     }
@@ -126,11 +126,6 @@ fn contradictory_report_mutations_fail_closed() {
             json!(false),
         ),
         (
-            false,
-            "/attempts/0/launch/guardian_started_before_authorization",
-            json!(true),
-        ),
-        (
             true,
             "/attempts/0/launch/target_spawn_error_reported",
             json!(true),
@@ -186,6 +181,61 @@ fn contradictory_report_mutations_fail_closed() {
     let attempt = multiple["attempts"][0].clone();
     multiple["attempts"].as_array_mut().unwrap().push(attempt);
     assert!(classify_report(&serde_json::to_vec(&multiple).unwrap(), SCENARIOS[0]).is_err());
+}
+#[test]
+fn ready_guardian_before_authorization_preserves_all_target_and_retirement_requirements() {
+    let mut baseline = report(false);
+    baseline["attempts"][0]["launch"]["guardian_started_before_authorization"] = json!(true);
+    classify_report(&serde_json::to_vec(&baseline).unwrap(), SCENARIOS[0]).unwrap();
+    for (path, value) in [
+        ("/supervision/targets_authorized", json!(1)),
+        ("/attempts/0/authorized_offset_ms", json!(10)),
+        ("/attempts/0/target_pid", json!(42)),
+        ("/attempts/0/runtime/target_pid", json!(42)),
+        ("/attempts/0/launch/target_released", json!(true)),
+        (
+            "/attempts/0/launch/target_spawn_error_reported",
+            json!(true),
+        ),
+        (
+            "/attempts/0/outcome/cleanup/direct_child_reaped",
+            json!(false),
+        ),
+        ("/attempts/0/outcome/cleanup/workload_empty", json!(false)),
+        (
+            "/attempts/0/restart_safety/direct_child_reaped",
+            json!(false),
+        ),
+        ("/attempts/0/restart_safety/helpers_reaped", json!(false)),
+        ("/attempts/0/restart_safety/workload_empty", json!(false)),
+        (
+            "/attempts/0/runtime/retirement/target_reaped_or_absent",
+            json!(false),
+        ),
+        (
+            "/attempts/0/runtime/retirement/group_reconciled",
+            json!(false),
+        ),
+        (
+            "/attempts/0/runtime/retirement/detached_identities_discharged",
+            json!(false),
+        ),
+        (
+            "/attempts/0/runtime/retirement/native_obligations_settled",
+            json!(false),
+        ),
+        (
+            "/attempts/0/runtime/retirement/policy_retired",
+            json!(false),
+        ),
+    ] {
+        let mut changed = baseline.clone();
+        *changed.pointer_mut(path).unwrap() = value;
+        assert!(
+            classify_report(&serde_json::to_vec(&changed).unwrap(), SCENARIOS[0]).is_err(),
+            "ready guardian accepted contradictory {path}"
+        );
+    }
 }
 #[test]
 fn supervision_setup_offset_does_not_change_work_budget() {

@@ -774,6 +774,7 @@ version = "0.5.8-dev"
 dependencies = [
  "libc",
  "memcordon-core",
+ "memcordon-windows-launch-core",
  "serde",
  "serde_json",
  "sha2",
@@ -832,6 +833,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

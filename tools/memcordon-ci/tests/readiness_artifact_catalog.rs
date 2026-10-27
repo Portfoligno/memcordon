@@ -69,6 +69,62 @@ fn record(path: &str) -> Artifact {
 }
 
 #[test]
+fn over_budget_catalog_reports_exact_totals_and_bounded_largest_sources() {
+    let records: Vec<_> = (0..12)
+        .map(|index| Artifact {
+            path: format!("evidence/{index}"),
+            length: MAX_ARTIFACT_BYTES,
+            sha256: record("unused").sha256,
+        })
+        .collect();
+    let overhead = 17;
+    let error = preflight_unique(&records, overhead, cutoff())
+        .unwrap_err()
+        .to_string();
+    let detail = error
+        .split_once("artifact unique byte plan exceeds producer bound: ")
+        .unwrap()
+        .1;
+    let facts: serde_json::Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(
+        facts["total"],
+        overhead + records.len() as u64 * MAX_ARTIFACT_BYTES
+    );
+    assert_eq!(facts["limit"], MAX_PRODUCER_BYTES);
+    assert_eq!(facts["overhead"], overhead);
+    assert_eq!(facts["unique_count"], records.len());
+    assert_eq!(facts["largest"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        facts["declared_content_bytes"],
+        overhead + MAX_ARTIFACT_BYTES
+    );
+    assert_eq!(facts["declared_content_groups"], 1);
+    assert_eq!(
+        facts["declared_duplicate_bytes"],
+        (records.len() as u64 - 1) * MAX_ARTIFACT_BYTES
+    );
+    assert_eq!(facts["declared_redundant_groups"], 1);
+    assert_eq!(
+        facts["largest_declared_redundant_groups"][0]["count"],
+        records.len()
+    );
+    assert_eq!(facts["content_custody_verified"], false);
+    assert!(error.len() < 16 * 1024);
+    let mut called = false;
+    assert!(
+        CanonicalCatalog::build(&records, overhead, cutoff(), |_| {
+            called = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(
+        !called,
+        "over-budget plans cannot acquire publication authority"
+    );
+}
+
+#[test]
 fn shared_references_are_each_validated_but_only_unique_bytes_are_planned() {
     let shared = record("lifetime/shared.bin");
     let later = record("recipe-59/journal.bin");

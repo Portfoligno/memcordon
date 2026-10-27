@@ -40,38 +40,9 @@ pub fn resolve(command: &Value, contract_bytes: Option<&[u8]>) -> Result<Value, 
     let arguments: Vec<Vec<u8>> =
         serde_json::from_value(command["arguments"].clone()).map_err(|error| error.to_string())?;
     if let Some(endpoint) = command.get("endpoint_access") {
-        closed(
-            endpoint,
-            &[
-                "format",
-                "revision",
-                "path",
-                "device",
-                "inode",
-                "uid",
-                "gid",
-                "mode",
-                "links",
-                "supplementary_groups",
-                "group_argument",
-            ],
-        )?;
-        let gid = number(&endpoint["gid"])?;
+        let gid = endpoint_group(endpoint)?;
         let argument = format!("--groups={gid}").into_bytes();
-        if endpoint["format"] != "memcordon.linux-owned-frontend-endpoint-access"
-            || endpoint["revision"] != 1
-            || path(&endpoint["path"])? != b"/run/memcordon/sealed-agent.sock"
-            || number(&endpoint["device"])? == 0
-            || number(&endpoint["inode"])? == 0
-            || endpoint["uid"] != 0
-            || gid == 0
-            || gid > u64::from(u32::MAX)
-            || endpoint["mode"] != 0o140660
-            || endpoint["links"] != 1
-            || endpoint["supplementary_groups"] != serde_json::json!([gid])
-            || bytes(&endpoint["group_argument"])? != argument
-            || arguments.get(4) != Some(&argument)
-        {
+        if arguments.get(4) != Some(&argument) {
             return Err("frontend supplementary group differs from held public endpoint".into());
         }
     } else if arguments.get(4).map(Vec::as_slice) != Some(b"--clear-groups") {
@@ -237,4 +208,43 @@ pub fn resolve(command: &Value, contract_bytes: Option<&[u8]>) -> Result<Value, 
         .remove("file_access");
     resolved["arguments"] = serde_json::to_value(arguments).map_err(|error| error.to_string())?;
     Ok(resolved)
+}
+
+/// Decode the same finite original endpoint observation used by the frontend
+/// invocation and the independent control-intervention receipt.
+pub(crate) fn endpoint_group(endpoint: &Value) -> Result<u32, String> {
+    closed(
+        endpoint,
+        &[
+            "format",
+            "revision",
+            "path",
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "links",
+            "supplementary_groups",
+            "group_argument",
+        ],
+    )?;
+    let gid = number(&endpoint["gid"])?;
+    let argument = format!("--groups={gid}").into_bytes();
+    if endpoint["format"] != "memcordon.linux-owned-frontend-endpoint-access"
+        || endpoint["revision"] != 1
+        || path(&endpoint["path"])? != b"/run/memcordon/sealed-agent.sock"
+        || number(&endpoint["device"])? == 0
+        || number(&endpoint["inode"])? == 0
+        || endpoint["uid"] != 0
+        || gid == 0
+        || gid > u64::from(u32::MAX)
+        || endpoint["mode"] != 0o140660
+        || endpoint["links"] != 1
+        || endpoint["supplementary_groups"] != serde_json::json!([gid])
+        || bytes(&endpoint["group_argument"])? != argument
+    {
+        return Err("frontend supplementary group differs from held public endpoint".into());
+    }
+    Ok(gid as u32)
 }

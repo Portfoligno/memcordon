@@ -213,6 +213,7 @@ pub fn roots(purpose: &str, shard: &str) -> Result<Vec<PathBuf>> {
         }
         ("msrv", "complete") => &["target/ci/msrv"],
         ("native-debug", "complete") => &["target/ci/native"],
+        ("windows-fixture-native-v1", "complete") => &[crate::windows_fixture_native::TARGET_DIR],
         ("native-auxiliary", "complete") => &["target/debug", "target/release"],
         ("private", "complete") => &[
             "target/ci-build/product",

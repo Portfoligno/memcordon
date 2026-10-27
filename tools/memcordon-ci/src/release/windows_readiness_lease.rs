@@ -37,6 +37,7 @@ pub(crate) fn retain_payload(
 ) -> Result<(
     Vec<crate::windows_installed_cases::SelectedArtifact>,
     crate::windows_installed_cases::SelectedArtifact,
+    Option<crate::windows_installed_cases::WorkloadDiagnosticInput>,
     Vec<crate::windows_readiness_adapter::HeldWindowsArtifact>,
 )> {
     let selected_count = payload.selected_case_artifacts()?.len();
@@ -94,9 +95,25 @@ pub(crate) fn retain_payload(
     )?;
     let path = destination.join("owned-fixture.exe");
     let sha256 = copy(&payload.fixture.path, &path, Some(&payload.fixture.sha256))?;
+    let diagnostic = payload
+        .workload_diagnostic
+        .clone()
+        .map(|mut diagnostic| {
+            diagnostic.validate_for(&payload.source, &payload.distribution.target)?;
+            let path = destination.join("memcordon-windows-loader-lab.exe");
+            copy(
+                &diagnostic.executable.path,
+                &path,
+                Some(&diagnostic.executable.sha256),
+            )?;
+            diagnostic.executable.path = path;
+            Ok::<_, CiError>(diagnostic)
+        })
+        .transpose()?;
     Ok((
         artifacts,
         crate::windows_installed_cases::SelectedArtifact { path, sha256 },
+        diagnostic,
         held,
     ))
 }
@@ -294,10 +311,10 @@ pub fn run(
     )?;
     let plan = inspect_removal_plan(root, payload, identity, output, deadline)?;
     let retained_current = output.join("selected-current-payload");
-    let (current_artifacts, current_fixture, _current_custody) =
+    let (current_artifacts, current_fixture, current_diagnostic, _current_custody) =
         retain_payload(payload, &retained_current)?;
     let retained_older = output.join("selected-predecessor-payload");
-    let (older_artifacts, older_fixture, _predecessor_custody) =
+    let (older_artifacts, older_fixture, older_diagnostic, _predecessor_custody) =
         retain_payload(predecessor, &retained_older)?;
     let current = InstalledWindowsPayload::from_materialized(
         payload.channel,
@@ -306,6 +323,7 @@ pub fn run(
         current_artifacts,
         &retained_current,
         current_fixture,
+        current_diagnostic,
         &plan.binary_root,
         output.join("current"),
     )?;
@@ -316,9 +334,11 @@ pub fn run(
         older_artifacts,
         &retained_older,
         older_fixture,
+        older_diagnostic,
         &plan.binary_root,
         output.join("predecessor"),
     )?;
+    current.require_workload_diagnostic()?;
     fs::create_dir_all(&current.output_directory)?;
     super::source::write_json(&output.join("selected-current.json"), &current)?;
     super::source::write_json(&output.join("selected-predecessor.json"), &older)?;

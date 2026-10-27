@@ -16,6 +16,7 @@ fn workflow_collection_executes_fixed_suites_with_supported_mode() {
         Suite::WorkingWindowsPrepare,
         Suite::RehearsalToolBuild,
         Suite::Policy,
+        Suite::WindowsFixtureNative,
         Suite::Stress,
         Suite::StressPackages,
         Suite::StressLifecycle,
@@ -77,5 +78,5 @@ fn workflow_collection_executes_fixed_suites_with_supported_mode() {
         }
     }
     // SupplyAudit and SupplyDeny are adaptive; their split CLI compatibility leaves remain.
-    assert_eq!((fixed, adaptive), (20, 48));
+    assert_eq!((fixed, adaptive), (21, 48));
 }

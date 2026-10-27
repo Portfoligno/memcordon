@@ -602,58 +602,31 @@ fn run_spawner(
     }
 }
 
-pub fn run_workload(request: &Path, result: &Path) -> Result<(), String> {
-    use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
+pub fn run_workload(request: &Path, result: &Path, request_sha256: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        };
-        options
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(request).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
-        return Err("workload diagnostic request is not a bounded regular file".into());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err("workload diagnostic request is a reparse point".into());
-        }
-    }
-    let mut bytes = Vec::new();
-    (&file)
-        .take(16 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err("workload diagnostic request exceeds bound".into());
-    }
-    let input: memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1 =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    input.validate()?;
-    #[cfg(windows)]
-    {
-        windows_service::run_workload(
+        let held = memcordon_windows_loader_lab::workload::HeldWorkloadRequest::open(
+            request,
+            Some(request_sha256),
+        )?;
+        let outcome = windows_service::run_workload(
             &std::env::current_exe().map_err(|error| error.to_string())?,
             request,
             result,
-            &input,
-        )
+            &held.input,
+            request_sha256,
+        );
+        match (outcome, held.recheck(request)) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(primary), Err(binding)) => {
+                Err(format!("{primary}; request custody recheck: {binding}"))
+            }
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = result;
+        let _ = (request, result, request_sha256);
         Err("actual-workload diagnostic requires native Windows".into())
     }
 }
@@ -692,7 +665,15 @@ mod windows_service {
         run_id: &str,
         scenario_id: &str,
     ) -> Result<(), String> {
-        run_inner(executable, scenario, result, run_id, scenario_id, None)
+        run_inner(
+            executable,
+            scenario,
+            result,
+            run_id,
+            scenario_id,
+            None,
+            None,
+        )
     }
 
     pub fn run_workload(
@@ -700,6 +681,7 @@ mod windows_service {
         request: &Path,
         result: &Path,
         input: &memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1,
+        request_sha256: &str,
     ) -> Result<(), String> {
         let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
         if input.work_deadline_tick_ms <= now || input.cleanup_deadline_tick_ms <= now {
@@ -719,6 +701,7 @@ mod windows_service {
             &input.diagnostic_id,
             "actual-workload",
             Some((work, cleanup)),
+            Some(request_sha256),
         )
     }
 
@@ -729,6 +712,7 @@ mod windows_service {
         run_id: &str,
         scenario_id: &str,
         cutoffs: Option<(Instant, Instant)>,
+        request_sha256: Option<&str>,
     ) -> Result<(), String> {
         let source = SourceToken::current()?;
         let source_process_id = unsafe { GetCurrentProcessId() };
@@ -765,6 +749,13 @@ mod windows_service {
                 ],
             );
             arguments[4] = OsStr::new("--request").encode_wide().collect();
+            arguments.extend([
+                OsStr::new("--request-sha256").encode_wide().collect(),
+                request_sha256
+                    .ok_or("workload service raw request digest absent")?
+                    .encode_utf16()
+                    .collect(),
+            ]);
         }
         let mut command_line = memcordon_core::encode_windows_command_line(&arguments);
         command_line.push(0);

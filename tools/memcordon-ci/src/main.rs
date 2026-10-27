@@ -499,6 +499,42 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new(
+                memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT,
+            ))
+        {
+            let arguments = std::env::args_os()
+                .skip(2)
+                .take(memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT_COUNT + 1)
+                .map(|value| {
+                    if value.len()
+                        > memcordon_ci::release::linux_image_custodian::CHILD_ARGUMENT_BYTES
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "custody argument exceeds finite byte bound",
+                        ));
+                    }
+                    value.into_string().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "custody argument is not UTF8",
+                        )
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>();
+            if let Err(error) = arguments.and_then(|arguments| {
+                memcordon_ci::release::linux_image_custodian::run_child(&arguments)
+            }) {
+                eprintln!("memcordon-ci original image custodian: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     match memcordon_ci::public_install_capture::run_if_wrapper() {
         Ok(Some(status)) => memcordon_ci::public_install_capture::exit_wrapper(status),
         Ok(None) => {}
@@ -507,13 +543,37 @@ fn main() {
             std::process::exit(1);
         }
     }
-    if let Err(error) = run() {
+    let result = run();
+    #[cfg(windows)]
+    let result = match (
+        result,
+        memcordon_ci::windows_consumer_readiness::observe_transferred_helper_wait_cleanup(),
+    ) {
+        (Err(original), Err(cleanup)) => Err(CiError::Message(format!(
+            "{original}; isolated diagnostic cleanup={cleanup}"
+        ))),
+        (Err(original), _) => Err(original),
+        (Ok(()), cleanup) => cleanup.map_err(CiError::Io),
+    };
+    #[cfg(target_os = "linux")]
+    let transferred_cleanup =
+        memcordon_ci::release::linux_image_custodian::observe_transferred_cleanup();
+    if let Err(error) = result {
         eprintln!("memcordon-ci: {error}");
         let mut source = std::error::Error::source(&error);
         while let Some(error) = source {
             eprintln!("  caused by: {error}");
             source = error.source();
         }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = transferred_cleanup {
+            eprintln!("  retained native cleanup: {error}");
+        }
+        std::process::exit(1);
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = transferred_cleanup {
+        eprintln!("memcordon-ci: {error}");
         std::process::exit(1);
     }
 }

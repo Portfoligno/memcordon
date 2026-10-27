@@ -435,6 +435,31 @@ fn evaluate_filter<const N: usize>(
 }
 
 #[test]
+fn mixed_filters_keep_special_node_creation_denied_for_both_native_abis() {
+    for (abi, architecture, syscalls) in [
+        (NativeAbi::X86_64, 0xc000_003e_u32, &[133_u32, 259_u32][..]),
+        (NativeAbi::Aarch64, 0xc000_00b7_u32, &[33_u32][..]),
+    ] {
+        for program in [
+            crate::linux::network_filter::compile_mixed_closed_filter(abi),
+            crate::linux::network_filter::compile_mixed_seqpacket_filter(abi),
+        ] {
+            for syscall in syscalls {
+                assert_eq!(
+                    evaluate_filter(
+                        &program,
+                        architecture,
+                        *syscall,
+                        [0_u64, u64::from(libc::S_IFIFO | 0o600), 0]
+                    ),
+                    0x0005_0000 | libc::EPERM as u32
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mixed_seqpacket_profile_preserves_stream_only_authority() {
     use crate::linux::network_filter::{
         compile_mixed_closed_filter, compile_mixed_seqpacket_filter, select_mixed_filter,

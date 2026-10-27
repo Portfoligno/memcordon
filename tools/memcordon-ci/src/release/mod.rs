@@ -23,6 +23,12 @@ pub mod linux_export_recovery;
 #[cfg(target_os = "linux")]
 mod linux_fixture_memory_budget;
 #[cfg(target_os = "linux")]
+pub mod linux_image_custodian;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_image_custody;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_image_custody_completion;
+#[cfg(target_os = "linux")]
 pub mod linux_image_normalize;
 #[cfg(target_os = "linux")]
 pub mod linux_import_normalize;
@@ -123,6 +129,10 @@ pub enum ConsumerChannel {
 pub enum ReleaseCommand {
     ConsumerReadinessReport(readiness_report::ReportArguments),
     SelectPreparation,
+    PrepareReadinessTools {
+        #[arg(long)]
+        build_source: PathBuf,
+    },
     CheckPreparation {
         #[arg(long)]
         build_source: PathBuf,
@@ -367,6 +377,9 @@ fn repository(root: &Path, supplied: Option<String>) -> Result<String> {
 
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
+        ReleaseCommand::PrepareReadinessTools { build_source } => {
+            target::prepare_readiness_tools(root, &build_source)
+        }
         ReleaseCommand::CheckPreparation {
             build_source,
             consumer_readiness,

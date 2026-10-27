@@ -466,7 +466,7 @@ pub(crate) fn mixed_backend_run(
                 memcordon_core::BoundedText::new(if detail.len() <= 4096 {
                     detail
                 } else {
-                    "mixed frontend relay error exceeded diagnostic bound"
+                    crate::mixed_indeterminate::RELAY_OVERSIZE
                 })
             })
             .transpose()
@@ -478,7 +478,7 @@ pub(crate) fn mixed_backend_run(
                 memcordon_core::BoundedText::new(if detail.len() <= 4096 {
                     detail
                 } else {
-                    "mixed retirement observation error exceeded diagnostic bound"
+                    crate::mixed_indeterminate::OBSERVATION_OVERSIZE
                 })
             })
             .transpose()
@@ -487,7 +487,29 @@ pub(crate) fn mixed_backend_run(
     let mut errors = receipt.relay_error.into_iter().collect::<Vec<_>>();
     errors.extend(receipt.observation_error);
     if !receipt.relay_drained {
-        errors.push("frontend mixed byte relay was not completely drained/restored".into());
+        errors.push(crate::mixed_indeterminate::UNDRAINED.into());
+    }
+    if matches!(
+        &receipt.terminal.outcome,
+        MixedRuntimeOutcomeV2::Indeterminate { .. }
+    ) {
+        let mut backend = crate::linux_cgroup::sealed_info(live);
+        if let crate::backend::SealedAvailability::Available { capability, .. } =
+            &mut backend.boundary_support.sealed
+        {
+            capability.mechanism = contract.authorized_profile.id.as_str().into();
+        }
+        return crate::mixed_indeterminate::project(crate::mixed_indeterminate::Projection {
+            contract,
+            native: MixedRuntimeExecutionV2 {
+                runtime: receipt.terminal,
+                frontend: frontend_evidence,
+            },
+            frontend_errors: errors,
+            backend,
+            duration: started.elapsed(),
+        })
+        .map_err(|error| *error);
     }
     let (complete, released, child_pid, authorization, child) = match &receipt.terminal.outcome {
         MixedRuntimeOutcomeV2::Executed { execution, .. } => {
@@ -537,27 +559,8 @@ pub(crate) fn mixed_backend_run(
                 None,
             )
         }
-        MixedRuntimeOutcomeV2::Indeterminate {
-            retained_obligations,
-            ..
-        } => {
-            errors.extend(
-                retained_obligations
-                    .obligations
-                    .as_slice()
-                    .iter()
-                    .map(|detail| detail.as_str().to_owned()),
-            );
-            (
-                false,
-                matches!(
-                    retained_obligations.authorization,
-                    MixedAuthorizationKnowledgeV2::Authorized
-                ),
-                None,
-                None,
-                None,
-            )
+        MixedRuntimeOutcomeV2::Indeterminate { .. } => {
+            unreachable!("typed mixed indeterminate projection returned above")
         }
     };
     let cleanup = memcordon_core::CleanupSummary {

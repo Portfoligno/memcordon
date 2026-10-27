@@ -458,17 +458,19 @@ pub(crate) fn validate(
         (16, "--mixed-observation-directory"),
         (18, "--image-entrypoint"),
         (19, "owned-readiness"),
-        (20, "--"),
-        (21, "own-abstract-held"),
+        (20, "--wait-for"),
+        (21, "command"),
+        (22, "--"),
+        (23, "own-abstract-held"),
     ];
     if frontend["format"] != "memcordon.linux-owned-frontend-invocation"
         || frontend["revision"] != 1
         || program != b"/usr/bin/setpriv"
-        || args.len() != 23
+        || args.len() != 25
         || fixed
             .into_iter()
             .any(|(index, value)| args[index] != value.as_bytes())
-        || args[22] != hex::encode(challenge).as_bytes()
+        || args[24] != hex::encode(challenge).as_bytes()
         || frontend["environment_cleared"] != true
         || frontend["caller_uid"] != 65534
         || frontend["caller_gid"] != 65534

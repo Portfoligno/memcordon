@@ -7,6 +7,14 @@ pub use memcordon_platform::test_support::{
     NativeExecObservation, configure_native_exec_observation,
 };
 
+#[cfg(target_os = "linux")]
+pub use memcordon_platform::test_support::{
+    IMAGE_CUSTODY_PACKET_BOUND, ImageCustodyFdBudget, ImageCustodyPacket, ImageCustodyPeer,
+    ImageCustodySocket, image_custody_current_peer, image_custody_cutoff_nanos,
+    image_custody_deadline, image_custody_fd_budget, image_custody_monotonic_nanos,
+    image_custody_parent_pid,
+};
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use memcordon_platform::test_support::unsearchable_directory;
 
@@ -14,9 +22,15 @@ pub use memcordon_platform::test_support::unsearchable_directory;
 pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
 #[cfg(windows)]
 pub use memcordon_platform::test_support::{
-    ProcessIdentity, WindowsHeldFileIdentity, WindowsImageProcess, windows_available_memory_bytes,
-    windows_console_host_path, windows_held_file_identity, windows_native_work_cutoff,
-    windows_performance_counter, windows_processes_for_image, windows_processes_for_image_until,
+    ProcessIdentity, WINDOWS_WAIT_OBSERVER_BOUND, WindowsHeldFileIdentity, WindowsImageProcess,
+    WindowsRenameCommitted, WindowsSynchronousRenameSource, WindowsThreadActivitySample,
+    WindowsWaitInherited, WindowsWaitObserver, WindowsWaitObserverRetirement,
+    WindowsWaitObserverSnapshot, WindowsWaitThreadHandle, windows_available_memory_bytes,
+    windows_console_host_path, windows_held_file_identity, windows_held_file_metadata,
+    windows_native_work_cutoff, windows_observe_transferred_wait_cleanup,
+    windows_open_synchronous_rename_source, windows_performance_counter,
+    windows_prepare_persistent_stage, windows_processes_for_image,
+    windows_processes_for_image_until, windows_unresolved_wait_owner_count,
 };
 
 use std::fmt;

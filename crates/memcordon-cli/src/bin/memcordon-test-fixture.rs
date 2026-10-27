@@ -1434,6 +1434,14 @@ fn main() {
         .unwrap_or_else(|| fail("a fixture subcommand is required"));
     let status = match command.as_str() {
         #[cfg(windows)]
+        "namespace-primary-experiment" => {
+            if args.next().is_some() {
+                fail("namespace experiment accepts only bounded stdin");
+            }
+            consumer_readiness_windows::namespace_primary_experiment()
+                .unwrap_or_else(|error| fail(error.to_string()))
+        }
+        #[cfg(windows)]
         "consumer-readiness-windows" => {
             consumer_readiness_windows::run(args).unwrap_or_else(|error| fail(error.to_string()))
         }

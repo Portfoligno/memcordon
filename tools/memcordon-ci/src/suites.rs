@@ -444,6 +444,31 @@ fn native_phase(
     Ok(())
 }
 
+fn windows_fixture_native(root: &Path, stable: &str) -> Result<()> {
+    if !cfg!(windows) {
+        return Err(CiError::Message(
+            "native fixture contract requires Windows".into(),
+        ));
+    }
+    memcordon_ci::workflow_output::revoke_compilation("compiled-recipe-complete")?;
+    let mut commands = memcordon_ci::native_test_plan::windows_fixture_commands().into_iter();
+    let compile = commands.next().expect("fixture compile plan");
+    cargo_with_deadline(root, stable, "test", compile.arguments, compile.deadline)?;
+    // A settled test failure must not discard successfully compiled outputs.
+    // This is compiler completion, never a cached test-success certificate.
+    memcordon_ci::workflow_output::compilation_complete("compiled-recipe-complete")?;
+    let execute = commands.next().expect("fixture execute plan");
+    let output = cargo_with_deadline(root, stable, "test", execute.arguments, execute.deadline)?;
+    settled_validation(|| {
+        memcordon_ci::windows_fixture_native::verify_one_test(&output).map_err(Into::into)
+    })?;
+    eprintln!(
+        "[ci windows-fixture-native] verified selected-test={}; executed=1; passed=1; failed=0; ignored=0",
+        memcordon_ci::windows_fixture_native::TEST_SELECTOR
+    );
+    Ok(())
+}
+
 fn install_tool(root: &Path, stable: &str, name: &str, version: &str) -> Result<()> {
     install_tool_until(
         root,
@@ -886,10 +911,11 @@ fn fuzz_phase(
     execute: bool,
     mode: crate::failure_mode::FailureMode,
 ) -> Result<()> {
-    let targets = memcordon_ci::fuzz_targets::targets_sharded(
+    let target_plans = memcordon_ci::fuzz_targets::plans_sharded(
         &std::fs::read_to_string(root.join("fuzz").join("Cargo.toml"))?,
         shard,
     )?;
+    let targets: Vec<_> = target_plans.iter().map(|target| &target.name).collect();
     let name = match shard.map(|s| (s.index(), s.count())) {
         None => "all.json",
         Some((0, 2)) => "first.json",
@@ -904,7 +930,7 @@ fn fuzz_phase(
         root,
         "fuzz",
         name,
-        &serde_json::json!({"planner_version": 1, "shard_index": shard.map(|s| s.index()), "shard_count": shard.map(|s| s.count()), "targets": targets}),
+        &serde_json::json!({"planner_version": 2, "shard_index": shard.map(|s| s.index()), "shard_count": shard.map(|s| s.count()), "targets": targets,"target_plans":target_plans}),
     )?;
     cargo(
         root,
@@ -933,7 +959,9 @@ fn fuzz_phase(
     }
     let mut failures = None;
     if compile {
-        for target in &targets {
+        for target in &target_plans {
+            let arguments = target.build_arguments();
+            announce_fuzz_command("compile", &target.name, nightly, &cargo_fuzz, &arguments);
             let outcome = CommandSpec::toolchain_program(
                 "rustup",
                 root,
@@ -941,11 +969,7 @@ fn fuzz_phase(
                 &cargo_fuzz,
                 CARGO_DEADLINE,
             )
-            .args([
-                OsString::from("fuzz"),
-                OsString::from("build"),
-                OsString::from(target),
-            ])
+            .args(arguments)
             .run()
             .map(|_| ());
             retain_failure(&mut failures, outcome, mode)?;
@@ -962,7 +986,9 @@ fn fuzz_phase(
         // `cargo fuzz run` may compile again. A failed later writer must not
         // retain a completion claim from the earlier build recipe.
         memcordon_ci::workflow_output::revoke_compilation("compiled-recipe-complete")?;
-        for target in &targets {
+        for target in &target_plans {
+            let arguments = target.run_arguments();
+            announce_fuzz_command("execute", &target.name, nightly, &cargo_fuzz, &arguments);
             let outcome = CommandSpec::toolchain_program(
                 "rustup",
                 root,
@@ -970,24 +996,35 @@ fn fuzz_phase(
                 &cargo_fuzz,
                 Duration::from_secs(5 * 60),
             )
-            .args([
-                OsString::from("fuzz"),
-                OsString::from("run"),
-                OsString::from(target),
-                OsString::from("--"),
-                OsString::from("-max_total_time=30"),
-                OsString::from(if target.starts_with("workload-") {
-                    "-max_len=1048576"
-                } else {
-                    "-max_len=4096"
-                }),
-            ])
+            .args(arguments)
             .run()
             .map(|_| ());
             retain_failure(&mut failures, outcome, mode)?;
         }
     }
     failures.map_or(Ok(()), Err)
+}
+
+fn announce_fuzz_command(
+    phase: &'static str,
+    target: &str,
+    toolchain: &str,
+    program: &Path,
+    arguments: &[OsString],
+) {
+    use std::io::Write;
+    let observed = |value: &OsStr| {
+        let bytes = value.as_encoded_bytes();
+        let end = bytes.len().min(512);
+        serde_json::json!({"prefix_hex":hex::encode(&bytes[..end]),"original_bytes":bytes.len(),"omitted_bytes":bytes.len()-end})
+    };
+    let record = serde_json::json!({"format":"memcordon.fuzz-command","revision":1,"phase":phase,
+        "target":observed(OsStr::new(target)),"toolchain":observed(OsStr::new(toolchain)),
+        "selected_program":observed(program.as_os_str()),
+        "arguments":arguments.iter().take(16).map(|value|observed(value.as_os_str())).collect::<Vec<_>>(),
+        "omitted_argument_count":arguments.len().saturating_sub(16)});
+    // Release the diagnostic sink before the native command/progress workers run.
+    let _ = writeln!(std::io::stderr().lock(), "fuzz-command {record}");
 }
 
 fn write_plan(root: &Path, family: &str, name: &str, value: &serde_json::Value) -> Result<()> {
@@ -1828,6 +1865,7 @@ fn run_inner(root: &Path, suite: Suite, options: SuiteOptions) -> Result<()> {
         Suite::Native => native(root, &toolchains.stable, false, options.failure_mode),
         Suite::NativeCompile => native_phase(root, &toolchains.stable, options.failure_mode, true),
         Suite::NativeExecute => native_phase(root, &toolchains.stable, options.failure_mode, false),
+        Suite::WindowsFixtureNative => windows_fixture_native(root, &toolchains.stable),
         Suite::FuzzCompileFirst
         | Suite::FuzzCompileSecond
         | Suite::FuzzCompileQuarterOne

@@ -3,6 +3,8 @@
 mod checkpoint;
 #[path = "../../src/bin/original_native_recovery_contract.rs"]
 pub(crate) mod contract;
+#[path = "../../src/bin/original_native_recovery_delivery.rs"]
+mod delivery;
 
 use contract::{Context, Input, RecoveryResult};
 use sha2::{Digest, Sha256};
@@ -279,23 +281,22 @@ fn validate_records(
         }
     }
     if matches!(input.context, Context::Delivery { .. }) {
+        let invocation = json(&records["frontend_invocation"])?;
+        delivery::validate_contract(
+            &records["original_contract"],
+            &prepared,
+            &input.identity.source_commit,
+        )?;
         let destination = json(&records["report_destination"])?;
         let failure = json(&records["report_delivery_failure"])?;
-        if destination["format"] != "memcordon.linux-report-destination"
-            || destination["revision"] != 1
-            || failure["format"] != "memcordon.linux-native-report-delivery-failure"
-            || failure["revision"] != 1
-            || failure["report_path"] != destination["path"]
-            || failure["destination"]["is_directory"] != true
-            || failure["destination"]["device"] != destination["device"]
-            || failure["destination"]["inode"] != destination["inode"]
-            || failure["submitted_report"]
-                .as_array()
-                .is_none_or(|v| v.is_empty() || v.len() > 16 * 1024 * 1024)
-            || failure["native_errno"].as_i64().is_none_or(|n| n == 0)
-        {
-            return Err("original recovery report delivery association differs".into());
-        }
+        delivery::validate(
+            &invocation,
+            &records["original_contract"],
+            &destination,
+            &failure,
+            prepared.caller.pid,
+            prepared.admission.caller_uid,
+        )?;
     }
     Ok(())
 }

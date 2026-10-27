@@ -15,6 +15,13 @@ pub struct HeldControlConnection {
     worker_birth: u64,
     caller_pid: u32,
     caller_birth: u64,
+    control_pid: u32,
+    control_birth: u64,
+    control_source: serde_json::Value,
+    control_status: Vec<u8>,
+    expected_endpoint: super::linux_mixed_installed::RetainedControlEndpoint,
+    caller_image_owner: HeldLinuxProcess,
+    caller_image: serde_json::Value,
     source_descriptor: i32,
     device: u64,
     inode: u64,
@@ -23,47 +30,35 @@ pub struct HeldControlConnection {
     caller_status: Vec<u8>,
 }
 
+pub struct ControlCredentialExpectations {
+    caller: (u32, u32),
+    endpoint: super::linux_mixed_installed::RetainedControlEndpoint,
+}
+
 impl HeldControlConnection {
     pub fn acquire(
         worker: &HeldLinuxProcess,
+        control: &HeldLinuxProcess,
+        control_source: serde_json::Value,
         caller: &HeldLinuxProcess,
-        caller_uid: u32,
-        caller_gid: u32,
+        credentials: ControlCredentialExpectations,
+        expected_cli_sha256: &str,
         deadline: Instant,
     ) -> Result<Self> {
+        let (caller_uid, caller_gid) = credentials.caller;
+        let control_gid = credentials.endpoint.group();
         require_live(worker, caller, deadline)?;
+        control
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        let control_status = native_credentials(control, "authenticated-control", 0, control_gid)?;
         if caller_uid == 0 || caller_gid == 0 {
             return Err(CiError::Message(
                 "lifecycle control caller must be the actual unprivileged owner".into(),
             ));
         }
-        use std::io::Read;
-        let mut caller_status = Vec::new();
-        File::open(format!("/proc/{}/status", caller.process_id))?
-            .take(65537)
-            .read_to_end(&mut caller_status)?;
-        if caller_status.len() > 65536 {
-            return Err(CiError::Message(
-                "native caller status exceeds bound".into(),
-            ));
-        }
-        let status = std::str::from_utf8(&caller_status)
-            .map_err(|error| CiError::Message(error.to_string()))?;
-        for (field, expected) in [("Uid:", caller_uid), ("Gid:", caller_gid)] {
-            let fields = status
-                .lines()
-                .find_map(|line| line.strip_prefix(field))
-                .ok_or_else(|| CiError::Message("native caller credentials absent".into()))?
-                .split_whitespace()
-                .map(str::parse::<u32>)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| CiError::Message(error.to_string()))?;
-            if fields != vec![expected; 4] {
-                return Err(CiError::Message(
-                    "native control caller credentials differ from original launch".into(),
-                ));
-            }
-        }
+        let caller_status =
+            native_credentials(caller, "unprivileged-frontend", caller_uid, caller_gid)?;
         let pidfd = rustix::process::pidfd_open(
             rustix::process::Pid::from_raw(worker.process_id as i32)
                 .ok_or_else(|| CiError::Message("control worker PID differs".into()))?,
@@ -115,9 +110,9 @@ impl HeldControlConnection {
             }
             let peer = rustix::net::sockopt::socket_peercred(&socket)
                 .map_err(|error| CiError::Message(error.to_string()))?;
-            if peer.pid.as_raw_nonzero().get() != caller.process_id as i32
-                || peer.uid.as_raw() != caller_uid
-                || peer.gid.as_raw() != caller_gid
+            if peer.pid.as_raw_nonzero().get() != control.process_id as i32
+                || peer.uid.as_raw() != 0
+                || peer.gid.as_raw() != control_gid
             {
                 continue;
             }
@@ -134,6 +129,19 @@ impl HeldControlConnection {
                 worker_birth: worker.birth,
                 caller_pid: caller.process_id,
                 caller_birth: caller.birth,
+                control_pid: control.process_id,
+                control_birth: control.birth,
+                control_source: control_source.clone(),
+                control_status: control_status.clone(),
+                expected_endpoint: credentials.endpoint.clone(),
+                caller_image_owner: caller.duplicate_for_intervention(deadline).map_err(
+                    |failure| {
+                        CiError::Message(format!(
+                            "original frontend image capability failed: {failure:?}"
+                        ))
+                    },
+                )?,
+                caller_image: serde_json::Value::Null,
                 source_descriptor: descriptor,
                 device: before.dev(),
                 inode: before.ino(),
@@ -141,6 +149,16 @@ impl HeldControlConnection {
                 peer_gid: peer.gid.as_raw(),
                 caller_status: caller_status.clone(),
             };
+            let mut owner = owner;
+            owner.caller_image = owner
+                .caller_image_owner
+                .hold_executable_image(deadline)
+                .map_err(CiError::Message)?;
+            if owner.caller_image["sha256"] != expected_cli_sha256 {
+                return Err(CiError::Message(
+                    "original frontend image differs from selected CLI".into(),
+                ));
+            }
             if selected.replace(owner).is_some() {
                 return Err(CiError::Message(
                     "selected worker has multiple caller-associated control connections".into(),
@@ -148,6 +166,9 @@ impl HeldControlConnection {
             }
         }
         require_live(worker, caller, deadline)?;
+        control
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
         selected.ok_or_else(|| {
             CiError::Message("actual caller-associated native control connection absent".into())
         })
@@ -156,10 +177,41 @@ impl HeldControlConnection {
     pub fn shutdown(
         &self,
         worker: &HeldLinuxProcess,
+        control: &HeldLinuxProcess,
         caller: &HeldLinuxProcess,
+        endpoint: super::linux_mixed_installed::RetainedControlEndpoint,
         deadline: Instant,
     ) -> Result<serde_json::Value> {
         require_live(worker, caller, deadline)?;
+        let control_image_check = control
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        let worker_image_check = worker
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        let caller_image_check = self
+            .caller_image_owner
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        if endpoint.group() != self.expected_endpoint.group()
+            || endpoint.observation() != self.expected_endpoint.observation()
+        {
+            return Err(CiError::Message(
+                "original installed control endpoint changed before shutdown".into(),
+            ));
+        }
+        native_credentials(
+            control,
+            "authenticated-control",
+            0,
+            self.expected_endpoint.group(),
+        )?;
+        native_credentials(caller, "unprivileged-frontend", 65534, 65534)?;
+        if control.process_id != self.control_pid || control.birth != self.control_birth {
+            return Err(CiError::Message(
+                "control/frontend original identity or credentials changed".into(),
+            ));
+        }
         if (
             worker.process_id,
             worker.birth,
@@ -187,6 +239,26 @@ impl HeldControlConnection {
                 "native control socket was replaced before shutdown".into(),
             ));
         }
+        let peer = rustix::net::sockopt::socket_peercred(&self.socket)
+            .map_err(|error| CiError::Message(error.to_string()))?;
+        if peer.pid.as_raw_nonzero().get() != self.control_pid as i32
+            || peer.uid.as_raw() != self.peer_uid
+            || peer.gid.as_raw() != self.peer_gid
+        {
+            return Err(CiError::Message(
+                "original authenticated control socket peer changed".into(),
+            ));
+        }
+        require_live(worker, caller, deadline)?;
+        control
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        worker
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
+        self.caller_image_owner
+            .verify_intervention_image(deadline)
+            .map_err(CiError::Message)?;
         let observed = rustix::net::shutdown(&self.socket, rustix::net::Shutdown::Both);
         let status = if observed.is_ok() { 0 } else { -1 };
         let errno = observed.err().map(|error| error.raw_os_error());
@@ -197,15 +269,76 @@ impl HeldControlConnection {
             ));
         }
         Ok(
-            serde_json::json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":1,
+            serde_json::json!({"format":"memcordon.linux-lifecycle-control-shutdown","revision":3,
             "worker":{"pid":self.worker_pid,"birth":self.worker_birth},"caller":{"pid":self.caller_pid,"birth":self.caller_birth},
+            "control":self.control_source,"control_status_bytes":self.control_status,
+            "control_endpoint":self.expected_endpoint.observation(),
+            "caller_image":self.caller_image,
+            "worker_image_check":worker_image_check,"control_image_check":control_image_check,"caller_image_check":caller_image_check,
             "source_descriptor":self.source_descriptor,"device":self.device,"inode":self.inode,
-            "peer_uid":self.peer_uid,"peer_gid":self.peer_gid,"socket_type":libc::SOCK_STREAM,
+            "peer_pid":self.control_pid,"peer_uid":self.peer_uid,"peer_gid":self.peer_gid,"socket_type":libc::SOCK_STREAM,
             "socket_domain":libc::AF_UNIX,"caller_status_bytes":self.caller_status,
             "native_how":libc::SHUT_RDWR,"native_status":status,"native_errno":errno}),
         )
     }
 }
+
+fn native_credentials(owner: &HeldLinuxProcess, role: &str, uid: u32, gid: u32) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    File::open(format!("/proc/{}/status", owner.process_id))?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 65536 {
+        return Err(CiError::Message(
+            "native control credential source exceeds bound".into(),
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|error| CiError::Message(error.to_string()))?;
+    validate_credential_fields(text, role, owner.process_id, owner.birth, uid, gid)?;
+    Ok(bytes)
+}
+
+fn validate_credential_fields(
+    text: &str,
+    role: &str,
+    pid: u32,
+    birth: u64,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    for (field, expected) in [("Uid:", uid), ("Gid:", gid)] {
+        let fields = text
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .ok_or_else(|| CiError::Message("native control credential field absent".into()))?
+            .split_whitespace();
+        let count = fields.clone().count();
+        let values = fields
+            .take(4)
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| CiError::Message(error.to_string()))?;
+        if count != 4 {
+            return Err(CiError::Message(format!(
+                "native credentials malformed cardinality; role={role}; pid={pid}; birth={birth}; field={field}; expected={expected}; actual_count={count}; first_four={values:?}"
+            )));
+        }
+        if values != vec![expected; 4] {
+            return Err(CiError::Message(format!(
+                "native credentials differ; role={role}; pid={pid}; birth={birth}; field={field}; expected={expected}; actual={values:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../../tests/private/lifecycle_control_credentials.rs"]
+mod control_credential_tests;
+
+#[path = "lifecycle_frontend_arguments.rs"]
+mod frontend_arguments;
 
 fn require_live(
     worker: &HeldLinuxProcess,
@@ -461,8 +594,13 @@ pub fn begin_case(
         receipt,
         file,
     });
-    let launch = InstalledMixedLaunch::start_with_delivery_controls(
+    let launch = InstalledMixedLaunch::start_with_first_record(
         InstalledMixedLaunchInput {
+            lifetime: if phase == "drain" {
+                memcordon_core::Lifetime::Workload
+            } else {
+                memcordon_core::Lifetime::Command
+            },
             directory,
             contract: context.contract_path,
             caller_uid: 65534,
@@ -472,7 +610,7 @@ pub fn begin_case(
             memory: std::ffi::OsStr::new(&memory),
         },
         delivery,
-        None,
+        phase == "drain",
     )?;
     let index = report.native.owners.len();
     report.native.owners.push(OwnedMixedRecipe {
@@ -590,11 +728,27 @@ pub fn begin_case(
     )?;
     let worker_index = report.workers.len() - 1;
     if actor == "control" {
+        let control_source = super::linux_readiness_image_cases::retain_prepared_control(
+            &worker_source,
+            observer,
+            context.selected_agent_sha256,
+            context.work_deadline,
+            &mut report.workers,
+        )?;
+        let control = report
+            .workers
+            .last()
+            .expect("retained authenticated control");
         report.controls.push(HeldControlConnection::acquire(
             &report.workers[worker_index],
+            control,
+            control_source,
             &observer.caller,
-            65534,
-            65534,
+            ControlCredentialExpectations {
+                caller: (65534, 65534),
+                endpoint: owner.launch.retained_control_endpoint()?,
+            },
+            context.selected_cli_sha256,
             context.work_deadline,
         )?);
     }
@@ -1083,7 +1237,30 @@ pub fn intervene(
             .ok_or_else(|| {
                 CiError::Message("original lifecycle control connection absent".into())
             })?;
-        match connection.shutdown(worker, &observer.caller, context.work_deadline) {
+        let control = report
+            .workers
+            .iter()
+            .find(|process| {
+                process.process_id == connection.control_pid
+                    && process.birth == connection.control_birth
+            })
+            .ok_or_else(|| {
+                CiError::Message("retained authenticated control owner absent".into())
+            })?;
+        if record["mixed_control"]
+            != serde_json::json!({"pid":control.process_id,"start_time":control.birth})
+        {
+            return Err(CiError::Message(
+                "phase journal changed original authenticated control".into(),
+            ));
+        }
+        match connection.shutdown(
+            worker,
+            control,
+            &observer.caller,
+            owner.launch.retained_control_endpoint()?,
+            context.work_deadline,
+        ) {
             Ok(mut value) => {
                 value["current_image_check"] = current_image;
                 value
@@ -1171,14 +1348,35 @@ fn read_caller_observation(
     };
     let mut named_bytes = vec![0; bytes.len()];
     named.read_exact_at(&mut named_bytes, 0)?;
-    if stamp(&before) != stamp(&after)
-        || stamp(&after) != stamp(&actual)
-        || bytes != named_bytes
-        || Instant::now() >= deadline
-    {
-        return Err(CiError::Message(
-            "actual caller observation was replaced during custody capture".into(),
-        ));
+    if stamp(&before) != stamp(&after) {
+        return Err(CiError::Message(format!(
+            "actual caller observation held metadata changed during custody capture; member={:?}; before={:?}; after={:?}",
+            path.file_name(),
+            stamp(&before),
+            stamp(&after)
+        )));
+    }
+    if stamp(&after) != stamp(&actual) {
+        return Err(CiError::Message(format!(
+            "actual caller observation named metadata differs during custody capture; member={:?}; held={:?}; named={:?}",
+            path.file_name(),
+            stamp(&after),
+            stamp(&actual)
+        )));
+    }
+    if bytes != named_bytes {
+        return Err(CiError::Message(format!(
+            "actual caller observation content differs during custody capture; member={:?}; held_length={}; named_length={}",
+            path.file_name(),
+            bytes.len(),
+            named_bytes.len()
+        )));
+    }
+    if Instant::now() >= deadline {
+        return Err(CiError::Message(format!(
+            "original caller observation cutoff expired during custody capture; member={:?}",
+            path.file_name()
+        )));
     }
     Ok(bytes)
 }
@@ -1384,33 +1582,28 @@ pub fn run_case(
                     "original drain fixture cutoff exhausted".into(),
                 ));
             }
-            if owner.launch.stdout.exists() {
-                let bytes = super::linux_mixed_installed::read_owned_resource(
-                    &owner.launch.stdout,
-                    16 * 1024 * 1024,
-                )?;
-                if let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
-                    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes[..end])
-                        .map_err(CiError::Message)?;
-                    let row: crate::linux_consumer_readiness::LinuxTranscriptRow =
-                        serde_json::from_slice(&bytes[..end])?;
-                    if row.challenge != challenge
-                        || row.sequence != 1
-                        || row.operation != "root-exiting-before-held-descendant"
-                    {
-                        return Err(CiError::Message(
-                            "actual drain held descendant transcript differs".into(),
-                        ));
-                    }
-                    owner.launch.hold_fixture_tree_into(
-                        observer,
-                        &row.observation,
-                        &mut owner.held,
-                    )?;
-                    owner.transcript.push(row);
-                    owner.launch.release_fixture_barrier()?;
-                    break;
+            if let Some(bytes) = owner.launch.first_stdout_record(context.work_deadline)? {
+                let record = bytes.strip_suffix(b"\n").ok_or_else(|| {
+                    CiError::Message("committed capture record lacks newline".into())
+                })?;
+                memcordon_core::workload_contract::reject_duplicate_json_keys(record)
+                    .map_err(CiError::Message)?;
+                let row: crate::linux_consumer_readiness::LinuxTranscriptRow =
+                    serde_json::from_slice(record)?;
+                if row.challenge != challenge
+                    || row.sequence != 1
+                    || row.operation != "root-exiting-before-held-descendant"
+                {
+                    return Err(CiError::Message(
+                        "actual drain held descendant transcript differs".into(),
+                    ));
                 }
+                owner
+                    .launch
+                    .hold_fixture_tree_into(observer, &row.observation, &mut owner.held)?;
+                owner.transcript.push(row);
+                owner.launch.release_fixture_barrier()?;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1778,6 +1971,19 @@ pub fn run_case(
         )));
     }
     report.files.push(retained?);
+    if delivery {
+        // Normalization publishes this original later. Capture its exact bytes
+        // now, while the original source custody and recovery owner are held.
+        let bytes = super::linux_mixed_installed::read_owned_resource(
+            context.contract_path,
+            4 * 1024 * 1024,
+        )?;
+        retain_bytes(
+            &root.join("original-contract.json"),
+            &bytes,
+            &mut report.files,
+        )?;
+    }
     use super::linux_original_recovery::{contract, record};
     let original_input = contract::Input {
         format: "memcordon.original-native-recovery-input".into(),
@@ -1801,6 +2007,8 @@ pub fn run_case(
                 lease_owner: record(context.lease_owner_path)?,
                 prepared: record(&root.join("prepared.json"))?,
                 allocation_journal: record(&root.join("allocation-phase-journal.bin"))?,
+                frontend_invocation: record(&root.join("frontend-invocation.json"))?,
+                original_contract: record(&root.join("original-contract.json"))?,
                 report_destination: record(&root.join("report-destination.json"))?,
                 report_delivery_failure: record(&root.join("report-delivery-failure.json"))?,
             }
@@ -2088,11 +2296,22 @@ pub fn normalize_completed(
                 ));
             }
             let relative = format!("{prefix}/{name}");
-            retain_bytes(
-                &input.artifact_root.join(&relative),
-                bytes,
-                &mut report.files,
-            )?;
+            let destination = input.artifact_root.join(&relative);
+            if key.family == "L-LIFE-05" && name == "original-contract.json" {
+                // The original recovery input already owns this publication.
+                // Never replace it with a later source reread, even if valid.
+                let original = super::linux_mixed_installed::read_owned_resource(
+                    &destination,
+                    4 * 1024 * 1024,
+                )?;
+                if original != bytes {
+                    return Err(CiError::Message(
+                        "delivery original contract changed after recovery capture".into(),
+                    ));
+                }
+            } else {
+                retain_bytes(&destination, bytes, &mut report.files)?;
+            }
             let artifact = Artifact {
                 path: relative,
                 length: bytes.len() as u64,
@@ -2130,22 +2349,6 @@ pub fn normalize_completed(
                 65536,
             )?)?;
         let arguments: Vec<Vec<u8>> = serde_json::from_value(invocation["arguments"].clone())?;
-        let marker = arguments
-            .windows(3)
-            .enumerate()
-            .filter(|(_, values)| {
-                values[0] == b"--image-entrypoint"
-                    && values[1] == b"owned-readiness"
-                    && values[2] == b"--"
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if marker.len() != 1 {
-            return Err(CiError::Message(
-                "actual lifecycle frontend entrypoint argument association differs".into(),
-            ));
-        }
-        let target = arguments[marker[0] + 3..].to_vec();
         let delivery = key.family == "L-LIFE-05";
         let phase = key
             .scenario
@@ -2165,11 +2368,13 @@ pub fn normalize_completed(
         if delivery {
             expected.push(b"0".to_vec());
         }
-        if target != expected {
-            return Err(CiError::Message(
-                "actual lifecycle native target arguments changed".into(),
-            ));
-        }
+        let lifetime: &[u8] = if !delivery && phase == "drain" {
+            b"workload"
+        } else {
+            b"command"
+        };
+        let target = frontend_arguments::normalize(&arguments, lifetime, &expected)
+            .map_err(|error| CiError::Message(error.into()))?;
         let descriptor = FixtureInput {
             format: "memcordon.consumer-readiness.input".into(),
             revision: 1,

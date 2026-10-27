@@ -833,6 +833,14 @@ impl ImportRefusalReport {
             ]
             .map(|name| retirement.join(name)),
         );
+        if !retired.status.success() {
+            return Err(captured_import_failure(
+                "isolation original definition native retirement command failed",
+                retirement,
+                "original input definition owner remains retained",
+                &retired,
+            ));
+        }
         let receipt: serde_json::Value =
             serde_json::from_slice(&retired.stdout).map_err(|error| {
                 captured_import_failure(
@@ -842,8 +850,7 @@ impl ImportRefusalReport {
                     &retired,
                 )
             })?;
-        if !retired.status.success()
-            || receipt["format"] != "memcordon.runtime-image-retirement"
+        if receipt["format"] != "memcordon.runtime-image-retirement"
             || receipt["revision"] != 1
             || receipt["reference"] != serde_json::to_value(&reference)?
             || receipt["storage_absent"] != true
@@ -1481,6 +1488,7 @@ impl AccountRefusalReport {
         self.launches
             .push(super::linux_mixed_installed::InstalledMixedLaunch::start(
                 super::linux_mixed_installed::InstalledMixedLaunchInput {
+                    lifetime: memcordon_core::Lifetime::Command,
                     directory: &directory.join("frontend"),
                     contract: &directory.join(if scenario == "account-alias" {
                         "alias.contract.json"

@@ -4,7 +4,10 @@ mod sddl_text;
 use crate::windows_consumer_readiness::CaseInput;
 use crate::windows_installed_cases::InstalledWindowsPayload;
 use crate::{CiError, Result};
-use memcordon_windows_loader_lab::workload::WorkloadDiagnosticRequestV1;
+use memcordon_windows_loader_lab::workload::{
+    DefaultDaclProbeEligibilityV1, DefaultDaclProbeKindV1, DefaultDaclProbeTargetV1,
+    MAX_REQUEST_BYTES, WorkloadDiagnosticRequestV1,
+};
 use std::{
     fs,
     os::windows::io::{AsRawHandle, OwnedHandle},
@@ -126,6 +129,7 @@ pub(super) fn observe(
     }
     let mut input = WorkloadDiagnosticRequestV1 {
         schema_version: 1,
+        default_dacl_probe: None,
         original_result_sha256: original.sha256.clone(),
         original_terminal_sha256: terminal_file.sha256.clone(),
         original_result_bytes: original.bytes.clone(),
@@ -169,33 +173,19 @@ pub(super) fn observe(
             "diagnostic workspace source differs from selected provider".into(),
         ));
     }
-    let toolchain = crate::config::toolchains(&workspace)?.stable;
-    // Reuse the existing cached native release tree; introduce no separate
-    // unvalidated cache or optimization profile for this diagnostic.
-    let target = workspace.join("target/ci/native");
-    crate::command::rustup_cargo(
-        &workspace,
-        &toolchain,
-        [
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "-p",
-            "memcordon-windows-loader-lab",
-            "--bin",
-            "memcordon-windows-loader-lab",
-            "--target-dir",
-        ],
-        Duration::from_secs(180),
-    )
-    .arg(target.as_os_str())
-    .bounded_until(work)
-    .defer_group_failure()
-    .run()?;
+    let diagnostic = config.require_workload_diagnostic()?;
+    if config.provider.source_commit.as_str() != config.source_commit {
+        return Err(CiError::Message(
+            "controlled diagnostic provider source differs from qualified selection".into(),
+        ));
+    }
     let (executable, held_executable) =
-        crate::windows_readiness_adapter::prepare_workload_executable(&target, report)?;
-    // Compilation and materialization consume original time; neither can
+        crate::windows_readiness_adapter::prepare_workload_executable(
+            &diagnostic.executable.path,
+            &diagnostic.executable.sha256,
+            report,
+        )?;
+    // Materialization consumes original time; it cannot
     // silently renew the caller's deadline or the experiment's finite slice.
     let now = Instant::now();
     let ticks = uptime();
@@ -216,14 +206,39 @@ pub(super) fn observe(
     input.cleanup_deadline_tick_ms = ticks
         .checked_add(cleanup_remaining.as_millis() as u64)
         .ok_or_else(|| CiError::Message("diagnostic cleanup cutoff overflow".into()))?;
+    input.default_dacl_probe = Some(DefaultDaclProbeEligibilityV1 {
+        revision: 1,
+        kind: DefaultDaclProbeKindV1::QualifiedRestrictedEnvelopeFixture,
+        source_commit: config.source_commit.clone(),
+        target: DefaultDaclProbeTargetV1::try_from(config.target.as_str())
+            .map_err(CiError::Message)?,
+        fixture_sha256: image.sha256.clone(),
+        original_result_sha256: input.original_result_sha256.clone(),
+        original_terminal_sha256: input.original_terminal_sha256.clone(),
+        original_descriptor_sha256: input.original_descriptor_sha256.clone(),
+    });
     input.validate().map_err(CiError::Message)?;
-    publish(&request_path, &serde_json::to_vec(&input)?)?;
+    let request_bytes = serde_json::to_vec(&input)?;
+    if request_bytes.len() > MAX_REQUEST_BYTES {
+        return Err(CiError::Message(
+            "controlled diagnostic request exceeds existing byte bound".into(),
+        ));
+    }
+    let request_sha256 = crate::windows_causal_acceptance::sha256(&request_bytes);
+    publish(&request_path, &request_bytes)?;
+    let held_request = crate::windows_readiness_adapter::hold_artifact(
+        &request_path,
+        Some(&request_sha256),
+        MAX_REQUEST_BYTES as u64,
+    )?;
     let result_path = report.with_extension("workload-observation.json");
     let launched =
         crate::command::CommandSpec::new(&executable, &workspace, Duration::from_secs(60))
             .arg("run-workload")
             .arg("--request")
             .arg(request_path.as_os_str())
+            .arg("--request-sha256")
+            .arg(&request_sha256)
             .arg("--result")
             .arg(result_path.as_os_str())
             .bounded_until(cleanup)
@@ -231,14 +246,20 @@ pub(super) fn observe(
             .output_quiet();
     crate::windows_readiness_adapter::verify_named_artifact(&held_executable, &executable)?;
     crate::windows_readiness_adapter::verify_named_artifact(&image, &fixture_path)?;
+    crate::windows_readiness_adapter::verify_named_artifact(&held_request, &request_path)?;
     let observation =
         crate::windows_readiness_adapter::hold_artifact(&result_path, None, 32 * 1024 * 1024)
             .map(|record| serde_json::json!({"path":result_path,"sha256":record.sha256}))
             .map_err(|error| error.to_string());
+    let probes_path = request_path.with_extension("startup-access-probes.json");
+    let probes = crate::windows_readiness_adapter::hold_artifact(&probes_path, None, 256 * 1024)
+        .map(|record| serde_json::json!({"path":probes_path,"sha256":record.sha256}))
+        .map_err(|error| error.to_string());
     Ok(
         serde_json::json!({"authority":"diagnostic-only","original_failure_unchanged":true,
         "source_commit":config.source_commit,"executable_path":executable,"executable_sha256":held_executable.sha256,
-        "request":request_path,"observation":observation,"command":launched.map(|output|serde_json::json!({"status":output.status.code()})).map_err(|error|error.to_string()),
+        "qualified_diagnostic":diagnostic,"request":request_path,"observation":observation,"startup_access_probes":probes,
+        "command":launched.map(|output|serde_json::json!({"status":output.status.code()})).map_err(|error|error.to_string()),
         "equivalence":"startup policy with recorded fresh descriptor/objects and debugger/creator differences; never original authority"}),
     )
 }
@@ -299,6 +320,184 @@ pub(super) fn gate_sddl(gate: &OwnedHandle) -> Result<String> {
     unsafe { sddl_text::from_descriptor(pointer, 0x17) }
         .map(|(text, _, _)| text)
         .map_err(CiError::Message)
+}
+
+pub(super) fn gate_security_snapshot(
+    gate: &OwnedHandle,
+    deadline: Instant,
+) -> std::io::Result<super::gate_security::Snapshot> {
+    let snapshot =
+        super::gate_security::parse(&gate_descriptor_bytes(gate, deadline, 0x0000_0007)?)?;
+    gate_snapshot_live(deadline)?;
+    Ok(snapshot)
+}
+
+pub(super) fn gate_mandatory_label_snapshot(
+    gate: &OwnedHandle,
+    deadline: Instant,
+) -> std::io::Result<super::gate_label::Snapshot> {
+    // LABEL_SECURITY_INFORMATION alone requires the owner's existing READ_CONTROL.
+    let snapshot = super::gate_label::parse(&gate_descriptor_bytes(gate, deadline, 0x0000_0010)?)?;
+    gate_snapshot_live(deadline)?;
+    Ok(snapshot)
+}
+
+fn gate_snapshot_live(deadline: Instant) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "original gate snapshot cutoff elapsed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(unsafe_code)] // Only bounded queries on the original READ_CONTROL event owner.
+fn gate_descriptor_bytes(
+    gate: &OwnedHandle,
+    deadline: Instant,
+    information: u32,
+) -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError},
+        Security::{
+            GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorLength,
+            IsValidSecurityDescriptor, SE_SELF_RELATIVE,
+        },
+    };
+    let live = || gate_snapshot_live(deadline);
+    live()?;
+    let mut needed = 0;
+    let status = unsafe {
+        GetKernelObjectSecurity(
+            gate.as_raw_handle(),
+            information,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let error = unsafe { GetLastError() };
+    live()?;
+    if status == 0 && error != ERROR_INSUFFICIENT_BUFFER {
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+    if status != 0
+        || error != ERROR_INSUFFICIENT_BUFFER
+        || needed == 0
+        || needed as usize > super::gate_security::BYTE_BOUND
+    {
+        return Err(std::io::Error::other(
+            "original gate descriptor sizing or bound differs",
+        ));
+    }
+    let capacity = needed;
+    let mut storage = vec![0_u64; (capacity as usize).div_ceil(size_of::<u64>())];
+    let pointer = storage.as_mut_ptr().cast();
+    live()?;
+    if unsafe {
+        GetKernelObjectSecurity(
+            gate.as_raw_handle(),
+            information,
+            pointer,
+            capacity,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    live()?;
+    if needed == 0 || needed > capacity || unsafe { IsValidSecurityDescriptor(pointer) } == 0 {
+        return Err(std::io::Error::other(
+            "original gate descriptor returned extent or validity differs",
+        ));
+    }
+    let actual = unsafe { GetSecurityDescriptorLength(pointer) };
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(pointer, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if actual == 0 || actual > needed || actual > capacity || control & SE_SELF_RELATIVE == 0 {
+        return Err(std::io::Error::other(
+            "original gate descriptor self-relative extent differs",
+        ));
+    }
+    // SAFETY: validated native descriptor length is inside the aligned owned allocation.
+    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), actual as usize) };
+    let snapshot = bytes.to_vec();
+    live()?;
+    Ok(snapshot)
+}
+
+#[allow(unsafe_code)] // Query current process identity and its session; no token mutation.
+pub(super) fn gate_controller_context(deadline: Instant) -> std::io::Result<serde_json::Value> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        Security::{GetTokenInformation, TOKEN_QUERY, TokenSessionId},
+        System::Threading::{
+            GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcessToken,
+        },
+    };
+    let live = || {
+        if Instant::now() >= deadline {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "original gate controller context cutoff elapsed",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    live()?;
+    let process = unsafe { GetCurrentProcess() };
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let birth =
+        (u64::from(creation.dwHighDateTime) << u32::BITS) | u64::from(creation.dwLowDateTime);
+    live()?;
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut session = 0_u32;
+    let mut returned = 0;
+    live()?;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenSessionId,
+            (&mut session as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if returned as usize != size_of::<u32>() || pid == 0 || birth == 0 {
+        return Err(std::io::Error::other(
+            "original gate controller identity/session extent differs",
+        ));
+    }
+    live()?;
+    Ok(
+        serde_json::json!({"pid":pid,"birth":birth.to_string(),"process_token_session":session,
+        "authority":"current-process-query-only; not a fixture token observation"}),
+    )
 }
 
 #[allow(unsafe_code)] // Read only the machine-wide monotonic uptime clock.

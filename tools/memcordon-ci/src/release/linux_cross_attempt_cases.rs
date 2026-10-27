@@ -544,6 +544,7 @@ fn start(
             .max(1)
     );
     let launch = InstalledMixedLaunch::start(InstalledMixedLaunchInput {
+        lifetime: memcordon_core::Lifetime::Command,
         directory: &directory.join("frontend"),
         contract: &contract_path,
         caller_uid: 65534,

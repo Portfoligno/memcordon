@@ -265,6 +265,230 @@ fn recover_records(
     Ok(())
 }
 
+/// Authenticate exactly one durable V4 write. Constructing each permitted
+/// successor from the predecessor preserves every original identity/resource;
+/// a newer phase alone cannot authorize discarding an earlier obligation.
+pub(crate) fn validate_mixed_pending_transition(
+    current: &super::private_attempt::PrivateAttemptRecordV4,
+    pending: &super::private_attempt::PrivateAttemptRecordV4,
+) -> Result<(), String> {
+    use super::private_attempt::{PrivateAttemptPhase as Phase, ReleaseKnowledge};
+    current.validate()?;
+    pending.validate()?;
+    if current.mixed_admission_metadata.is_none() {
+        return Err("pending transition has no canonical mixed admission authority".into());
+    }
+    fn matches(
+        current: &super::private_attempt::PrivateAttemptRecordV4,
+        pending: &super::private_attempt::PrivateAttemptRecordV4,
+        edit: impl FnOnce(&mut super::private_attempt::PrivateAttemptRecordV4),
+    ) -> bool {
+        let mut expected = current.clone();
+        edit(&mut expected);
+        expected == *pending
+    }
+    let accepted = current == pending
+        || (current.phase == Phase::Allocated
+            && pending.phase == Phase::BoundaryCreated
+            && matches(current, pending, |next| next.phase = Phase::BoundaryCreated))
+        || (current.phase == Phase::BoundaryCreated
+            && pending.phase == Phase::GuardianReady
+            && pending.guardian.is_some()
+            && matches(current, pending, |next| {
+                next.phase = Phase::GuardianReady;
+                next.guardian = pending.guardian.clone();
+            }))
+        || (current.phase == Phase::GuardianReady
+            && pending.phase == Phase::TargetGated
+            && pending.target.is_some()
+            && pending.namespace_init.is_some()
+            && pending.network_namespace_inode.is_some()
+            && matches(current, pending, |next| {
+                next.phase = Phase::TargetGated;
+                next.target = pending.target.clone();
+                next.namespace_init = pending.namespace_init.clone();
+                next.network_namespace_inode = pending.network_namespace_inode;
+            }))
+        || (current.phase == Phase::TargetGated
+            && pending.phase == Phase::CheckpointCommitted
+            && pending.gated_facts.is_some()
+            && matches(current, pending, |next| {
+                next.phase = Phase::CheckpointCommitted;
+                next.gated_facts = pending.gated_facts.clone();
+            }))
+        || (current.phase == Phase::CheckpointCommitted
+            && pending.phase == Phase::ReleaseIntent
+            && matches(current, pending, |next| {
+                next.phase = Phase::ReleaseIntent;
+                next.release_knowledge = ReleaseKnowledge::PossiblyReleased;
+            }))
+        || (current.phase == Phase::ReleaseIntent
+            && pending.phase == Phase::ExecutionObserved
+            && matches(current, pending, |next| {
+                next.phase = Phase::ExecutionObserved;
+                next.release_knowledge = ReleaseKnowledge::ExecObserved;
+            }))
+        || (current.phase != Phase::Retired
+            && pending.phase == Phase::Retiring
+            && matches(current, pending, |next| next.phase = Phase::Retiring))
+        || (current.phase == Phase::Retiring
+            && pending.phase == Phase::Retired
+            && matches(current, pending, |next| next.phase = Phase::Retired))
+        || (current.phase != Phase::Retired
+            && pending.phase == Phase::CleanupIncomplete
+            && pending.cleanup_error.is_some()
+            && matches(current, pending, |next| {
+                next.phase = Phase::CleanupIncomplete;
+                next.cleanup_error = pending.cleanup_error.clone();
+            }))
+        || (current.phase == Phase::Allocated
+            && current.mixed_worker.is_none()
+            && pending.mixed_worker.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_worker = pending.mixed_worker.clone()
+            }))
+        || (current.phase == Phase::Allocated
+            && current.mixed_control.is_none()
+            && pending.mixed_control.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_control = pending.mixed_control.clone()
+            }))
+        || (current.phase == Phase::BoundaryCreated
+            && current.mixed_root_staging_intent.is_none()
+            && pending.mixed_root_staging_intent.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_root_staging_intent = pending.mixed_root_staging_intent.clone()
+            }))
+        || (current.phase == Phase::BoundaryCreated
+            && current.mixed_cgroup_identity.is_none()
+            && pending.mixed_cgroup_identity.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_cgroup_identity = pending.mixed_cgroup_identity.clone()
+            }))
+        || (current.phase == Phase::BoundaryCreated
+            && current.mixed_staging_identity.is_none()
+            && pending.mixed_staging_identity.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_staging_identity = pending.mixed_staging_identity.clone()
+            }))
+        || (current.phase == Phase::Retiring
+            && current.mixed_export_intent.is_none()
+            && pending.mixed_export_intent.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_export_intent = pending.mixed_export_intent.clone()
+            }))
+        || (current.phase == Phase::Retiring
+            && current.mixed_export_identity.is_none()
+            && pending.mixed_export_identity.is_some()
+            && matches(current, pending, |next| {
+                next.mixed_export_identity = pending.mixed_export_identity.clone()
+            }));
+    if !accepted {
+        return Err(format!(
+            "pending V4 transition is not an authenticated single write: canonical={:?} pending={:?}",
+            current.phase, pending.phase
+        ));
+    }
+    Ok(())
+}
+
+struct HeldMixedPending {
+    file: File,
+    bytes: Vec<u8>,
+    record: super::private_attempt::PrivateAttemptRecordV4,
+    observation: String,
+}
+
+#[cfg(test)]
+pub(crate) fn inspect_mixed_pending_for_test(
+    path: &Path,
+    current: &super::private_attempt::PrivateAttemptRecordV4,
+) -> Result<Option<super::private_attempt::PrivateAttemptRecordV4>, String> {
+    held_mixed_pending(path, current).map(|held| held.map(|held| held.record))
+}
+
+fn held_mixed_pending(
+    path: &Path,
+    current: &super::private_attempt::PrivateAttemptRecordV4,
+) -> Result<Option<HeldMixedPending>, String> {
+    use sha2::{Digest, Sha256};
+    let Some(file) = held_recovery_file(path)? else {
+        return Ok(None);
+    };
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    let bytes = recovery_file_bytes(&file)?;
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let observation = format!(
+        "pending-present=true device={} inode={} size={} sha256={digest} canonical-phase={:?}",
+        before.dev(),
+        before.ino(),
+        bytes.len(),
+        current.phase
+    );
+    recheck_recovery_bytes(path, &file, &bytes)
+        .map_err(|error| format!("{observation}; pending-custody={error}"))?;
+    let record = super::private_attempt::PrivateAttemptRecordV4::parse(&bytes)
+        .map_err(|error| format!("{observation}; pending-parse={error}"))?;
+    validate_mixed_pending_transition(current, &record).map_err(|error| {
+        format!(
+            "{observation}; pending-phase={:?}; transition={error}",
+            record.phase
+        )
+    })?;
+    let observation = format!(
+        "{observation}; pending-parse=valid; pending-phase={:?}; transition=validated",
+        record.phase
+    );
+    Ok(Some(HeldMixedPending {
+        file,
+        bytes,
+        record,
+        observation,
+    }))
+}
+
+fn recovery_file_bytes(file: &File) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::FileExt;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length > MAX_RECORD_BYTES {
+        return Err("mixed recovery file grew beyond bound".into());
+    }
+    let mut bytes = vec![0; usize::try_from(length).map_err(|error| error.to_string())?];
+    file.read_exact_at(&mut bytes, 0)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+fn recheck_recovery_bytes(path: &Path, original: &File, bytes: &[u8]) -> Result<(), String> {
+    let named = held_recovery_file(path)?.ok_or("mixed recovery named authority disappeared")?;
+    let held = original.metadata().map_err(|error| error.to_string())?;
+    let current = named.metadata().map_err(|error| error.to_string())?;
+    let stamp = |metadata: &fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    };
+    if held.nlink() != 1
+        || held.uid() != 0
+        || held.mode() & 0o7777 != 0o600
+        || stamp(&held) != stamp(&current)
+        || recovery_file_bytes(original)? != bytes
+        || recovery_file_bytes(&named)? != bytes
+    {
+        return Err("mixed recovery held/named authority bytes or inode changed".into());
+    }
+    Ok(())
+}
+
 fn recover_mixed_record(
     state_root: &Path,
     cgroup_root: &Path,
@@ -322,8 +546,58 @@ fn recover_mixed_record(
     if super::private_attempt::PrivateAttemptRecordV4::parse(&journal_bytes)? != *record {
         return Err("mixed recovery held journal differs from parsed owner".into());
     }
-    super::mixed_recovery::settle_native(record, cgroup_root, layout.output_files.as_slice())?;
+    let pending_path = journal.with_extension("new");
+    let mut pending = held_mixed_pending(&pending_path, record)?;
+    // Every authenticated successor retains the predecessor's entire owner
+    // inventory. Settlement consumes their union under one original allowance,
+    // never a new five-second budget for a late-discovered pending write.
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    super::mixed_recovery::settle_native_until(
+        pending.as_ref().map_or(record, |pending| &pending.record),
+        cgroup_root,
+        layout.output_files.as_slice(),
+        cleanup_deadline,
+    )
+    .map_err(|error| {
+        format!(
+            "{}; settlement={error}",
+            pending
+                .as_ref()
+                .map_or("pending-present=false", |pending| pending
+                    .observation
+                    .as_str())
+        )
+    })?;
+    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
+    match &pending {
+        Some(held) => recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)
+            .map_err(|error| format!("{}; pending-after-settlement={error}", held.observation))?,
+        None => {
+            // Original writers are now retired. A write interrupted during
+            // settlement is still authenticated against the retained canonical
+            // predecessor, and its additional obligations must also settle.
+            pending = held_mixed_pending(&pending_path, record)?;
+            if let Some(held) = &pending {
+                super::mixed_recovery::settle_native_until(
+                    &held.record,
+                    cgroup_root,
+                    layout.output_files.as_slice(),
+                    cleanup_deadline,
+                )
+                .map_err(|error| format!("{}; pending-settlement={error}", held.observation))?;
+                recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)?;
+            }
+        }
+    }
     super::mixed_admission::require_account_quiescent(account.uid.get(), None)?;
+    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
+    if let Some(held) = &pending {
+        recheck_recovery_bytes(&pending_path, &held.file, &held.bytes)?;
+        unlink_recovery_file(&pending_path, &held.file, &directory)?;
+    } else if held_recovery_file(&pending_path)?.is_some() {
+        return Err("mixed pending journal appeared after original writer settlement".into());
+    }
+    let record = pending.as_ref().map_or(record, |pending| &pending.record);
     // Reservation deletion remains under the same retained native settlement;
     // an unrelated or malformed reservation is never consumed by filename.
     for entry in fs::read_dir(state_root).map_err(|error| error.to_string())? {
@@ -423,6 +697,7 @@ fn recover_mixed_record(
         }
         unlink_recovery_file(&entry.path(), &file, &directory)?;
     }
+    recheck_recovery_bytes(journal, &journal_file, &journal_bytes)?;
     if let Some(reference) = reference {
         unlink_recovery_file(&reference_path, &reference, &directory)?;
     }
@@ -432,7 +707,7 @@ fn recover_mixed_record(
 fn held_recovery_file(path: &Path) -> Result<Option<File>, String> {
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,

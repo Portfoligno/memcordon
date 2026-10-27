@@ -279,6 +279,7 @@ pub(super) fn run(
         measured,
         &selected,
         fixture,
+        payload.workload_diagnostic.clone(),
         &removal.binary_root,
         directory.join("observations"),
     )?;

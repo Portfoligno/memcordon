@@ -599,6 +599,10 @@ impl ServiceRecoveryRole {
 mod extinction_staging;
 
 #[cfg(windows)]
+#[path = "windows_component_barriers.rs"]
+mod component_barriers;
+
+#[cfg(windows)]
 pub fn run_installed(
     config: &crate::windows_installed_cases::InstalledWindowsPayload,
     input: &ComponentInput,
@@ -1173,6 +1177,57 @@ mod native {
         certification_failure_preserved: bool,
         pending_frontend: Option<&memcordon_core::WindowsProcessIdentityV1>,
     ) -> Result<bool> {
+        let mut diagnostics = super::component_barriers::SettlementErrors::new();
+        let result = recover_held_attempt_retaining(
+            RecoveryCapture {
+                config,
+                input,
+                directory,
+                record,
+                held,
+                cutoff,
+                capture_stem,
+                certification_failure_preserved,
+                pending_frontend,
+            },
+            &mut diagnostics,
+        );
+        let completed = diagnostics
+            .capture_operation(result)
+            .map(|response| response.is_some());
+        diagnostics.finish(|operational, diagnostic| {
+            CiError::Message(format!("{operational}; diagnostic-retention={diagnostic}"))
+        })?;
+        Ok(completed.expect("successful authenticated recovery produced a result"))
+    }
+
+    struct RecoveryCapture<'a> {
+        config: &'a crate::windows_installed_cases::InstalledWindowsPayload,
+        input: &'a ComponentInput,
+        directory: &'a std::path::Path,
+        record: &'a mut ComponentAssessment,
+        held: &'a memcordon_core::WindowsGuardianAttemptObservation,
+        cutoff: Instant,
+        capture_stem: &'a str,
+        certification_failure_preserved: bool,
+        pending_frontend: Option<&'a memcordon_core::WindowsProcessIdentityV1>,
+    }
+
+    fn recover_held_attempt_retaining(
+        capture: RecoveryCapture<'_>,
+        diagnostics: &mut super::component_barriers::SettlementErrors<CiError>,
+    ) -> Result<Option<memcordon_core::WindowsProviderResponseV3>> {
+        let RecoveryCapture {
+            config,
+            input,
+            directory,
+            record,
+            held,
+            cutoff,
+            capture_stem,
+            certification_failure_preserved,
+            pending_frontend,
+        } = capture;
         let binding = crate::windows_component_failed_recovery::RecoveryBinding::from_held(
             held,
             &config.provider,
@@ -1194,7 +1249,7 @@ mod native {
             ])
             .materialize()?;
         command.env_clear();
-        let invocation = serde_json::to_vec(&serde_json::json!({
+        let invocation = diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
             "format":"memcordon.windows-failed-collection-recovery-command","revision":1,
             "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
             "provider":config.provider,"held_association":held,"certification_failure_preserved":certification_failure_preserved,
@@ -1203,12 +1258,17 @@ mod native {
             "argv_utf16":command.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
             "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
             "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis,
-        }))?;
-        retain(
-            &directory.join(format!("{capture_stem}-invocation.json")),
-            &invocation,
-            record,
-        )?;
+        })).map_err(CiError::from));
+        let invocation_sha256 = invocation
+            .as_ref()
+            .map(|bytes| crate::windows_causal_acceptance::sha256(bytes));
+        if let Some(invocation) = &invocation {
+            diagnostics.diagnostic(retain(
+                &directory.join(format!("{capture_stem}-invocation.json")),
+                invocation,
+                record,
+            ));
+        }
         let remaining = cutoff
             .checked_duration_since(Instant::now())
             .filter(|budget| !budget.is_zero())
@@ -1224,50 +1284,50 @@ mod native {
             if let memcordon_testkit::ProcessTestError::Timeout { stdout, stderr, .. }
             | memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, .. } = error
             {
-                retain(
+                diagnostics.diagnostic(retain(
                     &directory.join(format!("{capture_stem}.partial.stdout.bin")),
                     stdout,
                     record,
-                )?;
-                retain(
+                ));
+                diagnostics.diagnostic(retain(
                     &directory.join(format!("{capture_stem}.partial.stderr.bin")),
                     stderr,
                     record,
-                )?;
+                ));
             }
-            retain(
+            diagnostics.diagnostic((|| -> Result<()> { retain(
                 &directory.join(format!("{capture_stem}-failure.json")),
                 &serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-failed-collection-recovery-failure","revision":1,
-                    "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                    "invocation_sha256":invocation_sha256,
                     "failure":error.to_string(),"capture_complete":false,
                     "certification_failure_preserved":certification_failure_preserved,
                 }))?,
                 record,
-            )?;
+            ) })());
         }
         let output = captured.map_err(|error| CiError::Message(error.to_string()))?;
-        retain(
+        diagnostics.diagnostic(retain(
             &directory.join(format!("{capture_stem}.json")),
             &output.stdout,
             record,
-        )?;
-        retain(
+        ));
+        diagnostics.diagnostic(retain(
             &directory.join(format!("{capture_stem}.stderr.bin")),
             &output.stderr,
             record,
-        )?;
-        retain(
+        ));
+        diagnostics.diagnostic((|| -> Result<()> { retain(
             &directory.join(format!("{capture_stem}-exit.json")),
             &serde_json::to_vec(&serde_json::json!({
                 "format":"memcordon.windows-failed-collection-recovery-exit","revision":1,
-                "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                "invocation_sha256":invocation_sha256,
                 "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
                 "stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),
                 "native_status":output.status.code(),"certification_failure_preserved":certification_failure_preserved,
             }))?,
             record,
-        )?;
+        ) })());
         if let Some(frontend) = pending_frontend {
             if output.status.code() == Some(1) {
                 memcordon_core::canonical_json::reject_duplicate_json_keys(&output.stdout)
@@ -1282,7 +1342,7 @@ mod native {
                 )
                 .map_err(CiError::Message)?
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         }
@@ -1302,7 +1362,7 @@ mod native {
         binding
             .validate_response(&response)
             .map_err(CiError::Message)?;
-        Ok(true)
+        Ok(Some(response))
     }
 
     fn worker_recovery_receipt_authority(
@@ -1519,12 +1579,18 @@ mod native {
             }))?,
             record,
         )?;
-        let gate = case
-            .descriptor
-            .start_gate
-            .as_ref()
-            .map(|name| crate::windows_consumer_readiness::native::event_create(name))
-            .transpose()?;
+        // This outer owner outlives the callback and all original target/Job
+        // settlement and recovery below. Components never release the compiler
+        // observer barrier: full compiler qualification belongs to the ordinary driver.
+        let component_barriers = super::component_barriers::ComponentBarriers::create(
+            case.descriptor.start_gate.as_deref(),
+            held_phase && case.descriptor.toolchain.is_some(),
+            |name| {
+                crate::windows_consumer_readiness::native::event_create(name)
+                    .map_err(io::Error::other)
+            },
+        )?;
+        let gate = component_barriers.callback_start();
         let family = Arc::new(Mutex::new(Vec::new()));
         let held_family = Arc::clone(&family);
         let guardian = Arc::new(Mutex::new(None));
@@ -1974,46 +2040,59 @@ mod native {
                 Ok(())
             },
         );
-        record.artifacts.extend(
-            progression_record
+        // Capture failures are collection failures, not an early escape from
+        // original retirement/recovery while the outer barriers are still owned.
+        let post_spawn_retention = (|| -> Result<()> {
+            record.artifacts.extend(
+                progression_record
+                    .lock()
+                    .map_err(|_| CiError::Message("component recovery evidence poisoned".into()))?
+                    .artifacts
+                    .iter()
+                    .cloned(),
+            );
+            if let Some(live) = live
                 .lock()
-                .map_err(|_| CiError::Message("component recovery evidence poisoned".into()))?
-                .artifacts
-                .iter()
-                .cloned(),
-        );
-        if let Some(live) = live
-            .lock()
-            .map_err(|_| CiError::Message("component observation poisoned".into()))?
-            .as_ref()
-        {
-            retain(
-                &directory.join("held-before-fault.json"),
-                &serde_json::to_vec(live)?,
-                record,
-            )?;
-        }
-        if let Err(error) = &output {
-            match error {
-                memcordon_testkit::ProcessTestError::Timeout { stdout, stderr, .. }
-                | memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, .. } => {
-                    retain(&directory.join("partial-stdout.bin"), stdout, record)?;
-                    retain(&directory.join("partial-stderr.bin"), stderr, record)?;
-                }
-                _ => {}
+                .map_err(|_| CiError::Message("component observation poisoned".into()))?
+                .as_ref()
+            {
+                retain(
+                    &directory.join("held-before-fault.json"),
+                    &serde_json::to_vec(live)?,
+                    record,
+                )?;
             }
-            retain(
-                &directory.join("capture-failure.json"),
-                &serde_json::to_vec(&serde_json::json!({
-                    "format":"memcordon.windows-native-component-capture-failure","revision":1,
-                    "run_id":input.run_id,"recipe_id":input.recipe_id,"failure":error.to_string(),
-                    "capture_complete":false
-                }))?,
-                record,
-            )?;
-        }
+            if let Err(error) = &output {
+                match error {
+                    memcordon_testkit::ProcessTestError::Timeout { stdout, stderr, .. }
+                    | memcordon_testkit::ProcessTestError::OutputLimit { stdout, stderr, .. } => {
+                        retain(&directory.join("partial-stdout.bin"), stdout, record)?;
+                        retain(&directory.join("partial-stderr.bin"), stderr, record)?;
+                    }
+                    _ => {}
+                }
+                retain(
+                    &directory.join("capture-failure.json"),
+                    &serde_json::to_vec(&serde_json::json!({
+                        "format":"memcordon.windows-native-component-capture-failure","revision":1,
+                        "run_id":input.run_id,"recipe_id":input.recipe_id,"failure":error.to_string(),
+                        "capture_complete":false
+                    }))?,
+                    record,
+                )?;
+            }
+            Ok(())
+        })();
         drop(frontend_gate_owner);
         let collection = (|| -> Result<()> {
+            if let Err(retention) = post_spawn_retention {
+                return Err(match &output {
+                    Err(original) => CiError::Message(format!(
+                        "{original}; post-spawn evidence retention={retention}"
+                    )),
+                    Ok(_) => retention,
+                });
+            }
             let output = output
                 .as_ref()
                 .map_err(|error| CiError::Message(error.to_string()))?;
@@ -2675,68 +2754,91 @@ mod native {
                     CiError::Message("failed collection recovery cutoff overflow".into())
                 })?
                 .min(deadlines.cleanup);
-            // Certification custody failure must remain a failure, but cannot
-            // suppress the separately authenticated settlement of an attempt
-            // whose original native association we held before the fault.
-            if let Err(error) = &collection {
-                // Query the original retained handles before recovery can
-                // return early. This text is diagnostic only: live processes,
-                // absent handles and query failures are all retained verbatim.
-                // None of these observations supplies terminal authority.
-                let mut status = Vec::new();
-                writeln!(status, "diagnostic-only; certification-authority=false")?;
-                writeln!(status, "original-collection-error={error}")?;
-                match guardian.lock() {
-                    Ok(held) => match held.as_ref() {
-                        Some(held) => writeln!(
-                            status,
-                            "original-guardian={:?}; retired={:?}; native-exit-status={:?}; held-slot-current-state-pid-win32-service-specific={:?}",
-                            held.identity,
-                            held.has_retired(),
-                            held.native_exit_status(),
-                            held.service_exit_status()
-                        )?,
-                        None => writeln!(status, "original-guardian=not-held")?,
-                    },
-                    Err(error) => writeln!(status, "original-guardian-lock-error={error}")?,
-                }
-                match worker.lock() {
-                    Ok(held) => match held.as_ref() {
-                        Some(held) => writeln!(
-                            status,
-                            "original-worker-process={:?}; process-retired={:?}; process-native-exit-status={:?}; original-thread={:?}; thread-native-exit-status={:?}",
-                            held.process.identity,
-                            held.process.has_exited(),
-                            held.process.native_exit_status(),
-                            held.identity,
-                            worker_exit(held)
-                        )?,
-                        None => writeln!(status, "original-worker=not-held")?,
-                    },
-                    Err(error) => writeln!(status, "original-worker-lock-error={error}")?,
-                }
-                match family.lock() {
-                    Ok(held) => {
-                        writeln!(status, "original-target-handle-count={}", held.len())?;
-                        for target in held.iter() {
-                            writeln!(
-                                status,
-                                "original-target={:?}; retired={:?}; native-exit-status={:?}",
-                                target.identity,
-                                target.has_exited(),
-                                target.native_exit_status()
-                            )?;
+            super::component_barriers::settle(
+                recovery_cutoff,
+                |operational, diagnostic| {
+                    CiError::Message(format!("{operational}; diagnostic-retention={diagnostic}"))
+                },
+                |stage, recovery_cutoff, diagnostics| {
+                    use super::component_barriers::SettlementStage;
+                    match stage {
+                        SettlementStage::OwnerStatus => {
+                            // Certification custody failure must remain a failure, but cannot
+                            // suppress the separately authenticated settlement of an attempt
+                            // whose original native association we held before the fault.
+                            if let Err(error) = &collection {
+                                // Query the original retained handles before recovery can
+                                // return early. This text is diagnostic only: live processes,
+                                // absent handles and query failures are all retained verbatim.
+                                // None of these observations supplies terminal authority.
+                                let mut status = Vec::new();
+                                writeln!(status, "diagnostic-only; certification-authority=false")?;
+                                writeln!(status, "original-collection-error={error}")?;
+                                match guardian.lock() {
+                                    Ok(held) => match held.as_ref() {
+                                        Some(held) => writeln!(
+                                            status,
+                                            "original-guardian={:?}; retired={:?}; native-exit-status={:?}; held-slot-current-state-pid-win32-service-specific={:?}",
+                                            held.identity,
+                                            held.has_retired(),
+                                            held.native_exit_status(),
+                                            held.service_exit_status()
+                                        )?,
+                                        None => writeln!(status, "original-guardian=not-held")?,
+                                    },
+                                    Err(error) => {
+                                        writeln!(status, "original-guardian-lock-error={error}")?
+                                    }
+                                }
+                                match worker.lock() {
+                                    Ok(held) => match held.as_ref() {
+                                        Some(held) => writeln!(
+                                            status,
+                                            "original-worker-process={:?}; process-retired={:?}; process-native-exit-status={:?}; original-thread={:?}; thread-native-exit-status={:?}",
+                                            held.process.identity,
+                                            held.process.has_exited(),
+                                            held.process.native_exit_status(),
+                                            held.identity,
+                                            worker_exit(held)
+                                        )?,
+                                        None => writeln!(status, "original-worker=not-held")?,
+                                    },
+                                    Err(error) => {
+                                        writeln!(status, "original-worker-lock-error={error}")?
+                                    }
+                                }
+                                match family.lock() {
+                                    Ok(held) => {
+                                        writeln!(
+                                            status,
+                                            "original-target-handle-count={}",
+                                            held.len()
+                                        )?;
+                                        for target in held.iter() {
+                                            writeln!(
+                                                status,
+                                                "original-target={:?}; retired={:?}; native-exit-status={:?}",
+                                                target.identity,
+                                                target.has_exited(),
+                                                target.native_exit_status()
+                                            )?;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        writeln!(status, "original-target-lock-error={error}")?
+                                    }
+                                }
+                                retain(
+                                    &directory.join("held-owner-status-after-collection.txt"),
+                                    &status,
+                                    record,
+                                )?;
+                            }
+                            Ok(())
                         }
-                    }
-                    Err(error) => writeln!(status, "original-target-lock-error={error}")?,
-                }
-                retain(
-                    &directory.join("held-owner-status-after-collection.txt"),
-                    &status,
-                    record,
-                )?;
-            }
-            if fault
+                        SettlementStage::ExactRecovery => {
+                            let extinction = (|| -> Result<()> {
+                                if fault
                 == Some(memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization)
             {
                 let remaining = recovery_cutoff
@@ -2750,7 +2852,7 @@ mod native {
                         .args(["windows-recover", "converge", millis.as_str()])
                         .materialize()?;
                 staging.env_clear();
-                let invocation = serde_json::to_vec(&serde_json::json!({
+                let invocation = diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-capability-extinction-staging-command","revision":1,
                     "run_id":input.run_id,"recipe_id":input.recipe_id,"source_commit":input.source_commit,
                     "provider":config.provider,"executable_sha256":config.cli.sha256,
@@ -2758,38 +2860,41 @@ mod native {
                     "argv_utf16":staging.get_args().map(|arg|arg.encode_wide().collect::<Vec<_>>()).collect::<Vec<_>>(),
                     "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
                     "original_cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
-                }))?;
-                retain(
+                })).map_err(CiError::from));
+                let invocation_sha256=invocation.as_ref().map(|bytes|crate::windows_causal_acceptance::sha256(bytes));
+                if let Some(invocation)=&invocation { diagnostics.diagnostic(retain(
                     &directory.join("extinction-staging-invocation.json"),
-                    &invocation,
+                    invocation,
                     record,
-                )?;
+                )); }
+                let remaining = recovery_cutoff.checked_duration_since(Instant::now()).filter(|remaining|!remaining.is_zero())
+                    .ok_or_else(||CiError::Message("extinction staging deadline exhausted".into()))?;
                 let output = memcordon_testkit::run_with_deadline_output_limit(
                     &mut staging,
                     remaining,
                     256 * 1024,
                 )
                 .map_err(|error| CiError::Message(error.to_string()))?;
-                retain(
+                diagnostics.diagnostic(retain(
                     &directory.join("extinction-staging.json"),
                     &output.stdout,
                     record,
-                )?;
-                retain(
+                ));
+                diagnostics.diagnostic(retain(
                     &directory.join("extinction-staging.stderr.bin"),
                     &output.stderr,
                     record,
-                )?;
-                retain(
+                ));
+                diagnostics.diagnostic((|| -> Result<()> { retain(
                     &directory.join("extinction-staging-exit.json"),
                     &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-capability-extinction-staging-exit","revision":1,
-                        "invocation_sha256":crate::windows_causal_acceptance::sha256(&invocation),
+                        "invocation_sha256":invocation_sha256,
                         "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
                         "stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),"native_status":output.status.code()
                     }))?,
                     record,
-                )?;
+                ) })());
                 let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
                     serde_json::from_slice(&output.stdout)?;
                 if !super::extinction_staging::accepts_pending_authority(
@@ -2809,74 +2914,73 @@ mod native {
                     .ok_or_else(|| {
                         CiError::Message("extinction original association absent".into())
                     })?;
-                recover_held_attempt(
-                    config,
-                    input,
-                    directory,
-                    record,
-                    &held,
-                    recovery_cutoff,
-                    "extinction-terminal-recovery",
-                    collection.is_err(),
-                    None,
-                )?;
-                let recovered: serde_json::Value = serde_json::from_slice(&read(
-                    &directory.join("extinction-terminal-recovery.json"),
-                    256 * 1024,
-                )?)?;
-                let response: memcordon_core::WindowsProviderResponseV3 = serde_json::from_value(
-                    recovered.get("provider_response").cloned().ok_or_else(|| {
-                        CiError::Message("extinction terminal response absent".into())
-                    })?,
-                )?;
-                retain(
+                let response = recover_held_attempt_retaining(
+                    RecoveryCapture { config, input, directory, record, held: &held,
+                        cutoff: recovery_cutoff, capture_stem: "extinction-terminal-recovery",
+                        certification_failure_preserved: collection.is_err(), pending_frontend: None },
+                    diagnostics,
+                )?.ok_or_else(||CiError::Message("extinction terminal response absent".into()))?;
+                // Derive authority from the authenticated in-memory response, never
+                // from a diagnostic file whose persistence may have failed.
+                let authority=response.terminal_authority_json().map_err(|error|CiError::Message(error.to_string()))?;
+                diagnostics.diagnostic(retain(
                     &directory.join("extinction-terminal-authority.json"),
-                    response
-                        .terminal_authority_json()
-                        .map_err(|error| CiError::Message(error.to_string()))?
-                        .as_bytes(),
+                    authority.as_bytes(),
                     record,
-                )?;
+                ));
             }
-            let failed_collection_recovery = if collection.is_err() {
-                let held = live
-                    .lock()
-                    .map_err(|_| CiError::Message("component association poisoned".into()))?
-                    .clone();
-                held.as_ref()
-                    .map(|held| {
-                        recover_held_attempt(
-                            config,
-                            input,
-                            directory,
-                            record,
-                            held,
-                            recovery_cutoff,
-                            "failed-collection-recovery",
-                            true,
-                            None,
-                        )
-                    })
-                    .transpose()
-                    .map(|_| ())
-            } else {
-                Ok(())
-            };
-            let recovery_budget = recovery_cutoff
-                .checked_duration_since(Instant::now())
-                .filter(|budget| !budget.is_zero())
-                .ok_or_else(|| {
-                    CiError::Message("original failed collection recovery cutoff exhausted".into())
-                })?;
-            let recovery_millis = recovery_budget.as_millis().to_string();
-            let mut converge =
-                crate::command::CommandSpec::new(&config.cli.path, directory, recovery_budget)
-                    .args(["windows-recover", "converge", recovery_millis.as_str()])
-                    .materialize()?;
-            converge.env_clear();
-            retain(
-                &directory.join("recovery-invocation.json"),
-                &serde_json::to_vec(&serde_json::json!({
+                                Ok(())
+                            })();
+                            diagnostics.operation(extinction);
+                            if collection.is_err() {
+                                let held = live
+                                    .lock()
+                                    .map_err(|_| {
+                                        CiError::Message("component association poisoned".into())
+                                    })?
+                                    .clone();
+                                held.as_ref()
+                                    .map(|held| {
+                                        recover_held_attempt_retaining(
+                                            RecoveryCapture {
+                                                config,
+                                                input,
+                                                directory,
+                                                record,
+                                                held,
+                                                cutoff: recovery_cutoff,
+                                                capture_stem: "failed-collection-recovery",
+                                                certification_failure_preserved: true,
+                                                pending_frontend: None,
+                                            },
+                                            diagnostics,
+                                        )
+                                    })
+                                    .transpose()
+                                    .map(|_| ())?;
+                            }
+                            Ok(())
+                        }
+                        SettlementStage::Converge => {
+                            let recovery_budget = recovery_cutoff
+                                .checked_duration_since(Instant::now())
+                                .filter(|budget| !budget.is_zero())
+                                .ok_or_else(|| {
+                                    CiError::Message(
+                                        "original failed collection recovery cutoff exhausted"
+                                            .into(),
+                                    )
+                                })?;
+                            let recovery_millis = recovery_budget.as_millis().to_string();
+                            let mut converge = crate::command::CommandSpec::new(
+                                &config.cli.path,
+                                directory,
+                                recovery_budget,
+                            )
+                            .args(["windows-recover", "converge", recovery_millis.as_str()])
+                            .materialize()?;
+                            converge.env_clear();
+                            let invocation=diagnostics.capture_diagnostic(serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-component-settlement-command","revision":1,
                     "run_id":input.run_id,"recipe_id":input.recipe_id,"native_target":input.native_target,
                     "source_commit":input.source_commit,"executable_sha256":config.cli.sha256,
@@ -2885,169 +2989,226 @@ mod native {
                     "cwd_utf16":directory.as_os_str().encode_wide().collect::<Vec<_>>(),"environment_cleared":true,
                     "work_deadline_unix_millis":input.original_work_deadline_unix_millis,
                     "cleanup_deadline_unix_millis":input.original_cleanup_deadline_unix_millis
-                }))?,
-                record,
-            )?;
-            let output = memcordon_testkit::run_with_deadline_output_limit(
-                &mut converge,
-                recovery_budget,
-                256 * 1024,
-            )
-            .map_err(|error| CiError::Message(error.to_string()))?;
-            retain(&directory.join("recovery.json"), &output.stdout, record)?;
-            retain(
-                &directory.join("recovery.stderr.bin"),
-                &output.stderr,
-                record,
-            )?;
-            retain(
+                })).map_err(CiError::from));
+                            let invocation_sha256 = invocation
+                                .as_ref()
+                                .map(|bytes| crate::windows_causal_acceptance::sha256(bytes));
+                            if let Some(invocation) = &invocation {
+                                diagnostics.diagnostic(retain(
+                                    &directory.join("recovery-invocation.json"),
+                                    invocation,
+                                    record,
+                                ));
+                            }
+                            let recovery_budget = recovery_cutoff
+                                .checked_duration_since(Instant::now())
+                                .filter(|budget| !budget.is_zero())
+                                .ok_or_else(|| {
+                                    CiError::Message(
+                                        "original failed collection recovery cutoff exhausted"
+                                            .into(),
+                                    )
+                                })?;
+                            let output = memcordon_testkit::run_with_deadline_output_limit(
+                                &mut converge,
+                                recovery_budget,
+                                256 * 1024,
+                            )
+                            .map_err(|error| CiError::Message(error.to_string()))?;
+                            diagnostics.diagnostic(retain(
+                                &directory.join("recovery.json"),
+                                &output.stdout,
+                                record,
+                            ));
+                            diagnostics.diagnostic(retain(
+                                &directory.join("recovery.stderr.bin"),
+                                &output.stderr,
+                                record,
+                            ));
+                            diagnostics.diagnostic((|| -> Result<()> { retain(
                 &directory.join("recovery-exit.json"),
                 &serde_json::to_vec(&serde_json::json!({
                     "format":"memcordon.windows-component-settlement-exit","revision":1,
-                    "invocation_sha256":crate::windows_causal_acceptance::sha256(&read(&directory.join("recovery-invocation.json"),256*1024)?),
+                    "invocation_sha256":invocation_sha256,
                     "stdout_sha256":crate::windows_causal_acceptance::sha256(&output.stdout),
                     "stderr_sha256":crate::windows_causal_acceptance::sha256(&output.stderr),"native_status":output.status.code()
                 }))?,
                 record,
-            )?;
-            if !output.status.success() {
-                let excerpt = &output.stderr[..output.stderr.len().min(4096)];
-                return Err(CiError::Message(format!(
-                    "component native recovery command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}; original recovery records retained",
-                    output.status,
-                    output.stdout.len(),
-                    output.stderr.len(),
-                    excerpt.len() != output.stderr.len(),
-                    String::from_utf8_lossy(excerpt),
-                )));
-            }
-            failed_collection_recovery?;
-            let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
-                serde_json::from_slice(&output.stdout)?;
-            if !inventory.is_consistent()
-                || inventory.authority_unsettled()
-                || inventory.provider_generation != config.provider.generation.as_str()
-                || !memcordon_testkit::windows_processes_for_image_until(
-                    &config.fixture.path,
-                    deadlines.cleanup,
-                )?
-                .is_empty()
-            {
-                return Err(CiError::Message(
+            ) })());
+                            if !output.status.success() {
+                                let excerpt = &output.stderr[..output.stderr.len().min(4096)];
+                                return Err(CiError::Message(format!(
+                                    "component native recovery command failed; status={:?}; stdout-bytes={}; stderr-bytes={}; stderr-truncated={}; stderr={:?}; original recovery records retained",
+                                    output.status,
+                                    output.stdout.len(),
+                                    output.stderr.len(),
+                                    excerpt.len() != output.stderr.len(),
+                                    String::from_utf8_lossy(excerpt),
+                                )));
+                            }
+                            let inventory: memcordon_core::WindowsRecoveryInventoryV1 =
+                                serde_json::from_slice(&output.stdout)?;
+                            if !inventory.is_consistent()
+                                || inventory.authority_unsettled()
+                                || inventory.provider_generation
+                                    != config.provider.generation.as_str()
+                                || !memcordon_testkit::windows_processes_for_image_until(
+                                    &config.fixture.path,
+                                    deadlines.cleanup,
+                                )?
+                                .is_empty()
+                            {
+                                return Err(CiError::Message(
                     "component native recovery retained authority or live fixture family".into(),
                 ));
-            }
-            GuardianBaseline::quiescent(
-                &config.installed_agent.path,
-                &config.installed_manifest.path,
-                &config.installed_agent.sha256,
-                &config.installed_manifest.sha256,
-            )?;
-            if held_phase {
-                let family = family
-                    .lock()
-                    .map_err(|_| CiError::Message("component family ownership poisoned".into()))?;
-                let guardian = guardian.lock().map_err(|_| {
-                    CiError::Message("component guardian ownership poisoned".into())
-                })?;
-                if family.len() != 1
-                    || !family[0].has_exited()?
-                    || !guardian
-                        .as_ref()
-                        .is_some_and(|guardian| guardian.has_retired().unwrap_or(false))
-                {
-                    return Err(CiError::Message(
+                            }
+                            Ok(())
+                        }
+                        SettlementStage::HeldRetirement => {
+                            diagnostics.operation(GuardianBaseline::quiescent(
+                                &config.installed_agent.path,
+                                &config.installed_manifest.path,
+                                &config.installed_agent.sha256,
+                                &config.installed_manifest.sha256,
+                            ));
+                            if held_phase {
+                                let target_retirement = (|| -> Result<()> {
+                                    let family = family.lock().map_err(|_| {
+                                        CiError::Message(
+                                            "component family ownership poisoned".into(),
+                                        )
+                                    })?;
+                                    let guardian = guardian.lock().map_err(|_| {
+                                        CiError::Message(
+                                            "component guardian ownership poisoned".into(),
+                                        )
+                                    })?;
+                                    if family.len() != 1
+                                        || !family[0].has_exited()?
+                                        || !guardian.as_ref().is_some_and(|guardian| {
+                                            guardian.has_retired().unwrap_or(false)
+                                        })
+                                    {
+                                        return Err(CiError::Message(
                         "component held native family did not retire after fault".into(),
                     ));
-                }
-                let guardian_status = guardian
-                    .as_ref()
-                    .expect("checked held guardian")
-                    .native_exit_status()?;
-                if matches!(fault,Some(memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization
+                                    }
+                                    let guardian_status = guardian
+                                        .as_ref()
+                                        .expect("checked held guardian")
+                                        .native_exit_status()?;
+                                    if matches!(fault,Some(memcordon_core::WindowsSealedFault::GuardianKilledAfterAuthorization
                     |memcordon_core::WindowsSealedFault::AllJobOwnersClosedAfterAuthorization))&&guardian_status!=Some(0xC000_013A) {
                     return Err(CiError::Message("actual held guardian exit differs from selected native termination".into()));
                 }
-                retain(
+                                    let target_status = family[0].native_exit_status()?;
+                                    diagnostics.diagnostic((|| -> Result<()> { retain(
                     &directory.join("held-after-fault.json"),
                     &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-component-held-retirement","revision":1,
                         "target_process_id":family[0].identity.pid,"target_creation_time_100ns":family[0].identity.birth,
                         "guardian":guardian.as_ref().expect("checked held guardian").identity,
                         "held_before_fault":true,"target_retired":true,"guardian_retired":true,"guardian_native_exit_status":guardian_status,
-                        "target_native_exit_status":family[0].native_exit_status()?
+                        "target_native_exit_status":target_status
                     }))?,
                     record,
-                )?;
-                if worker_loss {
-                    let worker = worker.lock().map_err(|_| {
-                        CiError::Message("component worker ownership poisoned".into())
-                    })?;
-                    let worker = worker.as_ref().ok_or_else(|| {
-                        CiError::Message("component worker was not retained before release".into())
-                    })?;
-                    let status = worker_exit(worker)?;
-                    if status != 0xC000_013A {
-                        return Err(CiError::Message(
+                ) })());
+                                    Ok(())
+                                })();
+                                diagnostics.operation(target_retirement);
+                                if worker_loss {
+                                    let worker_retirement = (|| -> Result<()> {
+                                        let worker = worker.lock().map_err(|_| {
+                                            CiError::Message(
+                                                "component worker ownership poisoned".into(),
+                                            )
+                                        })?;
+                                        let worker = worker.as_ref().ok_or_else(|| {
+                                            CiError::Message(
+                                                "component worker was not retained before release"
+                                                    .into(),
+                                            )
+                                        })?;
+                                        let status = worker_exit(worker)?;
+                                        if status != 0xC000_013A {
+                                            return Err(CiError::Message(
                             "component worker exit did not match selected native fault".into(),
                         ));
-                    }
-                    let process_retired = worker.process.has_exited()?;
-                    if process_retired != launcher_process_loss {
-                        return Err(CiError::Message("component launcher process retirement differs from selected thread/process action".into()));
-                    }
-                    if process_retired && worker.process.native_exit_status()? != Some(0xC000_013A)
-                    {
-                        return Err(CiError::Message(
+                                        }
+                                        let process_retired = worker.process.has_exited()?;
+                                        if process_retired != launcher_process_loss {
+                                            return Err(CiError::Message("component launcher process retirement differs from selected thread/process action".into()));
+                                        }
+                                        let process_status = worker.process.native_exit_status()?;
+                                        if process_retired && process_status != Some(0xC000_013A) {
+                                            return Err(CiError::Message(
                             "held launcher process status differs from actual selected termination"
                                 .into(),
                         ));
-                    }
-                    retain(
+                                        }
+                                        diagnostics.diagnostic((|| -> Result<()> { retain(
                         &directory.join("held-worker-exit.json"),
                         &serde_json::to_vec(&serde_json::json!({
                             "format":"memcordon.windows-component-worker-exit","revision":1,
                             "process_id":worker.process.identity.pid,"process_creation_time_100ns":worker.process.identity.birth,
                             "thread":worker.identity,"held_before_fault":true,"exit_observed":true,"native_exit_status":status,
-                            "process_retirement_observed":process_retired,"process_native_exit_status":worker.process.native_exit_status()?
+                            "process_retirement_observed":process_retired,"process_native_exit_status":process_status
                         }))?,
                         record,
-                    )?;
-                }
-                if control_loss {
-                    let worker = control_worker.lock().map_err(|_| {
-                        CiError::Message("control worker ownership poisoned".into())
-                    })?;
-                    let worker = worker.as_ref().ok_or_else(|| {
-                        CiError::Message("actual control worker was not held before release".into())
-                    })?;
-                    let status = worker_exit(worker)?;
-                    let process_retired = worker.process.has_exited()?;
-                    let process_status = worker.process.native_exit_status()?;
-                    if !fault.is_some_and(|selected| {
-                        control_retirement_matches(
-                            selected,
-                            status,
-                            process_retired,
-                            process_status,
-                        )
-                    }) {
-                        return Err(CiError::Message(
-                            "actual held control service status differs".into(),
-                        ));
-                    }
-                    retain(
+                    ) })());
+                                        Ok(())
+                                    })(
+                                    );
+                                    diagnostics.operation(worker_retirement);
+                                }
+                                if control_loss {
+                                    let control_retirement = (|| -> Result<()> {
+                                        let worker = control_worker.lock().map_err(|_| {
+                                            CiError::Message(
+                                                "control worker ownership poisoned".into(),
+                                            )
+                                        })?;
+                                        let worker = worker.as_ref().ok_or_else(|| {
+                                            CiError::Message(
+                                                "actual control worker was not held before release"
+                                                    .into(),
+                                            )
+                                        })?;
+                                        let status = worker_exit(worker)?;
+                                        let process_retired = worker.process.has_exited()?;
+                                        let process_status = worker.process.native_exit_status()?;
+                                        if !fault.is_some_and(|selected| {
+                                            control_retirement_matches(
+                                                selected,
+                                                status,
+                                                process_retired,
+                                                process_status,
+                                            )
+                                        }) {
+                                            return Err(CiError::Message(
+                                                "actual held control service status differs".into(),
+                                            ));
+                                        }
+                                        diagnostics.diagnostic((|| -> Result<()> { retain(
                         &directory.join("held-control-worker-exit.json"),
                         &serde_json::to_vec(&serde_json::json!({
                         "format":"memcordon.windows-component-control-worker-exit","revision":1,"process_id":worker.process.identity.pid,
                         "process_creation_time_100ns":worker.process.identity.birth,"thread":worker.identity,"held_before_fault":true,
                         "exit_observed":true,"native_exit_status":status,"process_retirement_observed":process_retired,
-                        "process_native_exit_status":worker.process.native_exit_status()?}))?,
+                        "process_native_exit_status":process_status}))?,
                         record,
-                    )?;
-                }
-            }
-            Ok(())
+                    ) })());
+                                        Ok(())
+                                    })(
+                                    );
+                                    diagnostics.operation(control_retirement);
+                                }
+                            }
+                            Ok(())
+                        }
+                    }
+                },
+            )
         })();
         record.retirement = retirement.as_ref().map(|_| ()).map_err(ToString::to_string);
         if let Err(error) = &collection {
